@@ -8,6 +8,7 @@
 
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// 子进程句柄：自己拉起的持有 `Child`；接管来的只记 pid（如代理重启后继续守护）。
@@ -556,80 +557,101 @@ pub(crate) fn process_stats(pid: u32) -> Option<(u32, u32)> {
     }
 }
 
-/// 系统 CPU 使用率（0~100；200ms 两次采样差值）。
+/// 上次 CPU 采样 `(空转+等待 ticks, 总 ticks, 上次速率)`——请求间差分。
+static CPU_LAST: Mutex<Option<(u64, u64, f64)>> = Mutex::new(None);
+
+/// 由两次采样差值计算使用率（0~100）。
+///
+/// 口径对齐 psutil/宝塔：`busy = Δ总时 − Δ(idle + iowait)`；字段回退（负增量）按 0 处理
+/// （与 top/psutil 一致）；窗口内总时无变化（同 tick 内重复调用）返回 None。
+fn cpu_rate_from_delta(prev: (u64, u64), cur: (u64, u64)) -> Option<f64> {
+    let dtotal = cur.1.saturating_sub(prev.1);
+    if dtotal == 0 {
+        return None;
+    }
+    let didle = cur.0.saturating_sub(prev.0);
+    Some(((1.0 - didle as f64 / dtotal as f64) * 100.0).clamp(0.0, 100.0))
+}
+
+/// 解析 `/proc/stat` 首行，返回 `(idle + iowait, 总时)`（ticks）。
+///
+/// guest/guest_nice 已计入 user/nice，总时需扣除（psutil、htop 同口径）。
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_stat_first_cpu(text: &str) -> Option<(u64, u64)> {
+    let line = text.lines().find(|l| l.starts_with("cpu "))?;
+    let values: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|v| v.parse().ok())
+        .collect();
+    if values.len() < 4 {
+        return None;
+    }
+    let idle = values[3] + values.get(4).copied().unwrap_or(0);
+    let guest = values.get(8).copied().unwrap_or(0) + values.get(9).copied().unwrap_or(0);
+    let total = values.iter().sum::<u64>().saturating_sub(guest);
+    Some((idle, total))
+}
+
+/// 系统 CPU 使用率（0~100）。
+///
+/// 口径对齐 psutil/宝塔：`使用率 = busy / (busy + idle + iowait)`（Linux 扣除 guest 重复计数）；
+/// 采样窗口 = 与上次调用之间（面板 3 秒刷新 → 3 秒窗口均值），首次调用以 200ms 双采样建立基线。
 pub(crate) fn system_cpu_rate() -> Option<f64> {
     #[cfg(windows)]
-    {
+    let sample = || -> Option<(u64, u64)> {
         use windows_sys::Win32::Foundation::FILETIME;
         use windows_sys::Win32::System::Threading::GetSystemTimes;
 
+        fn value(t: FILETIME) -> u64 {
+            ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
+        }
+
         // 返回 (空闲 100ns, 总忙 100ns)；Windows 的内核时间已包含空闲时间
-        fn sample() -> Option<(u64, u64)> {
-            fn value(t: FILETIME) -> u64 {
-                ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
-            }
-
-            unsafe {
-                let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
-                    (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
-                if GetSystemTimes(&mut idle, &mut kernel, &mut user) == 0 {
-                    return None;
-                }
-                Some((value(idle), value(kernel) + value(user)))
-            }
-        }
-
-        let (idle1, total1) = sample()?;
-        std::thread::sleep(Duration::from_millis(200));
-        let (idle2, total2) = sample()?;
-
-        let total = total2.saturating_sub(total1);
-        let idle = idle2.saturating_sub(idle1);
-        if total == 0 {
-            return None;
-        }
-        Some(((1.0 - idle as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        // /proc/stat 首行：cpu user nice system idle iowait irq softirq steal ...
-        fn sample() -> Option<(u64, u64)> {
-            let text = std::fs::read_to_string("/proc/stat").ok()?;
-            let line = text.lines().find(|l| l.starts_with("cpu "))?;
-            let values: Vec<u64> = line
-                .split_whitespace()
-                .skip(1)
-                .filter_map(|v| v.parse().ok())
-                .collect();
-            if values.len() < 4 {
+        unsafe {
+            let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
+                (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+            if GetSystemTimes(&mut idle, &mut kernel, &mut user) == 0 {
                 return None;
             }
-            let idle = values[3] + values.get(4).copied().unwrap_or(0);
-            let total: u64 = values.iter().sum();
-            Some((idle, total))
+            Some((value(idle), value(kernel) + value(user)))
         }
+    };
 
-        let (idle1, total1) = sample()?;
-        std::thread::sleep(Duration::from_millis(200));
-        let (idle2, total2) = sample()?;
-
-        let total = total2.saturating_sub(total1);
-        let idle = idle2.saturating_sub(idle1);
-        if total == 0 {
-            return None;
-        }
-        Some(((1.0 - idle as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
-    }
+    #[cfg(target_os = "linux")]
+    let sample = || -> Option<(u64, u64)> {
+        let text = std::fs::read_to_string("/proc/stat").ok()?;
+        parse_proc_stat_first_cpu(&text)
+    };
 
     #[cfg(not(any(windows, target_os = "linux")))]
-    {
-        None
+    let sample = || -> Option<(u64, u64)> { None };
+
+    let mut slot = CPU_LAST.lock().unwrap();
+    if let Some((prev_idle, prev_total, prev_rate)) = *slot {
+        let (idle, total) = sample()?;
+        let rate = cpu_rate_from_delta((prev_idle, prev_total), (idle, total)).unwrap_or(prev_rate);
+        *slot = Some((idle, total, rate));
+        return Some(rate);
     }
+
+    // 首次调用：以 200ms 双采样建立基线，后续按请求间隔差分
+    let first = sample()?;
+    std::thread::sleep(Duration::from_millis(200));
+    let second = sample()?;
+    let rate = cpu_rate_from_delta(first, second).unwrap_or(0.0);
+    *slot = Some((second.0, second.1, rate));
+    Some(rate)
 }
 
 /// 机器唯一标识（Windows 注册表 `MachineGuid`；Linux `/etc/machine-id`）。
 pub(crate) fn machine_guid() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_machine_guid).clone()
+}
+
+/// 检测机器唯一标识（进程生命周期内不变，结果缓存）。
+fn detect_machine_guid() -> Option<String> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::NO_ERROR;
@@ -933,12 +955,15 @@ pub(crate) fn tcp_counts() -> (u32, u32, u32) {
             return (0, 0, 0);
         };
         let (mut estab, mut time_wait, mut close_wait) = (0u32, 0u32, 0u32);
+        // 只取第 4 列（状态码）做字节比较：连接多时避免每行两次堆分配（Vec + 大写 String）
         for line in text.lines().skip(1) {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            match fields.get(3).map(|v| v.to_ascii_uppercase()) {
-                Some(state) if state == "01" => estab += 1,
-                Some(state) if state == "06" => time_wait += 1,
-                Some(state) if state == "08" => close_wait += 1,
+            let Some(state) = line.split_whitespace().nth(3) else {
+                continue;
+            };
+            match state.as_bytes() {
+                b"01" => estab += 1,
+                b"06" => time_wait += 1,
+                b"08" => close_wait += 1,
                 _ => {}
             }
         }
@@ -1093,7 +1118,14 @@ fn for_each_process(mut f: impl FnMut(&str, u32, u32)) {
 }
 
 /// 主机名。
+///
+/// 进程生命周期内视为不变，缓存避免每次面板请求重复读取环境变量 / `/etc/hostname`。
 pub(crate) fn hostname() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_hostname).clone()
+}
+
+fn detect_hostname() -> String {
     #[cfg(windows)]
     {
         std::env::var("COMPUTERNAME").unwrap_or_default()
@@ -1164,7 +1196,14 @@ pub(crate) fn user_name() -> String {
 }
 
 /// 操作系统描述（Windows 形如 `Microsoft Windows NT 10.0.26200.0`，与 .NET `OSDescription` 一致）。
+///
+/// 进程生命周期内不变，缓存避免每次面板请求重复读 `/etc/os-release` / 调用 RtlGetVersion。
 pub(crate) fn os_description() -> String {
+    static CACHE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_os_description).clone()
+}
+
+fn detect_os_description() -> String {
     #[cfg(windows)]
     {
         // 与 dhrust::logs 的实现同源（RtlGetVersion）；待公共化后统一下沉
@@ -1212,7 +1251,14 @@ pub(crate) fn os_description() -> String {
 }
 
 /// CPU 型号（Windows 读注册表 ProcessorNameString；Linux 读 /proc/cpuinfo；macOS 读 sysctl）。
+///
+/// 型号在进程生命周期内不变，缓存避免每次面板请求重复读注册表 / 解析 `/proc/cpuinfo`。
 pub(crate) fn cpu_model() -> Option<String> {
+    static CACHE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(detect_cpu_model).clone()
+}
+
+fn detect_cpu_model() -> Option<String> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::NO_ERROR;
@@ -1298,6 +1344,43 @@ pub(crate) fn cpu_model() -> Option<String> {
     }
 }
 
+/// 解析 `/proc/meminfo`，返回 `(总内存, MemFree, Buffers, Cached + SReclaimable)`（字节）。
+///
+/// `cached` 口径对齐 psutil/宝塔与 `free` 命令：`Cached` 与 `SReclaimable` 相加。
+#[cfg(any(target_os = "linux", test))]
+fn parse_meminfo_bytes(text: &str) -> Option<(u64, u64, u64, u64)> {
+    let mut total = None;
+    let mut free = None;
+    let mut buffers = None;
+    let mut cached = None;
+    let mut sreclaimable = 0u64;
+    for line in text.lines() {
+        let Some((key, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let Some(kb) = rest
+            .split_whitespace()
+            .next()
+            .and_then(|v| v.parse::<u64>().ok())
+        else {
+            continue;
+        };
+        match key {
+            "MemTotal" => total = Some(kb * 1024),
+            "MemFree" => free = Some(kb * 1024),
+            "Buffers" => buffers = Some(kb * 1024),
+            "Cached" => cached = Some(kb * 1024),
+            "SReclaimable" => sreclaimable = kb * 1024,
+            _ => {}
+        }
+    }
+    let total = total?;
+    let free = free?;
+    let buffers = buffers.unwrap_or(0);
+    let cached = cached.unwrap_or(0) + sreclaimable;
+    Some((total, free, buffers, cached))
+}
+
 /// 物理内存（总量、可用；字节）。
 pub(crate) fn memory_info() -> Option<(u64, u64)> {
     #[cfg(windows)]
@@ -1316,28 +1399,15 @@ pub(crate) fn memory_info() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
-        let parse_kb = |line: &str, key: &str| {
-            line.strip_prefix(key).and_then(|rest| {
-                rest.split_whitespace()
-                    .next()
-                    .and_then(|v| v.parse::<u64>().ok())
-                    .map(|kb| kb * 1024)
-            })
-        };
-        let mut total = None;
-        let mut avail = None;
-        for line in text.lines() {
-            if total.is_none() {
-                total = parse_kb(line, "MemTotal:");
-            }
-            if avail.is_none() {
-                avail = parse_kb(line, "MemAvailable:");
-            }
-            if total.is_some() && avail.is_some() {
-                break;
-            }
+        let (total, free, buffers, cached) = parse_meminfo_bytes(&text)?;
+        // 对齐宝塔/psutil 口径：已用 = 总 - MemFree - Buffers - Cached - SReclaimable，
+        // 即“可用”按宽松口径计算（缓存视为可回收）
+        let mut avail = free + buffers + cached;
+        if avail > total {
+            // 容器等场景数值失真时退化为纯空闲（psutil 同处理）
+            avail = free;
         }
-        total.map(|t| (t, avail.unwrap_or(0)))
+        Some((total, avail))
     }
 
     #[cfg(target_os = "macos")]
@@ -1853,6 +1923,64 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     }
 }
 
+/// 临时/虚拟文件系统类型黑名单（对齐 DHDeploy `IsTemporaryVolume`）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const TEMP_FS_TYPES: &[&str] = &[
+    "tmpfs",
+    "devtmpfs",
+    "devfs",
+    "overlay",
+    "ramfs",
+    "squashfs",
+    "aufs",
+    "proc",
+    "sysfs",
+    "cgroup",
+    "cgroup2",
+    "pstore",
+    "debugfs",
+    "mqueue",
+    "hugetlbfs",
+    "autofs",
+    "configfs",
+    "securityfs",
+    "binfmt_misc",
+    "rpc_pipefs",
+    "devpts",
+];
+
+/// 挂载点归一：去除尾部斜杠（根 `/` 除外），与 `/proc/mounts` 及 df 输出对齐。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn mount_key(mount: &str) -> &str {
+    if mount.len() > 1 {
+        mount.trim_end_matches('/')
+    } else {
+        mount
+    }
+}
+
+/// 是否为临时/虚拟文件系统挂载（对齐 DHDeploy `IsTemporaryVolume`）：
+/// ① 文件系统类型黑名单（tmpfs/overlay/squashfs 等）；② 引导分区 `/boot`、`/boot/efi`；
+/// ③ `/sys`、`/proc`、`/dev`、`/run`、`/snap` 等系统虚拟目录（含子路径）。
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn is_temporary_mount(mount: &str, fs_type: &str) -> bool {
+    if TEMP_FS_TYPES.iter().any(|t| t.eq_ignore_ascii_case(fs_type)) {
+        return true;
+    }
+    let mount = mount_key(mount);
+    if mount == "/boot" || mount == "/boot/efi" {
+        return true;
+    }
+    for prefix in ["/sys", "/proc", "/dev", "/run", "/snap"] {
+        if let Some(rest) = mount.strip_prefix(prefix) {
+            if rest.is_empty() || rest.starts_with('/') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// 枚举磁盘（对齐 C# `ShowMachineInfo`：全量枚举并标注类型）。
 pub(crate) fn disks() -> Vec<DiskItem> {
     #[cfg(windows)]
@@ -1932,6 +2060,10 @@ pub(crate) fn disks() -> Vec<DiskItem> {
                 continue;
             };
             if !dev.starts_with("/dev/") {
+                continue;
+            }
+            // 过滤引导分区与系统虚拟文件系统（对齐 DHDeploy `IsTemporaryVolume`）
+            if is_temporary_mount(mp, fs) {
                 continue;
             }
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -2039,6 +2171,28 @@ mod tests {
     }
 
     #[test]
+    fn temporary_mount_filter_matches_dhdeploy() {
+        // ① 类型黑名单
+        assert!(is_temporary_mount("/", "tmpfs"));
+        assert!(is_temporary_mount("/www", "overlay"));
+        assert!(is_temporary_mount("/mnt/x", "squashfs"));
+        // ② 引导分区（含尾斜杠归一）
+        assert!(is_temporary_mount("/boot", "ext4"));
+        assert!(is_temporary_mount("/boot/efi", "vfat"));
+        assert!(is_temporary_mount("/boot/", "ext4"));
+        // ③ 系统虚拟目录前缀
+        assert!(is_temporary_mount("/dev/shm", "tmpfs"));
+        assert!(is_temporary_mount("/run/user/0", "tmpfs"));
+        assert!(is_temporary_mount("/snap/core20/1234", "squashfs"));
+        assert!(is_temporary_mount("/sys/fs/cgroup", "cgroup2"));
+        // 正常业务挂载不受影响
+        assert!(!is_temporary_mount("/", "ext4"));
+        assert!(!is_temporary_mount("/www", "xfs"));
+        assert!(!is_temporary_mount("/data", "ext4"));
+        assert!(!is_temporary_mount("/boot2", "ext4"), "仅精确匹配 /boot");
+    }
+
+    #[test]
     fn machine_info_contains_core_lines() {
         let text = machine_info();
         for key in ["系统：", "处理器：", "内存：", "程序："] {
@@ -2082,6 +2236,62 @@ Inter-|   Receive                                                |  Transmit
         assert_eq!(entries[1], ("veth1".to_string(), 30, 40));
         // 逐接口解析的汇总应与总量一致
         assert_eq!(parse_net_dev(sample), (1030, 4040));
+    }
+
+    #[test]
+    fn parse_meminfo_matches_baota_semantics() {
+        let sample = "\
+MemTotal:       16299544 kB
+MemFree:          512000 kB
+MemAvailable:    8192000 kB
+Buffers:          102400 kB
+Cached:          4096000 kB
+SReclaimable:     204800 kB
+Shmem:            100000 kB
+";
+        let (total, free, buffers, cached) = parse_meminfo_bytes(sample).unwrap();
+        assert_eq!(total, 16299544 * 1024);
+        assert_eq!(free, 512000 * 1024);
+        assert_eq!(buffers, 102400 * 1024);
+        // cached = Cached + SReclaimable（free 命令/psutil 口径）
+        assert_eq!(cached, (4096000 + 204800) * 1024);
+        // 宝塔 memRealUsed = 总 - MemFree - Buffers - Cached - SReclaimable
+        let used = total - free - buffers - cached;
+        assert_eq!(used, (16299544 - 512000 - 102400 - 4096000 - 204800) * 1024);
+    }
+
+    #[test]
+    fn parse_meminfo_without_optional_fields() {
+        let sample = "MemTotal:       1000 kB\nMemFree:         100 kB\n";
+        let (total, free, buffers, cached) = parse_meminfo_bytes(sample).unwrap();
+        assert_eq!((total, free, buffers, cached), (1000 * 1024, 100 * 1024, 0, 0));
+        assert!(
+            parse_meminfo_bytes("MemFree: 100 kB\n").is_none(),
+            "缺 MemTotal 应失败"
+        );
+    }
+
+    #[test]
+    fn parse_proc_stat_first_cpu_matches_psutil() {
+        // 10 字段（含 guest/guest_nice）：guest 已计入 user/nice，总时须扣除
+        let text = "cpu  100 20 30 400 50 5 5 0 15 5\ncpu0 10 2 3 40 5 0 0 0 1 0\n";
+        let (idle, total) = parse_proc_stat_first_cpu(text).unwrap();
+        assert_eq!(idle, 400 + 50, "空转=idle+iowait");
+        // 全部字段和 630，扣除 guest(15)+guest_nice(5)
+        assert_eq!(total, 630 - 20);
+        // 仅 4 字段的旧内核
+        let legacy = "cpu  1 2 3 4\n";
+        assert_eq!(parse_proc_stat_first_cpu(legacy), Some((4, 10)));
+    }
+
+    #[test]
+    fn cpu_rate_from_delta_matches_psutil_formula() {
+        // Δ总 100、Δ(idle+iowait) 20 → 80%
+        assert_eq!(cpu_rate_from_delta((10, 100), (30, 200)), Some(80.0));
+        // 字段回退（负增量）按 0 处理 → 全忙
+        assert_eq!(cpu_rate_from_delta((50, 100), (40, 150)), Some(100.0));
+        // 窗口内无 tick 变化：沿用上次速率
+        assert_eq!(cpu_rate_from_delta((0, 100), (0, 100)), None);
     }
 
     #[test]

@@ -400,6 +400,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
     let disks = sys::disk_usages();
+    // 进程 CPU 时间：供内嵌 health 字段使用（复用本次采集，避免前端第二次请求）
+    let (cpu_total, cpu_kernel, cpu_user) = sys::process_cpu_seconds();
     let load = sys::load_average();
     let cpu_rate = sys::system_cpu_rate();
     let (tcp_estab, tcp_time_wait, tcp_close_wait) = sys::tcp_counts();
@@ -418,6 +420,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cpu_count = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(0);
+    // 进程自身 CPU 占用（占整机百分比：与网络速率同模式按请求间隔差分；首帧为自启动以来的平均值）
+    let proc_cpu = process_cpu_rate(cpu_total, uptime.as_secs_f64());
 
     let data = json!({
         "serviceName": cfg.service_name,
@@ -432,6 +436,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "memoryTotalMB": mem_total / 1024 / 1024,
         "threadCount": threads,
         "handleCount": handles,
+        "processCpuRate": format!("{proc_cpu:.1}"),
+        "processCpuRateValue": (proc_cpu * 10.0).round() / 10.0,
         "startTime": panel.started_at.format("%m-%d %H:%M:%S").to_string(),
         "hostMachine": sys::hostname(),
         "platform": platform_name(),
@@ -472,6 +478,21 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         // 默认凭据提示：面板顶部横幅数据（remoteAccess=允许远程访问时风险更高）
         "defaultPassword": uses_default_credentials(&cfg),
         "remoteAccess": !cfg.local_only,
+        // 进程健康指标（原 /api/health 合并至此：面板每 3 秒刷新只需一次请求，
+        // 且复用上面已采集的进程统计，省一次全进程快照与进程内存查询）
+        "health": json!({
+            "memoryMB": memory_mb,
+            "memoryLimitMB": 0,
+            "threadCount": threads,
+            "threadLimit": 0,
+            "handleCount": handles,
+            "handleLimit": 0,
+            "totalProcessorTime": format!("{cpu_total:.1}"),
+            "privilegedProcessorTime": format!("{cpu_kernel:.1}"),
+            "userProcessorTime": format!("{cpu_user:.1}"),
+            "gcTotalMemory": 0,
+            "gcCollections": { "gen0": 0, "gen1": 0, "gen2": 0 },
+        }),
     });
 
     json_result(0, "", Some(data))
@@ -503,6 +524,34 @@ fn health(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     });
 
     json_result(0, "", Some(data))
+}
+
+/// 进程 CPU 占用百分比（占整机口径：CPU 时间 / 经过时间 / 逻辑核数 × 100，钳制到 100）。
+fn process_cpu_percent(cpu_seconds: f64, elapsed_secs: f64, cores: usize) -> f64 {
+    if elapsed_secs <= 0.0 || cores == 0 {
+        return 0.0;
+    }
+    ((cpu_seconds / elapsed_secs) / cores as f64 * 100.0).clamp(0.0, 100.0)
+}
+
+/// 请求时差分的进程 CPU 占用百分比；首次调用无差分基线时返回“自启动以来的平均占用”。
+fn process_cpu_rate(total_seconds: f64, uptime_secs: f64) -> f64 {
+    static PROC_CPU_LAST: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    let now = Instant::now();
+    let mut last = PROC_CPU_LAST.lock().expect("process cpu sample");
+    let pct = match last.as_ref() {
+        Some((t0, c0)) => process_cpu_percent(
+            (total_seconds - c0).max(0.0),
+            now.duration_since(*t0).as_secs_f64(),
+            cores,
+        ),
+        None => process_cpu_percent(total_seconds, uptime_secs, cores),
+    };
+    *last = Some((now, total_seconds));
+    pct
 }
 
 /// 上次网络采样（时间, 接收字节, 发送字节）——面板速率差分用。
@@ -1951,6 +2000,11 @@ mod tests {
         assert!(d["diskReadBytes"].as_u64().is_some() && d["diskWriteBytes"].as_u64().is_some());
         assert!(d["diskLatencyMs"].is_number(), "应返回 IO 延迟数值");
 
+        // health 已合并进 status（面板每 3 秒刷新只需一次请求）
+        assert!(d["health"]["memoryMB"].is_number(), "status 应内嵌 health 指标");
+        assert!(d["health"]["threadCount"].is_number());
+        assert!(d["health"]["gcCollections"]["gen0"].is_number());
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1975,6 +2029,20 @@ mod tests {
         assert!(!uses_default_credentials(&panel.manager.config()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn process_cpu_percent_computes_and_clamps() {
+        // 1 秒间隔消耗 0.5 秒 CPU、单核 → 50%
+        assert!((process_cpu_percent(0.5, 1.0, 1) - 50.0).abs() < 0.01);
+        // 8 核下 0.4 秒 CPU / 1 秒 → 5%（占整机口径）
+        assert!((process_cpu_percent(0.4, 1.0, 8) - 5.0).abs() < 0.01);
+        // 异常输入：零间隔 / 零核
+        assert_eq!(process_cpu_percent(1.0, 0.0, 8), 0.0);
+        assert_eq!(process_cpu_percent(1.0, 1.0, 0), 0.0);
+        // 负数增量（时钟噪声）钳制为 0，超界钳制为 100
+        assert_eq!(process_cpu_percent(-1.0, 1.0, 8), 0.0);
+        assert_eq!(process_cpu_percent(16.0, 1.0, 8), 100.0);
     }
 
     #[test]

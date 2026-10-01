@@ -391,9 +391,10 @@ let _machineInfoBuilt=false;
 
 async function loadDashboard(){
  try{
-  const[s,h]=await Promise.all([api('/api/status'),api('/api/health')]);
+  // 单请求：health 指标已合并进 /api/status（后端复用同一批系统采集，省去第二次请求与重复采样）
+  const s=await api('/api/status');
   if(s.code!==0)return;statusData=s.data;
-  const d=s.data;
+  const d=s.data;const h={data:d.health||null};
   const title='StarAgent';
   document.title=title+' 管理面板';
   $('header-title').textContent=title+' 管理面板';
@@ -433,9 +434,12 @@ function buildDashboard(d,health){
  html+=`<div class="stats-grid">`;
  html+=statCard('服务名',d.displayName||d.serviceName,'','svc-name');
  html+=statCard('运行时长',d.uptime,'','svc-uptime');
+ html+=statCard('进程 CPU',(d.processCpuRate||'0.0')+'%','font-mono','svc-cpu');
+ html+=statCard('进程内存',d.memoryMB+' MB','','svc-mem',d.memoryMB>500?'text-yellow':'');
+ html+=statCard('线程数',d.threadCount||0,'','svc-thr');
+ html+=statCard('句柄数',d.handleCount||0,'','svc-hnd');
  html+=statCard('进程 ID',d.processId,'font-mono','svc-pid');
  html+=statCard('监听端口',d.port,'font-mono','svc-port');
- html+=statCard('进程内存',d.memoryMB+' MB','','svc-mem',d.memoryMB>500?'text-yellow':'');
  html+=statCard('启动时间',d.startTime,'text-secondary','svc-start');
  html+=statCard('连接数',d.tcpConnections||0,'','conn-val',d.tcpConnections>1000?'text-red':(d.tcpConnections>100?'text-yellow':'text-green'));
  html+=statCard('磁盘 IO',formatIops(d.diskIops),'font-mono','disk-iops');
@@ -446,15 +450,17 @@ function buildDashboard(d,health){
  const memUsedMB = d.memoryUsedMB||0, memTotalMB = d.memoryTotalMB||0;
  const memPct = memTotalMB>0 ? pct(memUsedMB, memTotalMB) : 0;
  const hasLoad = d.load1!=null;
- const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/d.cpuCount*100)) : 0;
+ // 宝塔口径：负载百分比 = 1 分钟均值 /（CPU 逻辑核数 × 2）（与宝塔 load.max 一致）
+ const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/(d.cpuCount*2)*100)) : 0;
 
  html+=`<div class="glass-card card"><h2>💚 资源监控</h2><div class="gauge-row">`;
+ // 顺序与宝塔一致：负载 → CPU → 内存 → 磁盘（负载仅 Linux 显示）
+ if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=ringGauge('CPU 使用率', (d.cpuCount||0)+' 核', '', cpuPct, 'gauge-cpu');
  html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem');
  (d.disks||[]).forEach((x,i)=>{
   html+=ringGauge('磁盘 '+x.name, fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '', pct(x.usedMB,x.totalMB), 'gauge-disk-'+i);
  });
- if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=`</div>`;
  if(health){
   html+=`<div class="mt-12"><div class="collapse-header" onclick="this.classList.toggle('open');document.getElementById('gc-body').classList.toggle('open')"><span class="arrow">▶</span> GC 与 CPU 统计</div>`;
@@ -497,7 +503,10 @@ function updateDashboard(d,health){
  setText('svc-uptime',d.uptime);
  setText('svc-pid',d.processId);
  setText('svc-port',d.port);
+ setText('svc-cpu',(d.processCpuRate||'0.0')+'%');
  setText('svc-mem',d.memoryMB+' MB');
+ setText('svc-thr',d.threadCount||0);
+ setText('svc-hnd',d.handleCount||0);
  setText('svc-start',d.startTime);
  const ind=$('svc-indicator');
  if(ind){
@@ -508,7 +517,8 @@ function updateDashboard(d,health){
  const memUsedMB = d.memoryUsedMB||0, memTotalMB = d.memoryTotalMB||0;
  const memPct = memTotalMB>0 ? pct(memUsedMB, memTotalMB) : 0;
  const hasLoad = d.load1!=null;
- const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/d.cpuCount*100)) : 0;
+ // 宝塔口径：负载百分比 = 1 分钟均值 /（CPU 逻辑核数 × 2）（与宝塔 load.max 一致）
+ const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/(d.cpuCount*2)*100)) : 0;
  updateGauge('gauge-cpu', cpuPct, (d.cpuCount||0)+' 核', '');
  updateGauge('gauge-mem', memPct, fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '');
  (d.disks||[]).forEach((x,i)=>{

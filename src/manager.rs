@@ -153,6 +153,13 @@ impl AppManager {
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("state.json");
         let text = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string());
+        // 内容未变化时不写盘：守护周期（默认 30 秒）高频触发，避免无谓的磁盘写入与原子替换
+        if std::fs::read_to_string(&path)
+            .map(|old| old == text)
+            .unwrap_or(false)
+        {
+            return;
+        }
         let _ = dhrust::io::write_all_text_atomic(&path, &text);
     }
 
