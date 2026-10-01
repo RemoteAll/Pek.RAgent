@@ -15,10 +15,12 @@ use std::sync::Arc;
 
 use dhrust::net::http::{HttpOutcome, HttpResponse, HttpServer, HttpServerOptions};
 use dhrust::net::router::{Ctx, route, Router};
+use dhrust::net::static_files::StaticFiles;
 use serde::Serialize;
 
 use crate::manager::AppManager;
 use crate::util;
+use crate::webpanel::{build_api_controller, build_star_controller, WebPanel};
 
 /// 服务操作结果（字段与 C# `ServiceOperationResult` 对齐）。
 #[derive(Serialize)]
@@ -80,6 +82,11 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
 /// 构建路由。
 fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let mut router = Router::new();
+
+    // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板）
+    let panel = WebPanel::new(manager.clone(), manager.base(), port);
+    build_api_controller(panel.clone()).mount(&mut router);
+    build_star_controller(panel).mount(&mut router);
 
     // DHDeploy 契约：应用级启停重启
     let m = manager.clone();
@@ -162,33 +169,28 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| async move { kill_and_start(ctx) }),
     );
 
-    // 根路径帮助
-    router.map_get(
-        "/",
-        route(|_ctx| async move {
-            let text = concat!(
-                "Pek.RAgent 本地控制接口\n",
-                "GET /RestartService?serviceName=X\n",
-                "GET /StartService?serviceName=X\n",
-                "GET /StopService?serviceName=X\n",
-                "GET /GetServices\n",
-                "GET /Info\n",
-                "GET /Ping?processId=&watchdogTimeout=\n",
-                "POST /KillAndStart\n"
-            );
-            HttpOutcome::Response(HttpResponse::text(200, text))
-        }),
+    // 静态资源：优先嵌入的面板首页（单文件部署稳定），其次 wwwroot 目录
+    let statics = StaticFiles::new("wwwroot").embed(
+        "/index.html",
+        include_bytes!("../web/index.html"),
+        "text/html; charset=utf-8",
     );
 
-    // 404
-    router.fallback(route(|ctx| async move {
-        HttpOutcome::Response(HttpResponse::json(
-            404,
-            format!(
-                "{{\"Code\":404,\"Message\":\"Not Found: {}\"}}",
-                util::escape_json(&ctx.req.path)
-            ),
-        ))
+    // 404（静态未命中时）
+    router.fallback(route(move |ctx| {
+        let statics = statics.clone();
+        async move {
+            if let Some(response) = statics.try_serve(&ctx.req.path) {
+                return HttpOutcome::Response(response);
+            }
+            HttpOutcome::Response(HttpResponse::json(
+                404,
+                format!(
+                    "{{\"Code\":404,\"Message\":\"Not Found: {}\"}}",
+                    util::escape_json(&ctx.req.path)
+                ),
+            ))
+        }
     }));
 
     router

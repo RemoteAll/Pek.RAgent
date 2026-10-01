@@ -14,6 +14,7 @@ mod server;
 mod service;
 mod sys;
 mod util;
+mod webpanel;
 
 use std::path::{Path, PathBuf};
 

@@ -23,6 +23,7 @@
 | 本地 HTTP 控制接口 | 默认 `127.0.0.1:5500`，兼容 DHDeploy 的调用契约；仅本机访问（可配） |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/Agent.json` 被外部修改后自动重新加载并应用 |
+| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗；默认 `admin`/`admin`，Bearer Token 鉴权，前端页编译期内嵌 |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
@@ -290,7 +291,39 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 
 ---
 
-## 8. 系统服务
+## 8. Web 管理面板
+
+内置管理面板，浏览器访问 `http://127.0.0.1:5500/`（`LocalOnly=false` 时允许远程）：
+
+- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
+- **状态**：运行时长、进程内存/线程/句柄、系统 CPU 使用率、TCP 连接数、机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
+- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/Agent.json`）；
+- **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
+- **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
+- **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
+- **日志**：`Log/` 目录文件列表与尾部内容查看（支持行数/文件/级别过滤）；
+- **看门狗**：`WatchDog` 配置的进程名存活状态检查。
+
+接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。
+
+| 端点 | 说明 |
+|------|------|
+| `POST /api/login`、`POST /api/logout` | 登录（返回 Token）/ 注销 |
+| `GET /api/status`、`GET /api/health` | 服务状态 / 健康指标 |
+| `POST /api/control` | 启停重启代理（`{"action":"start|stop|restart"}`） |
+| `GET /api/freeMemory` | 释放内存 |
+| `GET /api/configMetadata`、`POST /api/updateConfig`、`POST /api/changePassword` | 配置元数据 / 更新 / 修改密码 |
+| `GET /api/logs`、`GET /api/logFiles`、`GET /api/watchdog` | 日志内容 / 文件列表 / 看门狗 |
+| `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
+| `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
+| `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
+| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
+
+> 鉴权：除 `login` 外所有端点需 `Authorization: Bearer <token>`；未通过返回 `{code:401}`。
+
+---
+
+## 9. 系统服务
 
 ### 8.1 Windows
 
@@ -329,20 +362,20 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 
 ---
 
-## 9. 与 C# StarAgent 的差异（当前版本）
+## 10. 与 C# StarAgent 的差异（当前版本）
 
 | 项 | 说明 |
 |----|------|
 | StarServer / StarWeb 对接 | **暂未实现**；`-server` 参数仅保存到配置 |
-| Web 管理面板 | 未实现（原 5580 面板）；控制手段为控制台菜单 + 本地 HTTP 接口 |
-| 本地 RPC | 原 UDP 5500 改为 HTTP 5500；对 DHDeploy 的契约保持兼容 |
-| 配置格式 | 本项目使用 `Config/Agent.json`；未兼容 C# 的 XML 配置 |
+| Web 管理面板 | **已实现**（对齐 C# 契约，前端直接复用）；差异：无 GC 统计（`gcTotalMemory`/`gcCollections` 恒为 0）、磁盘 IOPS 恒为 0、网卡收发包字节未统计、无“扩展面板”接口 |
+| 本地 RPC | 原 UDP 5500 的 RPC 尚未实现（UDP 服务待补）；TCP 5500 已提供 HTTP 契约（DHDeploy + Web 面板），并对 DHDeploy 保持兼容 |
+| 配置格式 | 本项目使用 `Config/Agent.json`（新增 `WebUserName`/`WebPassword`/`WebAuthLevel`/`WatchDog`）；未兼容 C# 的 XML 配置 |
 | 未实现功能 | Nginx 配置生成、防火墙端口自动开放、阿里云 DNS、自身升级/修复、`-watch` 看门狗服务 |
 | 状态存储 | `data/state.json` 记录运行中 PID（用于接管），原 `Service.csv` 不再使用 |
 
 ---
 
-## 10. 开发
+## 11. 开发
 
 ```text
 src/
@@ -352,23 +385,26 @@ src/
 ├─ manager.rs    应用管理器：多应用守护、控制、状态持久化、看门狗、配置热更新
 ├─ app.rs        单应用运行时：启动/停止/退出检测/内存/文件变动
 ├─ deploy.rs     部署：解压、影子目录、可执行文件检索、安全文件替换
-├─ server.rs     本地 HTTP 控制接口（dhrust::net::http + router）
+├─ server.rs     本地 HTTP 控制接口 + Web 面板路由（dhrust::net 控制器）
+├─ webpanel.rs   Web 管理面板：登录鉴权/令牌/限流、/api 与 /star 控制器
+├─ web/          面板前端（index.html，编译期内嵌）
 ├─ service/      平台服务管理（windows / systemd / launchd / unsupported）
-├─ sys.rs        平台进程工具（存活/内存/信号/机器信息）
+├─ sys.rs        平台进程/机器工具（存活/内存/信号/进程枚举/机器信息/工作集回收）
 ├─ netc.rs       极简 HTTP 客户端 / TCP 连通检查
 ├─ config.rs     配置模型（Config/Agent.json）
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（22 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定等）；
-- 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用 5500 接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管。
+- 单元测试：`cargo test`（39 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权/限流/子服务 CRUD/日志/机器信息等）；
+- 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ---
 
-## 11. 路线图
+## 12. 路线图
 
 - [ ] StarServer / StarWeb 对接（登录、心跳、指令下发）
-- [ ] Web 管理面板（子服务 CRUD / 日志 / 配置在线修改）
+- [x] Web 管理面板（子服务 CRUD / 日志 / 配置在线修改 / 看门狗 / 本机信息）
+- [ ] UDP 5500 本地 RPC（与 C# StarAgent 的 UDP 指令互通）
 - [ ] 自身升级（`-upgrade` 完整实现）与 `-repair`
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
 - [ ] 进程按名称接管 / 多实例精确匹配

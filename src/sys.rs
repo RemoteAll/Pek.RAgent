@@ -706,6 +706,29 @@ pub(crate) fn machine_guid() -> Option<String> {
     }
 }
 
+/// 系统运行时长（秒）。
+pub(crate) fn host_uptime_seconds() -> u64 {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::GetTickCount64;
+        unsafe { GetTickCount64() / 1000 }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/uptime")
+            .ok()
+            .and_then(|t| t.split_whitespace().next()?.parse::<f64>().ok())
+            .map(|v| v as u64)
+            .unwrap_or(0)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        0
+    }
+}
+
 /// 是否存在指定进程名的进程（大小写不敏感、忽略 `.exe` 后缀；看门狗用）。
 pub(crate) fn is_process_running(name: &str) -> bool {
     let name = name.trim().trim_end_matches(".exe");
@@ -922,10 +945,17 @@ pub(crate) fn empty_working_set() -> bool {
     {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
-        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_SET_QUOTA,
+        };
 
         unsafe {
-            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, std::process::id());
+            // EmptyWorkingSet 需要 SET_QUOTA 权限（PROCESS_QUERY_LIMITED_INFORMATION 不足）
+            let h = OpenProcess(
+                PROCESS_SET_QUOTA | PROCESS_QUERY_INFORMATION,
+                0,
+                std::process::id(),
+            );
             if h.is_null() {
                 return false;
             }

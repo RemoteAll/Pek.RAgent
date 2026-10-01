@@ -79,6 +79,11 @@ impl AppManager {
         self.inner.lock().unwrap().config.clone()
     }
 
+    /// 基础目录。
+    pub fn base(&self) -> &Path {
+        &self.base
+    }
+
     /// 是否正在关闭。
     pub fn shutting_down(&self) -> bool {
         self.inner.lock().unwrap().shutting_down
