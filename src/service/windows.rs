@@ -1,0 +1,293 @@
+//! Windows 服务：SCM 控制（sc.exe）与运行时宿主（windows-service crate）。
+
+use std::process::Command;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
+use super::{ServiceManager, ServiceState};
+use crate::util;
+
+/// 执行命令并返回（退出码，标准输出，标准错误）。
+fn run(program: &str, args: &[&str]) -> (i32, String, String) {
+    match Command::new(program).args(args).output() {
+        Ok(out) => (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).to_string(),
+            String::from_utf8_lossy(&out.stderr).to_string(),
+        ),
+        Err(e) => (-1, String::new(), e.to_string()),
+    }
+}
+
+/// 查询服务状态。
+pub fn query(mgr: &ServiceManager) -> ServiceState {
+    let (code, stdout, stderr) = run("sc", &["query", &mgr.name]);
+    let text = format!("{}\n{}", stdout, stderr).to_uppercase();
+
+    if code != 0 {
+        // 1060 = 指定的服务未安装
+        return ServiceState::NotInstalled;
+    }
+
+    if text.contains("RUNNING") {
+        ServiceState::Running
+    } else if text.contains("STOPPED") {
+        ServiceState::Stopped
+    } else {
+        ServiceState::Unknown
+    }
+}
+
+/// 等待服务到达期望状态。
+fn wait_state(mgr: &ServiceManager, expected: ServiceState, timeout_ms: u64) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
+    while std::time::Instant::now() < deadline {
+        if query(mgr) == expected {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    query(mgr) == expected
+}
+
+/// 安装（`start` 为 true 时安装并启动）。
+pub fn install(mgr: &ServiceManager, start: bool) -> Result<(), String> {
+    if query(mgr) != ServiceState::NotInstalled {
+        return Err(format!(
+            "服务已存在：{}（可先 -uninstall，或使用 -reinstall）",
+            mgr.name
+        ));
+    }
+
+    let bin_path = format!("\"{}\" -s", mgr.exe.display());
+    let (code, stdout, stderr) = run(
+        "sc",
+        &[
+            "create",
+            &mgr.name,
+            "binPath=",
+            &bin_path,
+            "start=",
+            "auto",
+            "DisplayName=",
+            &mgr.display,
+        ],
+    );
+    if code != 0 {
+        return Err(format!(
+            "安装服务失败（请以管理员身份运行）：{}",
+            format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+        ));
+    }
+
+    // 描述与失败恢复策略（尽力而为）
+    let _ = run("sc", &["description", &mgr.name, &mgr.description]);
+    let _ = run(
+        "sc",
+        &[
+            "failure",
+            &mgr.name,
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/5000/restart/10000/restart/30000",
+        ],
+    );
+
+    util::log_format(
+        "Windows 服务已安装：{}（程序目录 {}）",
+        &[&mgr.name, &mgr.base.display().to_string()],
+    );
+
+    if start {
+        start_service(mgr)?;
+    }
+
+    Ok(())
+}
+
+/// 重新安装。
+pub fn reinstall(mgr: &ServiceManager) -> Result<(), String> {
+    let _ = uninstall(mgr, true);
+    std::thread::sleep(Duration::from_millis(500));
+    install(mgr, true)
+}
+
+/// 卸载（`stop` 为 true 时先停止）。
+pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
+    if query(mgr) == ServiceState::NotInstalled {
+        return Ok(());
+    }
+
+    if stop && query(mgr) == ServiceState::Running {
+        let _ = stop_service(mgr);
+    }
+
+    let (code, stdout, stderr) = run("sc", &["delete", &mgr.name]);
+    if code != 0 {
+        return Err(format!(
+            "卸载服务失败（请以管理员身份运行）：{}",
+            format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+        ));
+    }
+
+    util::log_format("Windows 服务已卸载：{}", &[&mgr.name]);
+    Ok(())
+}
+
+/// 启动服务。
+pub fn start(mgr: &ServiceManager) -> Result<(), String> {
+    start_service(mgr)
+}
+
+/// 停止服务。
+pub fn stop(mgr: &ServiceManager) -> Result<(), String> {
+    stop_service(mgr)
+}
+
+/// 重启服务。
+pub fn restart(mgr: &ServiceManager) -> Result<(), String> {
+    if query(mgr) == ServiceState::Running {
+        stop_service(mgr)?;
+    }
+    start_service(mgr)
+}
+
+fn start_service(mgr: &ServiceManager) -> Result<(), String> {
+    if query(mgr) == ServiceState::NotInstalled {
+        return Err(format!("服务未安装：{}", mgr.name));
+    }
+    if query(mgr) == ServiceState::Running {
+        return Ok(());
+    }
+
+    let (code, stdout, stderr) = run("sc", &["start", &mgr.name]);
+    if code != 0 {
+        return Err(format!(
+            "启动服务失败：{}",
+            format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+        ));
+    }
+
+    if wait_state(mgr, ServiceState::Running, 30_000) {
+        Ok(())
+    } else {
+        Err("启动服务超时（可查看事件日志）".to_string())
+    }
+}
+
+fn stop_service(mgr: &ServiceManager) -> Result<(), String> {
+    if query(mgr) != ServiceState::Running {
+        return Ok(());
+    }
+
+    let (code, stdout, stderr) = run("sc", &["stop", &mgr.name]);
+    if code != 0 {
+        return Err(format!(
+            "停止服务失败：{}",
+            format!("{}\n{}", stdout.trim(), stderr.trim()).trim()
+        ));
+    }
+
+    if wait_state(mgr, ServiceState::Stopped, 30_000) {
+        Ok(())
+    } else {
+        Err("停止服务超时".to_string())
+    }
+}
+
+// ————— 服务运行时（windows-service crate）—————
+
+#[cfg(windows)]
+mod host {
+    use super::*;
+
+    use std::ffi::OsString;
+    use std::sync::OnceLock;
+
+    use windows_service::service::{
+        ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState as WinServiceState,
+        ServiceStatus, ServiceType,
+    };
+    use windows_service::service_control_handler::{self, ServiceControlHandlerResult};
+    use windows_service::{define_windows_service, service_dispatcher};
+
+    static RUN: OnceLock<Box<dyn Fn() + Send + Sync>> = OnceLock::new();
+    static NAME: OnceLock<String> = OnceLock::new();
+
+    define_windows_service!(ffi_service_main, service_main);
+
+    fn service_main(_args: Vec<OsString>) {
+        if let Err(e) = run_in_service() {
+            util::log_error(&format!("Windows 服务运行失败：{:?}", e));
+        }
+    }
+
+    fn run_in_service() -> windows_service::Result<()> {
+        let name = NAME.get().cloned().unwrap_or_default();
+
+        let event_handler = move |control: ServiceControl| -> ServiceControlHandlerResult {
+            match control {
+                ServiceControl::Stop | ServiceControl::Shutdown => {
+                    crate::agent::SHUTDOWN.store(true, Ordering::SeqCst);
+                    ServiceControlHandlerResult::NoError
+                }
+                ServiceControl::Interrogate => ServiceControlHandlerResult::NoError,
+                _ => ServiceControlHandlerResult::NotImplemented,
+            }
+        };
+
+        let status_handle = service_control_handler::register(name.as_str(), event_handler)?;
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: WinServiceState::Running,
+            controls_accepted: ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN,
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        if let Some(run) = RUN.get() {
+            run();
+        }
+
+        status_handle.set_service_status(ServiceStatus {
+            service_type: ServiceType::OWN_PROCESS,
+            current_state: WinServiceState::Stopped,
+            controls_accepted: ServiceControlAccept::empty(),
+            exit_code: ServiceExitCode::Win32(0),
+            checkpoint: 0,
+            wait_hint: Duration::default(),
+            process_id: None,
+        })?;
+
+        Ok(())
+    }
+
+    /// 以 Windows 服务方式运行；若未由 SCM 启动（如手工执行 `-s`），回退为前台模式。
+    pub fn run_as_service<F>(service_name: &str, run: F)
+    where
+        F: Fn() + Send + Sync + 'static,
+    {
+        let _ = RUN.set(Box::new(run));
+        let _ = NAME.set(service_name.to_string());
+
+        match service_dispatcher::start(service_name, ffi_service_main) {
+            Ok(()) => {}
+            Err(e) => {
+                util::log_format(
+                    "未由服务控制管理器启动（{:?}），回退为前台运行；如需安装服务请使用 -install",
+                    &[&format!("{:?}", e)],
+                );
+                if let Some(run) = RUN.get() {
+                    run();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+pub use host::run_as_service;

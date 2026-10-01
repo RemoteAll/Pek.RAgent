@@ -1,0 +1,40 @@
+[package]
+name = "pek-ragent"
+version = "0.1.0"
+edition = "2024"
+description = "Pek.RAgent：星尘代理（StarAgent 的 Rust 实现）——多应用守护、影子目录部署、跨平台服务管理与本地 HTTP 控制接口"
+authors = ["PeiKeSmart"]
+license = "MIT"
+
+[dependencies]
+# DH 基础库（DH.RustBase）：日志（XTrace 等价）、线程定时调度（Timer/TimerScheduler）、
+# 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）
+dhrust = { path = "../DH.RustBase", features = ["net"] }
+# 配置序列化（Config/Agent.json）
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = "0.4"
+# MD5 摘要（影子目录命名 {name}-{hash}，与 C# StarAgent 对齐）
+md-5 = "0.10"
+# 部署包解压（与 Pek.RCode 同版本同特性；纯 Rust deflate）
+zip = { version = "2", default-features = false, features = ["deflate"] }
+# HTTP 服务端宿主运行时（dhrust::net::http 基于 hyper/tokio）
+tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# Windows 服务运行时（与 SCM 交互：StartServiceCtrlDispatcher/HandlerEx/SetServiceStatus）
+windows-service = "0.7"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+    "Win32_System_SystemInformation",
+    "Win32_System_Console",
+] }
+
+[profile.release]
+lto = "thin"
+strip = true
