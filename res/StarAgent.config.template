@@ -48,6 +48,14 @@
   <WebAuthLevel>LocalOnly</WebAuthLevel>
   <!--后台资源采样间隔（毫秒）。默认 1000（与任务管理器/宝塔同粒度）；0 = 关闭后台采样（改为面板请求时现采）-->
   <SampleInterval>1000</SampleInterval>
+  <!--网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + 下方手动补充），默认 true-->
+  <WebTraffic>true</WebTraffic>
+  <!--网站日志手动配置。`名称=路径;名称2=路径2`；自动发现不到时补充（如 Caddy 自定义日志、非标准目录）-->
+  <WebLogs></WebLogs>
+  <!--端口流量统计。Linux 使用 nftables 独立计数表统计各端口收发流量（需 root）；默认 false（启用后会在系统中创建 pek_stats 计数表）-->
+  <PortTraffic>false</PortTraffic>
+  <!--端口流量统计端口。形如 `22,80,443,3306`；留空 = 自动取系统监听端口-->
+  <PortTrafficPorts></PortTrafficPorts>
 
   <!--应用服务集合-->
   <Services></Services>

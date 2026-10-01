@@ -347,6 +347,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post("updateStarConfig", move |ctx| update_star_config(&p, ctx));
     let p = panel.clone();
     controller = controller.get("machine", move |ctx| machine(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("webTraffic", move |ctx| web_traffic(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("portTraffic", move |ctx| port_traffic(&p, ctx));
     controller.get("getProcessList", move |ctx| get_process_list(&panel, ctx))
 }
 
@@ -519,7 +523,6 @@ fn health(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
-
     let pid = std::process::id();
     let (threads, handles) = sys::process_stats(pid).unwrap_or((0, 0));
     let memory_mb = sys::memory_mb(pid).unwrap_or(0);
@@ -540,6 +543,22 @@ fn health(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     });
 
     json_result(0, "", Some(data))
+}
+
+/// 网站流量统计（`/star/webTraffic`）：站点日志聚合快照（今日/累计/UV/状态码）。
+fn web_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    json_result(0, "", Some(crate::weblog::snapshot_json()))
+}
+
+/// 端口流量统计（`/star/portTraffic`）：各端口收发字节/速率/连接数。
+fn port_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    json_result(0, "", Some(crate::portstat::snapshot_json()))
 }
 
 /// 速率格式化（人类可读）。
@@ -648,6 +667,10 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("WebUserName", "面板用户名", "String", cfg.web_user_name.clone(), "Web 管理面板的登录用户名"),
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
+        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点 + WebLogs 手动补充），零侵入只读；修改后自动生效"),
+        config_item("WebLogs", "网站日志（名称=路径;…）", "String", cfg.web_logs.clone(), "手动配置站点日志（绝对路径，分号分隔多条），自动发现不到时补充；修改后自动生效"),
+        config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "Linux 创建 nftables 计数表统计各端口收发流量（需 root）；Windows/无 nft 时降级为连接视图；修改后自动生效"),
+        config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -1543,6 +1566,10 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         },
         "guardperiod" => set_u64(value, |v| cfg.guard_period = v),
         "sampleinterval" => set_u64(value, |v| cfg.sample_interval = v),
+        "webtraffic" => set_bool(value, |b| cfg.web_traffic = b),
+        "weblogs" => set_string(value, |s| cfg.web_logs = s),
+        "porttraffic" => set_bool(value, |b| cfg.port_traffic = b),
+        "porttrafficports" => set_string(value, |s| cfg.port_traffic_ports = s),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -1677,6 +1704,42 @@ mod tests {
         // 注销后失效
         let _ = logout(&panel, &context("POST", "/api/logout", "", Some(&token)));
         assert!(!panel.validate_token(&token));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn traffic_endpoints_require_auth() {
+        let (panel, dir) = panel_with_default_password();
+
+        // 未鉴权：拒绝
+        let r = web_traffic(&panel, &context("GET", "/star/webTraffic", "", None));
+        assert_eq!(body_json(r)["code"], 401);
+        let r = port_traffic(&panel, &context("GET", "/star/portTraffic", "", None));
+        assert_eq!(body_json(r)["code"], 401);
+
+        // 鉴权后：返回快照信封（模块未启动时为占位数据，但结构完整）
+        let ok = login(
+            &panel,
+            &context("POST", "/api/login", r#"{"user":"admin","password":"admin"}"#, None),
+        );
+        let token = body_json(ok)["data"]["token"].as_str().unwrap().to_string();
+
+        let j = body_json(web_traffic(
+            &panel,
+            &context("GET", "/star/webTraffic", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        assert!(j["data"].get("enabled").is_some());
+        assert!(j["data"].get("sites").is_some());
+
+        let j = body_json(port_traffic(
+            &panel,
+            &context("GET", "/star/portTraffic", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        assert!(j["data"].get("ports").is_some());
+        assert!(j["data"].get("mode").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

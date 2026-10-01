@@ -13,12 +13,14 @@ mod config;
 mod deploy;
 mod manager;
 mod netc;
+mod portstat;
 mod sampler;
 mod server;
 mod service;
 mod sys;
 mod udp_rpc;
 mod util;
+mod weblog;
 mod webpanel;
 
 use std::path::{Path, PathBuf};

@@ -37,6 +37,11 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
     // （多客户端读数一致、请求零采集；SampleInterval=0 时关闭，改由请求时现采）
     crate::sampler::start(manager.config().sample_interval);
 
+    // 流量统计：网站（访问日志增量解析）与端口（nftables 计数 / 连接视图）
+    // 各自线程按配置开关运行；线程内响应配置热重载
+    crate::weblog::start(manager.clone());
+    crate::portstat::start(manager.clone());
+
     let addr = if local_only {
         format!("127.0.0.1:{}", port)
     } else {

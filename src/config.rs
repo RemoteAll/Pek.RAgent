@@ -64,6 +64,14 @@ pub struct AgentConfig {
     pub web_auth_level: String,
     /// 后台资源采样间隔（毫秒）。默认 1000；0 = 关闭后台采样（回退为面板请求时现采）
     pub sample_interval: u64,
+    /// 网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + `web_logs` 手动补充），默认开启
+    pub web_traffic: bool,
+    /// 网站日志手动配置。`名称=路径;名称2=路径2`；自动发现不到时的补充（如 Caddy 自定义日志）
+    pub web_logs: String,
+    /// 端口流量统计。Linux 使用 nftables 独立计数表（需 root），默认关闭
+    pub port_traffic: bool,
+    /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
+    pub port_traffic_ports: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -91,6 +99,12 @@ impl Default for AgentConfig {
             web_user_password: "admin".to_string(),
             web_auth_level: "LocalOnly".to_string(),
             sample_interval: 1000,
+            // 网站流量：只读日志文件、无系统副作用，默认开启（面板直接可见）
+            web_traffic: true,
+            web_logs: String::new(),
+            // 端口流量：Linux 会创建 nftables 计数表（系统级改动），默认关闭，需显式启用
+            port_traffic: false,
+            port_traffic_ports: String::new(),
             apps: sample_apps(),
         }
     }
@@ -307,6 +321,8 @@ impl AgentConfig {
         if self.sample_interval != 0 {
             self.sample_interval = self.sample_interval.clamp(200, 60_000);
         }
+        self.web_logs = self.web_logs.trim().to_string();
+        self.port_traffic_ports = self.port_traffic_ports.trim().to_string();
 
         for app in &mut self.apps {
             let name = app.name.trim().to_string();
@@ -497,6 +513,18 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = parse_of::<u64>(obj, "SampleInterval") {
         cfg.sample_interval = v;
     }
+    if let Some(v) = bool_of(obj, "WebTraffic") {
+        cfg.web_traffic = v;
+    }
+    if let Some(v) = text_of(obj, "WebLogs") {
+        cfg.web_logs = v;
+    }
+    if let Some(v) = bool_of(obj, "PortTraffic") {
+        cfg.port_traffic = v;
+    }
+    if let Some(v) = text_of(obj, "PortTrafficPorts") {
+        cfg.port_traffic_ports = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -605,6 +633,10 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebPassword", cfg.web_user_password.clone());
         push("WebAuthLevel", cfg.web_auth_level.clone());
         push("SampleInterval", cfg.sample_interval.to_string());
+        push("WebTraffic", bool_text(cfg.web_traffic));
+        push("WebLogs", cfg.web_logs.clone());
+        push("PortTraffic", bool_text(cfg.port_traffic));
+        push("PortTrafficPorts", cfg.port_traffic_ports.clone());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -856,6 +888,42 @@ mod tests {
     }
 
     #[test]
+    fn traffic_config_reads_renders_and_normalizes() {
+        // XML 读取路径（XML 值在 JSON 形态下是字符串）
+        let json: Json = serde_json::from_str(
+            r#"{ "WebTraffic": "false", "WebLogs": "a=/tmp/a.log", "PortTraffic": "true", "PortTrafficPorts": "22,80" }"#,
+        )
+        .unwrap();
+        let cfg = config_from_json(&json);
+        assert!(!cfg.web_traffic);
+        assert_eq!(cfg.web_logs, "a=/tmp/a.log");
+        assert!(cfg.port_traffic);
+        assert_eq!(cfg.port_traffic_ports, "22,80");
+
+        // 默认值：网站流量开启（只读无副作用）；端口流量关闭（系统级改动）
+        let mut cfg = AgentConfig::default();
+        assert!(cfg.web_traffic);
+        assert!(!cfg.port_traffic);
+
+        // 归一化：两侧空白清理
+        cfg.web_logs = "  x=/tmp/x.log ".to_string();
+        cfg.port_traffic_ports = " 22 ".to_string();
+        cfg.normalize();
+        assert_eq!(cfg.web_logs, "x=/tmp/x.log");
+        assert_eq!(cfg.port_traffic_ports, "22");
+
+        // 渲染：模板骨架带上新字段（注释由模板保障）
+        let text = render_xml(&cfg, None).unwrap();
+        assert!(text.contains("<WebTraffic>true</WebTraffic>"), "{text}");
+        assert!(text.contains("<WebLogs>x=/tmp/x.log</WebLogs>"), "{text}");
+        assert!(text.contains("<PortTraffic>false</PortTraffic>"), "{text}");
+        assert!(
+            text.contains("<PortTrafficPorts>22</PortTrafficPorts>"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn normalize_fills_app_defaults() {
         let mut cfg = AgentConfig {
             apps: vec![AppConfig {
@@ -951,6 +1019,36 @@ mod tests {
         let back = AgentConfig::load(&base);
         assert_eq!(back.local_port, 5599);
         assert!(back.apps[0].enable);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_clears_text_fields_when_empty() {
+        // 回归：空值此前写不回文件（upsert 跳过空值），导致“清空 WebLogs/PortTrafficPorts”不生效
+        let base = temp_base("clear");
+        let mut cfg = AgentConfig::load(&base);
+        cfg.web_logs = "demo=/tmp/demo.log".to_string();
+        cfg.port_traffic_ports = "22,80".to_string();
+        cfg.save(&base).unwrap();
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(text.contains("<WebLogs>demo=/tmp/demo.log</WebLogs>"), "{text}");
+
+        // 清空后保存：文件应写回空元素
+        cfg.web_logs = String::new();
+        cfg.port_traffic_ports = String::new();
+        cfg.save(&base).unwrap();
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(text.contains("<WebLogs></WebLogs>"), "清空后应为空元素：\n{text}");
+        assert!(
+            text.contains("<PortTrafficPorts></PortTrafficPorts>"),
+            "清空后应为空元素：\n{text}"
+        );
+        assert!(!text.contains("demo="), "旧值应被清除：\n{text}");
+
+        let back = AgentConfig::load(&base);
+        assert!(back.web_logs.is_empty());
+        assert!(back.port_traffic_ports.is_empty());
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -266,6 +266,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <nav id="nav-bar" class="glass">
 <a data-panel="dashboard" class="active">📊 状态</a>
 <a data-panel="services">📦 子服务</a>
+<a data-panel="traffic">📈 流量</a>
 <a data-panel="control">⚡ 控制</a>
 <a data-panel="config">⚙ 配置</a>
 <a data-panel="starconfig">🌐 星尘设置</a>
@@ -278,6 +279,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <main>
 <div id="panel-dashboard" class="panel active"></div>
 <div id="panel-services" class="panel"></div>
+<div id="panel-traffic" class="panel"></div>
 <div id="panel-control" class="panel"></div>
 <div id="panel-config" class="panel"></div>
 <div id="panel-starconfig" class="panel"></div>
@@ -301,7 +303,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 
 <script>
 let token='',timer=null,statusData=null,logFiles=[],currentLogFile=null;
-let svcTimer=null,starTimer=null;
+let svcTimer=null,starTimer=null,trafficTimer=null;
 let cmdHistory=JSON.parse(sessionStorage.getItem('agent_cmd_history')||'[]');
 const $=id=>document.getElementById(id);
 
@@ -329,6 +331,7 @@ async function logout(){
  try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'}})}catch(e){}
  sessionStorage.removeItem('agent_token');token='';
  clearInterval(timer);if(svcTimer)clearInterval(svcTimer);if(starTimer)clearInterval(starTimer);
+ if(trafficTimer){clearInterval(trafficTimer);trafficTimer=null}
  $('login').style.display='';$('app').style.display='none';$('luser').focus()
 }
 
@@ -367,17 +370,21 @@ function switchPanel(name){
  const link=document.querySelector(`nav a[data-panel="${name}"]`);if(link)link.classList.add('active');
  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
  const panel=$('panel-'+name);if(panel)panel.classList.add('active');
+ // 流量页签：进入时 3 秒轮询、离开即停止（其它页签不产生额外请求）
+ if(trafficTimer){clearInterval(trafficTimer);trafficTimer=null}
  if(!panel)return;
  // 切换 tab 时立即加载对应数据
  const loaders={
   dashboard:loadDashboard,
   services:loadServices,
+  traffic:loadTraffic,
   config:loadConfig,
   starconfig:loadStarConfig,
   logs:loadLogs,
   watchdog:loadWatchDog
  };
  if(loaders[name])loaders[name]();
+ if(name==='traffic')trafficTimer=setInterval(loadTraffic,3000);
 }
 
 document.querySelector('#nav-bar').addEventListener('click',e=>{
@@ -616,6 +623,88 @@ async function loadMachineDetail(){
 
   el.innerHTML=html;
  }catch(e){el.innerHTML=`<p class="text-muted">加载失败</p>`}
+}
+
+/* ── 流量统计（网站访问日志 + 端口计数） ── */
+const TH='font-size:11px;color:var(--text-tertiary)'; // 流量表头样式
+function fmtBytes(v){
+ v=Number(v)||0;
+ if(v>=1099511627776)return (v/1099511627776).toFixed(2)+' TB';
+ if(v>=1073741824)return (v/1073741824).toFixed(2)+' GB';
+ if(v>=1048576)return (v/1048576).toFixed(1)+' MB';
+ if(v>=1024)return (v/1024).toFixed(1)+' KB';
+ return v+' B';
+}
+function fmtRate(v){return v==null?'—':fmtBytes(v)+'/s'}
+function ensureTrafficShell(){
+ if($('web-traffic-body'))return;
+ $('panel-traffic').innerHTML=`
+  <div class="glass-card card">
+   <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy）· 今日与累计</span></h2>
+   <div id="web-traffic-body"><p class="text-muted">加载中…</p></div>
+  </div>
+  <div class="glass-card card">
+   <h2>🔌 端口流量 <span id="port-traffic-mode" style="font-size:11px;font-weight:400;color:var(--text-tertiary)"></span></h2>
+   <div id="port-traffic-body"><p class="text-muted">加载中…</p></div>
+  </div>`;
+}
+async function loadTraffic(){
+ ensureTrafficShell();
+ try{
+  const [w,p]=await Promise.all([api('/star/webTraffic'),api('/star/portTraffic')]);
+  renderWebTraffic(w.code===0?w.data:null);
+  renderPortTraffic(p.code===0?p.data:null);
+ }catch(e){}
+}
+function renderWebTraffic(d){
+ const el=$('web-traffic-body');if(!el)return;
+ if(!d){el.innerHTML='<p class="text-muted">加载失败</p>';return}
+ if(!d.enabled){el.innerHTML=`<p class="text-muted">${esc(d.message||'网站流量统计未启用（配置 WebTraffic=true 开启）')}</p>`;return}
+ const sites=d.sites||[];
+ if(!sites.length){el.innerHTML=`<p class="text-muted">${esc(d.message||'未发现网站日志')}</p>`;return}
+ let html=`<table class="info-table"><tr>`;
+ html+=['站点','今日流量','请求','UV','2xx / 4xx / 5xx','速率','累计流量'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ html+=`</tr>`;
+ sites.forEach(s=>{
+  const logs=(s.logs||[]).join('\n');
+  html+=`<tr>
+   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${esc(logs)}">${esc(s.name)}</td>
+   <td>${fmtBytes(s.todayBytes)}</td>
+   <td>${s.todayRequests||0}</td>
+   <td>${s.uv||0}</td>
+   <td><span class="text-green">${s.s2xx||0}</span> / <span class="${s.s4xx?'text-yellow':'text-muted'}">${s.s4xx||0}</span> / <span class="${s.s5xx?'text-red':'text-muted'}">${s.s5xx||0}</span></td>
+   <td>${fmtRate(s.rateBps)}</td>
+   <td>${fmtBytes(s.totalBytes)}</td>
+  </tr>`;
+ });
+ el.innerHTML=html+`</table>`;
+}
+function renderPortTraffic(d){
+ const el=$('port-traffic-body');if(!el)return;
+ const modeEl=$('port-traffic-mode');
+ if(!d){el.innerHTML='<p class="text-muted">加载失败</p>';return}
+ if(modeEl)modeEl.textContent=d.mode==='nft'?'（nftables 计数 · 5 秒采样）':(d.mode==='view'?'（连接视图 · 无字节计数）':'');
+ if(!d.enabled){el.innerHTML=`<p class="text-muted">端口流量统计未启用（在配置页把 PortTraffic 设为 true；Linux 需 root 与 nft 命令，Windows 为连接视图）</p>`;return}
+ const rows=d.ports||[];
+ const note=d.message?`<p class="text-muted" style="margin-bottom:10px">${esc(d.message)}</p>`:'';
+ if(!rows.length){el.innerHTML=note+'<p class="text-muted">暂无数据（采样中…）</p>';return}
+ let html=note+`<table class="info-table"><tr>`;
+ html+=['端口','协议','状态','连接数','接收','发送','↓ 速率','↑ 速率'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ html+=`</tr>`;
+ rows.forEach(r=>{
+  const st=r.listen?'<span class="text-green">监听中</span>':'—';
+  html+=`<tr>
+   <td style="font-family:var(--font-mono);font-size:12px">${r.port}</td>
+   <td>${esc((r.proto||'').toUpperCase())}</td>
+   <td>${st}</td>
+   <td>${r.conns||0}</td>
+   <td>${r.rxBytes==null?'—':fmtBytes(r.rxBytes)}</td>
+   <td>${r.txBytes==null?'—':fmtBytes(r.txBytes)}</td>
+   <td>${fmtRate(r.rxBps)}</td>
+   <td>${fmtRate(r.txBps)}</td>
+  </tr>`;
+ });
+ el.innerHTML=html+`</table>`;
 }
 
 function formatIops(v){

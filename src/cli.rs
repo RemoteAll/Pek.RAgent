@@ -301,6 +301,8 @@ fn cmd_uninstall(base: &Path, stop: bool) -> i32 {
     println!("正在卸载服务 {}...", svc.name);
     match svc.uninstall(stop) {
         Ok(()) => {
+            // 流量统计清理：删除 nftables 计数表（inet pek_stats；未启用/无表时静默）
+            crate::portstat::cleanup();
             println!("服务卸载成功。");
             0
         }

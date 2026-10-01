@@ -95,6 +95,11 @@ impl AppManager {
         if let Err(e) = cfg.save(&self.base) {
             util::log_error(&format!("保存配置失败：{}", e));
         }
+        // 保存后同步“文件指纹”：避免守护周期把自身写入误判为外部修改而整份重载
+        // （否则内存与磁盘短暂不一致时会出现“刚改的配置被回滚”现象）
+        let path = crate::config::config_path(&self.base);
+        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.inner.lock().unwrap().config_stamp = stamp;
     }
 
     /// 恢复状态文件并接管存活进程。
