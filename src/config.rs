@@ -396,6 +396,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "Project") {
         cfg.project = v;
     }
+    if let Some(v) = text_of(obj, "Server") {
+        cfg.server = v;
+    }
     if let Some(v) = parse_of::<u64>(obj, "Delay") {
         cfg.delay = v;
     }
@@ -529,6 +532,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         };
         push("Debug", bool_text(cfg.debug));
         push("Project", cfg.project.clone());
+        push("Server", cfg.server.clone());
         push("LocalPort", cfg.local_port.to_string());
         push("Delay", cfg.delay.to_string());
         push("StartupHook", bool_text(cfg.startup_hook));

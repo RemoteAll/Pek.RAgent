@@ -8,6 +8,8 @@
   <Secret></Secret>
   <!--项目名。新节点默认所需要加入的项目-->
   <Project></Project>
+  <!--星尘服务端地址。预留（`-server` 参数写入，C# StarAgent 会忽略）-->
+  <Server></Server>
   <!--本地端口。默认5500-->
   <LocalPort>5500</LocalPort>
   <!--更新通道。默认Release-->
