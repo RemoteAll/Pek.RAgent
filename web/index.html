@@ -154,6 +154,7 @@ html{overflow-anchor:none}
 .toast.error{background:#7f1d1d;color:#fecaca;border:1px solid rgba(239,68,68,0.3)}
 .toast.info{background:#1e3a5f;color:#dbeafe;border:1px solid rgba(59,130,246,0.3)}
 .toast.show{display:block}
+.sec-banner{width:calc(100% - 48px);max-width:1272px;margin:14px auto 0;padding:10px 16px;border:1px solid rgba(245,158,11,0.5);background:rgba(245,158,11,0.12);color:#f59e0b;border-radius:var(--radius-md);font-size:13px;font-weight:600;text-align:center;position:relative;z-index:1;box-sizing:border-box}
 .cmd-history{margin-top:16px}
 .cmd-history .cmd-item{display:flex;align-items:center;gap:12px;padding:8px 0;border-bottom:1px solid var(--border-subtle);font-size:12px}
 .cmd-history .cmd-time{color:var(--text-muted);font-family:var(--font-mono);min-width:140px}
@@ -271,6 +272,8 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="logs">📋 日志</a>
 <a data-panel="watchdog">🐕 看门狗</a>
 </nav>
+
+<div id="sec-banner" class="sec-banner hidden"></div>
 
 <main>
 <div id="panel-dashboard" class="panel active"></div>
@@ -397,6 +400,7 @@ async function loadDashboard(){
   $('header-meta').textContent='PID '+d.processId;
   const dot=$('status-dot-header');
   dot.className='dot status-dot '+(d.running?'on':'off');
+  updateSecBanner(d);
 
   const diskSig=(d.disks||[]).map(x=>x.name).join(',');
   if(diskSig!==_diskSig){_diskSig=diskSig;_dashboardBuilt=false}
@@ -411,10 +415,19 @@ async function loadDashboard(){
  }catch(e){}
 }
 
+// 默认密码安全横幅：仍为 admin/admin 时常显，改密后随 3 秒状态刷新自动消失
+function updateSecBanner(d){
+ const el=$('sec-banner');if(!el)return;
+ if(d.defaultPassword){
+  el.textContent='⚠️ 安全提示：Web 面板仍在使用默认密码 admin/admin'+(d.remoteAccess?'，且已允许远程访问（LocalOnly=false），存在被自动化扫描利用的风险':'')+'，请尽快在【配置】页修改密码！';
+  el.classList.remove('hidden');
+ }else{
+  el.classList.add('hidden');
+ }
+}
 function buildDashboard(d,health){
  const running=d.running;
  let html='';
-
  // 服务状态卡片
  html+=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📊 服务状态</h2><span id="svc-indicator" class="status-indicator ${running?'running':'stopped'}"><span class="status-dot ${running?'on':'off'}"></span>${running?'运行中':'已停止'}</span></div>`;
  html+=`<div class="stats-grid">`;

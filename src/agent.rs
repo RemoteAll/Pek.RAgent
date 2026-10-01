@@ -138,12 +138,11 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     manager.start_all();
 
     // 2) 本地控制接口（线程持有；进程退出即结束）
-    //    安全提示：允许远程访问且仍用默认密码时明确提醒（默认密码是公开信息）
+    //    安全提示：允许远程访问且仍用默认密码时明确提醒（默认密码是公开信息；
+    //    面板登录后另有常显横幅，见 status 的 defaultPassword 字段）
     if !local_only {
         let cfg = manager.config();
-        if cfg.web_user_name.trim().eq_ignore_ascii_case("admin")
-            && cfg.web_user_password == "admin"
-        {
+        if crate::webpanel::uses_default_credentials(&cfg) {
             util::log_info(
                 "安全提示：Web 面板已允许远程访问（LocalOnly=false）且仍使用默认密码 admin/admin，请尽快修改密码！",
             );

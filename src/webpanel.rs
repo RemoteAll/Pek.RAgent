@@ -382,6 +382,11 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "ok", None)
 }
 
+/// 是否仍在使用默认登录凭据（admin/admin）。启动日志与面板横幅共用判定。
+pub(crate) fn uses_default_credentials(cfg: &AgentConfig) -> bool {
+    cfg.web_user_name.trim().eq_ignore_ascii_case("admin") && cfg.web_user_password == "admin"
+}
+
 /// 服务状态。
 fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
@@ -464,6 +469,9 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "load15": load.map(|l| l.2),
         "hostUptime": format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
         "port": panel.port(),
+        // 默认凭据提示：面板顶部横幅数据（remoteAccess=允许远程访问时风险更高）
+        "defaultPassword": uses_default_credentials(&cfg),
+        "remoteAccess": !cfg.local_only,
     });
 
     json_result(0, "", Some(data))
@@ -1942,6 +1950,29 @@ mod tests {
         assert!(d["netRxBytes"].as_u64().unwrap_or(0) > 0, "应返回累计接收字节");
         assert!(d["diskReadBytes"].as_u64().is_some() && d["diskWriteBytes"].as_u64().is_some());
         assert!(d["diskLatencyMs"].is_number(), "应返回 IO 延迟数值");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn status_flags_default_password_for_banner() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // 默认配置 admin/admin 且 LocalOnly=false：应提示修改默认密码
+        let json = body_json(status(&panel, &context("GET", "/api/status", "", Some(&token))));
+        let d = &json["data"];
+        assert_eq!(d["defaultPassword"], true, "默认凭据应触发横幅提示");
+        assert_eq!(d["remoteAccess"], true, "默认配置允许远程访问");
+        assert!(uses_default_credentials(&AgentConfig::default()));
+
+        // 修改密码后提示消失（已签发令牌仍有效）
+        panel
+            .manager
+            .update_config(|cfg| cfg.web_user_password = "secret".to_string());
+        let json = body_json(status(&panel, &context("GET", "/api/status", "", Some(&token))));
+        assert_eq!(json["data"]["defaultPassword"], false, "改密后不应再提示");
+        assert!(!uses_default_credentials(&panel.manager.config()));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
