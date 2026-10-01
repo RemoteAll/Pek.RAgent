@@ -346,6 +346,50 @@ impl AgentConfig {
             None => false,
         }
     }
+
+    /// 新增或更新子服务配置（供 `-AddService` 与安装脚本调用）。
+    ///
+    /// - 已存在同名（大小写不敏感）：覆盖程序路径，目录/参数传 `None` 时保留原值；
+    /// - 不存在：新增条目；
+    /// - 两者均置为启用（注册即启用，星尘启动/重载时会拉起）。
+    /// 返回 `true` 表示产生变化；名称或程序路径为空时返回 `false`。
+    pub fn upsert_app(
+        &mut self,
+        name: &str,
+        file_name: &str,
+        working_directory: Option<&str>,
+        arguments: Option<&str>,
+    ) -> bool {
+        let name = name.trim();
+        let file_name = file_name.trim();
+        if name.is_empty() || file_name.is_empty() {
+            return false;
+        }
+        match self.find_app_mut(name) {
+            Some(app) => {
+                app.file_name = file_name.to_string();
+                if let Some(dir) = working_directory {
+                    app.working_directory = Some(dir.trim().to_string());
+                }
+                if let Some(args) = arguments {
+                    app.arguments = Some(args.trim().to_string());
+                }
+                app.enable = true;
+                true
+            }
+            None => {
+                self.apps.push(AppConfig {
+                    name: name.to_string(),
+                    file_name: file_name.to_string(),
+                    working_directory: working_directory.map(|s| s.trim().to_string()),
+                    arguments: arguments.map(|s| s.trim().to_string()),
+                    enable: true,
+                    ..AppConfig::default()
+                });
+                true
+            }
+        }
+    }
 }
 
 // ————— XML 读写与迁移辅助（模板保注释；dhrust::config XML 管线，对齐 C# StarAgent.config） —————
@@ -784,6 +828,41 @@ mod tests {
         assert_eq!(cfg.apps[0].file_name, "app1.zip");
         assert_eq!(cfg.apps[0].working_directory.as_deref(), Some("../apps/app1"));
         assert_eq!(cfg.apps[0].mode_text(), "shadow");
+    }
+
+    #[test]
+    fn upsert_app_adds_and_updates() {
+        // 默认配置自带示例应用，这里以空列表起步
+        let mut cfg = AgentConfig {
+            apps: Vec::new(),
+            ..AgentConfig::default()
+        };
+
+        // 新增：启用、字段落位
+        assert!(cfg.upsert_app("app1", "/opt/app1/app", Some("/opt/app1"), Some("-x")));
+        assert_eq!(cfg.apps.len(), 1);
+        let app = cfg.find_app("APP1").unwrap();
+        assert!(app.enable);
+        assert_eq!(app.file_name, "/opt/app1/app");
+        assert_eq!(app.working_directory.as_deref(), Some("/opt/app1"));
+        assert_eq!(app.arguments.as_deref(), Some("-x"));
+
+        // 更新：覆盖程序路径并重新启用，未覆盖字段（如 mode）保留
+        cfg.apps[0].mode = "hosted".to_string();
+        cfg.apps[0].enable = false;
+        assert!(cfg.upsert_app("app1", "/opt/app1/app2", None, None));
+        assert_eq!(cfg.apps.len(), 1, "同名更新不应新增条目");
+        let app = cfg.apps[0].clone();
+        assert_eq!(app.file_name, "/opt/app1/app2");
+        assert_eq!(app.mode, "hosted", "未覆盖字段应保留");
+        assert!(app.enable, "注册即启用");
+        assert_eq!(app.working_directory.as_deref(), Some("/opt/app1"));
+        assert_eq!(app.arguments.as_deref(), Some("-x"));
+
+        // 空名称 / 空程序路径：拒绝且不产生条目
+        assert!(!cfg.upsert_app("  ", "/x", None, None));
+        assert!(!cfg.upsert_app("app2", "  ", None, None));
+        assert_eq!(cfg.apps.len(), 1);
     }
 
     /// 独立临时目录（含 Config 子目录）。

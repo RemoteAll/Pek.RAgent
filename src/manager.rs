@@ -482,13 +482,27 @@ impl AppManager {
         }
 
         util::log_info("检测到配置文件变化，重新加载");
+        self.reload_inner();
+    }
+
+    /// 强制重新加载配置（本机控制接口 `/ReloadConfig` 调用）。
+    /// 供安装脚本/本机工具注册新服务后立即生效；新增应用仅建运行时，不自动启动。
+    pub fn reload_config(&self) {
+        util::log_info("收到重载指令，重新加载配置");
+        self.reload_inner();
+    }
+
+    /// 重载实现：读盘 → 规范化 → 替换内存配置 → 同步运行时。
+    fn reload_inner(&self) {
+        let path = crate::config::config_path(&self.base);
+        let stamp = std::fs::metadata(&path).and_then(|m| m.modified()).ok();
         let mut cfg = AgentConfig::load(&self.base);
         cfg.normalize();
 
         {
             let mut inner = self.inner.lock().unwrap();
             inner.config = cfg;
-            inner.config_stamp = Some(stamp);
+            inner.config_stamp = stamp;
         }
 
         self.sync_runtimes();

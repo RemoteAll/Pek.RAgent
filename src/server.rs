@@ -144,6 +144,22 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         }),
     );
 
+    // 重新加载配置文件（本机脚本/安装器调用：外部写入新服务配置后立即生效）
+    let m = manager.clone();
+    router.map_get(
+        "/ReloadConfig",
+        route(move |_ctx| {
+            let m = m.clone();
+            async move {
+                m.reload_config();
+                HttpOutcome::Response(HttpResponse::json(
+                    200,
+                    "{\"Success\":true,\"Message\":\"配置已重新加载\"}".to_string(),
+                ))
+            }
+        }),
+    );
+
     // 心跳/喂狗
     let m = manager.clone();
     router.map_get(

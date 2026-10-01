@@ -90,6 +90,7 @@ pub fn run(args: &[String], base: &Path) -> i32 {
         "startservice" => cmd_app_op_cli(base, args, AppOp::Start),
         "stopservice" => cmd_app_op_cli(base, args, AppOp::Stop),
         "restartservice" => cmd_app_op_cli(base, args, AppOp::Restart),
+        "addservice" | "add" => cmd_add_service(base, args),
         "showmachineinfo" | "machineinfo" | "info" => {
             println!("{}", sys::machine_info());
             0
@@ -552,6 +553,73 @@ fn cmd_list_apps(base: &Path) -> i32 {
     }
 
     0
+}
+
+/// 命令行注册子服务：`-AddService <名称> <程序路径> [工作目录] [启动参数]`。
+///
+/// 供安装脚本（如 DHDeploy Agent 的 install.sh）调用：
+/// 写入配置（启用）后，星尘在运行则立即重载并启动；否则待星尘启动时自动拉起。
+fn cmd_add_service(base: &Path, args: &[String]) -> i32 {
+    // 收集命令词之后的位置参数（对前导空串/其它前缀鲁棒）
+    let mut params: Vec<&str> = Vec::new();
+    let mut seen_cmd = false;
+    for a in args {
+        let t = a.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !seen_cmd {
+            if t.trim_start_matches('-')
+                .eq_ignore_ascii_case("addservice")
+                || t.trim_start_matches('-').eq_ignore_ascii_case("add")
+            {
+                seen_cmd = true;
+            }
+            continue;
+        }
+        params.push(t);
+    }
+
+    if params.len() < 2 || params[0].starts_with('-') || params[1].starts_with('-') {
+        println!("用法：-AddService <名称> <程序路径> [工作目录] [启动参数]");
+        println!("示例：pek-ragent -AddService myapp /opt/myapp/myapp /opt/myapp");
+        return 2;
+    }
+
+    let name = params[0];
+    let file = params[1];
+    let dir = params.get(2).copied();
+    let pargs = params.get(3).copied();
+
+    let mut cfg = AgentConfig::load(base);
+    let existed = cfg.find_app(name).is_some();
+    if !cfg.upsert_app(name, file, dir, pargs) {
+        println!("注册失败：服务名称与程序路径不能为空");
+        return 1;
+    }
+    if let Err(e) = cfg.save(base) {
+        println!("写入配置文件失败：{e}");
+        return 1;
+    }
+    println!(
+        "已{}子服务 [{}] → {}（启用{}）",
+        if existed { "更新" } else { "注册" },
+        name,
+        file,
+        dir.map(|d| format!("，工作目录 {d}")).unwrap_or_default()
+    );
+
+    if !probe_agent_alive(base) {
+        println!("星尘未运行：配置已保存，星尘启动时会自动拉起该服务");
+        return 0;
+    }
+
+    match api_get(base, "ReloadConfig", Duration::from_secs(30)) {
+        Ok(_) => println!("星尘已重新加载配置"),
+        Err(e) => println!("重载请求失败（{e}），星尘将在下一轮自动检测（≤30 秒）"),
+    }
+
+    cmd_app_op(base, AppOp::Start, name)
 }
 
 /// 命令行应用操作：`-StartService <名称>`。
@@ -1018,6 +1086,8 @@ fn print_help() {
   pek-ragent -StartService <名称>   启动子服务
   pek-ragent -StopService <名称>    停止子服务（同时禁用，防止自动拉起）
   pek-ragent -RestartService <名称> 重启子服务
+  pek-ragent -AddService <名称> <程序路径> [目录] [参数]
+                                    注册子服务并启用（安装脚本用；星尘在跑则立即拉起）
 
 一次性拉起 zip（影子目录，不纳入守护）：
   pek-ragent app.zip urls=http://*:8080
@@ -1033,7 +1103,7 @@ fn print_help() {
   pek-ragent -ShowMachineInfo       显示本机信息
   pek-ragent -help                  显示本帮助
 
-配置文件：Config/Agent.toml（应用列表、服务名、端口等）
+配置文件：Config/StarAgent.config（XML，与 C# StarAgent 同格式互通）
 本地控制接口：http://127.0.0.1:5500（RestartService / StartService / StopService 等，兼容 DHDeploy）
 "#,
         version = env!("CARGO_PKG_VERSION")
