@@ -1093,7 +1093,7 @@ function showServiceForm(svc,title){
  const health=s.HealthCheck||s.healthCheck||'';
  const env=s.Environments||s.environments||'';
  const autoStop=s.AutoStop??s.autoStop??false;
- const reload=s.ReloadOnChange??s.reloadOnChange??false;
+ const reload=s.ReloadOnChange??s.reloadOnChange??!isEdit;
  const multi=s.AllowMultiple??s.allowMultiple??false;
  const html=`<div class="form-row">
   <div class="form-group"><label>服务名称 *</label><input type="text" id="sf-name" value="${esc(name)}" placeholder="全局唯一标识"></div>

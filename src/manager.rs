@@ -116,6 +116,7 @@ impl AppManager {
             return;
         };
         let Ok(state) = serde_json::from_str::<SavedState>(&text) else {
+            util::log_error("状态恢复：state.json 解析失败，跳过接管");
             return;
         };
 
@@ -125,6 +126,10 @@ impl AppManager {
                 continue;
             }
             if !crate::sys::is_alive(saved.pid) {
+                util::log_format(
+                    "状态恢复：应用[{}] PID={} 已不存在，跳过接管",
+                    &[&name, &saved.pid.to_string()],
+                );
                 continue;
             }
             if let Some(rt) = apps
@@ -132,6 +137,8 @@ impl AppManager {
                 .find(|e| e.name.eq_ignore_ascii_case(&name))
             {
                 rt.adopt(saved.pid, saved.process_name);
+            } else {
+                util::log_format("状态恢复：应用[{}] 不在当前配置中，跳过接管", &[&name]);
             }
         }
     }

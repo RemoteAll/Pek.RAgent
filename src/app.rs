@@ -150,6 +150,9 @@ impl AppRuntime {
         st.hosted = false;
         st.error_count = 0;
         st.next_start = None;
+        // 接管不经过 start()，需在此补算工作目录（文件变动监视/停止清理等依赖它；缺失会静默跳过）
+        let wd = crate::deploy::work_dir(&self.base, &st.cfg);
+        st.work_dir = wd;
         util::log_format(
             "接管已存在进程：应用[{}] PID={}",
             &[&self.name, &pid.to_string()],
@@ -493,7 +496,10 @@ impl AppRuntime {
             if st.cfg.reload_on_change && !st.hosted {
                 let work_dir = st.work_dir.clone();
                 if !work_dir.as_os_str().is_empty() {
-                    let changed = scan_files(&work_dir, &mut st.files);
+                    let changed = match watch_target(&work_dir, &st.cfg.file_name) {
+                        Some(watch) => file_changed(&watch, &mut st.files),
+                        None => false,
+                    };
                     if !st.files_primed {
                         st.files_primed = true;
                     } else if changed {
@@ -559,53 +565,37 @@ fn wait_child(child: &mut std::process::Child, timeout_ms: u64) -> bool {
     }
 }
 
-/// 扫描目录下 `*.dll;*.exe;*.zip;*.jar` 的最后修改时间，返回是否有变化。
-fn scan_files(dir: &Path, files: &mut HashMap<PathBuf, u64>) -> bool {
-    let mut changed = false;
-    let mut stack = vec![dir.to_path_buf()];
-    let mut guard = 0;
-
-    while let Some(d) = stack.pop() {
-        guard += 1;
-        if guard > 10_000 {
-            break;
-        }
-
-        let Ok(entries) = std::fs::read_dir(&d) else {
-            continue;
-        };
-
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-
-            let ext = path
-                .extension()
-                .map(|e| e.to_string_lossy().to_ascii_lowercase())
-                .unwrap_or_default();
-            if !matches!(ext.as_str(), "dll" | "exe" | "zip" | "jar") {
-                continue;
-            }
-
-            let secs = entry
-                .metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0);
-
-            match files.insert(path.clone(), secs) {
-                Some(prev) if prev == secs => {}
-                _ => changed = true,
-            }
-        }
+/// 监视目标：配置的程序文件（`FileName`，相对工作目录或绝对路径）。
+///
+/// 仅监视“程序文件本身”而非整个工作目录——避免子服务写入自身数据
+/// （日志/数据库/上传的部署包等）时被误判为程序更新而反复重启；
+/// 同时支持无扩展名的 Linux 可执行文件（旧逻辑只认 dll/exe/zip/jar）。
+fn watch_target(work_dir: &Path, file_name: &str) -> Option<PathBuf> {
+    let name = file_name.trim();
+    if name.is_empty() {
+        return None;
     }
+    let p = Path::new(name);
+    let p = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        work_dir.join(p)
+    };
+    if p.is_file() { Some(p) } else { None }
+}
 
-    changed
+/// 单文件“最后修改秒”快照比较（快照表由 `files` 复用，仅一个条目）。
+fn file_changed(path: &Path, files: &mut HashMap<PathBuf, u64>) -> bool {
+    let secs = std::fs::metadata(path)
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    match files.insert(path.to_path_buf(), secs) {
+        Some(prev) => prev != secs,
+        None => false, // 首次见到的文件仅记录快照，不视为变化
+    }
 }
 
 /// 健康检查：`http://` 或 `tcp://host:port` / `host:port`。

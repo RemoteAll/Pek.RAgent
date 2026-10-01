@@ -167,7 +167,7 @@ impl Default for AppConfig {
             allow_multiple: false,
             environments: None,
             auto_stop: false,
-            reload_on_change: false,
+            reload_on_change: true,
             max_memory: 0,
             oom_score_adjust: 0,
             health_check: None,
