@@ -44,7 +44,7 @@ cargo build --release
 # 全部平台（Windows 本机 MSVC + Linux musl 交叉编译），产物输出到 dist\
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
 
-# 可选：-Targets windows|linux 只建某个平台；-Clean 先清旧产物与 zig 缓存；
+# 可选：-Targets 只建某平台（可多选，如 linux,linux-arm64）；-Clean 先清旧产物与 zig 缓存；
 #       -CleanAll 额外 cargo clean（清空全部编译缓存，最省磁盘，下次全量重建）
 powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linux -Clean
 ```
@@ -52,12 +52,16 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | 产物（`dist\`，含 `SHA256SUMS.txt`） | 说明 |
 |------|------|
 | `pek-ragent-v{x}-x86_64-pc-windows-msvc.zip` | Windows 可执行文件 |
-| `pek-ragent-v{x}-x86_64-unknown-linux-musl.tar.gz` | Linux 静态单文件（已带执行位，解压即用） |
+| `pek-ragent-v{x}-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 静态单文件（已带执行位，解压即用） |
+| `pek-ragent-v{x}-aarch64-unknown-linux-musl.tar.gz` | Linux ARM64 静态单文件（鲲鹏/飞腾/树莓派等） |
+| `pek-ragent-v{x}-riscv64gc-unknown-linux-musl.tar.gz` | Linux RISC-V 64 静态单文件（赛昉/进迭时空等） |
+| `pek-ragent-v{x}-loongarch64-unknown-linux-musl.tar.gz` | Linux LoongArch64 静态单文件（龙芯等） |
 
 - 已启用 **release 增量编译**（`[profile.release] incremental = true`），重复打包只重编改动部分；
-- Linux 交叉编译一次性准备：`cargo install --locked cargo-zigbuild`、`rustup target add x86_64-unknown-linux-musl`（国内可加 `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`）、安装 zig（本机位于 `G:\Tools\zig\zig-0.16.0`，或用 `CARGO_ZIGBUILD_ZIG_PATH` 指定）；
+- Linux 交叉编译前置（**打包脚本会自动补齐**：缺 rustup 目标自动 `target add`、缺 cargo-zigbuild 自动安装、缺 zig 自动从清华 PyPI 镜像下载到 `tools\zig`）：cargo-zigbuild + x86_64 / aarch64 / riscv64gc / loongarch64 的 musl 目标 + zig；手动准备清单、国内加速与常见问题见 **`docs/build-env.md`**；
 - 磁盘占用受控：zig 交叉缓存经 `.cargo/config.toml` 的 `[env]` 重定向到 `target\zig-cache\`，随 `-Clean` / `-CleanAll` 一键回收；
-- 提示：zig 链接时可能输出 `ignoring deprecated linker optimization setting`，属工具链无害提示。
+- 提示：zig 链接时可能输出 `ignoring deprecated linker optimization setting`，属工具链无害提示；
+- 多平台支持规划（国产化 Linux / 嵌入式路由系统 / macOS 等）：见 `docs/platform-support.md`。
 
 ---
 
@@ -295,9 +299,10 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 - 服务运行时由 `windows-service` crate 与 SCM 交互：响应停止/关闭控制，停止时优雅退出（停止 `AutoStop` 应用、保存状态）。
 - 服务进程的工作目录在启动时自动切换到程序目录，配置中的相对路径据此解析。
 
-### 8.2 Linux（systemd）
+### 8.2 Linux（自动探测 init：systemd / procd / SysV·OpenRC）
 
-- 安装：`sudo pek-ragent -install`，生成 `/etc/systemd/system/{ServiceName}.service` 并 `enable`：
+- 探测顺序：systemd（`/run/systemd/system`）→ OpenWrt procd（`/etc/rc.common`）→ SysVinit/OpenRC（`/etc/init.d`）；可用环境变量 `PEK_RAGENT_INIT=systemd|procd|sysv` 强制指定（排障用）；
+- 安装：`sudo pek-ragent -install`；**systemd** 生成 `/etc/systemd/system/{ServiceName}.service` 并 `enable`：
   ```ini
   [Service]
   Type=simple
@@ -309,7 +314,9 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
   OOMScoreAdjust=-1000    # 禁止被 OOM 杀死
   ```
 - 控制：`-start` / `-stop` / `-restart` / `-status`（内部经 `systemctl`）；
-- 卸载：`sudo pek-ragent -uninstall`（`disable` + 删除单元文件 + `daemon-reload`）。
+- 卸载：`sudo pek-ragent -uninstall`（`disable` + 删除单元文件 + `daemon-reload`）；
+- **OpenWrt（procd）**：生成 `/etc/init.d/{ServiceName}`（`USE_PROCD=1` + `respawn`），`enable` 配置自启，控制/卸载同样经该脚本；
+- **SysVinit / OpenRC**：生成 LSB 风格 `/etc/init.d/{ServiceName}`，自动尝试 `update-rc.d` / `chkconfig` / `rc-update` 配置自启（都不可用时提示手动配置）。
 
 ### 8.3 macOS（launchd，尽力支持）
 
@@ -364,3 +371,4 @@ src/
 - [ ] 自身升级（`-upgrade` 完整实现）与 `-repair`
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
 - [ ] 进程按名称接管 / 多实例精确匹配
+- [ ] 多平台支持：国产 Linux（麒麟/统信/openEuler）实机验证、嵌入式/路由系统（OpenWrt/Buildroot）服务化适配、macOS 实机（ARM64 交叉产物已打通；规划见 `docs/platform-support.md`）

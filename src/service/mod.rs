@@ -2,7 +2,9 @@
 //!
 //! - **Windows**：SCM。安装用 `sc.exe create`（binPath 指向 `{exe} -s`），运行时由
 //!   `windows-service` crate 与 SCM 交互（见 [`windows::run_as_service`]）；
-//! - **Linux**：systemd 单元文件 `/etc/systemd/system/{name}.service` + `systemctl`；
+//! - **Linux**：自动探测 init 并分发——**systemd**（主流发行版）、**procd**（OpenWrt，
+//!   `/etc/init.d/{name}` + `/etc/rc.common`）、**SysVinit / OpenRC**（`/etc/init.d` +
+//!   `update-rc.d` / `chkconfig` / `rc-update`）；对应实现见 systemd / procd / sysv 模块；
 //! - **macOS**：launchd `/Library/LaunchDaemons/{name}.plist` + `launchctl`。
 
 use std::path::{Path, PathBuf};
@@ -14,6 +16,16 @@ pub mod windows;
 
 #[cfg(target_os = "linux")]
 mod systemd;
+#[cfg(target_os = "linux")]
+mod procd;
+#[cfg(target_os = "linux")]
+mod sysv;
+#[cfg(target_os = "linux")]
+mod linux;
+
+/// Linux init 探测与脚本模板（纯逻辑；测试时也编译，便于在开发机上跑单测）
+#[cfg(any(target_os = "linux", test))]
+mod inits;
 
 #[cfg(target_os = "macos")]
 mod launchd;
@@ -24,7 +36,7 @@ mod unsupported;
 #[cfg(windows)]
 use windows as platform;
 #[cfg(target_os = "linux")]
-use systemd as platform;
+use linux as platform;
 #[cfg(target_os = "macos")]
 use launchd as platform;
 #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
@@ -57,7 +69,7 @@ impl ServiceState {
 
 /// 平台服务管理器。
 pub struct ServiceManager {
-    /// 服务名（Windows 服务名 / systemd 单元名 / launchd 标签）
+    /// 服务名（Windows 服务名 / systemd 单元名 / init 脚本名 / launchd 标签）
     pub name: String,
     /// 显示名
     pub display: String,

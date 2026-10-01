@@ -1,64 +1,15 @@
 //! Linux systemd 服务管理。
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::{Duration, Instant};
 
+use super::linux::{require_root, run};
 use super::{ServiceManager, ServiceState};
 use crate::util;
 
 /// 单元文件路径。
 fn unit_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/etc/systemd/system/{}.service", name))
-}
-
-/// 执行命令并返回（退出码，标准输出，标准错误）。
-fn run(program: &str, args: &[&str]) -> (i32, String, String) {
-    match Command::new(program).args(args).output() {
-        Ok(out) => (
-            out.status.code().unwrap_or(-1),
-            String::from_utf8_lossy(&out.stdout).to_string(),
-            String::from_utf8_lossy(&out.stderr).to_string(),
-        ),
-        Err(e) => (-1, String::new(), e.to_string()),
-    }
-}
-
-/// 要求 root 权限。
-fn require_root() -> Result<(), String> {
-    let euid = unsafe { libc::geteuid() };
-    if euid != 0 {
-        Err("需要 root 权限（请使用 sudo 运行）".to_string())
-    } else {
-        Ok(())
-    }
-}
-
-/// 单元文件内容。
-fn unit_text(mgr: &ServiceManager) -> String {
-    format!(
-        "[Unit]\n\
-Description={display}\n\
-After=network.target\n\
-\n\
-[Service]\n\
-Type=simple\n\
-WorkingDirectory=\"{base}\"\n\
-ExecStart=\"{exe}\" -s\n\
-Restart=always\n\
-RestartSec=5\n\
-# 只杀主进程，避免误杀应用进程（对齐 C# StarAgent 的 KillMode=process）\n\
-KillMode=process\n\
-# 禁止被 OOM 杀死\n\
-OOMScoreAdjust=-1000\n\
-LimitNOFILE=65535\n\
-\n\
-[Install]\n\
-WantedBy=multi-user.target\n",
-        display = mgr.display,
-        base = mgr.base.display(),
-        exe = mgr.exe.display()
-    )
 }
 
 /// 查询状态。
@@ -100,7 +51,7 @@ pub fn install(mgr: &ServiceManager, start: bool) -> Result<(), String> {
         ));
     }
 
-    std::fs::write(&path, unit_text(mgr))
+    std::fs::write(&path, super::inits::systemd_unit_text(mgr))
         .map_err(|e| format!("写入单元文件失败 {}：{}", path.display(), e))?;
 
     let (code, _, err) = run("systemctl", &["daemon-reload"]);
@@ -120,13 +71,6 @@ pub fn install(mgr: &ServiceManager, start: bool) -> Result<(), String> {
     }
 
     Ok(())
-}
-
-/// 重新安装。
-pub fn reinstall(mgr: &ServiceManager) -> Result<(), String> {
-    let _ = uninstall(mgr, true);
-    std::thread::sleep(Duration::from_millis(500));
-    install(mgr, true)
 }
 
 /// 卸载（`stop` 为 true 时先停止）。
