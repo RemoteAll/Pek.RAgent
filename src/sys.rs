@@ -473,8 +473,570 @@ pub fn machine_info() -> String {
     text
 }
 
+// ————— Web 面板数据辅助 —————
+
+/// 进程条目（Web 面板 Top 列表）。
+pub(crate) struct ProcItem {
+    /// 进程名（不含 .exe 后缀）
+    pub(crate) name: String,
+    /// 进程 ID
+    pub(crate) pid: u32,
+    /// 内存（MB）
+    pub(crate) memory_mb: u64,
+    /// 线程数
+    pub(crate) threads: u32,
+    /// CPU 时间（秒；内核 + 用户，累计值，与 C# `TotalProcessorTime` 语义一致）
+    pub(crate) cpu_seconds: f64,
+}
+
+/// 进程统计（线程数、句柄数）。取不到返回 None。
+pub(crate) fn process_stats(pid: u32) -> Option<(u32, u32)> {
+    #[cfg(windows)]
+    {
+        use std::mem::zeroed;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+            CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+            TH32CS_SNAPPROCESS,
+        };
+        use windows_sys::Win32::System::Threading::{
+            GetProcessHandleCount, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        unsafe {
+            let mut threads = 0u32;
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot != INVALID_HANDLE_VALUE && !snapshot.is_null() {
+                let mut entry: PROCESSENTRY32W = zeroed();
+                entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+                if Process32FirstW(snapshot, &mut entry) != 0 {
+                    loop {
+                        if entry.th32ProcessID == pid {
+                            threads = entry.cntThreads;
+                            break;
+                        }
+                        if Process32NextW(snapshot, &mut entry) == 0 {
+                            break;
+                        }
+                    }
+                }
+                CloseHandle(snapshot);
+            }
+
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return Some((threads, 0));
+            }
+            let mut handles = 0u32;
+            let ok = GetProcessHandleCount(h, &mut handles);
+            CloseHandle(h);
+
+            Some((threads, if ok != 0 { handles } else { 0 }))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        let threads = status
+            .lines()
+            .find_map(|l| l.strip_prefix("Threads:"))
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let handles = std::fs::read_dir(format!("/proc/{pid}/fd"))
+            .map(|it| it.count() as u32)
+            .unwrap_or(0);
+        Some((threads, handles))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// 系统 CPU 使用率（0~100；200ms 两次采样差值）。
+pub(crate) fn system_cpu_rate() -> Option<f64> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::FILETIME;
+        use windows_sys::Win32::System::Threading::GetSystemTimes;
+
+        // 返回 (空闲 100ns, 总忙 100ns)；Windows 的内核时间已包含空闲时间
+        fn sample() -> Option<(u64, u64)> {
+            fn value(t: FILETIME) -> u64 {
+                ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
+            }
+
+            unsafe {
+                let (mut idle, mut kernel, mut user): (FILETIME, FILETIME, FILETIME) =
+                    (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+                if GetSystemTimes(&mut idle, &mut kernel, &mut user) == 0 {
+                    return None;
+                }
+                Some((value(idle), value(kernel) + value(user)))
+            }
+        }
+
+        let (idle1, total1) = sample()?;
+        std::thread::sleep(Duration::from_millis(200));
+        let (idle2, total2) = sample()?;
+
+        let total = total2.saturating_sub(total1);
+        let idle = idle2.saturating_sub(idle1);
+        if total == 0 {
+            return None;
+        }
+        Some(((1.0 - idle as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/stat 首行：cpu user nice system idle iowait irq softirq steal ...
+        fn sample() -> Option<(u64, u64)> {
+            let text = std::fs::read_to_string("/proc/stat").ok()?;
+            let line = text.lines().find(|l| l.starts_with("cpu "))?;
+            let values: Vec<u64> = line
+                .split_whitespace()
+                .skip(1)
+                .filter_map(|v| v.parse().ok())
+                .collect();
+            if values.len() < 4 {
+                return None;
+            }
+            let idle = values[3] + values.get(4).copied().unwrap_or(0);
+            let total: u64 = values.iter().sum();
+            Some((idle, total))
+        }
+
+        let (idle1, total1) = sample()?;
+        std::thread::sleep(Duration::from_millis(200));
+        let (idle2, total2) = sample()?;
+
+        let total = total2.saturating_sub(total1);
+        let idle = idle2.saturating_sub(idle1);
+        if total == 0 {
+            return None;
+        }
+        Some(((1.0 - idle as f64 / total as f64) * 100.0).clamp(0.0, 100.0))
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 机器唯一标识（Windows 注册表 `MachineGuid`；Linux `/etc/machine-id`）。
+pub(crate) fn machine_guid() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::NO_ERROR;
+        use windows_sys::Win32::System::Registry::{
+            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+        };
+
+        fn wide(text: &str) -> Vec<u16> {
+            text.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        let sub = wide("SOFTWARE\\Microsoft\\Cryptography");
+        let value = wide("MachineGuid");
+        unsafe {
+            let mut hkey: HKEY = std::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey) != NO_ERROR {
+                return None;
+            }
+
+            let mut size = 0u32;
+            let mut kind = 0u32;
+            let mut guid = None;
+            if RegQueryValueExW(
+                hkey,
+                value.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            ) == NO_ERROR
+                && size > 2
+            {
+                let mut buf = vec![0u8; size as usize];
+                if RegQueryValueExW(
+                    hkey,
+                    value.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    buf.as_mut_ptr(),
+                    &mut size,
+                ) == NO_ERROR
+                {
+                    let wide_text: &[u16] =
+                        std::slice::from_raw_parts(buf.as_ptr() as *const u16, size as usize / 2);
+                    let end = wide_text
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(wide_text.len());
+                    let text = String::from_utf16_lossy(&wide_text[..end]);
+                    if !text.trim().is_empty() {
+                        guid = Some(text.trim().to_string());
+                    }
+                }
+            }
+            RegCloseKey(hkey);
+            guid
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/etc/machine-id").ok()?;
+        let text = text.trim();
+        if text.is_empty() {
+            None
+        } else {
+            Some(text.to_string())
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+/// 是否存在指定进程名的进程（大小写不敏感、忽略 `.exe` 后缀；看门狗用）。
+pub(crate) fn is_process_running(name: &str) -> bool {
+    let name = name.trim().trim_end_matches(".exe");
+    if name.is_empty() {
+        return false;
+    }
+
+    #[cfg(windows)]
+    {
+        let mut found = false;
+        for_each_process(|pname, _pid, _threads| {
+            if pname.eq_ignore_ascii_case(name) {
+                found = true;
+            }
+        });
+        found
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return false;
+        };
+        for entry in dir.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let Ok(comm) = std::fs::read_to_string(path.join("comm")) else {
+                continue;
+            };
+            if comm.trim().eq_ignore_ascii_case(name) {
+                return true;
+            }
+        }
+        false
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// Top 进程列表（按内存或 CPU 时间降序；取前 `count` 个）。
+pub(crate) fn top_processes(count: usize, sort_by_cpu: bool) -> Vec<ProcItem> {
+    let mut items: Vec<ProcItem> = Vec::new();
+
+    #[cfg(windows)]
+    {
+        for_each_process(|pname, pid, threads| {
+            items.push(ProcItem {
+                name: pname.to_string(),
+                pid,
+                memory_mb: memory_mb(pid).unwrap_or(0),
+                threads,
+                cpu_seconds: process_cpu_split(pid).map(|(total, _, _)| total).unwrap_or(0.0),
+            });
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        use std::sync::OnceLock;
+        static PAGE_SIZE: OnceLock<u64> = OnceLock::new();
+        let page = *PAGE_SIZE.get_or_init(|| {
+            let mut size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if size <= 0 {
+                size = 4096;
+            }
+            size as u64
+        });
+
+        if let Ok(dir) = std::fs::read_dir("/proc") {
+            for entry in dir.flatten() {
+                let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+                    continue;
+                };
+                // /proc/{pid}/stat：comm 位于括号内，其后 utime/stime/num_threads 为第 14/15/20 字段
+                let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+                    continue;
+                };
+                let Some(open) = stat.find('(') else { continue };
+                let Some(close) = stat.rfind(')') else { continue };
+                let name = stat[open + 1..close].to_string();
+                let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+                let utime: u64 = rest.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let stime: u64 = rest.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+                let threads: u32 = rest.get(17).and_then(|v| v.parse().ok()).unwrap_or(0);
+
+                let memory_mb = std::fs::read_to_string(format!("/proc/{pid}/statm"))
+                    .ok()
+                    .and_then(|t| t.split_whitespace().nth(1)?.parse::<u64>().ok())
+                    .map(|pages| pages * page / 1024 / 1024)
+                    .unwrap_or(0);
+
+                items.push(ProcItem {
+                    name,
+                    pid,
+                    memory_mb,
+                    threads,
+                    cpu_seconds: (utime + stime) as f64 / 100.0,
+                });
+            }
+        }
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        let _ = sort_by_cpu;
+    }
+
+    if sort_by_cpu {
+        items.sort_by(|a, b| b.cpu_seconds.total_cmp(&a.cpu_seconds));
+    } else {
+        items.sort_by(|a, b| b.memory_mb.cmp(&a.memory_mb));
+    }
+    items.truncate(count);
+    items
+}
+
+/// 系统 TCP 连接计数（已建立 / TIME_WAIT / CLOSE_WAIT）。
+pub(crate) fn tcp_counts() -> (u32, u32, u32) {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GetExtendedTcpTable, MIB_TCPROW_OWNER_PID, MIB_TCPTABLE_OWNER_PID,
+            TCP_TABLE_OWNER_PID_ALL,
+        };
+        use windows_sys::Win32::Networking::WinSock::AF_INET;
+
+        // MIB_TCP_STATE：5=ESTABLISHED 8=CLOSE_WAIT 11=TIME_WAIT（与 .NET TcpState 数值一致）
+        const ESTABLISHED: u32 = 5;
+        const CLOSE_WAIT: u32 = 8;
+        const TIME_WAIT: u32 = 11;
+
+        unsafe {
+            let mut size: u32 = 0;
+            GetExtendedTcpTable(
+                std::ptr::null_mut(),
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if size == 0 {
+                return (0, 0, 0);
+            }
+
+            let mut buf = vec![0u8; size as usize];
+            let ret = GetExtendedTcpTable(
+                buf.as_mut_ptr() as *mut core::ffi::c_void,
+                &mut size,
+                0,
+                AF_INET as u32,
+                TCP_TABLE_OWNER_PID_ALL,
+                0,
+            );
+            if ret != 0 {
+                return (0, 0, 0);
+            }
+
+            let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
+            let count = (*table).dwNumEntries as usize;
+            let rows = (*table).table.as_ptr();
+            let (mut estab, mut close_wait, mut time_wait) = (0u32, 0u32, 0u32);
+            for i in 0..count {
+                let row: *const MIB_TCPROW_OWNER_PID = rows.add(i);
+                match (*row).dwState {
+                    ESTABLISHED => estab += 1,
+                    CLOSE_WAIT => close_wait += 1,
+                    TIME_WAIT => time_wait += 1,
+                    _ => {}
+                }
+            }
+            (estab, time_wait, close_wait)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc/net/tcp：st 列（hex）：01=ESTABLISHED 06=TIME_WAIT 08=CLOSE_WAIT
+        let Ok(text) = std::fs::read_to_string("/proc/net/tcp") else {
+            return (0, 0, 0);
+        };
+        let (mut estab, mut time_wait, mut close_wait) = (0u32, 0u32, 0u32);
+        for line in text.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            match fields.get(3).map(|v| v.to_ascii_uppercase()) {
+                Some(state) if state == "01" => estab += 1,
+                Some(state) if state == "06" => time_wait += 1,
+                Some(state) if state == "08" => close_wait += 1,
+                _ => {}
+            }
+        }
+        (estab, time_wait, close_wait)
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        (0, 0, 0)
+    }
+}
+
+/// 当前进程 CPU 时间（总秒、内核秒、用户秒）。
+pub(crate) fn process_cpu_seconds() -> (f64, f64, f64) {
+    process_cpu_split(std::process::id()).unwrap_or((0.0, 0.0, 0.0))
+}
+
+/// 释放当前进程工作集（Windows `EmptyWorkingSet`；其它平台空操作）。
+pub(crate) fn empty_working_set() -> bool {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::ProcessStatus::EmptyWorkingSet;
+        use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, std::process::id());
+            if h.is_null() {
+                return false;
+            }
+            let ok = EmptyWorkingSet(h);
+            CloseHandle(h);
+            ok != 0
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        // glibc：将空闲堆归还系统（等价于 C# GC + 释放虚拟内存的尽力而为）
+        unsafe { libc::malloc_trim(0) != 0 }
+    }
+
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        false
+    }
+}
+
+/// 指定进程 CPU 时间（总秒、内核秒、用户秒）。
+#[cfg(windows)]
+pub(crate) fn process_cpu_split(pid: u32) -> Option<(f64, f64, f64)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    fn value(t: FILETIME) -> f64 {
+        (((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64) as f64 / 10_000_000.0
+    }
+
+    unsafe {
+        let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if h.is_null() {
+            return None;
+        }
+        let (mut creation, mut exit, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) =
+            (std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed(), std::mem::zeroed());
+        let ok = GetProcessTimes(h, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(h);
+        if ok == 0 {
+            return None;
+        }
+        let kernel = value(kernel);
+        let user = value(user);
+        Some((kernel + user, kernel, user))
+    }
+}
+
+/// 指定进程 CPU 时间（总秒、内核秒、用户秒）。
+#[cfg(target_os = "linux")]
+pub(crate) fn process_cpu_split(pid: u32) -> Option<(f64, f64, f64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let close = stat.rfind(')')?;
+    let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
+    let utime: u64 = rest.get(11).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let stime: u64 = rest.get(12).and_then(|v| v.parse().ok()).unwrap_or(0);
+    let user = utime as f64 / 100.0;
+    let kernel = stime as f64 / 100.0;
+    Some((user + kernel, kernel, user))
+}
+
+/// 指定进程 CPU 时间（总秒、内核秒、用户秒）。
+#[cfg(not(any(windows, target_os = "linux")))]
+pub(crate) fn process_cpu_split(_pid: u32) -> Option<(f64, f64, f64)> {
+    None
+}
+
+/// 遍历当前所有进程（名称、PID、线程数）。名称已去除 `.exe` 后缀。
+#[cfg(windows)]
+fn for_each_process(mut f: impl FnMut(&str, u32, u32)) {
+    use std::mem::zeroed;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE || snapshot.is_null() {
+            return;
+        }
+
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
+        if Process32FirstW(snapshot, &mut entry) != 0 {
+            loop {
+                let end = entry
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(entry.szExeFile.len());
+                let raw = String::from_utf16_lossy(&entry.szExeFile[..end]);
+                let name = raw.trim_end_matches(".exe");
+                if !name.is_empty() {
+                    f(name, entry.th32ProcessID, entry.cntThreads);
+                }
+                if Process32NextW(snapshot, &mut entry) == 0 {
+                    break;
+                }
+            }
+        }
+        CloseHandle(snapshot);
+    }
+}
+
 /// 主机名。
-fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     #[cfg(windows)]
     {
         std::env::var("COMPUTERNAME").unwrap_or_default()
@@ -496,52 +1058,52 @@ fn hostname() -> String {
 // ————— 机器信息辅助（-ShowMachineInfo） —————
 
 /// 网络接口信息。
-struct NetInterface {
+pub(crate) struct NetInterface {
     /// 接口名称（中文系统为“以太网/WLAN”等；Linux 为 eth0 等）
-    name: String,
+    pub(crate) name: String,
     /// 描述（网卡型号；Linux 通常为空）
-    description: String,
+    pub(crate) description: String,
     /// 是否已连接
-    up: bool,
+    pub(crate) up: bool,
     /// 链路速率（Mbps；0 表示未知）
-    speed_mbps: u64,
+    pub(crate) speed_mbps: u64,
     /// MAC 地址（`xx-xx-xx-xx-xx-xx`）
-    mac: String,
+    pub(crate) mac: String,
     /// IPv4 地址列表
-    ips: Vec<String>,
+    pub(crate) ips: Vec<String>,
     /// 网关列表
-    gateways: Vec<String>,
+    pub(crate) gateways: Vec<String>,
     /// DNS 服务器列表
-    dns: Vec<String>,
+    pub(crate) dns: Vec<String>,
 }
 
 /// 磁盘信息。
-struct DiskItem {
+pub(crate) struct DiskItem {
     /// 盘符（`C:\`）或挂载点
-    name: String,
+    pub(crate) name: String,
     /// 类型（固定/可移动/网络/光驱等）
-    kind: String,
+    pub(crate) kind: String,
     /// 文件系统（NTFS/ext4 等）
-    format: String,
+    pub(crate) format: String,
     /// 卷标
-    label: String,
+    pub(crate) label: String,
     /// 总字节（未就绪为 0）
-    total: u64,
+    pub(crate) total: u64,
     /// 可用字节
-    free: u64,
+    pub(crate) free: u64,
     /// 是否就绪（光驱无盘等）
-    ready: bool,
+    pub(crate) ready: bool,
 }
 
 /// 当前用户名。
-fn user_name() -> String {
+pub(crate) fn user_name() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_default()
 }
 
 /// 操作系统描述（Windows 形如 `Microsoft Windows NT 10.0.26200.0`，与 .NET `OSDescription` 一致）。
-fn os_description() -> String {
+pub(crate) fn os_description() -> String {
     #[cfg(windows)]
     {
         // 与 dhrust::logs 的实现同源（RtlGetVersion）；待公共化后统一下沉
@@ -589,7 +1151,7 @@ fn os_description() -> String {
 }
 
 /// CPU 型号（Windows 读注册表 ProcessorNameString；Linux 读 /proc/cpuinfo；macOS 读 sysctl）。
-fn cpu_model() -> Option<String> {
+pub(crate) fn cpu_model() -> Option<String> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::NO_ERROR;
@@ -676,7 +1238,7 @@ fn cpu_model() -> Option<String> {
 }
 
 /// 物理内存（总量、可用；字节）。
-fn memory_info() -> Option<(u64, u64)> {
+pub(crate) fn memory_info() -> Option<(u64, u64)> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -726,7 +1288,7 @@ fn memory_info() -> Option<(u64, u64)> {
 }
 
 /// 系统运行时长文本（如 `21天13小时`）。
-fn uptime_text() -> Option<String> {
+pub(crate) fn uptime_text() -> Option<String> {
     #[cfg(windows)]
     let millis: Option<u64> =
         Some(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() });
@@ -759,7 +1321,7 @@ fn uptime_text() -> Option<String> {
 }
 
 /// 字节数友好格式（对齐 C# `ToGMK`：1024 进制，保留 1 位小数，如 `63.7G`）。
-fn format_gmk(bytes: u64) -> String {
+pub(crate) fn format_gmk(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
     let mut value = bytes as f64;
     let mut idx = 0usize;
@@ -812,7 +1374,7 @@ fn is_virtual_adapter(description: &str) -> bool {
 }
 
 /// 枚举网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡，取 IPv4）。
-fn network_interfaces() -> Vec<NetInterface> {
+pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
@@ -972,7 +1534,7 @@ fn network_interfaces() -> Vec<NetInterface> {
 }
 
 /// 枚举磁盘（对齐 C# `ShowMachineInfo`：全量枚举并标注类型）。
-fn disks() -> Vec<DiskItem> {
+pub(crate) fn disks() -> Vec<DiskItem> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Storage::FileSystem::{

@@ -39,6 +39,8 @@ windows-sys = { version = "0.59", features = [
     "Win32_Networking_WinSock",
     "Win32_Storage_FileSystem",
     "Win32_System_Registry",
+    # Web 面板：进程枚举/线程数（Toolhelp）与 TCP 连接表（IpHelper）
+    "Win32_System_Diagnostics_ToolHelp",
 ] }
 
 [profile.release]

@@ -328,6 +328,76 @@ impl AppManager {
         self.sync_runtimes();
     }
 
+    /// 新增或更新应用配置（Web 面板调用）。返回是否命中的是已有应用。
+    pub fn upsert_app(&self, app: crate::config::AppConfig) -> bool {
+        let name = app.name.trim().to_string();
+        if name.is_empty() {
+            return false;
+        }
+
+        let mut updated = false;
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let mut cfg = inner.config.clone();
+            match cfg.find_app_mut(&name) {
+                Some(old) => {
+                    *old = app;
+                    updated = true;
+                }
+                None => {
+                    let mut app = app;
+                    app.name = name.clone();
+                    cfg.apps.push(app);
+                }
+            }
+            cfg.normalize();
+            inner.config = cfg;
+        }
+
+        self.sync_runtimes();
+        self.save_config();
+        util::log_format(
+            "Web 面板{}应用配置[{}]",
+            &[if updated { "更新" } else { "新增" }, &name],
+        );
+        updated
+    }
+
+    /// 删除应用配置（Web 面板调用；运行中的实例由 sync_runtimes 停止并移除）。返回是否找到。
+    pub fn remove_app(&self, name: &str) -> bool {
+        let found = {
+            let mut inner = self.inner.lock().unwrap();
+            let mut cfg = inner.config.clone();
+            let before = cfg.apps.len();
+            cfg.apps.retain(|e| !e.name.eq_ignore_ascii_case(name.trim()));
+            let found = cfg.apps.len() != before;
+            if found {
+                inner.config = cfg;
+            }
+            found
+        };
+
+        if found {
+            self.sync_runtimes();
+            self.save_config();
+            self.persist_state();
+            util::log_format("Web 面板删除应用配置[{}]", &[name]);
+        }
+        found
+    }
+
+    /// 更新全局配置（Web 面板调用）；闭包修改后立即落盘。
+    pub fn update_config(&self, f: impl FnOnce(&mut AgentConfig)) {
+        {
+            let mut inner = self.inner.lock().unwrap();
+            let mut cfg = inner.config.clone();
+            f(&mut cfg);
+            cfg.normalize();
+            inner.config = cfg;
+        }
+        self.save_config();
+    }
+
     /// 仅更新内存配置（不落盘，批量变更时用）。
     fn set_app_enable_quiet(&self, name: &str, enable: bool) {
         let mut inner = self.inner.lock().unwrap();

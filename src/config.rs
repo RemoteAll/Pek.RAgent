@@ -44,6 +44,14 @@ pub struct AgentConfig {
     pub project: String,
     /// 启动挂钩。对 .NET 应用注入 Stardust.dll（未引用星尘 SDK 时）
     pub startup_hook: bool,
+    /// 看门狗。保护其它服务，每分钟检查一次；多个进程名逗号分隔
+    pub watch_dog: String,
+    /// Web 面板用户名。默认 admin
+    pub web_user_name: String,
+    /// Web 面板密码。默认 admin
+    pub web_user_password: String,
+    /// Web 面板鉴权级别（None/LocalOnly/Full）。默认 LocalOnly
+    pub web_auth_level: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -64,6 +72,10 @@ impl Default for AgentConfig {
             server: String::new(),
             project: String::new(),
             startup_hook: false,
+            watch_dog: String::new(),
+            web_user_name: "admin".to_string(),
+            web_user_password: "admin".to_string(),
+            web_auth_level: "LocalOnly".to_string(),
             apps: sample_apps(),
         }
     }
@@ -239,6 +251,15 @@ impl AgentConfig {
         }
         if self.guard_period < 5_000 {
             self.guard_period = 30_000;
+        }
+        if self.web_user_name.trim().is_empty() {
+            self.web_user_name = "admin".to_string();
+        }
+        if self.web_user_password.is_empty() {
+            self.web_user_password = "admin".to_string();
+        }
+        if self.web_auth_level.trim().is_empty() {
+            self.web_auth_level = "LocalOnly".to_string();
         }
 
         for app in &mut self.apps {
