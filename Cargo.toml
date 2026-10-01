@@ -41,6 +41,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Registry",
     # Web 面板：进程枚举/线程数（Toolhelp）与 TCP 连接表（IpHelper）
     "Win32_System_Diagnostics_ToolHelp",
+    # Web 面板：磁盘 IOPS 采样（DeviceIoControl → IOCTL_DISK_PERFORMANCE；CreateFileW 依赖 Security）
+    "Win32_System_IO",
+    "Win32_Security",
 ] }
 
 [profile.release]

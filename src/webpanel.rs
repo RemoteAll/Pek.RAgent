@@ -393,10 +393,22 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let (threads, handles) = sys::process_stats(pid).unwrap_or((0, 0));
     let memory_mb = sys::memory_mb(pid).unwrap_or(0);
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
+    let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
+    let disks = sys::disk_usages();
+    let load = sys::load_average();
     let cpu_rate = sys::system_cpu_rate();
     let (tcp_estab, tcp_time_wait, tcp_close_wait) = sys::tcp_counts();
     // 网络速率（两次请求差分；网页关闭时无请求 = 零开销）
     let (net_up, net_down) = net_speed();
+    let (net_rx_total, net_tx_total) = sys::net_total_bytes().unwrap_or((0, 0));
+    let (
+        disk_iops_rate,
+        disk_read_bps,
+        disk_write_bps,
+        disk_latency_ms,
+        disk_read_bytes,
+        disk_write_bytes,
+    ) = disk_rates();
     let uptime = panel.uptime();
     let cpu_count = std::thread::available_parallelism()
         .map(|v| v.get())
@@ -411,6 +423,7 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "uptimeSeconds": uptime.as_secs(),
         "processId": pid,
         "memoryMB": memory_mb,
+        "memoryUsedMB": mem_used_mb,
         "memoryTotalMB": mem_total / 1024 / 1024,
         "threadCount": threads,
         "handleCount": handles,
@@ -429,10 +442,26 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "machineGuid": sys::machine_guid().unwrap_or_default(),
         "uplinkSpeed": format_speed(net_up),
         "downlinkSpeed": format_speed(net_down),
+        "uplinkBps": net_up,
+        "downlinkBps": net_down,
+        "netTxBytes": net_tx_total,
+        "netRxBytes": net_rx_total,
         "tcpConnections": tcp_estab,
         "tcpTimeWait": tcp_time_wait,
         "tcpCloseWait": tcp_close_wait,
-        "diskIops": 0,
+        "diskIops": disk_iops_rate,
+        "diskReadBps": disk_read_bps,
+        "diskWriteBps": disk_write_bps,
+        "diskLatencyMs": disk_latency_ms,
+        "diskReadBytes": disk_read_bytes,
+        "diskWriteBytes": disk_write_bytes,
+        "disks": disks
+            .iter()
+            .map(|(used, total, name)| json!({ "name": name, "usedMB": used, "totalMB": total }))
+            .collect::<Vec<_>>(),
+        "load1": load.map(|l| l.0),
+        "load5": load.map(|l| l.1),
+        "load15": load.map(|l| l.2),
         "hostUptime": format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
         "port": panel.port(),
     });
@@ -508,6 +537,63 @@ fn format_speed(bps: u64) -> String {
     } else {
         format!("{v:.0} B/s")
     }
+}
+
+/// 字节数可读格式（对齐 C# `StarApi.FormatBytes`：1024 进制，B/KB/MB/GB）。
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
+    } else {
+        format!("{:.2} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
+    }
+}
+
+/// 上次磁盘 IO 采样（时间, 累计统计）——面板速率差分用。
+static DISK_LAST: Mutex<Option<(Instant, sys::DiskIo)>> = Mutex::new(None);
+
+/// 磁盘速率差分：返回 `(iops, 读字节/秒, 写字节/秒, 平均延迟毫秒, 累计读字节, 累计写字节)`；
+/// 首次调用或无数据返回全 0。
+fn disk_rates() -> (u64, u64, u64, f64, u64, u64) {
+    let Some(io) = sys::disk_io() else {
+        return (0, 0, 0, 0.0, 0, 0);
+    };
+    let now = Instant::now();
+    let mut slot = DISK_LAST.lock().unwrap();
+    let (iops, read_bps, write_bps, latency) = match *slot {
+        Some((t, last)) => {
+            let dt = now.duration_since(t).as_secs_f64();
+            if dt >= 0.2 {
+                let ops = (io.reads + io.writes).saturating_sub(last.reads + last.writes);
+                let latency = if ops > 0 {
+                    io.ms_total.saturating_sub(last.ms_total) as f64 / ops as f64
+                } else {
+                    0.0
+                };
+                (
+                    ops as f64 / dt,
+                    io.read_bytes.saturating_sub(last.read_bytes) as f64 / dt,
+                    io.write_bytes.saturating_sub(last.write_bytes) as f64 / dt,
+                    latency,
+                )
+            } else {
+                (0.0, 0.0, 0.0, 0.0)
+            }
+        }
+        None => (0.0, 0.0, 0.0, 0.0),
+    };
+    *slot = Some((now, io));
+    (
+        iops as u64,
+        read_bps as u64,
+        write_bps as u64,
+        (latency * 10.0).round() / 10.0,
+        io.read_bytes,
+        io.write_bytes,
+    )
 }
 
 /// 释放内存（尽力回收工作集）。
@@ -1149,8 +1235,8 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 "type": "",
                 "speed": if n.speed_mbps > 0 { format!("{} Mbps", n.speed_mbps) } else { String::new() },
                 "operationalStatus": if n.up { "Up" } else { "Down" },
-                "bytesReceived": "",
-                "bytesSent": "",
+                "bytesReceived": format_bytes(n.bytes_received),
+                "bytesSent": format_bytes(n.bytes_sent),
             })
         })
         .collect();
@@ -1820,6 +1906,47 @@ mod tests {
     }
 
     #[test]
+    fn status_reports_host_wide_resources() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        let json = body_json(status(&panel, &context("GET", "/api/status", "", Some(&token))));
+        assert_eq!(json["code"], 0);
+        let d = &json["data"];
+
+        // 整机内存：已用/总量为合理正数
+        let used = d["memoryUsedMB"].as_u64().unwrap_or(0);
+        let total = d["memoryTotalMB"].as_u64().unwrap_or(0);
+        assert!(total > 0, "应返回整机总内存");
+        assert!(used > 0 && used <= total, "整机已用内存应介于 0 与总量之间：{used}/{total}");
+
+        // 磁盘列表：数组，每项总量为正、已用不超过总量、名称非空
+        let disks = d["disks"].as_array().expect("应返回磁盘数组");
+        for disk in disks {
+            let used = disk["usedMB"].as_u64().unwrap_or(0);
+            let total = disk["totalMB"].as_u64().unwrap_or(0);
+            assert!(total > 0, "磁盘总量应为正：{disk}");
+            assert!(used <= total, "磁盘已用不应超过总量：{disk}");
+            assert!(!disk["name"].as_str().unwrap_or_default().is_empty());
+        }
+
+        // 平台负载：Linux 有值，Windows 为 null
+        #[cfg(target_os = "linux")]
+        assert!(d["load1"].as_f64().is_some(), "Linux 应返回负载");
+        #[cfg(not(target_os = "linux"))]
+        assert!(d["load1"].is_null(), "非 Linux 平台负载应为 null");
+
+        // 趋势图数据：数值速率与累计量齐备
+        assert!(d["uplinkBps"].is_number() && d["downlinkBps"].is_number());
+        assert!(d["netTxBytes"].as_u64().unwrap_or(0) > 0, "应返回累计发送字节");
+        assert!(d["netRxBytes"].as_u64().unwrap_or(0) > 0, "应返回累计接收字节");
+        assert!(d["diskReadBytes"].as_u64().is_some() && d["diskWriteBytes"].as_u64().is_some());
+        assert!(d["diskLatencyMs"].is_number(), "应返回 IO 延迟数值");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn client_ip_strips_port() {
         let ctx = context_from("127.0.0.1:50000", "GET", "/", "", None);
         assert_eq!(WebPanel::client_ip(&ctx), "127.0.0.1");
@@ -1922,5 +2049,15 @@ mod tests {
         assert_eq!(AuthLevel::parse("localonly"), AuthLevel::LocalOnly);
         assert_eq!(AuthLevel::parse(""), AuthLevel::LocalOnly);
         assert_eq!(AuthLevel::parse("unknown"), AuthLevel::LocalOnly);
+    }
+
+    #[test]
+    fn format_bytes_matches_csharp_starapi() {
+        // 对齐 C# StarApi.FormatBytes：B/KB/MB/GB，1024 进制
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(512), "512 B");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
     }
 }

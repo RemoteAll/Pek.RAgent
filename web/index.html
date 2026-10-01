@@ -107,6 +107,19 @@ main{padding:20px 24px;max-width:1320px;margin:0 auto;position:relative;z-index:
 .ring-wrap .ring-text .unit{font-size:11px;color:var(--text-tertiary)}
 .gauge-label{font-size:13px;font-weight:600;margin-bottom:4px}
 .gauge-detail{font-size:11px;color:var(--text-tertiary)}
+.chart-head{display:flex;align-items:flex-end;justify-content:space-between}
+.chart-tabs{display:flex;gap:24px}
+.chart-tab{padding:6px 2px;font-size:14px;font-weight:600;color:var(--text-tertiary);cursor:pointer;border-bottom:2px solid transparent;transition:color .2s,border-color .2s}
+.chart-tab.active{color:var(--text-primary);border-bottom-color:#22c55e}
+.chart-hint{font-size:11px;color:var(--text-tertiary);padding-bottom:8px}
+.chart-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:14px 0 10px}
+.chart-stat{background:var(--surface-2);border:1px solid var(--border-default);border-radius:var(--radius-md);padding:10px 12px;display:flex;align-items:center;justify-content:space-between;gap:8px}
+.chart-stat .l{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)}
+.chart-stat .dotc{width:8px;height:8px;border-radius:50%;display:inline-block}
+.chart-stat .v{font-size:14px;font-weight:700;font-family:var(--font-mono)}
+.chart-wrap svg{display:block;width:100%;height:auto}
+/* 图表每 3 秒局部重绘会干扰浏览器滚动锚定（滚动条被自动弹回）；禁用锚定以保持滚动位置稳定 */
+html{overflow-anchor:none}
 .config-table{width:100%;border-collapse:collapse}
 .config-table td{padding:12px 14px;border-bottom:1px solid var(--border-subtle);vertical-align:middle}
 .config-table td:first-child{font-size:13px;font-weight:600;color:var(--text-primary);white-space:nowrap;width:160px}
@@ -370,6 +383,7 @@ document.querySelector('#nav-bar').addEventListener('click',e=>{
 
 /* ── Dashboard ── */
 let _dashboardBuilt=false;
+let _diskSig=''; // 磁盘列表签名：磁盘增减时重建仪表盘
 let _machineInfoBuilt=false;
 
 async function loadDashboard(){
@@ -384,12 +398,16 @@ async function loadDashboard(){
   const dot=$('status-dot-header');
   dot.className='dot status-dot '+(d.running?'on':'off');
 
+  const diskSig=(d.disks||[]).map(x=>x.name).join(',');
+  if(diskSig!==_diskSig){_diskSig=diskSig;_dashboardBuilt=false}
   if(!_dashboardBuilt){
    _dashboardBuilt=true;
    buildDashboard(d,h.data);
   }else{
    updateDashboard(d,h.data);
   }
+  pushHistory(d);
+  renderChart(d);
  }catch(e){}
 }
 
@@ -404,29 +422,26 @@ function buildDashboard(d,health){
  html+=statCard('运行时长',d.uptime,'','svc-uptime');
  html+=statCard('进程 ID',d.processId,'font-mono','svc-pid');
  html+=statCard('监听端口',d.port,'font-mono','svc-port');
- html+=statCard('内存占用',d.memoryMB+' MB','','svc-mem',d.memoryMB>500?'text-yellow':'');
+ html+=statCard('进程内存',d.memoryMB+' MB','','svc-mem',d.memoryMB>500?'text-yellow':'');
  html+=statCard('启动时间',d.startTime,'text-secondary','svc-start');
+ html+=statCard('连接数',d.tcpConnections||0,'','conn-val',d.tcpConnections>1000?'text-red':(d.tcpConnections>100?'text-yellow':'text-green'));
+ html+=statCard('磁盘 IO',formatIops(d.diskIops),'font-mono','disk-iops');
  html+=`</div></div>`;
 
- // 资源监控
- const memLimit = health && health.memoryLimitMB > 0 ? health.memoryLimitMB : 0;
- const memTotal = memLimit > 0 ? memLimit : (d.memoryTotalMB || 0);
- const memPct = memTotal > 0 ? pct(d.memoryMB, memTotal) : 0;
- const thrPct = health ? pct(health.threadCount, health.threadLimit) : 0;
- const hndPct = health ? pct(health.handleCount, health.handleLimit) : 0;
+ // 资源监控（整机视角，与宝塔一致：CPU / 内存 / 磁盘×N / 负载）
  const cpuPct = d.cpuRateValue>0 ? Math.min(100, d.cpuRateValue) : (d.cpuRate?Math.min(100, parseFloat(d.cpuRate)):0);
+ const memUsedMB = d.memoryUsedMB||0, memTotalMB = d.memoryTotalMB||0;
+ const memPct = memTotalMB>0 ? pct(memUsedMB, memTotalMB) : 0;
+ const hasLoad = d.load1!=null;
+ const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/d.cpuCount*100)) : 0;
 
  html+=`<div class="glass-card card"><h2>💚 资源监控</h2><div class="gauge-row">`;
- html+=ringGauge('CPU 使用率', cpuPct+'%', '100%', cpuPct, 'gauge-cpu');
- html+=ringGauge('内存', d.memoryMB+' MB', memTotal>0?memTotal+' MB':'∞', memPct, 'gauge-mem');
- html+=ringGauge('线程数', d.threadCount, (health&&health.threadLimit>0)?health.threadLimit+'':'∞', thrPct, 'gauge-thr');
- html+=ringGauge('句柄数', d.handleCount, (health&&health.handleLimit>0)?health.handleLimit+'':'∞', hndPct, 'gauge-hnd');
- html+=`</div>`;
- html+=`<div class="gauge-row" style="margin-top:8px">`;
- html+=connCard('连接数', d.tcpConnections||0);
- html+=numCard('上行速率', d.uplinkSpeed||'0 bps', 'font-mono', 'net-up');
- html+=numCard('下行速率', d.downlinkSpeed||'0 bps', 'font-mono', 'net-down');
- html+=numCard('磁盘 IO', d.diskIops!=null?formatIops(d.diskIops):'0 ops/s', 'font-mono', 'disk-iops');
+ html+=ringGauge('CPU 使用率', (d.cpuCount||0)+' 核', '', cpuPct, 'gauge-cpu');
+ html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem');
+ (d.disks||[]).forEach((x,i)=>{
+  html+=ringGauge('磁盘 '+x.name, fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '', pct(x.usedMB,x.totalMB), 'gauge-disk-'+i);
+ });
+ if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=`</div>`;
  if(health){
   html+=`<div class="mt-12"><div class="collapse-header" onclick="this.classList.toggle('open');document.getElementById('gc-body').classList.toggle('open')"><span class="arrow">▶</span> GC 与 CPU 统计</div>`;
@@ -436,6 +451,11 @@ function buildDashboard(d,health){
   html+=`</div><div style="margin-top:12px;text-align:right"><button class="btn btn-ghost btn-sm" onclick="freeMemory()">🗑 释放内存</button></div></div></div>`;
  }
  html+=`</div>`;
+
+ // 流量 / 磁盘 IO 趋势图（独立卡片，对齐宝塔：下划线页签 + 统计块 + 平滑双曲线）
+ html+=`<div class="glass-card card"><div class="chart-head"><div class="chart-tabs"><span class="chart-tab active" id="tab-net" onclick="switchChart('net')">流量</span><span class="chart-tab" id="tab-disk" onclick="switchChart('disk')">磁盘 IO</span></div><span class="chart-hint">近 30 秒 · 每 3 秒采样</span></div>`;
+ html+=`<div class="chart-stats" id="chart-stats"></div>`;
+ html+=`<div class="chart-wrap"><svg id="trend-svg" viewBox="0 0 600 150"></svg></div></div>`;
 
  // 系统信息
  html+=`<div class="glass-card card"><h2>🖥 系统信息</h2><table class="info-table">`;
@@ -471,21 +491,20 @@ function updateDashboard(d,health){
   ind.className='status-indicator '+(d.running?'running':'stopped');
   ind.innerHTML=`<span class="status-dot ${d.running?'on':'off'}"></span>${d.running?'运行中':'已停止'}`;
  }
- const memLimit = health && health.memoryLimitMB > 0 ? health.memoryLimitMB : 0;
- const memTotal = memLimit > 0 ? memLimit : (d.memoryTotalMB || 0);
- const memPct = memTotal > 0 ? pct(d.memoryMB, memTotal) : 0;
- const thrPct = health ? pct(health.threadCount, health.threadLimit) : 0;
- const hndPct = health ? pct(health.handleCount, health.handleLimit) : 0;
  const cpuPct = d.cpuRateValue>0 ? Math.min(100, d.cpuRateValue) : (d.cpuRate?Math.min(100, parseFloat(d.cpuRate)):0);
- updateGauge('gauge-cpu', cpuPct, cpuPct+'%', '100%');
- updateGauge('gauge-mem', memPct, d.memoryMB+' MB', memTotal>0?memTotal+' MB':'∞');
- updateGauge('gauge-thr', thrPct, d.threadCount, (health&&health.threadLimit>0)?health.threadLimit+'':'∞');
- updateGauge('gauge-hnd', hndPct, d.handleCount, (health&&health.handleLimit>0)?health.handleLimit+'':'∞');
+ const memUsedMB = d.memoryUsedMB||0, memTotalMB = d.memoryTotalMB||0;
+ const memPct = memTotalMB>0 ? pct(memUsedMB, memTotalMB) : 0;
+ const hasLoad = d.load1!=null;
+ const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/d.cpuCount*100)) : 0;
+ updateGauge('gauge-cpu', cpuPct, (d.cpuCount||0)+' 核', '');
+ updateGauge('gauge-mem', memPct, fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '');
+ (d.disks||[]).forEach((x,i)=>{
+  updateGauge('gauge-disk-'+i, pct(x.usedMB,x.totalMB), fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '');
+ });
+ if(hasLoad)updateGauge('gauge-load', loadPct, d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2));
  setText('conn-val', d.tcpConnections||0);
  setConnColor('conn-val', d.tcpConnections||0);
- setText('net-up', d.uplinkSpeed||'0 bps');
- setText('net-down', d.downlinkSpeed||'0 bps');
- setText('disk-iops', d.diskIops!=null?formatIops(d.diskIops):'0 ops/s');
+ setText('disk-iops', formatIops(d.diskIops));
  if(health){
   if(health.gcCollections){
    setText('gc-gen0',health.gcCollections.gen0);
@@ -580,11 +599,6 @@ function formatIops(v){
  if(v>=1000)return (v/1000).toFixed(1)+' K ops/s';
  return v+' ops/s';
 }
-
-function connCard(lbl,val){
- const cls=val>1000?'text-red':val>100?'text-yellow':'text-green';
- return `<div class="stat"><div class="stat-val ${cls}" id="conn-val">${esc(val)}</div><div class="stat-lbl">${lbl}</div></div>`;
-}
 function setConnColor(id,val){
  const el=document.getElementById(id);if(!el)return;
  el.className='stat-val '+(val>1000?'text-red':val>100?'text-yellow':'text-green');
@@ -611,19 +625,143 @@ function statCard(lbl,val,cls='',id='',valCls=''){
 }
 function infoRow(lbl,val,cls=''){return `<tr><td>${esc(lbl)}</td><td><span${cls?` class="${cls}"`:''}>${esc(val)}</span></td></tr>`}
 function gcStat(lbl,val,id=''){return `<div class="gc-stat"><div class="gc-val"${id?` id="${id}"`:''}>${esc(val)}</div><div class="gc-lbl">${lbl}</div></div>`}
-function numCard(lbl,val,cls='',id=''){
- return `<div class="stat"${id?` id="${id}-card"`:''}><div class="stat-val ${cls}"${id?` id="${id}"`:''}>${esc(val)}</div><div class="stat-lbl">${lbl}</div></div>`;
-}
 function pct(v,max){return max>0?Math.min(100,Math.round(v/max*100)):0}
-function ringGauge(label,val,max,pctVal,id){
+function fmtMem(mb){return mb>=1024?(mb/1024).toFixed(1)+' GB':Math.round(mb)+' MB'}
+function ringGauge(label,val,max,pctVal,id,unit='已使用'){
  const r=48,c=2*Math.PI*r,offset=c-(pctVal/100)*c;
  const cls=pctVal>80?'#ef4444':pctVal>50?'#f59e0b':'url(#gaugeGrad)';
  return `<div class="gauge-card glass-card"${id?` id="${id}-card"`:''}><div class="gauge-label">${label}</div>
  <div class="ring-wrap">
  <svg width="120" height="120" viewBox="0 0 120 120"><defs><linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#5b5bff"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
  <circle class="ring-bg" cx="60" cy="60" r="${r}"/><circle class="ring-fill" cx="60" cy="60" r="${r}" stroke="${cls}" stroke-dasharray="${c}" stroke-dashoffset="${offset}"${id?` id="${id}-fill"`:''}/></svg>
- <div class="ring-text"><span class="pct"${id?` id="${id}-pct"`:''}>${pctVal}%</span><span class="unit">已使用</span></div></div>
- <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)} / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}</div></div>`;
+ <div class="ring-text"><span class="pct"${id?` id="${id}-pct"`:''}>${pctVal}%</span><span class="unit">${unit}</span></div></div>
+ <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)}${max?` / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}`:''}</div></div>`;
+}
+
+/* ── 流量 / 磁盘 IO 趋势图（SVG 手绘，对齐宝塔：双曲线 + 渐变面积 + 页签） ── */
+let _chartTab='net';
+const _hist={up:[],down:[],rd:[],wr:[]};
+const _histTs=[];
+const HIST_MAX=10; // 滚动窗口：10 个采样点（30 秒），与宝塔一致
+
+function pushHistory(d){
+ _hist.up.push(d.uplinkBps||0);
+ _hist.down.push(d.downlinkBps||0);
+ _hist.rd.push(d.diskReadBps||0);
+ _hist.wr.push(d.diskWriteBps||0);
+ _histTs.push(new Date());
+ for(const k in _hist){while(_hist[k].length>HIST_MAX)_hist[k].shift()}
+ while(_histTs.length>HIST_MAX)_histTs.shift();
+}
+
+function switchChart(tab){
+ _chartTab=tab;
+ const n=$('tab-net'),dk=$('tab-disk');
+ if(n)n.classList.toggle('active',tab==='net');
+ if(dk)dk.classList.toggle('active',tab==='disk');
+ renderChart(statusData);
+}
+
+function fmtRate(bps){
+ if(bps>=1048576)return (bps/1048576).toFixed(1)+' MB/s';
+ if(bps>=1024)return (bps/1024).toFixed(1)+' KB/s';
+ return Math.round(bps)+' B/s';
+}
+function fmtBytes(n){
+ if(n>=1099511627776)return (n/1099511627776).toFixed(2)+' TB';
+ if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB';
+ if(n>=1048576)return (n/1048576).toFixed(1)+' MB';
+ if(n>=1024)return (n/1024).toFixed(1)+' KB';
+ return Math.round(n)+' B';
+}
+function fmtAxis(v){
+ if(v>=1048576)return (v/1048576).toFixed(1)+'M';
+ if(v>=1024)return (v/1024).toFixed(0)+'K';
+ return Math.round(v)+'';
+}
+function chartStat(color,label,val){
+ const dot=color?`<span class="dotc" style="background:${color}"></span>`:'';
+ return `<div class="chart-stat"><span class="l">${dot}${esc(label)}</span><span class="v">${esc(val)}</span></div>`;
+}
+
+function renderChart(d){
+ const stats=$('chart-stats'); if(!stats)return;
+ const dd=d||statusData||{};
+ if(_chartTab==='net'){
+  stats.innerHTML=
+   chartStat('#22c55e','上行',fmtRate(dd.uplinkBps||0))+
+   chartStat('#f59e0b','下行',fmtRate(dd.downlinkBps||0))+
+   chartStat('','总发送',fmtBytes(dd.netTxBytes||0))+
+   chartStat('','总接收',fmtBytes(dd.netRxBytes||0));
+ }else{
+  const lat=dd.diskLatencyMs!=null?dd.diskLatencyMs.toFixed(1):'0.0';
+  stats.innerHTML=
+   chartStat('#f43f5e','读取',fmtRate(dd.diskReadBps||0))+
+   chartStat('#14b8a6','写入',fmtRate(dd.diskWriteBps||0))+
+   chartStat('','每秒读写',(dd.diskIops||0)+' 次')+
+   chartStat('','IO 延迟',lat+' ms');
+ }
+ drawTrend();
+}
+
+function smoothPath(pts,top,bottom){
+ if(pts.length<2)return '';
+ const clamp=v=>Math.max(top,Math.min(bottom,v));
+ let d=`M ${pts[0][0].toFixed(1)} ${pts[0][1].toFixed(1)}`;
+ for(let i=0;i<pts.length-1;i++){
+  const p0=pts[i-1]||pts[i],p1=pts[i],p2=pts[i+1],p3=pts[i+2]||p2;
+  const c1x=p1[0]+(p2[0]-p0[0])/6, c1y=clamp(p1[1]+(p2[1]-p0[1])/6);
+  const c2x=p2[0]-(p3[0]-p1[0])/6, c2y=clamp(p2[1]-(p3[1]-p1[1])/6);
+  d+=` C ${c1x.toFixed(1)} ${c1y.toFixed(1)}, ${c2x.toFixed(1)} ${c2y.toFixed(1)}, ${p2[0].toFixed(1)} ${p2[1].toFixed(1)}`;
+ }
+ return d;
+}
+
+function drawTrend(){
+ const svg=$('trend-svg'); if(!svg)return;
+ const W=600,H=150,PL=52,PR=12,PT=12,PB=24;
+ const iw=W-PL-PR, ih=H-PT-PB, top=PT, bottom=PT+ih;
+ const series=_chartTab==='net'?[_hist.up,_hist.down]:[_hist.rd,_hist.wr];
+ const colors=_chartTab==='net'?['#22c55e','#f59e0b']:['#f43f5e','#14b8a6'];
+ const all=series[0].concat(series[1]);
+ let maxV=1024;
+ for(const v of all)if(v>maxV)maxV=v;
+ const nice=Math.ceil(maxV*1.15);
+ const n=_histTs.length;
+ const xAt=i=>PL+iw*i/Math.max(1,n-1); // 按已有点数铺满全宽（与宝塔一致）
+ const parts=[];
+ for(let g=0;g<=6;g++){
+  const y=top+ih-(ih*g/6);
+  parts.push(`<line x1="${PL}" y1="${y.toFixed(1)}" x2="${W-PR}" y2="${y.toFixed(1)}" stroke="var(--border-default)" stroke-dasharray="3 4"/>`);
+  parts.push(`<text x="${PL-6}" y="${(y+3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--text-tertiary)">${fmtAxis(nice*g/6)}</text>`);
+ }
+ if(n>=2){
+  for(let s=0;s<2;s++){
+   const data=series[s];
+   const pts=[];
+   for(let i=0;i<data.length;i++){
+    pts.push([xAt(i), top+ih-(ih*Math.min(nice,data[i])/nice)]);
+   }
+   const line=smoothPath(pts,top,bottom);
+   const lastX=pts[pts.length-1][0];
+   parts.push(`<path d="${line} L ${lastX.toFixed(1)} ${bottom} L ${PL} ${bottom} Z" fill="${colors[s]}" opacity="0.13"/>`);
+   parts.push(`<path d="${line}" fill="none" stroke="${colors[s]}" stroke-width="2" stroke-linecap="round"/>`);
+   for(const p of pts)parts.push(`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.6" fill="${colors[s]}"/>`);
+  }
+  const tf=t=>`${String(t.getHours()).padStart(2,'0')}:${String(t.getMinutes()).padStart(2,'0')}:${String(t.getSeconds()).padStart(2,'0')}`;
+  const step=Math.max(1,Math.ceil(n/10));
+  const xs=[];
+  for(let i=0;i<n;i+=step)xs.push(i);
+  if(xs[xs.length-1]!==n-1)xs.push(n-1);
+  for(const i of xs){
+   const x=xAt(i);
+   const anchor=i===0?'start':(x>W-56?'end':'middle');
+   parts.push(`<text x="${x.toFixed(1)}" y="${H-7}" text-anchor="${anchor}" font-size="9.5" fill="var(--text-tertiary)">${tf(_histTs[i])}</text>`);
+  }
+ }else{
+  parts.push(`<text x="${W/2}" y="${H/2}" text-anchor="middle" font-size="11" fill="var(--text-tertiary)">正在采集数据…</text>`);
+ }
+ svg.innerHTML=parts.join('');
 }
 
 /* ── 子服务管理 ── */

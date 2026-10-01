@@ -3,6 +3,9 @@
 //! 入口职责：确定基础目录、切换工作目录、初始化日志、预处理参数（zip 绝对化）、分发命令。
 //! 详见 `README.md` 与 `Doc/`。
 
+// `serde_json::json!` 大对象（status 响应字段较多）需要更高的宏递归上限
+#![recursion_limit = "256"]
+
 mod agent;
 mod app;
 mod cli;

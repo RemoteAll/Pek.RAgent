@@ -729,6 +729,23 @@ pub(crate) fn host_uptime_seconds() -> u64 {
     }
 }
 
+/// 系统负载（1/5/15 分钟平均值）。Windows 无此概念，返回 `None`。
+#[cfg(target_os = "linux")]
+pub(crate) fn load_average() -> Option<(f64, f64, f64)> {
+    let text = std::fs::read_to_string("/proc/loadavg").ok()?;
+    let mut it = text.split_whitespace();
+    let l1 = it.next()?.parse().ok()?;
+    let l5 = it.next()?.parse().ok()?;
+    let l15 = it.next()?.parse().ok()?;
+    Some((l1, l5, l15))
+}
+
+/// 系统负载（1/5/15 分钟平均值）。Windows 无此概念，返回 `None`。
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn load_average() -> Option<(f64, f64, f64)> {
+    None
+}
+
 /// 是否存在指定进程名的进程（大小写不敏感、忽略 `.exe` 后缀；看门狗用）。
 pub(crate) fn is_process_running(name: &str) -> bool {
     let name = name.trim().trim_end_matches(".exe");
@@ -1115,6 +1132,10 @@ pub(crate) struct NetInterface {
     pub(crate) gateways: Vec<String>,
     /// DNS 服务器列表
     pub(crate) dns: Vec<String>,
+    /// 累计接收字节数（自系统启动；0 表示未知）
+    pub(crate) bytes_received: u64,
+    /// 累计发送字节数（自系统启动；0 表示未知）
+    pub(crate) bytes_sent: u64,
 }
 
 /// 磁盘信息。
@@ -1414,30 +1435,51 @@ fn is_virtual_adapter(description: &str) -> bool {
         .any(|e| lower.contains(&e.to_ascii_lowercase()))
 }
 
+/// 解析 `/proc/net/dev`，返回每个非回环接口的 `(名称, 接收字节, 发送字节)`。
+///
+/// 格式：前两行为表头，其后每行 `ifname: rx_bytes ... tx_bytes ...`（冒号后第 1 列为接收、
+/// 第 9 列为发送）。
+#[cfg(any(target_os = "linux", test))]
+fn parse_net_dev_entries(text: &str) -> Vec<(String, u64, u64)> {
+    let mut out = Vec::new();
+    for line in text.lines().skip(2) {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.is_empty() || name == "lo" {
+            continue;
+        }
+        let cols: Vec<&str> = rest.split_whitespace().collect();
+        if cols.len() < 9 {
+            continue;
+        }
+        out.push((
+            name.to_string(),
+            cols[0].parse::<u64>().unwrap_or(0),
+            cols[8].parse::<u64>().unwrap_or(0),
+        ));
+    }
+    out
+}
+
+/// 汇总 `/proc/net/dev` 非回环接口的 `(接收字节, 发送字节)`。
+#[cfg(any(target_os = "linux", test))]
+fn parse_net_dev(text: &str) -> (u64, u64) {
+    parse_net_dev_entries(text)
+        .into_iter()
+        .fold((0, 0), |(rx, tx), (_, r, t)| (rx + r, tx + t))
+}
+
 /// 枚举网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡，取 IPv4）。
 /// 本机网络总流量（接收字节, 发送字节）。用于面板速率差分计算。
 pub(crate) fn net_total_bytes() -> Option<(u64, u64)> {
     #[cfg(target_os = "linux")]
     {
-        // /sys/class/net/<if>/statistics/{rx_bytes,tx_bytes}（排除 lo）
-        let dir = std::fs::read_dir("/sys/class/net").ok()?;
-        let mut rx_total = 0u64;
-        let mut tx_total = 0u64;
-        for entry in dir.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name == "lo" {
-                continue;
-            }
-            let base = entry.path();
-            let read = |file: &str| {
-                std::fs::read_to_string(base.join(file))
-                    .ok()
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-            };
-            rx_total += read("statistics/rx_bytes")?;
-            tx_total += read("statistics/tx_bytes")?;
-        }
-        Some((rx_total, tx_total))
+        // /proc/net/dev 单文件汇总（内核 2.2+ 恒提供，容器/OpenVZ 同样可用）；
+        // 不再逐接口读 /sys，避免个别接口缺失时整体失败导致速率恒为 0
+        let text = std::fs::read_to_string("/proc/net/dev").ok()?;
+        Some(parse_net_dev(&text))
     }
     #[cfg(windows)]
     {
@@ -1471,12 +1513,149 @@ pub(crate) fn net_total_bytes() -> Option<(u64, u64)> {
     }
 }
 
+/// 磁盘 IO 累计统计（读/写完成次数与字节数）。
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) struct DiskIo {
+    /// 读完成次数
+    pub(crate) reads: u64,
+    /// 写完成次数
+    pub(crate) writes: u64,
+    /// 读字节数
+    pub(crate) read_bytes: u64,
+    /// 写字节数
+    pub(crate) write_bytes: u64,
+    /// IO 累计耗时（毫秒；Linux 为 diskstats 的 ms 字段，Windows 由 100ns 换算）
+    pub(crate) ms_total: u64,
+}
+
+/// 解析 `/proc/diskstats`，汇总“整盘”（不做分区/映射层重复计数）的读写统计。
+///
+/// 规则：次设备号 `% 16 == 0` 视为整盘（兼容 sda/sdb/vda 多块盘；分区均为非 0）；
+/// 跳过 `dm-`（LVM）与 `md`（软 RAID）映射，其 IO 已体现在底层物理盘。
+#[cfg(any(target_os = "linux", test))]
+fn parse_diskstats(text: &str) -> DiskIo {
+    let mut io = DiskIo::default();
+    for line in text.lines() {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 11 {
+            continue;
+        }
+        let name = cols[2];
+        if name.starts_with("dm-") || name.starts_with("md") {
+            continue;
+        }
+        let minor = cols[1].parse::<u64>().unwrap_or(1);
+        if minor % 16 != 0 {
+            continue;
+        }
+        io.reads += cols[3].parse::<u64>().unwrap_or(0);
+        io.read_bytes += cols[5].parse::<u64>().unwrap_or(0) * 512; // 扇区 = 512 字节
+        io.writes += cols[7].parse::<u64>().unwrap_or(0);
+        io.write_bytes += cols[9].parse::<u64>().unwrap_or(0) * 512;
+        io.ms_total += cols[6].parse::<u64>().unwrap_or(0) + cols[10].parse::<u64>().unwrap_or(0);
+    }
+    io
+}
+
+/// 磁盘 IO 累计统计。Web 面板差分计算 IOPS 与读/写速率用。
+/// Linux 读 `/proc/diskstats`；Windows 汇总物理磁盘（`IOCTL_DISK_PERFORMANCE`）。
+pub(crate) fn disk_io() -> Option<DiskIo> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_to_string("/proc/diskstats")
+            .ok()
+            .map(|t| parse_diskstats(&t))
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        use windows_sys::Win32::System::IO::DeviceIoControl;
+
+        /// `DISK_PERFORMANCE`（winioctl.h）头部：仅取读写统计所需字段，`_rest` 保持布局。
+        #[repr(C)]
+        #[derive(Default, Clone, Copy)]
+        struct DiskPerformance {
+            bytes_read: i64,
+            bytes_written: i64,
+            read_time: i64,
+            write_time: i64,
+            idle_time: i64,
+            read_count: u32,
+            write_count: u32,
+            queue_depth: u32,
+            split_count: u32,
+            _rest: [u8; 32],
+        }
+
+        const IOCTL_DISK_PERFORMANCE: u32 = 0x0007_0020;
+
+        let mut io = DiskIo::default();
+        let mut available = false;
+        for index in 0..16u32 {
+            let path = format!("\\\\.\\PhysicalDrive{index}");
+            let path_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let handle = unsafe {
+                CreateFileW(
+                    path_w.as_ptr(),
+                    0,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if handle == INVALID_HANDLE_VALUE {
+                continue;
+            }
+
+            let mut perf = DiskPerformance::default();
+            let mut returned = 0u32;
+            let ok = unsafe {
+                DeviceIoControl(
+                    handle,
+                    IOCTL_DISK_PERFORMANCE,
+                    std::ptr::null(),
+                    0,
+                    &mut perf as *mut DiskPerformance as *mut core::ffi::c_void,
+                    std::mem::size_of::<DiskPerformance>() as u32,
+                    &mut returned,
+                    std::ptr::null_mut(),
+                )
+            };
+            unsafe { CloseHandle(handle) };
+
+            if ok != 0 {
+                available = true;
+                io.reads += perf.read_count as u64;
+                io.writes += perf.write_count as u64;
+                io.read_bytes += perf.bytes_read.max(0) as u64;
+                io.write_bytes += perf.bytes_written.max(0) as u64;
+                // 时间字段单位为 100ns（换算为毫秒）
+                io.ms_total += ((perf.read_time.max(0) + perf.write_time.max(0)) as u64) / 10_000;
+            }
+        }
+
+        if available { Some(io) } else { None }
+    }
+
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     #[cfg(windows)]
     {
         use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
         use windows_sys::Win32::NetworkManagement::IpHelper::{
-            GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+            FreeMibTable, GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, GetIfTable2,
+            IP_ADAPTER_ADDRESSES_LH, MIB_IF_TABLE2,
         };
         use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN};
 
@@ -1503,6 +1682,27 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
                     len += 1;
                 }
                 String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            }
+        }
+
+        // 每网卡累计收发（MIB 接口行按 LUID 匹配；对齐 C# `GetIPv4Statistics()`）
+        let mut luid_stats: Vec<(u64, u64, u64)> = Vec::new(); // (LUID, 接收字节, 发送字节)
+        unsafe {
+            let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+            if GetIfTable2(&mut table) == 0 && !table.is_null() {
+                let t = &*table;
+                for i in 0..t.NumEntries as usize {
+                    let row = &*t.Table.as_ptr().add(i);
+                    // 过滤软件回环（IfType=24）
+                    if row.Type == 24 {
+                        continue;
+                    }
+                    // 计数器不可用时为 u64::MAX
+                    let rx = if row.InOctets == u64::MAX { 0 } else { row.InOctets };
+                    let tx = if row.OutOctets == u64::MAX { 0 } else { row.OutOctets };
+                    luid_stats.push((row.InterfaceLuid.Value, rx, tx));
+                }
+                FreeMibTable(table as *const _);
             }
         }
 
@@ -1572,6 +1772,16 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
                 }
 
                 let mac_len = (a.PhysicalAddressLength as usize).min(a.PhysicalAddress.len());
+                let luid = a.Luid.Value;
+                let (bytes_received, bytes_sent) = if luid != 0 {
+                    luid_stats
+                        .iter()
+                        .find(|(l, _, _)| *l == luid)
+                        .map(|(_, rx, tx)| (*rx, *tx))
+                        .unwrap_or((0, 0))
+                } else {
+                    (0, 0)
+                };
                 out.push(NetInterface {
                     name: pwstr(a.FriendlyName),
                     description,
@@ -1581,6 +1791,8 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
                     ips,
                     gateways,
                     dns,
+                    bytes_received,
+                    bytes_sent,
                 });
             }
         }
@@ -1589,6 +1801,10 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
 
     #[cfg(target_os = "linux")]
     {
+        // 每网卡累计收发：/proc/net/dev 单文件源（任一接口缺失不影响其他接口）
+        let dev_entries = std::fs::read_to_string("/proc/net/dev")
+            .map(|t| parse_net_dev_entries(&t))
+            .unwrap_or_default();
         let mut out = Vec::new();
         let Ok(dir) = std::fs::read_dir("/sys/class/net") else {
             return out;
@@ -1608,6 +1824,11 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
             if mac.is_empty() || mac == "00:00:00:00:00:00" {
                 continue; // 虚拟接口常见全零 MAC
             }
+            let (bytes_received, bytes_sent) = dev_entries
+                .iter()
+                .find(|(n, _, _)| n == &name)
+                .map(|(_, rx, tx)| (*rx, *tx))
+                .unwrap_or((0, 0));
             out.push(NetInterface {
                 name,
                 description: String::new(),
@@ -1619,6 +1840,8 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
                 ips: Vec::new(),
                 gateways: Vec::new(),
                 dns: Vec::new(),
+                bytes_received,
+                bytes_sent,
             });
         }
         out
@@ -1741,6 +1964,30 @@ pub(crate) fn disks() -> Vec<DiskItem> {
     }
 }
 
+/// 全部就绪磁盘的用量列表：`(已用 MB, 总量 MB, 名称)`。
+/// 过滤未就绪（光驱无盘等）与零容量项；Linux 尽量把根分区 `/` 排在最前。
+pub(crate) fn disk_usages() -> Vec<(u64, u64, String)> {
+    // Windows 下盘符已按 A-Z 升序，无需排序；`mut` 仅非 Windows 平台使用
+    #[cfg_attr(windows, allow(unused_mut))]
+    let mut list: Vec<DiskItem> = disks()
+        .into_iter()
+        .filter(|d| d.ready && d.total > 0)
+        .collect();
+
+    #[cfg(not(windows))]
+    list.sort_by_key(|d| if d.name == "/" { 0 } else { 1 });
+
+    list.into_iter()
+        .map(|d| {
+            (
+                d.total.saturating_sub(d.free) / 1024 / 1024,
+                d.total / 1024 / 1024,
+                d.name,
+            )
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1798,5 +2045,71 @@ mod tests {
             assert!(text.contains(key), "缺少 {key}:\n{text}");
         }
         assert!(!os_description().is_empty());
+    }
+
+    #[test]
+    fn load_average_matches_platform() {
+        #[cfg(target_os = "linux")]
+        assert!(load_average().is_some(), "Linux 应提供负载数据");
+        #[cfg(not(target_os = "linux"))]
+        assert!(load_average().is_none(), "非 Linux 平台无负载数据");
+    }
+
+    #[test]
+    fn parse_net_dev_skips_loopback_and_headers() {
+        let sample = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 999999   100    0    0    0     0          0         0   888888   100    0    0    0     0       0          0
+  eth0: 1000   10    0    0    0     0          0         0   4000   20    0    0    0     0       0          0
+ veth1: 30    0    0    0    0     0          0         0     40    0    0    0    0     0       0          0
+";
+        assert_eq!(parse_net_dev(sample), (1030, 4040));
+    }
+
+    #[test]
+    fn parse_net_dev_entries_per_interface() {
+        let sample = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo: 999999   100    0    0    0     0          0         0   888888   100    0    0    0     0       0          0
+  eth0: 1000   10    0    0    0     0          0         0   4000   20    0    0    0     0       0          0
+ veth1: 30    0    0    0    0     0          0         0     40    0    0    0    0     0       0          0
+";
+        let entries = parse_net_dev_entries(sample);
+        assert_eq!(entries.len(), 2, "回环与表头应被跳过");
+        assert_eq!(entries[0], ("eth0".to_string(), 1000, 4000));
+        assert_eq!(entries[1], ("veth1".to_string(), 30, 40));
+        // 逐接口解析的汇总应与总量一致
+        assert_eq!(parse_net_dev(sample), (1030, 4040));
+    }
+
+    #[test]
+    fn parse_diskstats_skips_partitions_and_mappers() {
+        let sample = "\
+   8       0 sda 100 0 1000 250 200 0 2000 500 0 0 0
+   8       1 sda1 50 0 500 100 60 0 600 200 0 0 0
+   8      16 sdb 7 0 70 5 8 0 80 6 0 0 0
+ 259       0 nvme0n1 10 0 100 30 20 0 200 40 0 0 0
+ 253       0 dm-0 90 0 900 300 180 0 1800 600 0 0 0
+ 252       0 md0 5 0 50 10 5 0 50 20 0 0 0
+";
+        let io = parse_diskstats(sample);
+        // 次数：sda(100+200) + sdb(7+8) + nvme0n1(10+20)；分区/映射层跳过
+        assert_eq!(io.reads + io.writes, 345);
+        // 字节 = 扇区×512：(1000+70+100)、（2000+80+200）
+        assert_eq!(io.read_bytes, 1170 * 512);
+        assert_eq!(io.write_bytes, 2280 * 512);
+        // IO 耗时毫秒：sda(250+500) + sdb(5+6) + nvme0n1(30+40)
+        assert_eq!(io.ms_total, 831);
+    }
+
+    #[test]
+    fn disk_usages_is_sane() {
+        for (used, total, name) in disk_usages() {
+            assert!(total > 0, "磁盘总量应为正");
+            assert!(used <= total, "磁盘已用不应超过总量");
+            assert!(!name.is_empty(), "磁盘名称不应为空");
+        }
     }
 }
