@@ -261,7 +261,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（配置页可在线修改密码） |
 | `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
 | `SampleInterval` | `1000` | 后台资源采样间隔（毫秒）：面板 CPU/网络/磁盘速率按此窗口差分；`0`=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效 |
-| `WebTraffic` | `true` | 网站流量统计开关：后台解析站点访问日志（自动发现常见目录 + `WebLogs` 手动补充），零侵入只读；关闭后停止读取 |
+| `WebTraffic` | `true` | 网站流量统计开关：后台解析站点访问日志（自动发现常见目录 + `WebLogs` 手动补充），零侵入只读；关闭后停止读取；统计口径默认响应体字节（`$body_bytes_sent`），日志行尾追加 `$bytes_sent` 时自动改用实际发送字节（响应头+响应体，推荐配置见 8. 面板“流量”节） |
 | `WebLogs` | 空 | 网站日志手动配置：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
 | `PortTraffic` | `true` | 端口流量统计开关（默认开启）：Linux 在独立 nftables 表 `inet pek_stats` 中按端口计数收发字节（需 root 与 `nft` 命令；**只计数不改转发**，关闭/卸载时自动删表）；无 nft 或权限不足、Windows/其它平台自动降级为连接视图（无字节数） |
 | `PortTrafficPorts` | 空 | 端口流量统计端口列表：`22,80,443`（逗号分隔）；留空自动取系统监听端口（上限 64 个） |
@@ -405,6 +405,18 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 - **日志**：`Log/` 目录文件列表与尾部内容查看（支持行数/文件/级别过滤）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
 - **流量**：**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细 + 端口每日流量，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
+
+**网站流量统计口径**：默认取日志中的响应体字节（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）。如需统计 **nginx 实际发送流量（响应头+响应体）**，为站点启用扩展日志格式（行尾追加 `$bytes_sent $request_length`），本代理自动识别并改用 `$bytes_sent`：
+
+```nginx
+# 站点 conf 顶层（server 块外，即 http 上下文）定义新格式：
+log_format agent_bw '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $bytes_sent $request_length';
+
+# 站点 server 块内，替换原有 access_log 行（加格式名）：
+access_log /www/wwwlogs/example.com.log agent_bw;
+```
+
+> 标准 combined 行尾是带引号的 UA，扩展格式行尾是纯数字（`$bytes_sent` 或 `$bytes_sent $request_length`），两者不会混淆；改动只影响新写入的日志行，历史数据不受影响；`nginx -t && nginx -s reload` 生效。
 
 接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。面板页签由 URL hash 记忆（如 `http://127.0.0.1:5500/#traffic`），刷新/重新登录后停留在当前页。
 

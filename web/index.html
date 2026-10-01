@@ -657,8 +657,8 @@ function fmtBytes(v){
  v=Number(v)||0;
  if(v>=1099511627776)return (v/1099511627776).toFixed(2)+' TB';
  if(v>=1073741824)return (v/1073741824).toFixed(2)+' GB';
- if(v>=1048576)return (v/1048576).toFixed(1)+' MB';
- if(v>=1024)return (v/1024).toFixed(1)+' KB';
+ if(v>=1048576)return (v/1048576).toFixed(2)+' MB';
+ if(v>=1024)return (v/1024).toFixed(2)+' KB';
  return v+' B';
 }
 function fmtRate(v){return v==null?'—':fmtBytes(v)+'/s'}
@@ -916,15 +916,15 @@ function switchChart(tab){
 }
 
 function fmtRate(bps){
- if(bps>=1048576)return (bps/1048576).toFixed(1)+' MB/s';
- if(bps>=1024)return (bps/1024).toFixed(1)+' KB/s';
+ if(bps>=1048576)return (bps/1048576).toFixed(2)+' MB/s';
+ if(bps>=1024)return (bps/1024).toFixed(2)+' KB/s';
  return Math.round(bps)+' B/s';
 }
 function fmtBytes(n){
  if(n>=1099511627776)return (n/1099511627776).toFixed(2)+' TB';
  if(n>=1073741824)return (n/1073741824).toFixed(2)+' GB';
- if(n>=1048576)return (n/1048576).toFixed(1)+' MB';
- if(n>=1024)return (n/1024).toFixed(1)+' KB';
+ if(n>=1048576)return (n/1048576).toFixed(2)+' MB';
+ if(n>=1024)return (n/1024).toFixed(2)+' KB';
  return Math.round(n)+' B';
 }
 function fmtAxis(v){

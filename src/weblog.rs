@@ -2,9 +2,10 @@
 //! 后台增量解析（inode+offset 防轮转/截断），按站点聚合今日/昨日/累计流量、请求数、UV
 //! 与状态码分布，供 Web 面板 `/star/webTraffic` 展示。
 //!
-//! **零侵入**：只读日志文件，不修改任何 Web 服务器配置。统计口径为日志中的响应体字节
-//! （nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`），与宝塔“网站统计”插件同口径；
-//! 解析走后台线程按 1 秒增量读取（只读新增部分，长跑开销恒定）。
+//! **零侵入**：只读日志文件，不修改任何 Web 服务器配置。统计口径默认取日志中的响应体
+//! 字节（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）；若日志格式在行尾追加
+//! `$bytes_sent [ $request_length ]`（推荐格式，可统计“响应头+响应体”的实际发送流量），
+//! 解析器自动改用 `$bytes_sent`。解析走后台线程按 1 秒增量读取（只读新增部分，长跑开销恒定）。
 //!
 //! 支持格式：
 //! - combined / common（nginx 默认与宝塔、Apache 默认）：`ip - - [time] "req" status bytes ...`
@@ -460,7 +461,8 @@ struct LogLine {
     ip: Option<IpAddr>,
     /// HTTP 状态码
     status: u16,
-    /// 响应体字节（统计口径：nginx $body_bytes_sent / Apache %b / Caddy size）
+    /// 计入统计的流量字节：扩展格式取 `$bytes_sent`（响应头+体的实际发送字节），
+    /// 否则为响应体（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）
     bytes: u64,
 }
 
@@ -481,6 +483,10 @@ fn parse_log_line(line: &str) -> Option<LogLine> {
 ///
 /// nginx 对日志中的引号做转义（`\x22`），因此第一对引号即 `$request`，其后的
 /// 两个字段就是状态码与响应体字节。
+///
+/// 扩展格式（行尾追加 `$bytes_sent [ $request_length ]`，形如 `... "UA" 5321 210`）：
+/// 标准 combined 行尾是带引号的 UA（必为 `"`），因此“行尾以数字结束”即扩展格式，
+/// 此时流量改用 `$bytes_sent`（响应头+响应体的实际发送字节数）。
 fn parse_combined_line(line: &str) -> Option<LogLine> {
     let first = line.find('"')?;
     let rest = &line[first + 1..];
@@ -492,15 +498,31 @@ fn parse_combined_line(line: &str) -> Option<LogLine> {
         return None;
     }
     // 响应体字节：缺失或 `-`（Apache %b 无响应体）按 0
-    let bytes = it
+    let body_bytes = it
         .next()
         .and_then(|b| b.parse::<u64>().ok())
         .unwrap_or(0);
+    let bytes = tail_sent_bytes(line).unwrap_or(body_bytes);
     let ip = line[..first]
         .split_whitespace()
         .next()
         .and_then(|s| s.parse::<IpAddr>().ok());
     Some(LogLine { ip, status, bytes })
+}
+
+/// 解析行尾附加字段 `$bytes_sent [ $request_length ]`，返回 `$bytes_sent`（若存在）。
+///
+/// 仅当行尾不是 `"`（标准格式以 UA 结束）且末尾为纯数字时生效：
+/// 行尾 2 个数字视为 `$bytes_sent $request_length`，1 个数字视为 `$bytes_sent`。
+fn tail_sent_bytes(line: &str) -> Option<u64> {
+    let trimmed = line.trim_end();
+    if trimmed.ends_with('"') {
+        return None;
+    }
+    let mut it = trimmed.split_whitespace().rev();
+    let last = it.next()?.parse::<u64>().ok()?;
+    let prev = it.next().and_then(|t| t.parse::<u64>().ok());
+    Some(prev.unwrap_or(last))
 }
 
 /// JSON 行（Caddy 默认访问日志）：取 `status` / `size` / `request.remote_ip`。
@@ -1135,6 +1157,23 @@ mod tests {
         let ev2 = parse_log_line(line2).unwrap();
         assert_eq!(ev2.status, 404);
         assert_eq!(ev2.bytes, 0);
+    }
+
+    #[test]
+    fn extended_format_prefers_bytes_sent() {
+        // 行尾 `$bytes_sent $request_length`：流量取 $bytes_sent（响应头+响应体）
+        let line = r#"192.168.1.10 - - [01/Oct/2026:10:00:00 +0800] "GET / HTTP/1.1" 200 917 "-" "curl/8.0" 1148 132"#;
+        let ev = parse_log_line(line).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 1148);
+
+        // 只追加 `$bytes_sent`
+        let line2 = r#"192.168.1.11 - - [01/Oct/2026:10:00:01 +0800] "GET /a HTTP/1.1" 304 0 "-" "curl/8.0" 143"#;
+        assert_eq!(parse_log_line(line2).unwrap().bytes, 143);
+
+        // 标准格式（行尾 UA 带引号）仍用响应体字节；UA 含空格不影响
+        let line3 = r#"192.168.1.12 - - [01/Oct/2026:10:00:02 +0800] "GET /b HTTP/1.1" 200 5123 "-" "Mozilla/5.0 (X11; Linux x86_64)""#;
+        assert_eq!(parse_log_line(line3).unwrap().bytes, 5123);
     }
 
     #[test]
