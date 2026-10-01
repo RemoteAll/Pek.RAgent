@@ -103,6 +103,26 @@ vi Config/StarAgent.config  # 将 "LocalOnly" 改为 false
 firewall-cmd --add-port=5500/tcp   # firewalld；ufw 对应 sudo ufw allow 5500
 ```
 
+### 3.2 运行时升级（不停止服务替换程序）
+
+Linux 内核保护"正在执行的 ELF"（**直接覆盖上传会报 `ETXTBSY`**）；Pek.RAgent 提供等效的
+"运行时替换"体验：**把新版本上传为 `{exe}.new` 即可**。
+
+```bash
+# 方式一（推荐）：上传后自动完成（服务模式下约 10 秒内）
+#   把新版本的 pek-ragent 上传/拷贝为程序目录下的 pek-ragent.new
+#   代理检测到完整的新文件（静置 ≥10 秒 + ELF/PE 头校验通过）后：
+#     自动原子替换程序文件 → 退出 → 由 systemd 拉起新版本（日志记录全过程）
+
+# 方式二：手动一条命令（立即生效）
+cd /www/Agent && sudo bash install.sh      # 自动识别 pek-ragent.new：替换 + 重启服务
+```
+
+说明：
+- 前台 `-run` 模式退出后不会自动拉起（需手动重启），日志有提示；
+- 校验不通过（半截上传/错误文件）会记录错误并**拒绝替换**，不影响当前运行；
+- Windows 服务同机制（上传 `pek-ragent.exe.new`），采用"改名让位"策略替换运行中的 exe。
+
 ---
 
 ## 4. 命令行一览

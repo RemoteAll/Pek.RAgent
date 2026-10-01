@@ -19,4 +19,14 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
+# 运行时升级支持：若存在上传的新版本（pek-ragent.new），先原子替换（运行中也可替换）。
+# 说明：Linux 内核禁止直接覆盖"正在执行的 ELF"（ETXTBSY），请上传为 pek-ragent.new 后执行本脚本；
+# 服务模式下代理自身也会在约 10 秒内自动完成替换并重启（无需本脚本）。
+if [ -f pek-ragent.new ]; then
+    echo "检测到 pek-ragent.new，正在替换程序文件……"
+    chmod +x pek-ragent.new
+    mv -f pek-ragent.new pek-ragent
+    echo "已替换，继续安装/重启服务。"
+fi
+
 exec ./pek-ragent -install "$@"
