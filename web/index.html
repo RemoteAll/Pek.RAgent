@@ -683,7 +683,7 @@ function ensureTrafficShell(){
    </div>
    <div id="hist-chart"><p class="text-muted">加载中…</p></div>
    <div id="traffic-history-body" class="mt-16"></div>
-   <div class="section-title mt-16">端口每日流量（Linux nftables 计数）</div>
+   <div class="section-title mt-16">端口每日流量（Linux nftables 计数 · 仅含有流量的端口）</div>
    <div id="port-history-body"><p class="text-muted">加载中…</p></div>
   </div>`;
 }
@@ -825,18 +825,24 @@ function renderPortHistory(){
  const el=$('port-history-body');if(!el)return;
  if(!histData){el.innerHTML='<p class="text-muted">加载中…</p>';return}
  const days=histViewDays().slice().reverse();
- const any=days.some(d=>d.ports&&Object.keys(d.ports).length);
+ // 仅统计有流量的端口（零流量端口不入档、也不展示），按总流量降序
+ const dayKeys=d=>{const ports=d.ports||{};return Object.keys(ports).filter(k=>(ports[k].rx||0)+(ports[k].tx||0)>0).sort((a,b)=>((ports[b].rx||0)+(ports[b].tx||0))-((ports[a].rx||0)+(ports[a].tx||0)))};
+ const any=days.some(d=>dayKeys(d).length);
  if(!any){el.innerHTML='<p class="text-muted">暂无端口历史（仅 Linux nftables 计数模式按天归档；连接视图/Windows 无字节数）</p>';return}
- let html=`<table class="info-table"><tr><td style="${TH}">日期</td><td style="${TH}">主要端口（接收 / 发送）</td></tr>`;
+ let html=`<table class="info-table"><tr>`+['日期','总接收','总发送','端口明细（接收 / 发送，按流量排序）'].map(h=>`<td style="${TH}">${h}</td>`).join('')+`</tr>`;
  days.forEach(d=>{
-  const ports=d.ports||{},keys=Object.keys(ports);
-  let text='—';
+  const ports=d.ports||{},keys=dayKeys(d);
+  let rx=0,tx=0,text='—';
+  keys.forEach(k=>{rx+=ports[k].rx||0;tx+=ports[k].tx||0});
   if(keys.length){
-   keys.sort((a,b)=>((ports[b].rx||0)+(ports[b].tx||0))-((ports[a].rx||0)+(ports[a].tx||0)));
-   text=keys.slice(0,5).map(k=>`<span style="font-family:var(--font-mono)">${esc(k)}</span> <span class="text-muted">收</span> ${fmtBytes(ports[k].rx||0)} <span class="text-muted">发</span> ${fmtBytes(ports[k].tx||0)}`).join('&emsp;');
-   if(keys.length>5)text+=`&emsp;<span class="text-muted">…等 ${keys.length} 个端口</span>`;
+   const shown=keys.slice(0,6);
+   text=shown.map(k=>`<span style="font-family:var(--font-mono)">${esc(k)}</span> <span class="text-muted">收</span> ${fmtBytes(ports[k].rx||0)} <span class="text-muted">发</span> ${fmtBytes(ports[k].tx||0)}`).join('&emsp;');
+   if(keys.length>shown.length){
+    const rest=keys.slice(shown.length).map(k=>`${k}  收 ${fmtBytes(ports[k].rx||0)}  发 ${fmtBytes(ports[k].tx||0)}`).join('\n');
+    text+=`&emsp;<span class="text-muted" style="cursor:help;border-bottom:1px dashed currentColor" title="${escAttr(rest).replace(/\n/g,'&#10;')}">…等 ${keys.length} 个端口</span>`;
+   }
   }
-  html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td style="font-size:12px">${text}</td></tr>`;
+  html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td>${fmtBytes(rx)}</td><td>${fmtBytes(tx)}</td><td style="font-size:12px">${text}</td></tr>`;
  });
  el.innerHTML=html+`</table>`;
 }

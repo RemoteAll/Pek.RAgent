@@ -695,7 +695,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("WebLogs", "网站日志（名称=路径;…）", "String", cfg.web_logs.clone(), "手动配置站点日志（绝对路径，分号分隔多条），自动发现不到时补充；修改后自动生效"),
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
         config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
-        config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档 Data/traffic/{日期}.json 的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
+        config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -1783,6 +1783,8 @@ mod tests {
         assert!(j["data"].get("days").is_some());
         assert!(j["data"].get("retentionDays").is_some());
 
+        // 释放 SQLite 连接后再删除临时目录（Windows 下打开的文件句柄会阻止删除）
+        crate::history::drop_storage_for_test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

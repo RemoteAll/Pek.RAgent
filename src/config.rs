@@ -73,7 +73,7 @@ pub struct AgentConfig {
     pub port_traffic: bool,
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
-    /// 流量历史保留天数（每日归档 `Data/traffic/{日期}.json`）。默认 90；0 = 永久保留
+    /// 流量历史保留天数（SQLite 每日归档 `Data/traffic.db`，模型见 `Entity/Model.xml`）。默认 90；0 = 永久保留
     pub traffic_history_days: u32,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,

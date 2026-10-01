@@ -13,7 +13,7 @@
 //! （上限 64 个）。采样间隔 5 秒；快照供 Web 面板 `/star/portTraffic` 展示。
 //!
 //! 每日归档（nft 计数模式）：按采样差分累计当日各端口收发（计数器回退时只增不减），
-//! 跨天把上一日最终值写入 `Data/traffic/{日期}.json`（见 `history` 模块）；当日累计
+//! 跨天把上一日最终值写入 SQLite（`Data/traffic.db`，模型 `Entity/Model.xml`）；当日累计
 //! 持久化在 `Data/port_traffic.json`（30 秒节流），重启同日续算、跨天自动收尾。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -329,7 +329,7 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
                     inner.last_counters = counters;
                     inner.last_sample = Some(now);
                     inner.message.clear();
-                    // 采样状态与历史日文件持久化（30 秒节流）
+                    // 采样状态持久化与每日归档（30 秒节流）
                     let due = inner
                         .last_persist
                         .map(|at| at.elapsed() >= PERSIST_INTERVAL)
@@ -389,24 +389,32 @@ fn accumulate_daily(
     }
 }
 
-/// 写入当前日累计到历史日文件（空值跳过；同键重复写为幂等覆盖）。
+/// 写入当前日累计到历史库（空值跳过；同键重复写为幂等覆盖）。
 fn write_day_file(base: &Path, inner: &Inner) {
     write_day_file_for(base, &inner.day_date, &inner.day_totals);
 }
 
-/// 写入指定日期的端口累计到历史日文件。
+/// 写入指定日期的端口累计到 SQLite 历史库（仅归档有流量的端口）。
+///
+/// 自动发现模式下会往历史里带入大量未产生流量的监听端口（含高位临时端口），
+/// 零值记录既无信息量也干扰面板展示，故只写入当日收发不全为 0 的端口。
 fn write_day_file_for(base: &Path, date: &str, totals: &HashMap<(Proto, u16), (u64, u64)>) {
-    if date.is_empty() || totals.is_empty() {
+    if date.is_empty() {
         return;
     }
     let mut ports: BTreeMap<String, history::PortCounters> = BTreeMap::new();
     for ((proto, port), (rx, tx)) in totals {
+        if *rx == 0 && *tx == 0 {
+            continue;
+        }
         ports.insert(
             history::port_key(proto.text(), *port),
             history::PortCounters { rx: *rx, tx: *tx },
         );
     }
-    history::update_ports(base, date, &ports);
+    if !ports.is_empty() {
+        history::update_ports(base, date, &ports);
+    }
 }
 
 /// 保存采样状态（日期 + 当日累计；失败仅日志）。
@@ -1279,6 +1287,8 @@ mod tests {
 
         let mut counters = HashMap::new();
         counters.insert(key, (100u64, 200u64));
+        // 零流量端口（从未有收发）：不应进入历史归档
+        counters.insert((Proto::Udp, 53), (0u64, 0u64));
         // 首帧：无差分基线，只建立基准不计入
         accumulate_daily(&base, &mut inner, &counters, "2026-10-01");
         assert_eq!(inner.day_totals.get(&key), Some(&(0, 0)));
@@ -1301,12 +1311,17 @@ mod tests {
         accumulate_daily(&base, &mut inner, &counters, "2026-10-02");
         assert_eq!(inner.day_date, "2026-10-02");
         assert_eq!(inner.day_totals.get(&key), Some(&(50, 70)));
-        let day = crate::history::read_day(&base, "2026-10-01");
+        let ports = crate::history::day_ports(&base, "2026-10-01");
         assert_eq!(
-            day.ports.get("tcp:80"),
+            ports.get("tcp:80"),
             Some(&crate::history::PortCounters { rx: 50, tx: 100 })
         );
+        assert!(
+            ports.get("udp:53").is_none(),
+            "零流量端口不应归档：{ports:?}"
+        );
 
+        crate::history::drop_storage_for_test(&base);
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -1332,12 +1347,13 @@ mod tests {
         let mut back2 = empty_inner();
         load_state(&base, &mut back2);
         assert!(back2.day_date.is_empty());
-        let day = crate::history::read_day(&base, "1999-01-01");
+        let ports = crate::history::day_ports(&base, "1999-01-01");
         assert_eq!(
-            day.ports.get("tcp:22"),
+            ports.get("tcp:22"),
             Some(&crate::history::PortCounters { rx: 1, tx: 2 })
         );
 
+        crate::history::drop_storage_for_test(&base);
         let _ = std::fs::remove_dir_all(&base);
     }
 }

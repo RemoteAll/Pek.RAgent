@@ -13,8 +13,8 @@
 //! 持久化 `Data/web_traffic.json`（30 秒节流）：站点累计与文件读取位置（inode+offset），
 //! 重启续读不重复统计。UV 集合不持久化（重启后按“基数 + 新集合”近似）。
 //!
-//! 每日归档：跨天时把上一日的站点汇总写入 `Data/traffic/{日期}.json`（见 `history` 模块），
-//! 当日数据也在 30 秒节流周期内持续刷新到当日日文件；面板“流量 → 历史数据”按天查看。
+//! 每日归档：跨天时把上一日的站点汇总写入 SQLite（`Data/traffic.db`，模型 `Entity/Model.xml`，
+//! 见 `history` 模块）；当日数据也在 30 秒节流周期内持续刷新；面板“流量 → 历史数据”按天查看。
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
@@ -1543,9 +1543,9 @@ server
         close_stale_days(&dir, &mut stats, "2026-10-01");
 
         // 旧日归档：只含 9-30 的 a.com；UV = 基数 3 + 集合 1
-        let day = crate::history::read_day(&dir, "2026-09-30");
-        assert_eq!(day.web.sites.len(), 1, "{:?}", day.web.sites);
-        let a_day = &day.web.sites["a.com"];
+        let sites = crate::history::day_web_sites(&dir, "2026-09-30");
+        assert_eq!(sites.len(), 1, "{sites:?}");
+        let a_day = &sites["a.com"];
         assert_eq!(a_day.hits, 1);
         assert_eq!(a_day.bytes, 500);
         assert_eq!(a_day.uv, 4);
@@ -1557,9 +1557,10 @@ server
         assert_eq!(a.yesterday.requests, 1);
         assert_eq!(stats["b.com"].today.requests, 1);
 
-        // 今日未跨天收尾（b 的数据由周期写入负责）：不产生 10-01 日文件
-        assert!(!crate::history::day_path(&dir, "2026-10-01").exists());
+        // 今日未跨天收尾（b 的数据由周期写入负责）：10-01 尚无记录
+        assert!(crate::history::day_web_sites(&dir, "2026-10-01").is_empty());
 
+        crate::history::drop_storage_for_test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -56,7 +56,7 @@
   <PortTraffic>true</PortTraffic>
   <!--端口流量统计端口。形如 `22,80,443,3306`；留空 = 自动取系统监听端口-->
   <PortTrafficPorts></PortTrafficPorts>
-  <!--流量历史保留天数。每日归档到 Data/traffic/{日期}.json；默认 90（7~3650），0 = 永久保留-->
+  <!--流量历史保留天数。每日归档落 SQLite（Data/traffic.db，Pek.RCode 按 Entity/Model.xml 模型管理）；默认 90（7~3650），0 = 永久保留-->
   <TrafficHistoryDays>90</TrafficHistoryDays>
 
   <!--应用服务集合-->

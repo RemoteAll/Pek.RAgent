@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="utf-8"?>
+<EntityModel xmlns:xs="http://www.w3.org/2001/XMLSchema-instance" xs:schemaLocation="https://newlifex.com https://newlifex.com/Model202509.xsd" Version="1.0.2026.1001" Document="https://newlifex.com/xcode/model" ModelVersion="2.0.2026.130" xmlns="https://newlifex.com/Model202509.xsd">
+  <!--Pek.RAgent 本地数据库模型（XCode 规范，唯一事实来源）。
+      存储：Data/traffic.db（SQLite，运行时由 Pek.RCode 按本模型增量同步表结构）。
+      生态：与 C# DH.NCode 共用同一份 Model.xml；可用 rcodegen 工具生成实体（见 Pek.RCode README）。-->
+  <Option>
+    <!--基类。可能包含基类和接口，其中{name}替换为Table.Name-->
+    <BaseClass>EntityBase</BaseClass>
+    <!--命名空间-->
+    <Namespace>Pek.RAgent.Entity</Namespace>
+    <!--输出目录-->
+    <Output>.\Entity\</Output>
+    <!--数据库连接名-->
+    <ConnName>Traffic</ConnName>
+    <!--命名格式。Default/Upper/Lower/Underline-->
+    <NameFormat>Default</NameFormat>
+    <!--是否使用中文文件名。默认false-->
+    <ChineseFileName>False</ChineseFileName>
+    <!--可为null上下文。生成String?等-->
+    <Nullable>True</Nullable>
+    <!--带有索引器。实现IModel接口-->
+    <HasIModel>False</HasIModel>
+  </Option>
+  <Tables>
+    <Table Name="WebTrafficDaily" TableName="Agent_WebTrafficDaily" Description="网站流量每日统计" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="StatDate" DataType="DateTime" Nullable="False" Description="统计日期（当日零点；与站点组成自然键）" />
+        <Column Name="Site" DataType="String" Length="200" Master="True" Nullable="False" Description="站点名称（server_name；自动发现或 WebLogs 手动配置）" />
+        <Column Name="Hits" DataType="Int64" Nullable="False" Description="请求数（当日累计）" />
+        <Column Name="Bytes" DataType="Int64" Nullable="False" Description="响应体字节（当日累计，与面板统计口径一致）" />
+        <Column Name="UV" DataType="Int64" Nullable="False" Description="独立 IP（当日，各站点独立计数）" />
+        <Column Name="S2xx" DataType="Int64" Nullable="False" Description="2xx 状态码数" />
+        <Column Name="S3xx" DataType="Int64" Nullable="False" Description="3xx 状态码数" />
+        <Column Name="S4xx" DataType="Int64" Nullable="False" Description="4xx 状态码数" />
+        <Column Name="S5xx" DataType="Int64" Nullable="False" Description="5xx 状态码数" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间（首次落库）" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间（最后采集刷新）" />
+      </Columns>
+    </Table>
+    <Table Name="PortTrafficDaily" TableName="Agent_PortTrafficDaily" Description="端口流量每日统计（nftables 计数）" IgnoreNameCase="False">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="StatDate" DataType="DateTime" Nullable="False" Description="统计日期（当日零点；与协议/端口组成自然键）" />
+        <Column Name="Proto" DataType="String" Length="8" Master="True" Nullable="False" Description="协议（tcp/udp）" />
+        <Column Name="Port" DataType="Int32" Nullable="False" Description="端口号" />
+        <Column Name="Rx" DataType="Int64" Nullable="False" Description="接收字节（当日累计）" />
+        <Column Name="Tx" DataType="Int64" Nullable="False" Description="发送字节（当日累计）" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间（首次落库）" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间（最后采集刷新）" />
+      </Columns>
+    </Table>
+  </Tables>
+</EntityModel>

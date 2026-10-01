@@ -1,72 +1,52 @@
-//! 流量历史（每日归档）：网站流量与端口流量按自然日落地 `Data/traffic/{YYYY-MM-DD}.json`。
+//! 流量历史（每日归档）：网站流量与端口流量按自然日落地 SQLite（Pek.RCode / XCode 体系）。
+//!
+//! **存储规范**：模型按 XCode 规范维护于 `Entity/Model.xml`（唯一事实来源，编译期内嵌），
+//! 运行时经 Pek.RCode（DH.NCode 的 Rust 实现）打开 `Data/traffic.db` 并增量同步表结构；
+//! 与 C# 生态共用同一份模型文件（`rcodegen` 可据此生成实体 / 反向工程）。
 //!
 //! 设计要点：
-//! - **绝对量快照**：文件内保存“该日截至最后写入时刻的累计值”（而非增量），同一日重复写入
-//!   为幂等合并（按站点/端口键覆盖），进程重启或一天内多次写入不会重复计数。
-//! - **尽力而为**：无事务；崩溃/断电最多丢失最后一次写入（≤30 秒）的数据。
-//! - **保留策略**：`TrafficHistoryDays`（默认 90 天；0 = 不清理），每天最多清理一次。
-//! - 线程模型：weblog / portstat 两个后台线程共用本模块，读-改-写以进程内互斥锁保护；
-//!   写入走原子替换（临时文件 + rename），读取永远看到完整文件。
+//! - **绝对量快照**：每行保存“该日截至最后写入时刻的累计值”（非增量），同键重复写入为
+//!   幂等覆盖（自然键：日期 + 站点 / 日期 + 协议 + 端口），进程重启或一天内多次写入不会重复计数；
+//! - **读取缓存**：面板读取走 Pek.RCode 实体缓存（整表缓存；默认 60 秒过期、任何写入即时失效）；
+//! - **保留策略**：`TrafficHistoryDays`（默认 90 天；0 = 不清理），每天最多清理一次；
+//! - **旧版迁移**：首次运行自动导入旧版 `Data/traffic/{日期}.json` 并删除已导入文件；
+//! - 线程模型：weblog / portstat / webpanel 共用本模块，读写以进程内互斥锁串行。
 //!
-//! 文件结构示例：
-//! ```json
-//! {
-//!   "date": "2026-10-01",
-//!   "updated": 1759294800,
-//!   "web": { "sites": { "example.com": { "hits": 12, "bytes": 3456, "uv": 5,
-//!                                        "s2xx": 10, "s3xx": 0, "s4xx": 1, "s5xx": 1 } } },
-//!   "ports": { "tcp:80": { "rx": 1024, "tx": 2048 } }
-//! }
-//! ```
+//! 表结构（详见 `Entity/Model.xml`）：
+//! - `Agent_WebTrafficDaily`：日期 + 站点 → 请求数 / 字节 / UV / 状态码分布；
+//! - `Agent_PortTrafficDaily`：日期 + 协议 + 端口 → 当日接收 / 发送字节。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Once};
 
-use chrono::{Days, Local, NaiveDate};
-use serde::{Deserialize, Serialize};
+use chrono::{Days, Local, NaiveDate, NaiveDateTime};
+use pek_rcode::{Dal, DbRow, DbValue, EntityModel, Query, SqlSession, Where};
+use serde::Deserialize;
 use serde_json::{json, Value as Json};
 
 use crate::util;
+
+/// XCode 模型文件（编译期内嵌；随源码维护并与 C# 生态互通）。
+const MODEL_XML: &str = include_str!("../Entity/Model.xml");
+/// 网站流量表（实体名，见 `Entity/Model.xml`）。
+const TABLE_WEB: &str = "WebTrafficDaily";
+/// 端口流量表。
+const TABLE_PORTS: &str = "PortTrafficDaily";
+/// 数据库文件名（位于 `Data/` 下）。
+const DB_FILE: &str = "traffic.db";
+/// 单次清理最多删除的行数（防御）。
+const MAX_PRUNE_ROWS: usize = 100_000;
 
 /// 保留天数上限（防御性）。
 pub const MAX_RETENTION_DAYS: u32 = 3650;
 /// 保留天数下限（非 0 时）。
 pub const MIN_RETENTION_DAYS: u32 = 7;
 
-/// 读-改-写互斥（weblog 与 portstat 线程共用）。
-static LOCK: Mutex<()> = Mutex::new(());
-/// 最近一次清理的日期（每天最多清理一次）。
-static LAST_PRUNE: Mutex<Option<String>> = Mutex::new(None);
-
 // ————— 数据模型 —————
 
-/// 单日归档文件。
-#[derive(Serialize, Deserialize, Default, Debug)]
-pub struct DayFile {
-    /// 日期（`%Y-%m-%d`）
-    pub date: String,
-    /// 最后写入时间（epoch 秒）
-    #[serde(default)]
-    pub updated: i64,
-    /// 网站流量
-    #[serde(default)]
-    pub web: WebPart,
-    /// 端口流量（键：`tcp:80` / `udp:53`）
-    #[serde(default)]
-    pub ports: BTreeMap<String, PortCounters>,
-}
-
-/// 网站流量段。
-#[derive(Serialize, Deserialize, Default, Debug)]
-pub struct WebPart {
-    /// 站点名 → 当日汇总
-    #[serde(default)]
-    pub sites: BTreeMap<String, SiteDay>,
-}
-
 /// 单站点单日汇总（绝对量：当日截至最后写入时刻的累计）。
-#[derive(Serialize, Deserialize, Default, Clone, Debug, PartialEq, Eq)]
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
 pub struct SiteDay {
     /// 请求数
     pub hits: u64,
@@ -75,21 +55,17 @@ pub struct SiteDay {
     /// 独立 IP（各站点独立计数；跨站不去重）
     pub uv: u64,
     /// 2xx 状态码数
-    #[serde(default)]
     pub s2xx: u64,
     /// 3xx 状态码数
-    #[serde(default)]
     pub s3xx: u64,
     /// 4xx 状态码数
-    #[serde(default)]
     pub s4xx: u64,
     /// 5xx 状态码数
-    #[serde(default)]
     pub s5xx: u64,
 }
 
-/// 单端口当日收发字节。
-#[derive(Serialize, Deserialize, Default, Clone, Copy, Debug, PartialEq, Eq)]
+/// 单端口当日累计收发字节。
+#[derive(Default, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PortCounters {
     /// 接收字节（到达该端口）
     pub rx: u64,
@@ -97,16 +73,598 @@ pub struct PortCounters {
     pub tx: u64,
 }
 
-// ————— 路径与命名 —————
+// ————— 数据访问层（Pek.RCode，按数据目录缓存） —————
 
-/// 历史目录：`{base}/Data/traffic`。
-pub fn dir(base: &Path) -> PathBuf {
-    base.join("Data").join("traffic")
+/// 数据访问层实例（生产环境只有一个；测试按临时目录各建一个）。
+struct Storage {
+    base: PathBuf,
+    dal: Dal,
 }
 
-/// 单日文件路径。
-pub fn day_path(base: &Path, date: &str) -> PathBuf {
-    dir(base).join(format!("{date}.json"))
+/// 按基础目录缓存的数据访问层。
+static REGISTRY: Mutex<BTreeMap<PathBuf, Arc<Storage>>> = Mutex::new(BTreeMap::new());
+/// 数据操作串行锁（写路径、清理与快照互斥；简化并发模型，SQLite 单连接即可满足）。
+static LOCK: Mutex<()> = Mutex::new(());
+/// 默认拦截器注册（TimeInterceptor：自动维护 CreateTime/UpdateTime，对齐 C# 实体工厂默认装配）。
+static INTERCEPTORS: Once = Once::new();
+/// 打开失败的日志节流（同一错误只记一次；成功恢复后重置）。
+static OPEN_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+/// 获取（或首次打开）某数据目录的数据访问层。
+fn storage(base: &Path) -> Result<Arc<Storage>, String> {
+    let key = base.to_path_buf();
+    {
+        let registry = REGISTRY.lock().unwrap();
+        if let Some(existing) = registry.get(&key) {
+            return Ok(existing.clone());
+        }
+    }
+
+    match open_storage(&key) {
+        Ok(opened) => {
+            if OPEN_ERROR.lock().unwrap().take().is_some() {
+                util::log_info("流量历史数据库已恢复可用");
+            }
+            let mut registry = REGISTRY.lock().unwrap();
+            let entry = registry.entry(key).or_insert_with(|| opened.clone());
+            Ok(entry.clone())
+        }
+        Err(e) => {
+            let mut last = OPEN_ERROR.lock().unwrap();
+            if last.as_deref() != Some(e.as_str()) {
+                util::log_error(&format!("流量历史数据库打开失败：{e}"));
+                *last = Some(e.clone());
+            }
+            Err(e)
+        }
+    }
+}
+
+/// 打开数据库：解析内嵌模型 → SQLite → 增量同步表结构 → 首轮旧版 JSON 迁移。
+fn open_storage(base: &Path) -> Result<Arc<Storage>, String> {
+    INTERCEPTORS.call_once(|| pek_rcode::interceptor::enable_defaults());
+
+    let model = EntityModel::parse(MODEL_XML).map_err(|e| format!("Model.xml 解析失败：{e}"))?;
+    let db_path = base.join("Data").join(DB_FILE);
+    if let Some(dir) = db_path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    }
+    let conn = format!("Data Source={};Provider=SQLite;ShowSql=false", db_path.display());
+    let dal =
+        Dal::open_with_model(&conn, model).map_err(|e| format!("打开 SQLite 失败：{e}"))?;
+    dal.sync_schema()
+        .map_err(|e| format!("同步表结构失败：{e}"))?;
+    util::log_format(
+        "流量历史数据库已就绪（{}）",
+        &[&db_path.display().to_string()],
+    );
+
+    let storage = Arc::new(Storage {
+        base: base.to_path_buf(),
+        dal,
+    });
+    import_legacy_json(&storage);
+    Ok(storage)
+}
+
+/// 释放某数据目录的连接（测试用；Windows 下否则无法删除临时目录）。
+#[cfg(test)]
+pub(crate) fn drop_storage_for_test(base: &Path) {
+    let mut registry = REGISTRY.lock().unwrap();
+    registry.remove(base);
+}
+
+// ————— 写入 —————
+
+/// 合并写入某日网站快照（按自然键“日期 + 站点”覆盖；幂等）。
+pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
+    if sites.is_empty() {
+        return;
+    }
+    let Ok(store) = storage(base) else {
+        return;
+    };
+    let Some(day) = parse_day(date) else {
+        return;
+    };
+    let _guard = LOCK.lock().unwrap();
+    let mut session = match store.dal.open_session() {
+        Ok(session) => session,
+        Err(e) => {
+            util::log_error(&format!("流量历史会话创建失败：{e}"));
+            return;
+        }
+    };
+    for (site, stats) in sites {
+        if let Err(e) = upsert_web_row(&store.dal, session.as_mut(), &day, site, stats) {
+            util::log_error(&format!("网站流量落库失败（{date} {site}）：{e}"));
+        }
+    }
+}
+
+/// 合并写入某日端口快照（按自然键“日期 + 协议 + 端口”覆盖；幂等）。
+pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounters>) {
+    if ports.is_empty() {
+        return;
+    }
+    let Ok(store) = storage(base) else {
+        return;
+    };
+    let Some(day) = parse_day(date) else {
+        return;
+    };
+    let _guard = LOCK.lock().unwrap();
+    let mut session = match store.dal.open_session() {
+        Ok(session) => session,
+        Err(e) => {
+            util::log_error(&format!("流量历史会话创建失败：{e}"));
+            return;
+        }
+    };
+    for (key, counters) in ports {
+        let Some((proto, port)) = parse_port_key(key) else {
+            continue;
+        };
+        if let Err(e) = upsert_port_row(&store.dal, session.as_mut(), &day, proto, port, counters) {
+            util::log_error(&format!("端口流量落库失败（{date} {key}）：{e}"));
+        }
+    }
+}
+
+/// 插入或更新一行网站流量（自然键：日期 + 站点）。
+fn upsert_web_row(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    day: &NaiveDateTime,
+    site: &str,
+    stats: &SiteDay,
+) -> pek_rcode::Result<()> {
+    let table = dal.table(TABLE_WEB)?;
+    let filter = Where::new().eq("StatDate", *day).eq("Site", site);
+    let found = table.query(
+        session,
+        &Query::new().column("Id").filter(filter).take(1),
+    )?;
+
+    let values: [(&str, DbValue); 7] = [
+        ("Hits", to_i64(stats.hits).into()),
+        ("Bytes", to_i64(stats.bytes).into()),
+        ("UV", to_i64(stats.uv).into()),
+        ("S2xx", to_i64(stats.s2xx).into()),
+        ("S3xx", to_i64(stats.s3xx).into()),
+        ("S4xx", to_i64(stats.s4xx).into()),
+        ("S5xx", to_i64(stats.s5xx).into()),
+    ];
+
+    if let Some(row) = found.first() {
+        let id = row
+            .get_by_name("Id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default();
+        table.update_by_pk(session, &values, &[id.into()])?;
+    } else {
+        let mut fields: Vec<(&str, DbValue)> = Vec::with_capacity(values.len() + 2);
+        fields.push(("StatDate", (*day).into()));
+        fields.push(("Site", site.into()));
+        fields.extend_from_slice(&values);
+        table.insert(session, &fields)?;
+    }
+    Ok(())
+}
+
+/// 插入或更新一行端口流量（自然键：日期 + 协议 + 端口）。
+fn upsert_port_row(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    day: &NaiveDateTime,
+    proto: &str,
+    port: u16,
+    counters: &PortCounters,
+) -> pek_rcode::Result<()> {
+    let table = dal.table(TABLE_PORTS)?;
+    let filter = Where::new()
+        .eq("StatDate", *day)
+        .eq("Proto", proto)
+        .eq("Port", i32::from(port));
+    let found = table.query(
+        session,
+        &Query::new().column("Id").filter(filter).take(1),
+    )?;
+
+    let values: [(&str, DbValue); 2] = [
+        ("Rx", to_i64(counters.rx).into()),
+        ("Tx", to_i64(counters.tx).into()),
+    ];
+
+    if let Some(row) = found.first() {
+        let id = row
+            .get_by_name("Id")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default();
+        table.update_by_pk(session, &values, &[id.into()])?;
+    } else {
+        let fields: [(&str, DbValue); 5] = [
+            ("StatDate", (*day).into()),
+            ("Proto", proto.into()),
+            ("Port", i32::from(port).into()),
+            ("Rx", to_i64(counters.rx).into()),
+            ("Tx", to_i64(counters.tx).into()),
+        ];
+        table.insert(session, &fields)?;
+    }
+    Ok(())
+}
+
+// ————— 清理 —————
+
+/// 最近一次清理的日期（每天最多清理一次）。
+static LAST_PRUNE: Mutex<Option<String>> = Mutex::new(None);
+
+/// 清理过期历史（每天最多执行一次；`retention_days = 0` 表示不清理）。
+pub fn maybe_prune(base: &Path, retention_days: u32) {
+    let today = today_string();
+    {
+        let guard = LAST_PRUNE.lock().unwrap();
+        if guard.as_deref() == Some(today.as_str()) {
+            return;
+        }
+    }
+    let Ok(store) = storage(base) else {
+        return;
+    };
+    let _lock = LOCK.lock().unwrap();
+    {
+        let mut guard = LAST_PRUNE.lock().unwrap();
+        if guard.as_deref() == Some(today.as_str()) {
+            return;
+        }
+        *guard = Some(today.clone());
+    }
+    if retention_days == 0 {
+        return;
+    }
+    let retention = retention_days.clamp(MIN_RETENTION_DAYS, MAX_RETENTION_DAYS);
+    let Ok(today_date) = NaiveDate::parse_from_str(&today, "%Y-%m-%d") else {
+        return;
+    };
+    // 保留 N 天（含今天）：删除严格早于 (今天 - (N-1) 天) 的记录
+    let Some(cutoff_date) = today_date.checked_sub_days(Days::new(retention as u64 - 1)) else {
+        return;
+    };
+    let Some(cutoff) = cutoff_date.and_hms_opt(0, 0, 0) else {
+        return;
+    };
+
+    let mut session = match store.dal.open_session() {
+        Ok(session) => session,
+        Err(e) => {
+            util::log_error(&format!("流量历史清理会话创建失败：{e}"));
+            return;
+        }
+    };
+    let mut removed = 0usize;
+    for table_name in [TABLE_WEB, TABLE_PORTS] {
+        let Ok(table) = store.dal.table(table_name) else {
+            continue;
+        };
+        let filter = Where::new().lt("StatDate", cutoff);
+        let rows = match table.query(
+            session.as_mut(),
+            &Query::new()
+                .column("Id")
+                .filter(filter)
+                .take(MAX_PRUNE_ROWS),
+        ) {
+            Ok(rows) => rows,
+            Err(e) => {
+                util::log_error(&format!("流量历史清理查询失败（{table_name}）：{e}"));
+                continue;
+            }
+        };
+        for row in &rows {
+            let Some(id) = row.get_by_name("Id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            if table.delete_by_pk(session.as_mut(), &[id.into()]).is_ok() {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        util::log_format(
+            "流量历史清理：移除 {} 条过期记录（保留 {} 天）",
+            &[&removed.to_string(), &retention_days.to_string()],
+        );
+    }
+}
+
+// ————— 面板快照 —————
+
+/// 面板快照：最近 `days` 天（按日期升序），附带保留天数与每日合计。
+///
+/// 读取走 Pek.RCode 实体缓存（整表缓存；写入自动失效、默认 60 秒过期）。
+pub fn snapshot_json(base: &Path, days: usize, retention_days: u32) -> Json {
+    let empty = || {
+        json!({
+            "retentionDays": retention_days,
+            "days": Vec::<Json>::new(),
+        })
+    };
+    let Ok(store) = storage(base) else {
+        return empty();
+    };
+    let _guard = LOCK.lock().unwrap();
+    let mut session = match store.dal.open_session() {
+        Ok(session) => session,
+        Err(e) => {
+            util::log_error(&format!("流量历史读取会话创建失败：{e}"));
+            return empty();
+        }
+    };
+
+    let web_rows: Arc<Vec<DbRow>> = match store
+        .dal
+        .entity_cache(TABLE_WEB)
+        .and_then(|c| c.entities(&store.dal, session.as_mut()))
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            util::log_error(&format!("网站流量历史读取失败：{e}"));
+            Arc::new(Vec::new())
+        }
+    };
+    let port_rows: Arc<Vec<DbRow>> = match store
+        .dal
+        .entity_cache(TABLE_PORTS)
+        .and_then(|c| c.entities(&store.dal, session.as_mut()))
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            util::log_error(&format!("端口流量历史读取失败：{e}"));
+            Arc::new(Vec::new())
+        }
+    };
+
+    // 按日期分组
+    let mut web: BTreeMap<String, BTreeMap<String, SiteDay>> = BTreeMap::new();
+    for row in web_rows.iter() {
+        let Some(date) = row
+            .get_by_name("StatDate")
+            .and_then(|v| v.as_datetime())
+            .map(|dt| format_day(&dt))
+        else {
+            continue;
+        };
+        let site = row
+            .get_by_name("Site")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let get = |name: &str| -> u64 {
+            row.get_by_name(name)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        web.entry(date).or_default().insert(
+            site,
+            SiteDay {
+                hits: get("Hits"),
+                bytes: get("Bytes"),
+                uv: get("UV"),
+                s2xx: get("S2xx"),
+                s3xx: get("S3xx"),
+                s4xx: get("S4xx"),
+                s5xx: get("S5xx"),
+            },
+        );
+    }
+    let mut ports: BTreeMap<String, BTreeMap<String, PortCounters>> = BTreeMap::new();
+    for row in port_rows.iter() {
+        let Some(date) = row
+            .get_by_name("StatDate")
+            .and_then(|v| v.as_datetime())
+            .map(|dt| format_day(&dt))
+        else {
+            continue;
+        };
+        let proto = row
+            .get_by_name("Proto")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let port = row
+            .get_by_name("Port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(0, u16::MAX as i64) as u16;
+        let get = |name: &str| -> u64 {
+            row.get_by_name(name)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        ports.entry(date).or_default().insert(
+            port_key(&proto, port),
+            PortCounters {
+                rx: get("Rx"),
+                tx: get("Tx"),
+            },
+        );
+    }
+
+    // 合并日期（升序），取最近 N 天
+    let mut all_dates: BTreeSet<String> = BTreeSet::new();
+    all_dates.extend(web.keys().cloned());
+    all_dates.extend(ports.keys().cloned());
+    let take = days.clamp(1, MAX_RETENTION_DAYS as usize);
+    let start = all_dates.len().saturating_sub(take);
+
+    let mut out: Vec<Json> = Vec::new();
+    for date in all_dates.iter().skip(start) {
+        let sites_map = web.get(date);
+        let hits: u64 = sites_map
+            .map(|m| m.values().map(|s| s.hits).sum())
+            .unwrap_or(0);
+        let bytes: u64 = sites_map
+            .map(|m| m.values().map(|s| s.bytes).sum())
+            .unwrap_or(0);
+        let uv: u64 = sites_map
+            .map(|m| m.values().map(|s| s.uv).sum())
+            .unwrap_or(0);
+        let sites_json: Json = sites_map
+            .map(|m| {
+                m.iter()
+                    .map(|(name, s)| {
+                        (
+                            name.clone(),
+                            json!({
+                                "hits": s.hits,
+                                "bytes": s.bytes,
+                                "uv": s.uv,
+                                "s2xx": s.s2xx,
+                                "s3xx": s.s3xx,
+                                "s4xx": s.s4xx,
+                                "s5xx": s.s5xx,
+                            }),
+                        )
+                    })
+                    .collect::<serde_json::Map<String, Json>>()
+                    .into()
+            })
+            .unwrap_or(Json::Object(serde_json::Map::new()));
+        let ports_json: Json = ports
+            .get(date)
+            .map(|m| {
+                m.iter()
+                    .map(|(key, c)| (key.clone(), json!({ "rx": c.rx, "tx": c.tx })))
+                    .collect::<serde_json::Map<String, Json>>()
+                    .into()
+            })
+            .unwrap_or(Json::Object(serde_json::Map::new()));
+        out.push(json!({
+            "date": date,
+            "web": {
+                "hits": hits,
+                "bytes": bytes,
+                "uv": uv,
+                "sites": sites_json,
+            },
+            "ports": ports_json,
+        }));
+    }
+
+    json!({
+        "retentionDays": retention_days,
+        "days": out,
+    })
+}
+
+// ————— 单日读取（测试辅助） —————
+
+/// 某日全部站点快照（仅测试引用；生产路径读快照或实时状态）。
+#[cfg(test)]
+pub(crate) fn day_web_sites(base: &Path, date: &str) -> BTreeMap<String, SiteDay> {
+    let mut out = BTreeMap::new();
+    let Ok(store) = storage(base) else {
+        return out;
+    };
+    let Some(day) = parse_day(date) else {
+        return out;
+    };
+    let _guard = LOCK.lock().unwrap();
+    let Ok(mut session) = store.dal.open_session() else {
+        return out;
+    };
+    let Ok(table) = store.dal.table(TABLE_WEB) else {
+        return out;
+    };
+    let Ok(rows) = table.query(
+        session.as_mut(),
+        &Query::new().filter(Where::new().eq("StatDate", day)),
+    ) else {
+        return out;
+    };
+    for row in &rows {
+        let Some(site) = row.get_by_name("Site").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let get = |name: &str| -> u64 {
+            row.get_by_name(name)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        out.insert(
+            site.to_string(),
+            SiteDay {
+                hits: get("Hits"),
+                bytes: get("Bytes"),
+                uv: get("UV"),
+                s2xx: get("S2xx"),
+                s3xx: get("S3xx"),
+                s4xx: get("S4xx"),
+                s5xx: get("S5xx"),
+            },
+        );
+    }
+    out
+}
+
+/// 某日全部端口快照（仅测试引用；生产路径读快照或实时状态）。
+#[cfg(test)]
+pub(crate) fn day_ports(base: &Path, date: &str) -> BTreeMap<String, PortCounters> {
+    let mut out = BTreeMap::new();
+    let Ok(store) = storage(base) else {
+        return out;
+    };
+    let Some(day) = parse_day(date) else {
+        return out;
+    };
+    let _guard = LOCK.lock().unwrap();
+    let Ok(mut session) = store.dal.open_session() else {
+        return out;
+    };
+    let Ok(table) = store.dal.table(TABLE_PORTS) else {
+        return out;
+    };
+    let Ok(rows) = table.query(
+        session.as_mut(),
+        &Query::new().filter(Where::new().eq("StatDate", day)),
+    ) else {
+        return out;
+    };
+    for row in &rows {
+        let Some(proto) = row.get_by_name("Proto").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let port = row
+            .get_by_name("Port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(0, u16::MAX as i64) as u16;
+        let get = |name: &str| -> u64 {
+            row.get_by_name(name)
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0)
+                .max(0) as u64
+        };
+        out.insert(
+            port_key(proto, port),
+            PortCounters {
+                rx: get("Rx"),
+                tx: get("Tx"),
+            },
+        );
+    }
+    out
+}
+
+// ————— 路径与工具 —————
+
+/// 旧版 JSON 归档目录：`{base}/Data/traffic`（仅用于首轮迁移）。
+fn dir(base: &Path) -> PathBuf {
+    base.join("Data").join("traffic")
 }
 
 /// 本地日期字符串（`%Y-%m-%d`）。
@@ -128,181 +686,189 @@ pub fn parse_port_key(key: &str) -> Option<(&str, u16)> {
     Some((proto, port.parse().ok()?))
 }
 
+/// `%Y-%m-%d` → 当日零点。
+fn parse_day(date: &str) -> Option<NaiveDateTime> {
+    NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .ok()
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+}
+
+/// 当日零点 → `%Y-%m-%d`。
+fn format_day(dt: &NaiveDateTime) -> String {
+    dt.date().format("%Y-%m-%d").to_string()
+}
+
 /// 是否为合法日期名（`%Y-%m-%d`）。
 fn is_day_name(s: &str) -> bool {
     s.len() == 10 && NaiveDate::parse_from_str(s, "%Y-%m-%d").is_ok()
 }
 
-// ————— 读取与写入 —————
-
-/// 读取单日文件（不存在返回默认；损坏则改名 `.corrupt` 保留现场后从零开始）。
-pub(crate) fn read_day(base: &Path, date: &str) -> DayFile {
-    let path = day_path(base, date);
-    let Ok(text) = std::fs::read_to_string(&path) else {
-        return DayFile::default();
-    };
-    match serde_json::from_str::<DayFile>(&text) {
-        Ok(day) => day,
-        Err(e) => {
-            util::log_error(&format!(
-                "流量历史文件损坏（{}）：{e}；改名保留后重新开始",
-                path.display()
-            ));
-            let corrupt = path.with_extension("json.corrupt");
-            let _ = std::fs::remove_file(&corrupt);
-            let _ = std::fs::rename(&path, &corrupt);
-            DayFile::default()
-        }
-    }
+/// u64 → i64（SQLite 整数；溢出按上限截断）。
+fn to_i64(value: u64) -> i64 {
+    value.min(i64::MAX as u64) as i64
 }
 
-/// 写入单日文件（原子替换；失败仅日志）。
-fn write_day(base: &Path, day: &DayFile) {
-    let path = day_path(base, &day.date);
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let text = match serde_json::to_string_pretty(day) {
-        Ok(t) => t,
-        Err(e) => {
-            util::log_error(&format!("流量历史序列化失败：{e}"));
-            return;
-        }
-    };
-    if let Err(e) = dhrust::io::write_all_text_atomic(&path, &text) {
-        util::log_error(&format!("流量历史写入失败（{}）：{e}", path.display()));
-    }
+// ————— 旧版 JSON 迁移 —————
+
+/// 旧版 JSON 日文件（第一代存储格式，仅迁移用）。
+#[derive(Deserialize, Default)]
+struct LegacyDay {
+    #[serde(default)]
+    date: String,
+    #[serde(default)]
+    web: LegacyWeb,
+    #[serde(default)]
+    ports: BTreeMap<String, LegacyCounters>,
 }
 
-/// 合并写入某日网站快照（按站点名覆盖；该日其它站点与端口数据保留）。
-///
-/// 可重复调用：同一站点同一日的多次写入为“最新绝对量”覆盖，幂等。
-pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
-    if sites.is_empty() || !is_day_name(date) {
-        return;
-    }
-    let _guard = LOCK.lock().unwrap();
-    let mut day = read_day(base, date);
-    day.date = date.to_string();
-    day.updated = Local::now().timestamp();
-    for (name, stats) in sites {
-        day.web.sites.insert(name.clone(), stats.clone());
-    }
-    write_day(base, &day);
+/// 旧版网站段。
+#[derive(Deserialize, Default)]
+struct LegacyWeb {
+    #[serde(default)]
+    sites: BTreeMap<String, LegacySite>,
 }
 
-/// 合并写入某日端口快照（按端口键覆盖；该日其它端口与网站数据保留）。
-pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounters>) {
-    if ports.is_empty() || !is_day_name(date) {
-        return;
-    }
-    let _guard = LOCK.lock().unwrap();
-    let mut day = read_day(base, date);
-    day.date = date.to_string();
-    day.updated = Local::now().timestamp();
-    for (key, counters) in ports {
-        day.ports.insert(key.clone(), *counters);
-    }
-    write_day(base, &day);
+/// 旧版单站点汇总。
+#[derive(Deserialize, Default)]
+struct LegacySite {
+    #[serde(default)]
+    hits: u64,
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    uv: u64,
+    #[serde(default)]
+    s2xx: u64,
+    #[serde(default)]
+    s3xx: u64,
+    #[serde(default)]
+    s4xx: u64,
+    #[serde(default)]
+    s5xx: u64,
 }
 
-/// 清理过期历史（每天最多执行一次；`retention_days = 0` 表示不清理）。
-pub fn maybe_prune(base: &Path, retention_days: u32) {
-    let today = today_string();
-    {
-        let guard = LAST_PRUNE.lock().unwrap();
-        if guard.as_deref() == Some(today.as_str()) {
-            return;
-        }
-    }
-    let _lock = LOCK.lock().unwrap();
-    {
-        let mut guard = LAST_PRUNE.lock().unwrap();
-        if guard.as_deref() == Some(today.as_str()) {
-            return;
-        }
-        *guard = Some(today.clone());
-    }
-    if retention_days == 0 {
+/// 旧版端口计数。
+#[derive(Deserialize, Default)]
+struct LegacyCounters {
+    #[serde(default)]
+    rx: u64,
+    #[serde(default)]
+    tx: u64,
+}
+
+/// 首轮迁移：库为空时导入 `Data/traffic/*.json`，成功导入的文件删除（迁移后以库为唯一来源）。
+fn import_legacy_json(store: &Storage) {
+    // 仅在库为空（首次迁移）时执行
+    let empty = (|| -> Result<bool, String> {
+        let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+        let mut count_all = |name: &str| -> Result<i64, String> {
+            store
+                .dal
+                .table(name)
+                .map_err(|e| e.to_string())?
+                .count(session.as_mut(), None)
+                .map_err(|e| e.to_string())
+        };
+        Ok(count_all(TABLE_WEB)? == 0 && count_all(TABLE_PORTS)? == 0)
+    })()
+    .unwrap_or(false);
+    if !empty {
         return;
     }
-    let retention = retention_days.clamp(MIN_RETENTION_DAYS, MAX_RETENTION_DAYS);
-    let Ok(today_date) = NaiveDate::parse_from_str(&today, "%Y-%m-%d") else {
+
+    let Ok(entries) = std::fs::read_dir(dir(&store.base)) else {
         return;
     };
-    // 保留 N 天（含今天）：删除严格早于 (今天 - (N-1) 天) 的文件
-    let Some(cutoff) = today_date.checked_sub_days(Days::new(retention as u64 - 1)) else {
-        return;
-    };
-    let cutoff_text = cutoff.format("%Y-%m-%d").to_string();
-    let Ok(entries) = std::fs::read_dir(dir(base)) else {
-        return;
-    };
-    let mut removed = 0usize;
+    let mut files: Vec<PathBuf> = Vec::new();
     for entry in entries.flatten() {
         let name = entry.file_name().to_string_lossy().to_string();
         let Some(stem) = name.strip_suffix(".json") else {
             continue;
         };
-        if !is_day_name(stem) {
-            continue;
-        }
-        if stem < cutoff_text.as_str() && std::fs::remove_file(entry.path()).is_ok() {
-            removed += 1;
-        }
-    }
-    if removed > 0 {
-        util::log_format(
-            "流量历史清理：移除 {} 个过期日文件（保留 {} 天）",
-            &[&removed.to_string(), &retention_days.to_string()],
-        );
-    }
-}
-
-/// 面板快照：最近 `days` 天（按日期升序），附带保留天数与每日合计。
-pub fn snapshot_json(base: &Path, days: usize, retention_days: u32) -> Json {
-    let mut files: Vec<(String, PathBuf)> = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(dir(base)) {
-        for entry in entries.flatten() {
-            let name = entry.file_name().to_string_lossy().to_string();
-            let Some(stem) = name.strip_suffix(".json") else {
-                continue;
-            };
-            if is_day_name(stem) {
-                files.push((stem.to_string(), entry.path()));
-            }
+        if is_day_name(stem) {
+            files.push(entry.path());
         }
     }
     files.sort();
 
-    let take = days.clamp(1, MAX_RETENTION_DAYS as usize);
-    let start = files.len().saturating_sub(take);
-    let mut out: Vec<Json> = Vec::new();
-    for (date, path) in &files[start..] {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    let mut imported = 0usize;
+    for path in files {
+        let stem = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let Ok(text) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let Ok(day) = serde_json::from_str::<DayFile>(&text) else {
+        let Ok(day_file) = serde_json::from_str::<LegacyDay>(&text) else {
+            util::log_error(&format!(
+                "流量历史迁移：解析失败，保留原文件 {}",
+                path.display()
+            ));
             continue;
         };
-        let hits: u64 = day.web.sites.values().map(|s| s.hits).sum();
-        let bytes: u64 = day.web.sites.values().map(|s| s.bytes).sum();
-        let uv: u64 = day.web.sites.values().map(|s| s.uv).sum();
-        out.push(json!({
-            "date": date,
-            "web": {
-                "hits": hits,
-                "bytes": bytes,
-                "uv": uv,
-                "sites": day.web.sites,
-            },
-            "ports": day.ports,
-        }));
+        let date = if day_file.date.is_empty() {
+            stem
+        } else {
+            day_file.date.clone()
+        };
+        let Some(day) = parse_day(&date) else {
+            continue;
+        };
+
+        let mut ok = true;
+        match store.dal.open_session() {
+            Ok(mut session) => {
+                for (site, s) in &day_file.web.sites {
+                    let stats = SiteDay {
+                        hits: s.hits,
+                        bytes: s.bytes,
+                        uv: s.uv,
+                        s2xx: s.s2xx,
+                        s3xx: s.s3xx,
+                        s4xx: s.s4xx,
+                        s5xx: s.s5xx,
+                    };
+                    if let Err(e) =
+                        upsert_web_row(&store.dal, session.as_mut(), &day, site, &stats)
+                    {
+                        util::log_error(&format!("流量历史迁移失败（{date} {site}）：{e}"));
+                        ok = false;
+                    }
+                }
+                for (key, c) in &day_file.ports {
+                    let Some((proto, port)) = parse_port_key(key) else {
+                        continue;
+                    };
+                    let counters = PortCounters { rx: c.rx, tx: c.tx };
+                    if let Err(e) = upsert_port_row(
+                        &store.dal,
+                        session.as_mut(),
+                        &day,
+                        proto,
+                        port,
+                        &counters,
+                    ) {
+                        util::log_error(&format!("流量历史迁移失败（{date} {key}）：{e}"));
+                        ok = false;
+                    }
+                }
+            }
+            Err(e) => {
+                util::log_error(&format!("流量历史迁移会话创建失败：{e}"));
+                ok = false;
+            }
+        }
+        if ok && std::fs::remove_file(&path).is_ok() {
+            imported += 1;
+        }
     }
-    json!({
-        "retentionDays": retention_days,
-        "days": out,
-    })
+    if imported > 0 {
+        util::log_format(
+            "流量历史迁移：导入 {} 个旧版日文件 → {}",
+            &[&imported.to_string(), DB_FILE],
+        );
+    }
 }
 
 #[cfg(test)]
@@ -331,68 +897,77 @@ mod tests {
         }
     }
 
+    fn cleanup(base: &Path) {
+        drop_storage_for_test(base);
+        let _ = std::fs::remove_dir_all(base);
+    }
+
     #[test]
-    fn merges_web_snapshots_across_writes() {
-        let dir = temp_dir("web");
+    fn upserts_and_merges_web_snapshots() {
+        let base = temp_dir("web");
         let mut first = BTreeMap::new();
         first.insert("a.com".to_string(), site(1, 100, 1));
-        update_web(&dir, "2026-10-01", &first);
+        update_web(&base, "2026-10-01", &first);
 
         let mut second = BTreeMap::new();
         let mut a2 = site(2, 200, 2);
         a2.s4xx = 1;
         second.insert("a.com".to_string(), a2);
         second.insert("b.com".to_string(), site(5, 500, 3));
-        update_web(&dir, "2026-10-01", &second);
+        update_web(&base, "2026-10-01", &second);
 
-        let day = read_day(&dir, "2026-10-01");
-        assert_eq!(day.date, "2026-10-01");
-        assert_eq!(day.web.sites.len(), 2);
-        assert_eq!(day.web.sites["a.com"].hits, 2, "同键应覆盖为最新快照");
-        assert_eq!(day.web.sites["a.com"].s4xx, 1);
-        assert_eq!(day.web.sites["b.com"].bytes, 500);
-        assert!(day.ports.is_empty());
+        let sites = day_web_sites(&base, "2026-10-01");
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites["a.com"].hits, 2, "同键应覆盖为最新快照");
+        assert_eq!(sites["a.com"].s4xx, 1);
+        assert_eq!(sites["b.com"].bytes, 500);
 
-        // 非法日期不落盘
-        update_web(&dir, "not-a-day", &second);
-        assert!(!day_path(&dir, "not-a-day").exists());
+        // 幂等：重复写入不叠加
+        update_web(&base, "2026-10-01", &second);
+        let sites = day_web_sites(&base, "2026-10-01");
+        assert_eq!(sites["a.com"].hits, 2);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        // 其它日期互不影响
+        update_web(&base, "2026-10-02", &first);
+        assert_eq!(day_web_sites(&base, "2026-10-01")["a.com"].hits, 2);
+        assert_eq!(day_web_sites(&base, "2026-10-02")["a.com"].hits, 1);
+
+        // 非法日期不落库
+        update_web(&base, "not-a-day", &first);
+        assert!(day_web_sites(&base, "not-a-day").is_empty());
+
+        cleanup(&base);
     }
 
     #[test]
-    fn merges_port_snapshots_and_keeps_others() {
-        let dir = temp_dir("port");
+    fn upserts_port_snapshots_and_keeps_others() {
+        let base = temp_dir("port");
         let mut first = BTreeMap::new();
         first.insert(port_key("tcp", 80), PortCounters { rx: 1, tx: 2 });
-        update_ports(&dir, "2026-10-01", &first);
+        update_ports(&base, "2026-10-01", &first);
 
         let mut second = BTreeMap::new();
         second.insert(port_key("tcp", 80), PortCounters { rx: 10, tx: 20 });
         second.insert(port_key("udp", 53), PortCounters { rx: 3, tx: 4 });
-        update_ports(&dir, "2026-10-01", &second);
+        update_ports(&base, "2026-10-01", &second);
 
-        let day = read_day(&dir, "2026-10-01");
-        assert_eq!(day.ports["tcp:80"], PortCounters { rx: 10, tx: 20 });
-        assert_eq!(day.ports["udp:53"], PortCounters { rx: 3, tx: 4 });
+        let ports = day_ports(&base, "2026-10-01");
+        assert_eq!(ports["tcp:80"], PortCounters { rx: 10, tx: 20 });
+        assert_eq!(ports["udp:53"], PortCounters { rx: 3, tx: 4 });
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&base);
     }
 
     #[test]
     fn snapshot_limits_range_and_sorts() {
-        let dir = temp_dir("snap");
+        let base = temp_dir("snap");
         for day in ["2026-09-28", "2026-09-29", "2026-09-30", "2026-10-01"] {
             let mut sites = BTreeMap::new();
             sites.insert("a.com".to_string(), site(1, 10, 1));
-            update_web(&dir, day, &sites);
+            update_web(&base, day, &sites);
         }
-        // 非日期文件与损坏文件应被忽略
-        let tdir = dir.join("Data").join("traffic");
-        std::fs::write(tdir.join("notes.json"), "{}").unwrap();
-        std::fs::write(tdir.join("2026-09-27.json"), "{broken").unwrap();
 
-        let v = snapshot_json(&dir, 3, 90);
+        let v = snapshot_json(&base, 3, 90);
         assert_eq!(v["retentionDays"], 90);
         let days = v["days"].as_array().unwrap();
         assert_eq!(days.len(), 3);
@@ -402,12 +977,12 @@ mod tests {
         assert_eq!(days[2]["web"]["bytes"], 10);
         assert_eq!(days[2]["web"]["sites"]["a.com"]["uv"], 1);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&base);
     }
 
     #[test]
-    fn prunes_expired_days_only() {
-        let dir = temp_dir("prune");
+    fn prunes_expired_rows_only() {
+        let base = temp_dir("prune");
         let today = today_string();
         let today_date = NaiveDate::parse_from_str(&today, "%Y-%m-%d").unwrap();
         let old = (today_date - Days::new(100)).format("%Y-%m-%d").to_string();
@@ -415,22 +990,59 @@ mod tests {
         for day in [old.as_str(), recent.as_str(), today.as_str()] {
             let mut sites = BTreeMap::new();
             sites.insert("a.com".to_string(), site(1, 10, 1));
-            update_web(&dir, day, &sites);
+            update_web(&base, day, &sites);
         }
 
         // 重置清理守卫，确保本测试真实执行清理
         *LAST_PRUNE.lock().unwrap() = None;
-        maybe_prune(&dir, 90);
-        assert!(!day_path(&dir, &old).exists(), "超过 90 天的日文件应被清理");
-        assert!(day_path(&dir, &recent).exists());
-        assert!(day_path(&dir, &today).exists());
+        maybe_prune(&base, 90);
+        assert!(
+            day_web_sites(&base, &old).is_empty(),
+            "超过 90 天的记录应被清理"
+        );
+        assert_eq!(day_web_sites(&base, &recent)["a.com"].hits, 1);
+        assert_eq!(day_web_sites(&base, &today)["a.com"].hits, 1);
 
-        // 0 = 不清理（旧文件已在上一步删除，此调用只验证不报错）
+        // 0 = 不清理（新写入的远古日期保留）
+        let ancient = (today_date - Days::new(200)).format("%Y-%m-%d").to_string();
+        let mut sites = BTreeMap::new();
+        sites.insert("a.com".to_string(), site(2, 20, 1));
+        update_web(&base, &ancient, &sites);
         *LAST_PRUNE.lock().unwrap() = None;
-        maybe_prune(&dir, 0);
-        assert!(day_path(&dir, &recent).exists());
+        maybe_prune(&base, 0);
+        assert_eq!(day_web_sites(&base, &ancient)["a.com"].hits, 2);
 
-        let _ = std::fs::remove_dir_all(&dir);
+        cleanup(&base);
+    }
+
+    #[test]
+    fn imports_legacy_json_files_once() {
+        let base = temp_dir("import");
+        let legacy_dir = dir(&base);
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        let text = r#"{
+            "date": "2026-09-30",
+            "web": { "sites": { "a.com": { "hits": 3, "bytes": 300, "uv": 2, "s2xx": 3 } } },
+            "ports": { "tcp:80": { "rx": 10, "tx": 20 } }
+        }"#;
+        std::fs::write(legacy_dir.join("2026-09-30.json"), text).unwrap();
+        std::fs::write(legacy_dir.join("notes.json"), "{}").unwrap();
+
+        // 首次访问触发建库 + 导入
+        let sites = day_web_sites(&base, "2026-09-30");
+        assert_eq!(sites["a.com"].hits, 3);
+        assert_eq!(sites["a.com"].uv, 2);
+        let ports = day_ports(&base, "2026-09-30");
+        assert_eq!(ports["tcp:80"], PortCounters { rx: 10, tx: 20 });
+        assert!(!legacy_dir.join("2026-09-30.json").exists(), "导入后应删除旧文件");
+        assert!(legacy_dir.join("notes.json").exists(), "非日文件不动");
+
+        // 重新打开：库非空，不重复导入
+        drop_storage_for_test(&base);
+        let sites = day_web_sites(&base, "2026-09-30");
+        assert_eq!(sites["a.com"].hits, 3, "重复打开不应双倍计数");
+
+        cleanup(&base);
     }
 
     #[test]
