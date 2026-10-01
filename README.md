@@ -91,17 +91,22 @@ sudo bash install.sh              # 一键：补可执行位并安装启动服�
 
 > 包内文件已带可执行位（`tar -xzf` 解压即用）；若通过 scp 直接传**单个文件**等不保留权限的途径获取，会出现 `-bash: ./pek-ragent: Permission denied`，执行一次 `chmod +x pek-ragent` 即可（或直接用包内 `bash install.sh`，它自动补权限）。
 
-**访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=true`，仅监听 `127.0.0.1:5500`）：
+**访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=false`，监听 `0.0.0.0:5500`，可直接通过服务器 IP 访问）：
 
 ```bash
-# 方式一（推荐）：SSH 隧道 —— 本地浏览器直接打开 http://127.0.0.1:5500/（admin/admin）
-ssh -L 5500:127.0.0.1:5500 root@server
-
-# 方式二：允许远程直连（默认密码 admin/admin，开放前务必先改用户名/密码，并自行加 HTTPS 反代等防护）
-vi Config/StarAgent.config  # 将 "LocalOnly" 改为 false
-./pek-ragent -restart
+# 默认：浏览器打开 http://服务器IP:5500/（admin/admin）
+# 安全提醒：仍使用默认密码时启动日志会明确提示；请尽快修改密码，
+#           并放行防火墙与云安全组：
 firewall-cmd --add-port=5500/tcp   # firewalld；ufw 对应 sudo ufw allow 5500
+# 云服务器还需在控制台安全组放行 5500/TCP
+
+# 可选（更安全）：仅本机访问 + SSH 隧道
+vi Config/StarAgent.config         # 将 "LocalOnly" 改为 true
+./pek-ragent -restart
+ssh -L 5500:127.0.0.1:5500 root@server   # 然后打开 http://127.0.0.1:5500/
 ```
+
+> 旧版本生成的配置若为 `LocalOnly=true`，改回 `false` 并重启即可远程访问。
 
 ### 3.2 运行时升级（"上传即升级"，不停止、不改名）
 

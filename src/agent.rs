@@ -138,6 +138,17 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     manager.start_all();
 
     // 2) 本地控制接口（线程持有；进程退出即结束）
+    //    安全提示：允许远程访问且仍用默认密码时明确提醒（默认密码是公开信息）
+    if !local_only {
+        let cfg = manager.config();
+        if cfg.web_user_name.trim().eq_ignore_ascii_case("admin")
+            && cfg.web_user_password == "admin"
+        {
+            util::log_info(
+                "安全提示：Web 面板已允许远程访问（LocalOnly=false）且仍使用默认密码 admin/admin，请尽快修改密码！",
+            );
+        }
+    }
     let _http = crate::server::start(manager.clone(), port, local_only);
 
     // 2.1) 本地 UDP RPC 服务端（NewLife ApiClient 协议；DHDeploy 重启/拉起链路依赖）
@@ -460,13 +471,6 @@ fn is_transient_upgrade_error(e: &str) -> bool {
     e.starts_with("替换失败") || e.starts_with("旧程序改名失败") || e.contains("os error 32")
 }
 
-/// 从升级目录挑选候选文件：最新的普通文件（排除 `*.failed` / `*.skipped` 留证文件）。
-///
-/// 目录名以 `Update` 为准（与 Config/Log 命名一致）；兼容早期小写 `update` 目录。
-pub(crate) fn latest_update_file(exe_dir: &Path) -> Option<PathBuf> {
-    collect_update_files(exe_dir).into_iter().next()
-}
-
 /// 收集升级目录中的全部候选文件（按修改时间降序：最新在前）。
 ///
 /// 同时覆盖 `Update/`（首选）与早期小写 `update/`；排除 `*.failed` / `*.skipped`
@@ -728,10 +732,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
 
         // 目录不存在 / 空目录：无候选
-        assert!(latest_update_file(&dir).is_none());
+        assert!(collect_update_files(&dir).is_empty());
         let update = dir.join("Update");
         std::fs::create_dir_all(&update).unwrap();
-        assert!(latest_update_file(&dir).is_none());
+        assert!(collect_update_files(&dir).is_empty());
 
         // 取最新修改的文件
         let old = update.join("old.bin");
@@ -739,12 +743,12 @@ mod tests {
         set_mtime(&old, -120);
         let fresh = update.join("fresh.bin");
         std::fs::write(&fresh, b"fresh").unwrap();
-        assert_eq!(latest_update_file(&dir).unwrap(), fresh);
+        assert_eq!(collect_update_files(&dir)[0], fresh);
 
         // `*.failed` 留证文件不参与
         let failed = update.join("zz.failed");
         std::fs::write(&failed, b"bad").unwrap();
-        assert_eq!(latest_update_file(&dir).unwrap(), fresh);
+        assert_eq!(collect_update_files(&dir)[0], fresh);
 
         // `*.skipped` 跳过文件不参与；collect 返回全部候选（最新在前）
         let skipped = update.join("yy.skipped");

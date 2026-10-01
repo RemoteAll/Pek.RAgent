@@ -72,7 +72,9 @@ impl Default for AgentConfig {
             display_name: "星尘代理".to_string(),
             description: "星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。".to_string(),
             local_port: DEFAULT_LOCAL_PORT,
-            local_only: true,
+            // 默认允许远程访问（服务器部署多为无头环境；面板有密码鉴权）。
+            // 安全提示：仍使用默认密码时，启动日志会输出提醒
+            local_only: false,
             delay: 3000,
             start_wait: 3000,
             max_fails: 20,
