@@ -70,10 +70,12 @@ pub fn decide(
 
 /// systemd 单元文件内容。
 ///
-/// **保守原则**（真实发行版首验后收紧）：仅保留最标准的指令与 ASCII 内容——
-/// 路径按需加引号、无注释、无中文（避免任何可能的发行版差异）；
+/// **保守原则**（真实发行版首验后收紧）：仅保留最标准的指令与 ASCII 内容；
 /// `KillMode=process` 必须保留（停止时不误杀子应用，对齐 C# StarAgent 语义）。
-/// 其余元素（如 OOMScoreAdjust）待自动诊断确认发行版兼容性后再逐步引入。
+///
+/// **坑（真实首验踩过）**：`WorkingDirectory=` 的值**不能加引号**——systemd 不剥离引号，
+/// 会把 `"/www/Agent"` 当作路径本体并判为“不是绝对路径”（fatal error，整个单元拒启）；
+/// 而 `ExecStart=` 支持引号且路径含空格时需要引号（按需加）。
 pub fn systemd_unit_text(mgr: &ServiceManager) -> String {
     format!(
         "[Unit]\n\
@@ -92,13 +94,15 @@ LimitNOFILE=65535\n\
 [Install]\n\
 WantedBy=multi-user.target\n",
         name = mgr.name,
-        workdir = quote_path(&mgr.base.display().to_string()),
+        workdir = mgr.base.display(), // 裸写（WorkingDirectory 不能引号）
         exe = quote_path(&mgr.exe.display().to_string()),
     )
 }
 
-/// 路径引号（仅含空白时加引号；避免无必要的引号——部分环境下对带引号的首参数
-/// 存在兼容性差异）。
+/// 路径引号（仅含空白时加引号）。
+///
+/// 仅适用于**支持引号剥离**的指令（如 `ExecStart=`）；
+/// `WorkingDirectory=` 不能加引号（systemd 会把引号当作路径本体 → fatal）。
 pub fn quote_path(path: &str) -> String {
     if path.chars().any(|c| c.is_whitespace()) {
         format!("\"{path}\"")
@@ -355,6 +359,32 @@ WantedBy=multi-user.target\n";
     fn quote_path_only_when_needed() {
         assert_eq!(quote_path("/opt/staragent/pek-ragent"), "/opt/staragent/pek-ragent");
         assert_eq!(quote_path("/opt/my agent/app"), "\"/opt/my agent/app\"");
+    }
+
+    #[test]
+    fn unit_with_spaced_path_quotes_only_execstart() {
+        // 真实首验教训：WorkingDirectory 不能加引号（会被判“不是绝对路径”）；
+        // ExecStart 含空格时需要引号
+        let mgr = ServiceManager {
+            name: "staragent".to_string(),
+            display: "星尘代理".to_string(),
+            description: "测试".to_string(),
+            exe: PathBuf::from("/opt/my agent/pek-ragent"),
+            base: PathBuf::from("/opt/my agent"),
+        };
+        let text = systemd_unit_text(&mgr);
+        assert!(
+            text.contains("WorkingDirectory=/opt/my agent\n"),
+            "WorkingDirectory 必须裸写：{text}"
+        );
+        assert!(
+            !text.contains("WorkingDirectory=\""),
+            "WorkingDirectory 不得出现引号：{text}"
+        );
+        assert!(
+            text.contains("ExecStart=\"/opt/my agent/pek-ragent\" -s"),
+            "ExecStart 含空格路径需要引号：{text}"
+        );
     }
 
     #[test]
