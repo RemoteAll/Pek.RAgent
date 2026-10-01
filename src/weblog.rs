@@ -12,8 +12,11 @@
 //!
 //! 持久化 `Data/web_traffic.json`（30 秒节流）：站点累计与文件读取位置（inode+offset），
 //! 重启续读不重复统计。UV 集合不持久化（重启后按“基数 + 新集合”近似）。
+//!
+//! 每日归档：跨天时把上一日的站点汇总写入 `Data/traffic/{日期}.json`（见 `history` 模块），
+//! 当日数据也在 30 秒节流周期内持续刷新到当日日文件；面板“流量 → 历史数据”按天查看。
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -24,6 +27,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as Json};
 
 use crate::config::AgentConfig;
+use crate::history::{self, SiteDay};
 use crate::manager::AppManager;
 use crate::util;
 
@@ -287,10 +291,10 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
         apply_sources(&mut inner, merge_sources(manual, auto));
     }
 
-    // 跨天滚动（先滚动再读取，避免跨天瞬间写错日期）
-    for st in inner.stats.values_mut() {
-        st.roll_day(&today);
-    }
+    // 跨天收尾与滚动（先归档旧日、再滚动，避免跨天瞬间写错日期）
+    close_stale_days(&t.base, &mut inner.stats, &today);
+    // 历史保留清理（内部每天最多执行一次，开销可忽略）
+    history::maybe_prune(&t.base, cfg.traffic_history_days);
 
     // 读取增量并聚合成事件（先收集，避免多字段可变借用冲突）
     let sources = inner.sources.clone();
@@ -329,23 +333,29 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
         st.tick_rate();
     }
 
-    // 持久化（30 秒节流；有变化才写）
+    // 持久化与每日归档（30 秒节流；有变化才写统计文件；进程启动后首个周期刷新日文件）
     let due = inner
         .last_persist
         .map(|at| at.elapsed() >= PERSIST_INTERVAL)
         .unwrap_or(true);
-    if inner.dirty && due {
-        save_persisted(t, &inner);
+    if due && (inner.dirty || inner.last_persist.is_none()) {
+        if inner.dirty {
+            save_persisted(t, &inner);
+        }
+        write_day_file(&t.base, &today, &inner.stats);
         inner.dirty = false;
         inner.last_persist = Some(Instant::now());
     }
 }
 
-/// 退出前落盘（不等节流窗口）。
+/// 退出前落盘（不等节流窗口）；历史日文件一并收尾。
 fn flush(t: &WebTraffic) {
     let inner = t.inner.lock().unwrap();
     if inner.dirty {
         save_persisted(t, &inner);
+    }
+    for date in stat_dates(&inner.stats) {
+        write_day_file(&t.base, &date, &inner.stats);
     }
 }
 
@@ -994,6 +1004,58 @@ fn day_from_json(v: Option<&Json>) -> DayStats {
     }
 }
 
+/// 站点统计中出现的全部日期（去重）。
+fn stat_dates(stats: &HashMap<String, SiteStats>) -> Vec<String> {
+    let mut dates: Vec<String> = Vec::new();
+    for st in stats.values() {
+        if !st.date.is_empty() && !dates.contains(&st.date) {
+            dates.push(st.date.clone());
+        }
+    }
+    dates
+}
+
+/// 跨天收尾：把仍在旧日期的站点快照写入对应历史日文件，然后滚动到新日期。
+fn close_stale_days(base: &Path, stats: &mut HashMap<String, SiteStats>, today: &str) {
+    for date in stat_dates(stats) {
+        if date != today {
+            write_day_file(base, &date, stats);
+        }
+    }
+    for st in stats.values_mut() {
+        st.roll_day(today);
+    }
+}
+
+/// 写入某日期各站点的当日快照（绝对量；同一站点重复写入为幂等覆盖）。
+fn write_day_file(base: &Path, date: &str, stats: &HashMap<String, SiteStats>) {
+    let mut sites: BTreeMap<String, SiteDay> = BTreeMap::new();
+    for (name, st) in stats {
+        if st.date != date {
+            continue;
+        }
+        let uv = st.today.uv_total();
+        if st.today.requests == 0 && st.today.bytes == 0 && uv == 0 {
+            continue;
+        }
+        sites.insert(
+            name.clone(),
+            SiteDay {
+                hits: st.today.requests,
+                bytes: st.today.bytes,
+                uv,
+                s2xx: st.today.s2xx,
+                s3xx: st.today.s3xx,
+                s4xx: st.today.s4xx,
+                s5xx: st.today.s5xx,
+            },
+        );
+    }
+    if !sites.is_empty() {
+        history::update_web(base, date, &sites);
+    }
+}
+
 /// 保存（原子写；失败仅日志）。
 fn save_persisted(t: &WebTraffic, inner: &Inner) {
     let path = persist_path(&t.base);
@@ -1446,6 +1508,57 @@ server
         assert_eq!(f.inode, 42);
         assert_eq!(f.offset, 1024);
         assert!(f.initialized);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ————— 每日归档 —————
+
+    #[test]
+    fn closes_stale_days_into_history_files() {
+        let dir = temp_dir("histclose");
+        let mut stats: HashMap<String, SiteStats> = HashMap::new();
+
+        // a.com：仍是“昨天”（9-30）的数据，跨天时应收尾归档
+        let mut a = SiteStats::default();
+        a.roll_day("2026-09-30");
+        a.add(&LogLine {
+            ip: Some("1.1.1.1".parse().unwrap()),
+            status: 200,
+            bytes: 500,
+        });
+        a.today.uv_base = 3; // 模拟历史 UV 基数
+        stats.insert("a.com".to_string(), a);
+
+        // b.com：已是“今天”（10-01）的数据
+        let mut b = SiteStats::default();
+        b.roll_day("2026-10-01");
+        b.add(&LogLine {
+            ip: None,
+            status: 500,
+            bytes: 100,
+        });
+        stats.insert("b.com".to_string(), b);
+
+        close_stale_days(&dir, &mut stats, "2026-10-01");
+
+        // 旧日归档：只含 9-30 的 a.com；UV = 基数 3 + 集合 1
+        let day = crate::history::read_day(&dir, "2026-09-30");
+        assert_eq!(day.web.sites.len(), 1, "{:?}", day.web.sites);
+        let a_day = &day.web.sites["a.com"];
+        assert_eq!(a_day.hits, 1);
+        assert_eq!(a_day.bytes, 500);
+        assert_eq!(a_day.uv, 4);
+
+        // 滚动完成：a 的今日清零、昨日保留；b 不受影响
+        let a = &stats["a.com"];
+        assert_eq!(a.date, "2026-10-01");
+        assert_eq!(a.today.requests, 0);
+        assert_eq!(a.yesterday.requests, 1);
+        assert_eq!(stats["b.com"].today.requests, 1);
+
+        // 今日未跨天收尾（b 的数据由周期写入负责）：不产生 10-01 日文件
+        assert!(!crate::history::day_path(&dir, "2026-10-01").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

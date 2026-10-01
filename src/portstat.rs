@@ -11,8 +11,13 @@
 //!
 //! 端口集合：配置 `PortTrafficPorts`（如 `22,80,443`）优先，留空自动取系统监听端口
 //! （上限 64 个）。采样间隔 5 秒；快照供 Web 面板 `/star/portTraffic` 展示。
+//!
+//! 每日归档（nft 计数模式）：按采样差分累计当日各端口收发（计数器回退时只增不减），
+//! 跨天把上一日最终值写入 `Data/traffic/{日期}.json`（见 `history` 模块）；当日累计
+//! 持久化在 `Data/port_traffic.json`（30 秒节流），重启同日续算、跨天自动收尾。
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,6 +25,7 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value as Json};
 
 use crate::config::AgentConfig;
+use crate::history;
 use crate::manager::AppManager;
 use crate::util;
 
@@ -34,6 +40,8 @@ const MAX_AUTO_PORTS: usize = 64;
 const MAX_CONFIGURED_PORTS: usize = 256;
 /// 降级后重试恢复 nft 计数的间隔。
 const RETRY_INTERVAL: Duration = Duration::from_secs(300);
+/// 采样状态与每日归档的持久化节流间隔。
+const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 /// 展示行上限（排序后截断：低端口优先，高位临时端口噪音被截断）。
 const MAX_ROWS: usize = 150;
 
@@ -135,10 +143,17 @@ struct Inner {
     last_sample: Option<Instant>,
     /// 上次尝试恢复 nft 模式的时间（降级后定期重试）
     last_retry: Option<Instant>,
+    /// 当日归档日期（本地 `%Y-%m-%d`；空 = 尚未起算）
+    day_date: String,
+    /// 当日累计（按采样差分累计；重启从 `Data/port_traffic.json` 恢复）
+    day_totals: HashMap<(Proto, u16), (u64, u64)>,
+    /// 上次持久化时间（采样状态与历史日文件的 30 秒节流）
+    last_persist: Option<Instant>,
 }
 
 /// 端口流量统计实例。
 struct PortStat {
+    base: PathBuf,
     enabled: AtomicBool,
     inner: Mutex<Inner>,
 }
@@ -153,6 +168,7 @@ pub(crate) fn start(manager: Arc<AppManager>) {
     static STARTED: std::sync::Once = std::sync::Once::new();
     STARTED.call_once(|| {
         let stat = Arc::new(PortStat {
+            base: manager.base().to_path_buf(),
             enabled: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 mode: Mode::Off,
@@ -161,8 +177,15 @@ pub(crate) fn start(manager: Arc<AppManager>) {
                 last_counters: HashMap::new(),
                 last_sample: None,
                 last_retry: None,
+                day_date: String::new(),
+                day_totals: HashMap::new(),
+                last_persist: None,
             }),
         });
+        {
+            let mut inner = stat.inner.lock().unwrap();
+            load_state(&stat.base, &mut inner);
+        }
         let _ = INSTANCE.set(stat.clone());
 
         let _ = std::thread::Builder::new()
@@ -183,6 +206,7 @@ fn run_loop(t: Arc<PortStat>, manager: Arc<AppManager>) {
     let mut last_fp: Option<(bool, String)> = None;
     loop {
         if crate::agent::SHUTDOWN.load(Ordering::SeqCst) {
+            flush(&t);
             break;
         }
 
@@ -277,8 +301,11 @@ fn retry_nft_if_degraded(t: &PortStat) {
 fn sample(t: &PortStat, cfg: &AgentConfig) {
     let views = conn_views();
     let configured = parse_port_list(&cfg.port_traffic_ports);
+    let today = history::today_string();
 
     let inner = &mut *t.inner.lock().unwrap();
+    // 历史保留清理（内部每天最多执行一次，开销可忽略）
+    history::maybe_prune(&t.base, cfg.traffic_history_days);
     match inner.mode {
         Mode::Nft => {
             let ports = if configured.is_empty() {
@@ -296,10 +323,22 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
                         .unwrap_or(0.0);
                     let (rows, counters) =
                         rows_nft(&rules, &ports, &views, &inner.last_counters, dt);
+                    // 每日归档累计（必须在 last_counters 更新前，用上一轮读数做差分）
+                    accumulate_daily(&t.base, inner, &counters, &today);
                     inner.rows = rows;
                     inner.last_counters = counters;
                     inner.last_sample = Some(now);
                     inner.message.clear();
+                    // 采样状态与历史日文件持久化（30 秒节流）
+                    let due = inner
+                        .last_persist
+                        .map(|at| at.elapsed() >= PERSIST_INTERVAL)
+                        .unwrap_or(true);
+                    if due {
+                        save_state(&t.base, inner);
+                        write_day_file(&t.base, inner);
+                        inner.last_persist = Some(Instant::now());
+                    }
                 }
                 Err(e) => {
                     // 运行中失败（nft 被移除/权限变化等）：降级连接视图
@@ -318,6 +357,148 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
         }
         Mode::Off | Mode::Unsupported => {}
     }
+}
+
+// ————— 持久化与每日归档 —————
+
+/// 采样状态持久化路径。
+fn state_path(base: &Path) -> PathBuf {
+    base.join("Data").join("port_traffic.json")
+}
+
+/// 每日归档累计：按“与上一轮读数差分”累计当日各端口收发。
+///
+/// 必须在 `last_counters` 更新前调用（差分基准）。计数器回退（计数表被重建/清空）时
+/// 差分为 0，当日累计只增不减；跨天时先把上一日最终值写入历史日文件，再开新一日。
+fn accumulate_daily(
+    base: &Path,
+    inner: &mut Inner,
+    counters: &HashMap<(Proto, u16), (u64, u64)>,
+    today: &str,
+) {
+    if inner.day_date != today {
+        write_day_file_for(base, &inner.day_date, &inner.day_totals);
+        inner.day_date = today.to_string();
+        inner.day_totals.clear();
+    }
+    for (key, cur) in counters {
+        let prev = inner.last_counters.get(key).copied().unwrap_or(*cur);
+        let entry = inner.day_totals.entry(*key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(cur.0.saturating_sub(prev.0));
+        entry.1 = entry.1.saturating_add(cur.1.saturating_sub(prev.1));
+    }
+}
+
+/// 写入当前日累计到历史日文件（空值跳过；同键重复写为幂等覆盖）。
+fn write_day_file(base: &Path, inner: &Inner) {
+    write_day_file_for(base, &inner.day_date, &inner.day_totals);
+}
+
+/// 写入指定日期的端口累计到历史日文件。
+fn write_day_file_for(base: &Path, date: &str, totals: &HashMap<(Proto, u16), (u64, u64)>) {
+    if date.is_empty() || totals.is_empty() {
+        return;
+    }
+    let mut ports: BTreeMap<String, history::PortCounters> = BTreeMap::new();
+    for ((proto, port), (rx, tx)) in totals {
+        ports.insert(
+            history::port_key(proto.text(), *port),
+            history::PortCounters { rx: *rx, tx: *tx },
+        );
+    }
+    history::update_ports(base, date, &ports);
+}
+
+/// 保存采样状态（日期 + 当日累计；失败仅日志）。
+fn save_state(base: &Path, inner: &Inner) {
+    let path = state_path(base);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let text = match serde_json::to_string_pretty(&json!({
+        "date": inner.day_date,
+        "updated": chrono::Local::now().timestamp(),
+        "totals": counters_json(&inner.day_totals),
+    })) {
+        Ok(t) => t,
+        Err(e) => {
+            util::log_error(&format!("端口流量持久化序列化失败：{e}"));
+            return;
+        }
+    };
+    if let Err(e) = dhrust::io::write_all_text_atomic(&path, &text) {
+        util::log_error(&format!("端口流量持久化写入失败：{e}"));
+    }
+}
+
+/// 计数器映射 → JSON（键 `tcp:80`，值 `[rx, tx]`）。
+fn counters_json(map: &HashMap<(Proto, u16), (u64, u64)>) -> Json {
+    let mut obj = serde_json::Map::new();
+    for ((proto, port), (rx, tx)) in map {
+        obj.insert(history::port_key(proto.text(), *port), json!([rx, tx]));
+    }
+    Json::Object(obj)
+}
+
+/// JSON → 计数器映射（非法键忽略）。
+fn counters_from_json(v: Option<&Json>) -> HashMap<(Proto, u16), (u64, u64)> {
+    let mut out = HashMap::new();
+    let Some(obj) = v.and_then(|x| x.as_object()) else {
+        return out;
+    };
+    for (key, value) in obj {
+        let Some((proto, port)) = history::parse_port_key(key) else {
+            continue;
+        };
+        let proto = match proto {
+            "tcp" => Proto::Tcp,
+            "udp" => Proto::Udp,
+            _ => continue,
+        };
+        let Some(arr) = value.as_array() else {
+            continue;
+        };
+        let rx = arr.first().and_then(|x| x.as_u64()).unwrap_or(0);
+        let tx = arr.get(1).and_then(|x| x.as_u64()).unwrap_or(0);
+        out.insert((proto, port), (rx, tx));
+    }
+    out
+}
+
+/// 恢复采样状态（不存在/损坏静默从零）。
+///
+/// - 重启发生在同日：继续累计（首帧差分为 0，仅丢失停机窗口的增量）；
+/// - 重启已跨天：先把上一日最终值写入历史日文件，再从首帧重新起算。
+fn load_state(base: &Path, inner: &mut Inner) {
+    let path = state_path(base);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Ok(v) = serde_json::from_str::<Json>(&text) else {
+        return;
+    };
+    let date = v.get("date").and_then(|x| x.as_str()).unwrap_or("");
+    if date.is_empty() {
+        return;
+    }
+    let totals = counters_from_json(v.get("totals"));
+    if date != history::today_string() {
+        // 跨天重启：收尾上一日（日期留空，等待首帧采样重新起算）
+        write_day_file_for(base, date, &totals);
+        return;
+    }
+    inner.day_date = date.to_string();
+    inner.day_totals = totals;
+}
+
+/// 退出前落盘（不等节流窗口）。
+fn flush(t: &PortStat) {
+    let inner = t.inner.lock().unwrap();
+    if inner.day_date.is_empty() {
+        return;
+    }
+    save_state(&t.base, &inner);
+    write_day_file(&t.base, &inner);
 }
 
 // ————— 面板快照 —————
@@ -1059,5 +1240,104 @@ mod tests {
             .unwrap();
         assert!(t22.listen);
         assert_eq!(t22.conns, 2);
+    }
+
+    // ————— 每日归档 —————
+
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-portstat-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn empty_inner() -> Inner {
+        Inner {
+            mode: Mode::Nft,
+            message: String::new(),
+            rows: Vec::new(),
+            last_counters: HashMap::new(),
+            last_sample: None,
+            last_retry: None,
+            day_date: String::new(),
+            day_totals: HashMap::new(),
+            last_persist: None,
+        }
+    }
+
+    #[test]
+    fn daily_accumulates_deltas_and_closes_on_rollover() {
+        let base = temp_base("daily");
+        let mut inner = empty_inner();
+        let key = (Proto::Tcp, 80);
+
+        let mut counters = HashMap::new();
+        counters.insert(key, (100u64, 200u64));
+        // 首帧：无差分基线，只建立基准不计入
+        accumulate_daily(&base, &mut inner, &counters, "2026-10-01");
+        assert_eq!(inner.day_totals.get(&key), Some(&(0, 0)));
+        inner.last_counters = counters.clone();
+
+        // 次帧：+50/+100
+        counters.insert(key, (150, 300));
+        accumulate_daily(&base, &mut inner, &counters, "2026-10-01");
+        assert_eq!(inner.day_totals.get(&key), Some(&(50, 100)));
+        inner.last_counters = counters.clone();
+
+        // 计数表重建（读数回退）：差分为 0，累计不回归
+        counters.insert(key, (10, 10));
+        accumulate_daily(&base, &mut inner, &counters, "2026-10-01");
+        assert_eq!(inner.day_totals.get(&key), Some(&(50, 100)));
+        inner.last_counters = counters.clone();
+
+        // 跨天：旧日写入历史（tcp:80 收 50 发 100），新日连续累计
+        counters.insert(key, (60, 80));
+        accumulate_daily(&base, &mut inner, &counters, "2026-10-02");
+        assert_eq!(inner.day_date, "2026-10-02");
+        assert_eq!(inner.day_totals.get(&key), Some(&(50, 70)));
+        let day = crate::history::read_day(&base, "2026-10-01");
+        assert_eq!(
+            day.ports.get("tcp:80"),
+            Some(&crate::history::PortCounters { rx: 50, tx: 100 })
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn state_roundtrip_and_stale_day_close() {
+        let base = temp_base("state");
+
+        // 同日恢复：累计继续（不写历史）
+        let mut same = empty_inner();
+        same.day_date = crate::history::today_string();
+        same.day_totals.insert((Proto::Udp, 53), (7, 9));
+        save_state(&base, &same);
+        let mut back = empty_inner();
+        load_state(&base, &mut back);
+        assert_eq!(back.day_date, crate::history::today_string());
+        assert_eq!(back.day_totals.get(&(Proto::Udp, 53)), Some(&(7, 9)));
+
+        // 跨天恢复：收尾写历史，日期置空等待首帧重起
+        let mut stale = empty_inner();
+        stale.day_date = "1999-01-01".to_string();
+        stale.day_totals.insert((Proto::Tcp, 22), (1, 2));
+        save_state(&base, &stale);
+        let mut back2 = empty_inner();
+        load_state(&base, &mut back2);
+        assert!(back2.day_date.is_empty());
+        let day = crate::history::read_day(&base, "1999-01-01");
+        assert_eq!(
+            day.ports.get("tcp:22"),
+            Some(&crate::history::PortCounters { rx: 1, tx: 2 })
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

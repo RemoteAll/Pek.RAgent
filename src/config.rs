@@ -73,6 +73,8 @@ pub struct AgentConfig {
     pub port_traffic: bool,
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
+    /// 流量历史保留天数（每日归档 `Data/traffic/{日期}.json`）。默认 90；0 = 永久保留
+    pub traffic_history_days: u32,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -107,6 +109,8 @@ impl Default for AgentConfig {
             // 关闭/卸载自动清理；无 nft/权限不足自动降级连接视图，Windows 为连接视图）
             port_traffic: true,
             port_traffic_ports: String::new(),
+            // 流量历史：每日归档保留 90 天（0 = 永久）
+            traffic_history_days: 90,
             apps: sample_apps(),
         }
     }
@@ -325,6 +329,13 @@ impl AgentConfig {
         }
         self.web_logs = self.web_logs.trim().to_string();
         self.port_traffic_ports = self.port_traffic_ports.trim().to_string();
+        // 流量历史保留天数：0 = 永久；非 0 时限定 7~3650 天（防误配清空全部历史）
+        if self.traffic_history_days != 0 {
+            self.traffic_history_days = self.traffic_history_days.clamp(
+                crate::history::MIN_RETENTION_DAYS,
+                crate::history::MAX_RETENTION_DAYS,
+            );
+        }
 
         for app in &mut self.apps {
             let name = app.name.trim().to_string();
@@ -527,6 +538,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "PortTrafficPorts") {
         cfg.port_traffic_ports = v;
     }
+    if let Some(v) = parse_of::<u32>(obj, "TrafficHistoryDays") {
+        cfg.traffic_history_days = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -639,6 +653,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebLogs", cfg.web_logs.clone());
         push("PortTraffic", bool_text(cfg.port_traffic));
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
+        push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -893,7 +908,7 @@ mod tests {
     fn traffic_config_reads_renders_and_normalizes() {
         // XML 读取路径（XML 值在 JSON 形态下是字符串）
         let json: Json = serde_json::from_str(
-            r#"{ "WebTraffic": "false", "WebLogs": "a=/tmp/a.log", "PortTraffic": "true", "PortTrafficPorts": "22,80" }"#,
+            r#"{ "WebTraffic": "false", "WebLogs": "a=/tmp/a.log", "PortTraffic": "true", "PortTrafficPorts": "22,80", "TrafficHistoryDays": "30" }"#,
         )
         .unwrap();
         let cfg = config_from_json(&json);
@@ -901,19 +916,28 @@ mod tests {
         assert_eq!(cfg.web_logs, "a=/tmp/a.log");
         assert!(cfg.port_traffic);
         assert_eq!(cfg.port_traffic_ports, "22,80");
+        assert_eq!(cfg.traffic_history_days, 30);
 
         // 默认值：网站与端口流量均默认开启（端口流量在 Linux 为独立计数表，只计数不改转发，
         // 无 nft/权限不足自动降级；关闭/卸载自动清理）
         let mut cfg = AgentConfig::default();
         assert!(cfg.web_traffic);
         assert!(cfg.port_traffic);
+        assert_eq!(cfg.traffic_history_days, 90, "默认保留 90 天");
 
-        // 归一化：两侧空白清理
+        // 归一化：两侧空白清理；保留天数下限 7 天
         cfg.web_logs = "  x=/tmp/x.log ".to_string();
         cfg.port_traffic_ports = " 22 ".to_string();
+        cfg.traffic_history_days = 2;
         cfg.normalize();
         assert_eq!(cfg.web_logs, "x=/tmp/x.log");
         assert_eq!(cfg.port_traffic_ports, "22");
+        assert_eq!(cfg.traffic_history_days, 7, "非 0 下限 7 天");
+
+        // 0 = 永久保留（不被下限修正）
+        cfg.traffic_history_days = 0;
+        cfg.normalize();
+        assert_eq!(cfg.traffic_history_days, 0);
 
         // 渲染：模板骨架带上新字段（注释由模板保障）
         let text = render_xml(&cfg, None).unwrap();
@@ -922,6 +946,10 @@ mod tests {
         assert!(text.contains("<PortTraffic>true</PortTraffic>"), "{text}");
         assert!(
             text.contains("<PortTrafficPorts>22</PortTrafficPorts>"),
+            "{text}"
+        );
+        assert!(
+            text.contains("<TrafficHistoryDays>0</TrafficHistoryDays>"),
             "{text}"
         );
     }

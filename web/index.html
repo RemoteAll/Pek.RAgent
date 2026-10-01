@@ -304,6 +304,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <script>
 let token='',timer=null,statusData=null,logFiles=[],currentLogFile=null;
 let svcTimer=null,starTimer=null,trafficTimer=null;
+let histData=null,histDays=30,histSite='',histStamp=''; // 流量历史（每日归档）
 let cmdHistory=JSON.parse(sessionStorage.getItem('agent_cmd_history')||'[]');
 const $=id=>document.getElementById(id);
 
@@ -339,6 +340,8 @@ function showApp(){
  $('login').style.display='none';$('app').style.display='block';
  loadDashboard();timer=setInterval(loadDashboard,3000);
  loadServices();svcTimer=setInterval(loadServices,3000);
+ // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法时保持默认“状态”页）
+ restorePanelFromHash();
 }
 
 async function api(url,opt={}){
@@ -385,10 +388,33 @@ function switchPanel(name){
  };
  if(loaders[name])loaders[name]();
  if(name==='traffic')trafficTimer=setInterval(loadTraffic,3000);
+ // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录）
+ if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);
+}
+
+// 从 URL hash 解析页签名（非法/缺省返回空串；与导航实际页签比对，避免选择器注入）
+function panelFromHash(){
+ const h=(location.hash||'').replace(/^#\/?/,'');
+ if(!h)return '';
+ return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===h)?h:'';
+}
+// 恢复上次所在页签；缺省/状态页时不切换（仅规范化 hash）
+function restorePanelFromHash(){
+ const h=panelFromHash();
+ if(h&&h!=='dashboard'){switchPanel(h);}
+ else if(location.hash!=='#dashboard'){history.replaceState(null,'','#dashboard');}
 }
 
 document.querySelector('#nav-bar').addEventListener('click',e=>{
  const a=e.target.closest('a[data-panel]');if(!a)return;switchPanel(a.dataset.panel);
+});
+
+// 手动修改 hash（或历史前进/后退）时同步切换页签
+window.addEventListener('hashchange',()=>{
+ const h=panelFromHash();
+ if(!h)return;
+ const link=[...document.querySelectorAll('nav a[data-panel]')].find(a=>a.dataset.panel===h);
+ if(link&&!link.classList.contains('active'))switchPanel(h);
 });
 
 /* ── Dashboard ── */
@@ -646,6 +672,19 @@ function ensureTrafficShell(){
   <div class="glass-card card">
    <h2>🔌 端口流量 <span id="port-traffic-mode" style="font-size:11px;font-weight:400;color:var(--text-tertiary)"></span></h2>
    <div id="port-traffic-body"><p class="text-muted">加载中…</p></div>
+  </div>
+  <div class="glass-card card">
+   <h2>🗓 历史数据 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">每日归档（跨天自动保存）· 保留 <span id="hist-retention">—</span> 天</span></h2>
+   <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px">
+    <span class="chart-tabs" id="hist-ranges"></span>
+    <select id="hist-site" onchange="histSite=this.value;renderHistChart();renderHistTable();" style="max-width:240px"></select>
+    <span style="flex:1"></span>
+    <button class="btn btn-ghost btn-sm" onclick="loadTrafficHistory(true)">🔄 刷新</button>
+   </div>
+   <div id="hist-chart"><p class="text-muted">加载中…</p></div>
+   <div id="traffic-history-body" class="mt-16"></div>
+   <div class="section-title mt-16">端口每日流量（Linux nftables 计数）</div>
+   <div id="port-history-body"><p class="text-muted">加载中…</p></div>
   </div>`;
 }
 async function loadTraffic(){
@@ -654,6 +693,10 @@ async function loadTraffic(){
   const [w,p]=await Promise.all([api('/star/webTraffic'),api('/star/portTraffic')]);
   renderWebTraffic(w.code===0?w.data:null);
   renderPortTraffic(p.code===0?p.data:null);
+  // 历史数据：首次进入拉取；跨天（本地日期变化）自动刷新；其余轮询不重复请求
+  const stamp=new Date().toDateString();
+  if(stamp!==histStamp){histStamp=stamp;loadTrafficHistory(true)}
+  else loadTrafficHistory(false);
  }catch(e){}
 }
 function renderWebTraffic(d){
@@ -703,6 +746,97 @@ function renderPortTraffic(d){
    <td>${fmtRate(r.rxBps)}</td>
    <td>${fmtRate(r.txBps)}</td>
   </tr>`;
+ });
+ el.innerHTML=html+`</table>`;
+}
+
+/* ── 流量历史（每日归档） ── */
+async function loadTrafficHistory(force){
+ if(histData&&!force)return;
+ try{
+  const r=await api('/star/trafficHistory?days=90');
+  if(r.code===0){histData=r.data||{days:[]};renderTrafficHistory()}
+ }catch(e){}
+}
+function renderTrafficHistory(){
+ const ret=$('hist-retention');if(ret)ret.textContent=(histData&&histData.retentionDays!=null)?histData.retentionDays:'—';
+ renderHistRanges();renderHistSites();renderHistChart();renderHistTable();renderPortHistory();
+}
+function histSetDays(n){histDays=n;renderHistRanges();renderHistChart();renderHistTable()}
+function renderHistRanges(){
+ const el=$('hist-ranges');if(!el)return;
+ el.innerHTML=[7,30,90].map(n=>`<span class="chart-tab${n===histDays?' active':''}" onclick="histSetDays(${n})">最近 ${n} 天</span>`).join('');
+}
+function histAllDays(){return (histData&&histData.days)||[]}
+function histViewDays(){return histAllDays().slice(-histDays)}
+function histDayAgg(d){ // 按站点过滤聚合当日数据（全部站点时 UV 为各站之和，可能有重复）
+ const sites=(d&&d.web&&d.web.sites)||{};
+ let a={hits:0,bytes:0,uv:0,s2xx:0,s3xx:0,s4xx:0,s5xx:0};
+ if(histSite){const s=sites[histSite];if(!s)return a;return {hits:s.hits||0,bytes:s.bytes||0,uv:s.uv||0,s2xx:s.s2xx||0,s3xx:s.s3xx||0,s4xx:s.s4xx||0,s5xx:s.s5xx||0}}
+ for(const k in sites){const s=sites[k];a.hits+=s.hits||0;a.bytes+=s.bytes||0;a.uv+=s.uv||0;a.s2xx+=s.s2xx||0;a.s3xx+=s.s3xx||0;a.s4xx+=s.s4xx||0;a.s5xx+=s.s5xx||0}
+ return a;
+}
+function renderHistSites(){
+ const el=$('hist-site');if(!el)return;
+ const names=new Set();
+ histAllDays().forEach(d=>{const s=(d.web&&d.web.sites)||{};Object.keys(s).forEach(k=>names.add(k))});
+ const list=[...names].sort();
+ if(histSite&&!names.has(histSite))histSite='';
+ el.innerHTML=`<option value="">全部站点</option>`+list.map(n=>`<option value="${escAttr(n)}"${n===histSite?' selected':''}>${esc(n)}</option>`).join('');
+}
+function renderHistChart(){
+ const el=$('hist-chart');if(!el)return;
+ if(!histData){el.innerHTML='<p class="text-muted">加载中…</p>';return}
+ const days=histViewDays().filter(d=>{const a=histDayAgg(d);return a.hits>0||a.bytes>0});
+ if(!days.length){el.innerHTML=`<p class="text-muted">暂无历史数据（跨天后自动归档；刚启用时需运行至次日零点）</p>`;return}
+ const vals=days.map(d=>histDayAgg(d).bytes);
+ const max=Math.max(...vals,1);
+ const W=720,H=190,padL=58,padR=10,padT=12,padB=26;
+ const innerW=W-padL-padR,innerH=H-padT-padB,step=innerW/days.length;
+ const bw=Math.max(2,Math.min(26,step-3));
+ let bars='';
+ days.forEach((d,i)=>{
+  const a=histDayAgg(d);
+  const h=Math.max(1,Math.round(innerH*(a.bytes/max)));
+  const x=padL+i*step+(step-bw)/2,y=H-padB-h;
+  bars+=`<rect x="${x.toFixed(1)}" y="${y}" width="${bw.toFixed(1)}" height="${h}" rx="2" fill="url(#histGrad)"><title>${esc(d.date)}：流量 ${fmtBytes(a.bytes)} · 请求 ${a.hits} · 独立IP ${a.uv}</title></rect>`;
+ });
+ let grid='';
+ [0,0.5,1].forEach(f=>{const y=H-padB-innerH*f;grid+=`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="rgba(128,128,128,0.25)" stroke-width="1"${f===0?'':' stroke-dasharray="3,3"'}/><text x="${padL-8}" y="${y+3}" text-anchor="end" font-size="10" fill="var(--text-tertiary)">${fmtBytes(Math.round(max*f))}</text>`});
+ let xs='';const skip=Math.max(1,Math.ceil(days.length/7));
+ days.forEach((d,i)=>{if(i%skip===0||i===days.length-1){const x=padL+i*step+step/2;xs+=`<text x="${x.toFixed(1)}" y="${H-8}" text-anchor="middle" font-size="10" fill="var(--text-tertiary)">${esc(d.date.slice(5))}</text>`}});
+ el.innerHTML=`<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto"><defs><linearGradient id="histGrad" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3b82f6"/><stop offset="1" stop-color="#3b82f6" stop-opacity="0.35"/></linearGradient></defs>${grid}${bars}${xs}</svg>`;
+}
+function renderHistTable(){
+ const el=$('traffic-history-body');if(!el)return;
+ if(!histData){el.innerHTML='';return}
+ const days=histViewDays().slice().reverse();
+ if(!days.length){el.innerHTML='';return}
+ let sum={hits:0,bytes:0,uv:0,s4xx:0,s5xx:0};
+ let html=`<table class="info-table"><tr>`+['日期','请求','流量','独立IP','4xx / 5xx'].map(h=>`<td style="${TH}">${h}</td>`).join('')+`</tr>`;
+ days.forEach(d=>{
+  const a=histDayAgg(d);sum.hits+=a.hits;sum.bytes+=a.bytes;sum.uv+=a.uv;sum.s4xx+=a.s4xx;sum.s5xx+=a.s5xx;
+  html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td>${a.hits}</td><td>${fmtBytes(a.bytes)}</td><td>${a.uv}</td><td><span class="${a.s4xx?'text-yellow':'text-muted'}">${a.s4xx}</span> / <span class="${a.s5xx?'text-red':'text-muted'}">${a.s5xx}</span></td></tr>`;
+ });
+ html+=`<tr><td style="${TH}">合计（${days.length} 天）</td><td style="${TH}">${sum.hits}</td><td style="${TH}">${fmtBytes(sum.bytes)}</td><td style="${TH}">≈${sum.uv}</td><td style="${TH}">${sum.s4xx} / ${sum.s5xx}</td></tr>`;
+ el.innerHTML=html+`</table>`;
+}
+function renderPortHistory(){
+ const el=$('port-history-body');if(!el)return;
+ if(!histData){el.innerHTML='<p class="text-muted">加载中…</p>';return}
+ const days=histViewDays().slice().reverse();
+ const any=days.some(d=>d.ports&&Object.keys(d.ports).length);
+ if(!any){el.innerHTML='<p class="text-muted">暂无端口历史（仅 Linux nftables 计数模式按天归档；连接视图/Windows 无字节数）</p>';return}
+ let html=`<table class="info-table"><tr><td style="${TH}">日期</td><td style="${TH}">主要端口（接收 / 发送）</td></tr>`;
+ days.forEach(d=>{
+  const ports=d.ports||{},keys=Object.keys(ports);
+  let text='—';
+  if(keys.length){
+   keys.sort((a,b)=>((ports[b].rx||0)+(ports[b].tx||0))-((ports[a].rx||0)+(ports[a].tx||0)));
+   text=keys.slice(0,5).map(k=>`<span style="font-family:var(--font-mono)">${esc(k)}</span> <span class="text-muted">收</span> ${fmtBytes(ports[k].rx||0)} <span class="text-muted">发</span> ${fmtBytes(ports[k].tx||0)}`).join('&emsp;');
+   if(keys.length>5)text+=`&emsp;<span class="text-muted">…等 ${keys.length} 个端口</span>`;
+  }
+  html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td style="font-size:12px">${text}</td></tr>`;
  });
  el.innerHTML=html+`</table>`;
 }

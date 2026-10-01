@@ -11,6 +11,7 @@ mod app;
 mod cli;
 mod config;
 mod deploy;
+mod history;
 mod manager;
 mod netc;
 mod portstat;

@@ -4,7 +4,8 @@
 //! - `/api/*`：login / logout / status / control / freeMemory / configMetadata /
 //!   updateConfig / changePassword / logs / logFiles / health / watchdog / syncTime
 //! - `/star/*`：services / startService / stopService / restartService / addService /
-//!   removeService / getStarConfig / updateStarConfig / machine / getProcessList
+//!   removeService / getStarConfig / updateStarConfig / machine / webTraffic / portTraffic /
+//!   trafficHistory / getProcessList
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
 //!
 //! 鉴权级别由 `WebAuthLevel` 控制（对齐 C# `ParseAuthLevel`）：`None` 全部放行 /
@@ -351,6 +352,8 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("webTraffic", move |ctx| web_traffic(&p, ctx));
     let p = panel.clone();
     controller = controller.get("portTraffic", move |ctx| port_traffic(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("trafficHistory", move |ctx| traffic_history(&p, ctx));
     controller.get("getProcessList", move |ctx| get_process_list(&panel, ctx))
 }
 
@@ -561,6 +564,27 @@ fn port_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(crate::portstat::snapshot_json()))
 }
 
+/// 流量历史（`/star/trafficHistory?days=30`）：每日归档（网站+端口）按日期升序。
+fn traffic_history(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let days = arg(ctx, "days")
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(30)
+        .clamp(1, crate::history::MAX_RETENTION_DAYS as usize);
+    let cfg = panel.manager.config();
+    json_result(
+        0,
+        "",
+        Some(crate::history::snapshot_json(
+            panel.manager.base(),
+            days,
+            cfg.traffic_history_days,
+        )),
+    )
+}
+
 /// 速率格式化（人类可读）。
 fn format_speed(bps: u64) -> String {
     const KB: f64 = 1024.0;
@@ -671,6 +695,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("WebLogs", "网站日志（名称=路径;…）", "String", cfg.web_logs.clone(), "手动配置站点日志（绝对路径，分号分隔多条），自动发现不到时补充；修改后自动生效"),
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
         config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
+        config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档 Data/traffic/{日期}.json 的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -1570,6 +1595,13 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         "weblogs" => set_string(value, |s| cfg.web_logs = s),
         "porttraffic" => set_bool(value, |b| cfg.port_traffic = b),
         "porttrafficports" => set_string(value, |s| cfg.port_traffic_ports = s),
+        "traffichistorydays" => match value_u64(value) {
+            Some(v) if v <= crate::history::MAX_RETENTION_DAYS as u64 => {
+                cfg.traffic_history_days = v as u32;
+                true
+            }
+            _ => false,
+        },
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -1717,6 +1749,8 @@ mod tests {
         assert_eq!(body_json(r)["code"], 401);
         let r = port_traffic(&panel, &context("GET", "/star/portTraffic", "", None));
         assert_eq!(body_json(r)["code"], 401);
+        let r = traffic_history(&panel, &context("GET", "/star/trafficHistory", "", None));
+        assert_eq!(body_json(r)["code"], 401);
 
         // 鉴权后：返回快照信封（模块未启动时为占位数据，但结构完整）
         let ok = login(
@@ -1740,6 +1774,14 @@ mod tests {
         assert_eq!(j["code"], 0);
         assert!(j["data"].get("ports").is_some());
         assert!(j["data"].get("mode").is_some());
+
+        let j = body_json(traffic_history(
+            &panel,
+            &context("GET", "/star/trafficHistory", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        assert!(j["data"].get("days").is_some());
+        assert!(j["data"].get("retentionDays").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

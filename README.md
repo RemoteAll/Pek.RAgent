@@ -25,7 +25,7 @@
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
 | Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗/服务器校时；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
 | 资源采样器 | 后台线程按 `SampleInterval`（默认 1 秒）采样整机 CPU/网络/磁盘/TCP/线程句柄并缓存；面板请求读快照（多客户端读数一致、请求零采集；CPU 与任务管理器/宝塔同粒度）；`SampleInterval=0` 可关闭改由请求时现采 |
-| 流量统计 | **网站流量**（解析 nginx/Apache/Caddy 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled` 等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`） |
+| 流量统计 | **网站流量**（解析 nginx/Apache/Caddy 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled` 等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 `Data/traffic/{日期}.json`，网站按站点、端口按天），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
@@ -265,6 +265,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `WebLogs` | 空 | 网站日志手动配置：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
 | `PortTraffic` | `true` | 端口流量统计开关（默认开启）：Linux 在独立 nftables 表 `inet pek_stats` 中按端口计数收发字节（需 root 与 `nft` 命令；**只计数不改转发**，关闭/卸载时自动删表）；无 nft 或权限不足、Windows/其它平台自动降级为连接视图（无字节数） |
 | `PortTrafficPorts` | 空 | 端口流量统计端口列表：`22,80,443`（逗号分隔）；留空自动取系统监听端口（上限 64 个） |
+| `TrafficHistoryDays` | `90` | 流量历史保留天数：每日归档 `Data/traffic/{日期}.json`（网站按站点、端口按天；跨天自动保存、进程重启续算不重复）；`7~3650`，`0`=永久保留 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）
@@ -403,9 +404,9 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 - **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
 - **日志**：`Log/` 目录文件列表与尾部内容查看（支持行数/文件/级别过滤）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
-- **流量**：**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图）；进入页签时 3 秒轮询、离开即停。
+- **流量**：**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图）+ **历史数据**（每日归档 `Data/traffic/{日期}.json`：趋势柱状图 + 按天明细 + 端口每日流量，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
 
-接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。
+接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。面板页签由 URL hash 记忆（如 `http://127.0.0.1:5500/#traffic`），刷新/重新登录后停留在当前页。
 
 | 端点 | 说明 |
 |------|------|
@@ -421,6 +422,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
 | `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
 | `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制） |
+| `GET /star/trafficHistory` | 流量历史每日归档（`?days=90` 最近 N 天：网站按站/端口按天数据与保留天数） |
 
 > `GET /star/services` 对运行中的应用额外返回 `CpuRate`（占整机 CPU %，按面板轮询间隔差分）与 `MemoryMB`（Rust 扩展字段；C# 面板反序列化忽略未知字段）。
 
@@ -510,7 +512,7 @@ src/
 - [ ] StarServer / StarWeb 对接（登录、心跳、指令下发）
 - [x] Web 管理面板（子服务 CRUD / 日志 / 配置在线修改 / 看门狗 / 本机信息）
 - [x] UDP 5500 本地 RPC（与 C# StarAgent 的 UDP 指令互通；DHDeploy 新版链路实测打通）
-- [x] 流量统计（网站：访问日志增量解析+持久化续读；端口：Linux nftables 计数表/连接视图）
+- [x] 流量统计（网站：访问日志增量解析+持久化续读；端口：Linux nftables 计数表/连接视图；每日归档 `Data/traffic` + 面板历史趋势）
 - [ ] 自身升级（`-upgrade` 完整实现）与 `-repair`
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
 - [ ] 进程按名称接管 / 多实例精确匹配
