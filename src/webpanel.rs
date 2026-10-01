@@ -669,7 +669,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
         config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点 + WebLogs 手动补充），零侵入只读；修改后自动生效"),
         config_item("WebLogs", "网站日志（名称=路径;…）", "String", cfg.web_logs.clone(), "手动配置站点日志（绝对路径，分号分隔多条），自动发现不到时补充；修改后自动生效"),
-        config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "Linux 创建 nftables 计数表统计各端口收发流量（需 root）；Windows/无 nft 时降级为连接视图；修改后自动生效"),
+        config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
         config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),

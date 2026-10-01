@@ -68,7 +68,8 @@ pub struct AgentConfig {
     pub web_traffic: bool,
     /// 网站日志手动配置。`名称=路径;名称2=路径2`；自动发现不到时的补充（如 Caddy 自定义日志）
     pub web_logs: String,
-    /// 端口流量统计。Linux 使用 nftables 独立计数表（需 root），默认关闭
+    /// 端口流量统计。Linux 创建独立 nftables 计数表（只计数不改转发，关闭/卸载自动清理；
+    /// 无 nft 或权限不足时自动降级为连接视图），默认开启
     pub port_traffic: bool,
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
@@ -102,8 +103,9 @@ impl Default for AgentConfig {
             // 网站流量：只读日志文件、无系统副作用，默认开启（面板直接可见）
             web_traffic: true,
             web_logs: String::new(),
-            // 端口流量：Linux 会创建 nftables 计数表（系统级改动），默认关闭，需显式启用
-            port_traffic: false,
+            // 端口流量：默认开启——Linux 创建独立 nftables 计数表（只计数、不改转发、
+            // 关闭/卸载自动清理；无 nft/权限不足自动降级连接视图，Windows 为连接视图）
+            port_traffic: true,
             port_traffic_ports: String::new(),
             apps: sample_apps(),
         }
@@ -900,10 +902,11 @@ mod tests {
         assert!(cfg.port_traffic);
         assert_eq!(cfg.port_traffic_ports, "22,80");
 
-        // 默认值：网站流量开启（只读无副作用）；端口流量关闭（系统级改动）
+        // 默认值：网站与端口流量均默认开启（端口流量在 Linux 为独立计数表，只计数不改转发，
+        // 无 nft/权限不足自动降级；关闭/卸载自动清理）
         let mut cfg = AgentConfig::default();
         assert!(cfg.web_traffic);
-        assert!(!cfg.port_traffic);
+        assert!(cfg.port_traffic);
 
         // 归一化：两侧空白清理
         cfg.web_logs = "  x=/tmp/x.log ".to_string();
@@ -916,7 +919,7 @@ mod tests {
         let text = render_xml(&cfg, None).unwrap();
         assert!(text.contains("<WebTraffic>true</WebTraffic>"), "{text}");
         assert!(text.contains("<WebLogs>x=/tmp/x.log</WebLogs>"), "{text}");
-        assert!(text.contains("<PortTraffic>false</PortTraffic>"), "{text}");
+        assert!(text.contains("<PortTraffic>true</PortTraffic>"), "{text}");
         assert!(
             text.contains("<PortTrafficPorts>22</PortTrafficPorts>"),
             "{text}"
