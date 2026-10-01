@@ -1505,82 +1505,12 @@ fn is_virtual_adapter(description: &str) -> bool {
         .any(|e| lower.contains(&e.to_ascii_lowercase()))
 }
 
-/// 解析 `/proc/net/dev`，返回每个非回环接口的 `(名称, 接收字节, 发送字节)`。
-///
-/// 格式：前两行为表头，其后每行 `ifname: rx_bytes ... tx_bytes ...`（冒号后第 1 列为接收、
-/// 第 9 列为发送）。
-#[cfg(any(target_os = "linux", test))]
-fn parse_net_dev_entries(text: &str) -> Vec<(String, u64, u64)> {
-    let mut out = Vec::new();
-    for line in text.lines().skip(2) {
-        let Some((name, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let name = name.trim();
-        if name.is_empty() || name == "lo" {
-            continue;
-        }
-        let cols: Vec<&str> = rest.split_whitespace().collect();
-        if cols.len() < 9 {
-            continue;
-        }
-        out.push((
-            name.to_string(),
-            cols[0].parse::<u64>().unwrap_or(0),
-            cols[8].parse::<u64>().unwrap_or(0),
-        ));
-    }
-    out
-}
+// `/proc/net/dev` 解析已下沉到 `dhrust::sys::net`（2026-10-01，三项目共用）。
 
-/// 汇总 `/proc/net/dev` 非回环接口的 `(接收字节, 发送字节)`。
-#[cfg(any(target_os = "linux", test))]
-fn parse_net_dev(text: &str) -> (u64, u64) {
-    parse_net_dev_entries(text)
-        .into_iter()
-        .fold((0, 0), |(rx, tx), (_, r, t)| (rx + r, tx + t))
-}
-
-/// 枚举网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡，取 IPv4）。
 /// 本机网络总流量（接收字节, 发送字节）。用于面板速率差分计算。
+/// 实现已下沉到 `dhrust::sys::net::net_totals`（2026-10-01，三项目共用）。
 pub(crate) fn net_total_bytes() -> Option<(u64, u64)> {
-    #[cfg(target_os = "linux")]
-    {
-        // /proc/net/dev 单文件汇总（内核 2.2+ 恒提供，容器/OpenVZ 同样可用）；
-        // 不再逐接口读 /sys，避免个别接口缺失时整体失败导致速率恒为 0
-        let text = std::fs::read_to_string("/proc/net/dev").ok()?;
-        Some(parse_net_dev(&text))
-    }
-    #[cfg(windows)]
-    {
-        use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
-
-        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
-        let ret = unsafe { GetIfTable2(&mut table) };
-        if ret != 0 || table.is_null() {
-            return None;
-        }
-        let mut rx_total = 0u64;
-        let mut tx_total = 0u64;
-        unsafe {
-            let t = &*table;
-            for i in 0..t.NumEntries as usize {
-                let row = &*t.Table.as_ptr().add(i);
-                // 过滤软件回环（IfType=24）
-                if row.Type == 24 {
-                    continue;
-                }
-                rx_total += row.InOctets;
-                tx_total += row.OutOctets;
-            }
-            FreeMibTable(table as *const _);
-        }
-        Some((rx_total, tx_total))
-    }
-    #[cfg(not(any(target_os = "linux", windows)))]
-    {
-        None
-    }
+    dhrust::sys::net::net_totals().map(|(rx, tx, _)| (rx, tx))
 }
 
 /// 磁盘 IO 累计统计（读/写完成次数与字节数）。
@@ -1873,7 +1803,7 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     {
         // 每网卡累计收发：/proc/net/dev 单文件源（任一接口缺失不影响其他接口）
         let dev_entries = std::fs::read_to_string("/proc/net/dev")
-            .map(|t| parse_net_dev_entries(&t))
+            .map(|t| dhrust::sys::net::parse_net_dev_entries(&t))
             .unwrap_or_default();
         let mut out = Vec::new();
         let Ok(dir) = std::fs::read_dir("/sys/class/net") else {
@@ -1923,63 +1853,7 @@ pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     }
 }
 
-/// 临时/虚拟文件系统类型黑名单（对齐 DHDeploy `IsTemporaryVolume`）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-const TEMP_FS_TYPES: &[&str] = &[
-    "tmpfs",
-    "devtmpfs",
-    "devfs",
-    "overlay",
-    "ramfs",
-    "squashfs",
-    "aufs",
-    "proc",
-    "sysfs",
-    "cgroup",
-    "cgroup2",
-    "pstore",
-    "debugfs",
-    "mqueue",
-    "hugetlbfs",
-    "autofs",
-    "configfs",
-    "securityfs",
-    "binfmt_misc",
-    "rpc_pipefs",
-    "devpts",
-];
-
-/// 挂载点归一：去除尾部斜杠（根 `/` 除外），与 `/proc/mounts` 及 df 输出对齐。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn mount_key(mount: &str) -> &str {
-    if mount.len() > 1 {
-        mount.trim_end_matches('/')
-    } else {
-        mount
-    }
-}
-
-/// 是否为临时/虚拟文件系统挂载（对齐 DHDeploy `IsTemporaryVolume`）：
-/// ① 文件系统类型黑名单（tmpfs/overlay/squashfs 等）；② 引导分区 `/boot`、`/boot/efi`；
-/// ③ `/sys`、`/proc`、`/dev`、`/run`、`/snap` 等系统虚拟目录（含子路径）。
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn is_temporary_mount(mount: &str, fs_type: &str) -> bool {
-    if TEMP_FS_TYPES.iter().any(|t| t.eq_ignore_ascii_case(fs_type)) {
-        return true;
-    }
-    let mount = mount_key(mount);
-    if mount == "/boot" || mount == "/boot/efi" {
-        return true;
-    }
-    for prefix in ["/sys", "/proc", "/dev", "/run", "/snap"] {
-        if let Some(rest) = mount.strip_prefix(prefix) {
-            if rest.is_empty() || rest.starts_with('/') {
-                return true;
-            }
-        }
-    }
-    false
-}
+// 挂载过滤（TEMP_FS_TYPES / mount_key / is_temporary_mount）已下沉到 `dhrust::sys::disk`（2026-10-01，三项目共用）。
 
 /// 枚举磁盘（对齐 C# `ShowMachineInfo`：全量枚举并标注类型）。
 pub(crate) fn disks() -> Vec<DiskItem> {
@@ -2062,12 +1936,13 @@ pub(crate) fn disks() -> Vec<DiskItem> {
             if !dev.starts_with("/dev/") {
                 continue;
             }
-            // 过滤引导分区与系统虚拟文件系统（对齐 DHDeploy `IsTemporaryVolume`）
-            if is_temporary_mount(mp, fs) {
+            // 八进制转义还原（\040 等）；过滤引导分区与系统虚拟文件系统（对齐 DHDeploy `IsTemporaryVolume`）
+            let mount = dhrust::sys::disk::unescape_mount(mp);
+            if dhrust::sys::disk::is_temporary_mount(&mount, Some(fs)) {
                 continue;
             }
             let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
-            let Ok(path) = std::ffi::CString::new(mp) else {
+            let Ok(path) = std::ffi::CString::new(mount.as_str()) else {
                 continue;
             };
             let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0;
@@ -2078,7 +1953,7 @@ pub(crate) fn disks() -> Vec<DiskItem> {
                 (0, 0)
             };
             out.push(DiskItem {
-                name: mp.to_string(),
+                name: mount.clone(),
                 kind: "固定".to_string(),
                 format: fs.to_string(),
                 label: String::new(),
@@ -2171,28 +2046,6 @@ mod tests {
     }
 
     #[test]
-    fn temporary_mount_filter_matches_dhdeploy() {
-        // ① 类型黑名单
-        assert!(is_temporary_mount("/", "tmpfs"));
-        assert!(is_temporary_mount("/www", "overlay"));
-        assert!(is_temporary_mount("/mnt/x", "squashfs"));
-        // ② 引导分区（含尾斜杠归一）
-        assert!(is_temporary_mount("/boot", "ext4"));
-        assert!(is_temporary_mount("/boot/efi", "vfat"));
-        assert!(is_temporary_mount("/boot/", "ext4"));
-        // ③ 系统虚拟目录前缀
-        assert!(is_temporary_mount("/dev/shm", "tmpfs"));
-        assert!(is_temporary_mount("/run/user/0", "tmpfs"));
-        assert!(is_temporary_mount("/snap/core20/1234", "squashfs"));
-        assert!(is_temporary_mount("/sys/fs/cgroup", "cgroup2"));
-        // 正常业务挂载不受影响
-        assert!(!is_temporary_mount("/", "ext4"));
-        assert!(!is_temporary_mount("/www", "xfs"));
-        assert!(!is_temporary_mount("/data", "ext4"));
-        assert!(!is_temporary_mount("/boot2", "ext4"), "仅精确匹配 /boot");
-    }
-
-    #[test]
     fn machine_info_contains_core_lines() {
         let text = machine_info();
         for key in ["系统：", "处理器：", "内存：", "程序："] {
@@ -2207,35 +2060,6 @@ mod tests {
         assert!(load_average().is_some(), "Linux 应提供负载数据");
         #[cfg(not(target_os = "linux"))]
         assert!(load_average().is_none(), "非 Linux 平台无负载数据");
-    }
-
-    #[test]
-    fn parse_net_dev_skips_loopback_and_headers() {
-        let sample = "\
-Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 999999   100    0    0    0     0          0         0   888888   100    0    0    0     0       0          0
-  eth0: 1000   10    0    0    0     0          0         0   4000   20    0    0    0     0       0          0
- veth1: 30    0    0    0    0     0          0         0     40    0    0    0    0     0       0          0
-";
-        assert_eq!(parse_net_dev(sample), (1030, 4040));
-    }
-
-    #[test]
-    fn parse_net_dev_entries_per_interface() {
-        let sample = "\
-Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 999999   100    0    0    0     0          0         0   888888   100    0    0    0     0       0          0
-  eth0: 1000   10    0    0    0     0          0         0   4000   20    0    0    0     0       0          0
- veth1: 30    0    0    0    0     0          0         0     40    0    0    0    0     0       0          0
-";
-        let entries = parse_net_dev_entries(sample);
-        assert_eq!(entries.len(), 2, "回环与表头应被跳过");
-        assert_eq!(entries[0], ("eth0".to_string(), 1000, 4000));
-        assert_eq!(entries[1], ("veth1".to_string(), 30, 40));
-        // 逐接口解析的汇总应与总量一致
-        assert_eq!(parse_net_dev(sample), (1030, 4040));
     }
 
     #[test]
