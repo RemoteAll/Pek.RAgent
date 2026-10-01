@@ -135,6 +135,34 @@ fn locate_zip(base: &Path, work: &Path, file_name: &str) -> Option<PathBuf> {
     cand.is_file().then_some(cand)
 }
 
+/// 定位单文件程序（非 zip；用于影子模式的运行副本）。
+///
+/// 绝对路径直接判断；相对路径先在工作目录找，再按基础目录解析；
+/// 简单命令名（不含路径分隔符，如 `ping`）返回 `None`（按 PATH 命令处理，不做影子复制）。
+fn locate_program(base: &Path, work: &Path, file_name: &str) -> Option<PathBuf> {
+    let file_name = file_name.trim();
+    if file_name.is_empty() {
+        return None;
+    }
+
+    let p = Path::new(file_name);
+    if p.is_absolute() {
+        return p.is_file().then(|| p.to_path_buf());
+    }
+
+    if !file_name.contains('/') && !file_name.contains('\\') {
+        return None;
+    }
+
+    let cand = work.join(p);
+    if cand.is_file() {
+        return Some(cand);
+    }
+
+    let cand = util::resolve(base, file_name);
+    cand.is_file().then_some(cand)
+}
+
 /// 部署准备：按模式解压部署包并解析出可执行文件与启动参数。
 pub fn prepare(ctx: &PrepareContext, app: &AppConfig) -> Result<Prepared, String> {
     let work = work_dir(ctx.base, app);
@@ -177,6 +205,40 @@ pub fn prepare(ctx: &PrepareContext, app: &AppConfig) -> Result<Prepared, String
 
                 shadow = Some(sdir.clone());
                 run_file = find_exe(&sdir, &app.name, &mut args_text);
+            } else if let Some(src) = locate_program(ctx.base, &work, &file_name) {
+                // 单文件可执行：同样走影子（复制运行副本），支持“运行中替换实际目录文件”；
+                // 配置与数据始终按实际工作目录；用户只需操作实际目录，无需关心影子位置
+                let hash = dhrust::sign::md5_file_hex(&src)
+                    .map_err(|e| format!("计算文件哈希失败：{}", e))?;
+                let hash8 = hash.get(..8).unwrap_or(&hash).to_ascii_lowercase();
+
+                let sdir = match ctx.shadow_override {
+                    Some(s) => s.join(format!("{}-{}", app.name, hash8)),
+                    None => shadow_base(&work).join(format!("{}-{}", app.name, hash8)),
+                };
+
+                let leaf = src.file_name().unwrap_or_default();
+                let dst = sdir.join(leaf);
+                if !dst.is_file() {
+                    clean_old_shadows(sdir.parent().unwrap_or(Path::new(".")), &app.name);
+                    util::log_format(
+                        "影子模式，复制到影子目录：{}",
+                        &[&sdir.display().to_string()],
+                    );
+                    std::fs::create_dir_all(&sdir)
+                        .map_err(|e| format!("创建影子目录失败 {}：{}", sdir.display(), e))?;
+                    std::fs::copy(&src, &dst).map_err(|e| {
+                        format!(
+                            "复制到影子目录失败 {} -> {}：{}",
+                            src.display(),
+                            dst.display(),
+                            e
+                        )
+                    })?;
+                }
+
+                shadow = Some(sdir);
+                run_file = Some(dst);
             } else {
                 util::log_format("影子模式降级为标准模式（未找到 {}）", &[&file_name]);
                 run_file = find_exe(&work, &app.name, &mut args_text);
@@ -724,6 +786,67 @@ mod tests {
         assert_eq!(DeployMode::parse("2"), DeployMode::Standard);
         assert_eq!(DeployMode::parse("standard"), DeployMode::Standard);
         assert_eq!(DeployMode::parse("3"), DeployMode::Task);
+    }
+
+    #[test]
+    fn shadow_single_file_copies_and_reuses() {
+        let tmp = std::env::temp_dir().join(format!(
+            "ragent-shadow-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let work = tmp.join("deploy");
+        std::fs::create_dir_all(&work).unwrap();
+        let src = work.join("myagent");
+        std::fs::write(&src, b"v1").unwrap();
+
+        let mut app = AppConfig::default();
+        app.name = "shadowapp".to_string();
+        app.file_name = src.to_string_lossy().into_owned();
+        app.working_directory = Some(work.to_string_lossy().into_owned());
+        app.mode = "shadow".to_string();
+
+        let global = AgentConfig::default();
+        let ctx = PrepareContext {
+            base: &tmp,
+            global: &global,
+            retry: false,
+            shadow_override: None,
+        };
+
+        let p1 = prepare(&ctx, &app).unwrap();
+        let sdir1 = p1.shadow.clone().expect("单文件也应建立影子目录");
+        assert!(
+            sdir1.starts_with(&tmp),
+            "影子目录应在 {{工作目录}}/../shadow 下：{}",
+            sdir1.display()
+        );
+        assert!(
+            Path::new(&p1.program).is_file(),
+            "程序应指向影子副本：{}",
+            p1.program
+        );
+        assert!(
+            Path::new(&p1.program).starts_with(&sdir1),
+            "程序应指向影子目录内"
+        );
+        assert_eq!(p1.work_dir, work, "工作目录（数据目录）保持实际目录");
+
+        // 相同版本：复用既有影子（不重复复制）
+        let p2 = prepare(&ctx, &app).unwrap();
+        assert_eq!(p2.shadow.unwrap(), sdir1);
+
+        // 更新实际目录文件：产生新影子目录（旧的仍可能被运行中进程使用）
+        std::fs::write(&src, b"v2-longer").unwrap();
+        let p3 = prepare(&ctx, &app).unwrap();
+        let sdir3 = p3.shadow.unwrap();
+        assert_ne!(sdir3, sdir1, "文件更新后应换用新影子目录");
+        assert!(Path::new(&p3.program).is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
