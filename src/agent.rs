@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use dhrust::threading::Timer;
@@ -159,6 +159,12 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     let up_timer = Timer::new(5_000, 10_000, move |_| check_self_upgrade());
     up_timer.set_async(true);
 
+    // 3.3) 心跳日志（每 5 分钟一条）：周期任务正常时也定期可见，便于运维确认代理存活；
+    //      有动作的守护/监视/升级事件本身即时记录，不受影响
+    let hb = manager.clone();
+    let hb_timer = Timer::new(60_000, 300_000, move |_| heartbeat(&hb));
+    hb_timer.set_async(true);
+
     util::log_format(
         "守护周期 {} 秒；按 Ctrl+C（前台模式可回车）退出",
         &[&(guard_period / 1000).to_string()],
@@ -174,6 +180,7 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     drop(timer);
     drop(reload_timer);
     drop(up_timer);
+    drop(hb_timer);
     util::log_info("星尘代理已退出");
 }
 
@@ -199,19 +206,24 @@ pub(crate) fn check_self_upgrade() {
         .map(|p| p.to_path_buf())
         .unwrap_or_else(|| PathBuf::from("."));
 
+    UPGRADE_CHECKS.fetch_add(1, Ordering::Relaxed);
+
     // 候选零：程序文件被外部直接替换（文件身份变化）
     check_external_replace(&exe);
 
     // 候选一：`{exe}.new`（Web 上传 / CLI / 兼容约定）
     let dot_new = PathBuf::from(format!("{}.new", exe.display()));
     if dot_new.is_file() {
-        try_auto_upgrade(&dot_new, &exe);
+        try_auto_upgrade(&dot_new, &exe, &[]);
         return;
     }
 
-    // 候选二：升级目录 `Update/`（取最新修改的文件；静置保护由升级管线把关）
-    if let Some(candidate) = latest_update_file(&exe_dir) {
-        try_auto_upgrade(&candidate, &exe);
+    // 候选二：升级目录 `Update/`：只采用最新修改的一个文件；其余候选在处置后统一标记
+    // `.skipped`——无论目录里放了多少文件，都只发生一轮升级（一次重启）
+    let mut candidates = collect_update_files(&exe_dir);
+    if !candidates.is_empty() {
+        let best = candidates.remove(0);
+        try_auto_upgrade(&best, &exe, &candidates);
     }
 }
 
@@ -259,6 +271,22 @@ fn exe_identity(path: &Path) -> Option<ExeIdentity> {
 static EXE_IDENTITY: Mutex<Option<ExeIdentity>> = Mutex::new(None);
 /// 已校验失败的外部替换文件指纹（len, mtime 秒），避免周期性重复处理。
 static EXTERNAL_REJECTED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
+/// 自升级检查累计次数（心跳日志展示，便于确认周期任务存活）。
+static UPGRADE_CHECKS: AtomicU64 = AtomicU64::new(0);
+
+/// 心跳日志（每 5 分钟）：周期任务正常时也定期可见，便于运维确认代理存活与工作状态。
+fn heartbeat(manager: &AppManager) {
+    let list = manager.list();
+    let running = list.iter().filter(|(_, s)| s.running).count();
+    util::log_format(
+        "运行中：子服务 {}/{} 运行，自升级检查 {} 次（未发现更新），守护/监视/升级检查正常",
+        &[
+            &running.to_string(),
+            &list.len().to_string(),
+            &UPGRADE_CHECKS.load(Ordering::Relaxed).to_string(),
+        ],
+    );
+}
 
 /// 记录进程启动时的 exe 身份基线（幂等；供外部替换检测对比）。
 fn record_exe_identity_baseline() {
@@ -340,12 +368,17 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 
 /// 执行一次自动升级：成功则替换文件并退出（服务管理器拉起新版）；
 /// 静置中保留待下轮；失败改名 `*.failed` 留证并停止重试（避免周期性日志刷屏）。
-fn try_auto_upgrade(new_path: &Path, exe: &Path) {
+///
+/// `skip_list`：同一批次未被采用的其他候选（升级目录里的其余文件）——处置后统一
+/// 标记 `.skipped`，保证无论目录里有多少文件都只发生一轮升级（一次重启）。
+fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf]) {
     match apply_upgrade(new_path, exe, 10) {
         Ok(()) => {
             util::log_info(
                 "检测到新版本：影子自检通过，程序文件已替换，正在退出以便服务管理器拉起新版本……",
             );
+            // 其余候选跳过（避免重启后逐个升级造成多轮重启）
+            skip_candidates(skip_list);
             // 不依赖服务管理器的失败恢复策略：由新版本进程显式确保服务运行
             schedule_service_restart(exe);
             // 异步文件日志同步落盘后再退出（否则最后一条日志可能在队列中丢失）
@@ -370,7 +403,18 @@ fn try_auto_upgrade(new_path: &Path, exe: &Path) {
             } else {
                 util::log_error(&format!("自升级失败（当前程序不受影响）：{e}"));
             }
+            // 其余候选同样跳过：避免失败后逐个重试造成多轮“尝试→重启”
+            skip_candidates(skip_list);
         }
+    }
+}
+
+/// 把未被采用的候选文件标记为 `*.skipped`（保留现场、不再参与自动升级）。
+fn skip_candidates(paths: &[PathBuf]) {
+    for p in paths {
+        let skipped = PathBuf::from(format!("{}.skipped", p.display()));
+        let _ = std::fs::remove_file(&skipped);
+        let _ = std::fs::rename(p, &skipped);
     }
 }
 
@@ -416,39 +460,53 @@ fn is_transient_upgrade_error(e: &str) -> bool {
     e.starts_with("替换失败") || e.starts_with("旧程序改名失败") || e.contains("os error 32")
 }
 
-/// 从升级目录挑选候选文件：最新的普通文件（排除 `*.failed` 留证文件）。
+/// 从升级目录挑选候选文件：最新的普通文件（排除 `*.failed` / `*.skipped` 留证文件）。
 ///
 /// 目录名以 `Update` 为准（与 Config/Log 命名一致）；兼容早期小写 `update` 目录。
 pub(crate) fn latest_update_file(exe_dir: &Path) -> Option<PathBuf> {
-    latest_update_file_in(&exe_dir.join("Update"))
-        .or_else(|| latest_update_file_in(&exe_dir.join("update")))
+    collect_update_files(exe_dir).into_iter().next()
 }
 
-/// 从指定目录挑选候选文件（内部实现）。
-fn latest_update_file_in(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(SystemTime, PathBuf)> = None;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        let path = entry.path();
-        let Ok(meta) = entry.metadata() else {
-            continue;
-        };
-        if !meta.is_file() {
+/// 收集升级目录中的全部候选文件（按修改时间降序：最新在前）。
+///
+/// 同时覆盖 `Update/`（首选）与早期小写 `update/`；排除 `*.failed` / `*.skipped`
+/// 留证文件。供"一次重启"策略使用：只升级最新的一个，其余标记跳过。
+pub(crate) fn collect_update_files(exe_dir: &Path) -> Vec<PathBuf> {
+    let mut all: Vec<(SystemTime, PathBuf)> = Vec::new();
+    let mut seen_dirs: Vec<PathBuf> = Vec::new();
+    for dir in [exe_dir.join("Update"), exe_dir.join("update")] {
+        // 目录去重：Windows 文件系统大小写不敏感，`Update` 与 `update` 可能是同一目录
+        // （canonicalize 会统一大小写与实际路径；失败时退回原路径比较）
+        let key = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+        if seen_dirs.contains(&key) {
             continue;
         }
-        // 排除留证文件（`*.failed`）
-        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-            if ext.eq_ignore_ascii_case("failed") {
+        seen_dirs.push(key);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if !meta.is_file() {
                 continue;
             }
-        }
-        let Ok(modified) = meta.modified() else {
-            continue;
-        };
-        if best.as_ref().map_or(true, |(t, _)| modified > *t) {
-            best = Some((modified, path));
+            // 排除留证文件（`*.failed`）与已跳过文件（`*.skipped`）
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if ext.eq_ignore_ascii_case("failed") || ext.eq_ignore_ascii_case("skipped") {
+                    continue;
+                }
+            }
+            let Ok(modified) = meta.modified() else {
+                continue;
+            };
+            all.push((modified, path));
         }
     }
-    best.map(|(_, p)| p)
+    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.into_iter().map(|(_, p)| p).collect()
 }
 
 /// 统一升级管线：预检 → 影子冒烟（独立进程执行新版自检）→ 原子替换。
@@ -687,6 +745,19 @@ mod tests {
         let failed = update.join("zz.failed");
         std::fs::write(&failed, b"bad").unwrap();
         assert_eq!(latest_update_file(&dir).unwrap(), fresh);
+
+        // `*.skipped` 跳过文件不参与；collect 返回全部候选（最新在前）
+        let skipped = update.join("yy.skipped");
+        std::fs::write(&skipped, b"skipped").unwrap();
+        let all = collect_update_files(&dir);
+        assert_eq!(all.len(), 2, "应仅剩 fresh + old 两个候选");
+        assert_eq!(all[0], fresh, "最新在前");
+        assert_eq!(all[1], old);
+
+        // skip_candidates：未被采用的候选改名 *.skipped，之后不再参与
+        skip_candidates(&collect_update_files(&dir));
+        assert!(collect_update_files(&dir).is_empty(), "跳过标记后应无候选");
+        assert!(update.join("fresh.bin.skipped").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
