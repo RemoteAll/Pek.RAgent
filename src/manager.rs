@@ -99,7 +99,14 @@ impl AppManager {
 
     /// 恢复状态文件并接管存活进程。
     fn restore_state(&self) {
-        let path = self.base.join("data").join("state.json");
+        // 状态目录以 `Data` 为准（与 Config/Log 命名一致）；兼容旧版小写 `data`
+        let mut path = self.base.join("Data").join("state.json");
+        if !path.exists() {
+            let legacy = self.base.join("data").join("state.json");
+            if legacy.exists() {
+                path = legacy;
+            }
+        }
         let Ok(text) = std::fs::read_to_string(&path) else {
             return;
         };
@@ -141,7 +148,10 @@ impl AppManager {
             }
         }
 
-        let path = self.base.join("data").join("state.json");
+        // 统一写入新目录（自旧目录读取的状态随首次持久化自动迁移到 `Data`）
+        let dir = self.base.join("Data");
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("state.json");
         let text = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string());
         let _ = dhrust::io::write_all_text_atomic(&path, &text);
     }

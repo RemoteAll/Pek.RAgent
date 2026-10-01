@@ -35,6 +35,9 @@ fn main() {
     util::init_logging(&base, true, level);
 
     let code = cli::run(&args, &base);
+    // 异步文件日志同步落盘后再退出（否则最后若干条日志可能在队列中丢失，
+    // 例如：重启助手进程的"服务已拉起"结论、CLI 升级的最终提示）
+    dhrust::logs::flush();
     std::process::exit(code);
 }
 

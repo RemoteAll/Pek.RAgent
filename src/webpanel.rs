@@ -266,6 +266,8 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("logFiles", move |ctx| log_files(&p, ctx));
     let p = panel.clone();
     controller = controller.get("watchdog", move |ctx| watchdog(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("upgrade", move |ctx| upgrade(&p, ctx));
     controller.post("control", move |ctx| control(&panel, ctx))
 }
 
@@ -895,6 +897,67 @@ fn get_star_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(json!({ "groups": groups })))
 }
 
+/// 上传升级：请求体即新版本程序文件（原始二进制），校验后影子冒烟并原子替换，随后自动重启。
+///
+/// 体验对齐 1Panel：面板选文件上传即可，服务端完成"暂存 → 校验 → 影子自检 → 替换 → 退出重拉"，
+/// 无需用户手动改名或停服。
+fn upgrade(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+
+    let body = &ctx.req.body;
+    // 上传上限（与 HTTP 服务器默认 body 上限一致）
+    const MAX_SIZE: usize = 64 * 1024 * 1024;
+    if body.len() < 1024 {
+        return json_error(400, "升级文件过小或为空，请上传完整的可执行文件");
+    }
+    if body.len() > MAX_SIZE {
+        return json_error(400, "升级文件过大（上限 64MB）");
+    }
+    let is_elf = body.starts_with(b"\x7FELF");
+    let is_pe = body.starts_with(b"MZ");
+    if !is_elf && !is_pe {
+        return json_error(400, "文件格式校验失败：不是可执行程序（ELF/PE）");
+    }
+
+    let Ok(current) = std::env::current_exe() else {
+        return json_error(500, "无法定位当前程序文件");
+    };
+    let exe = util::lexical_normalize(&current);
+    let staged = PathBuf::from(format!("{}.new", exe.display()));
+    if let Err(e) = std::fs::write(&staged, body.as_ref()) {
+        return json_error(500, &format!("写入升级文件失败：{e}"));
+    }
+
+    match agent::apply_upgrade(&staged, &exe, 0) {
+        Ok(()) => {
+            util::log_info(
+                "Web 面板上传升级：影子自检通过，程序文件已替换，即将退出等待服务管理器拉起新版本……",
+            );
+            // 不依赖服务管理器的失败恢复策略：由新版本进程显式确保服务运行
+            agent::schedule_service_restart(&exe);
+            // 异步文件日志同步落盘后再退出（否则最后一条日志可能在队列中丢失）
+            dhrust::logs::flush();
+            // 延迟退出：确保本次 HTTP 响应先送达浏览器，再由服务管理器拉起新版本
+            std::thread::spawn(|| {
+                std::thread::sleep(Duration::from_millis(1000));
+                std::process::exit(0);
+            });
+            json_result(
+                0,
+                "升级完成：影子自检通过，程序文件已替换，服务即将自动重启",
+                None,
+            )
+        }
+        Err(e) => {
+            // 失败清理暂存文件（错误原因已告知，避免残留文件触发周期性重试）
+            let _ = std::fs::remove_file(&staged);
+            json_error(500, &format!("升级失败（当前程序保持不变）：{e}"))
+        }
+    }
+}
+
 /// 更新星尘配置（安全白名单）。
 fn update_star_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
@@ -1384,6 +1447,52 @@ mod tests {
         // 注销后失效
         let _ = logout(&panel, &context("POST", "/api/logout", "", Some(&token)));
         assert!(!panel.validate_token(&token));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn upgrade_rejects_invalid_payloads_and_keeps_program() {
+        let (panel, dir) = panel_with_default_password();
+
+        let ok = login(
+            &panel,
+            &context("POST", "/api/login", r#"{"user":"admin","password":"admin"}"#, None),
+        );
+        let ok = body_json(ok);
+        assert_eq!(ok["code"], 0);
+        let token = ok["data"]["token"].as_str().unwrap().to_string();
+
+        // 未鉴权：拒绝
+        let r = upgrade(&panel, &context("POST", "/api/upgrade", "x", None));
+        assert_eq!(body_json(r)["code"], 401);
+
+        // 过小：拒绝
+        let r = upgrade(&panel, &context("POST", "/api/upgrade", "tiny", Some(&token)));
+        assert_eq!(body_json(r)["code"], 400);
+
+        // 非可执行格式：拒绝
+        let big = "x".repeat(4096);
+        let r = upgrade(&panel, &context("POST", "/api/upgrade", &big, Some(&token)));
+        let j = body_json(r);
+        assert_eq!(j["code"], 400);
+        assert!(j["message"].as_str().unwrap().contains("格式"));
+
+        // 形态合法但无法运行（假 ELF）：影子自检拦截，不得替换当前程序
+        let mut fake = vec![0x7Fu8, b'E', b'L', b'F'];
+        fake.extend_from_slice(&[b'x'; 4096]);
+        let fake = String::from_utf8_lossy(&fake).to_string();
+        let r = upgrade(&panel, &context("POST", "/api/upgrade", &fake, Some(&token)));
+        let j = body_json(r);
+        assert_eq!(j["code"], 500);
+        assert!(j["message"].as_str().unwrap().contains("升级失败"));
+
+        // 升级失败不得残留暂存文件
+        let staged = PathBuf::from(format!(
+            "{}.new",
+            util::lexical_normalize(&std::env::current_exe().unwrap()).display()
+        ));
+        assert!(!staged.exists(), "失败后应清理暂存文件");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

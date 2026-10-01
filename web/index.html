@@ -873,6 +873,14 @@ async function loadConfig(){
   html+=`<button class="btn btn-primary" onclick="changePassword()">修改密码</button>`;
   html+=`<span id="pwd-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
 
+  // 程序升级卡片
+  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🚀 程序升级</h2>`;
+  html+=`<p style="font-size:12px;color:var(--text-muted);margin-bottom:10px">选择新版本程序文件（Linux：pek-ragent / Windows：pek-ragent.exe），上传后服务端自动校验（影子自检）、替换程序文件并重启服务，无需手动改名或停服。</p>`;
+  html+=`<div style="display:flex;gap:12px;align-items:center;flex-wrap:wrap">`;
+  html+=`<input type="file" id="upgrade-file" style="font-size:12px">`;
+  html+=`<button class="btn btn-primary" onclick="doUpgrade()">⬆ 上传并升级</button>`;
+  html+=`<span id="upgrade-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
+
   $('panel-config').innerHTML=html;
  }catch(e){$('panel-config').innerHTML=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><p class="text-muted">加载失败</p></div>`}
 }
@@ -901,6 +909,31 @@ async function saveConfig(){
   if(j.code===0){dirtyFields.clear();showToast(j.message,'success');loadConfig()}
   else showToast(j.message,'error');
  }catch(e){showToast('保存失败','error')}
+}
+
+/* ── 程序升级 ── */
+async function doUpgrade(){
+ const input=$('upgrade-file');
+ const f=input&&input.files?input.files[0]:null;
+ if(!f){showToast('请先选择升级文件','error');return}
+ const mb=(f.size/1048576).toFixed(2);
+ showModal('程序升级',`确定上传「${esc(f.name)}」（${mb} MB）并升级？<br><span style="font-size:12px;color:var(--text-muted)">服务端会先执行影子自检，通过后自动替换程序文件并重启服务；失败时保持当前程序不变。</span>`,'确认升级',async()=>{
+  const msg=$('upgrade-msg');
+  try{
+   if(msg)msg.textContent='上传中…';
+   const r=await fetch('/api/upgrade',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/octet-stream'},body:f});
+   const j=await r.json();
+   if(msg)msg.textContent=j.message||'';
+   showToast(j.message||(j.code===0?'升级完成':'升级失败'),j.code===0?'success':'error');
+   if(j.code===0){
+    if(msg)msg.textContent='升级完成，服务重启中…';
+    setTimeout(()=>location.reload(),8000);
+   }
+  }catch(e){
+   if(msg)msg.textContent='上传失败：'+(e.message||e);
+   showToast('上传失败（若服务正在重启，属正常现象）','error');
+  }
+ });
 }
 
 /* ── 星尘设置 ── */

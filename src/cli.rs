@@ -4,6 +4,7 @@
 //! - **服务级**：`-status` / `-install`（安装并启动）/ `-i`（仅安装）/ `-reinstall` /
 //!   `-uninstall`（停止并卸载）/ `-u`（仅卸载）/ `-start` / `-stop` / `-restart` / `-run` / `-s`
 //! - **应用级**：`-ListServices` / `-StartService <名称>` / `-StopService <名称>` / `-RestartService <名称>`
+//! - **升级**：`-update [文件]`（用新版本文件升级当前程序并重启服务）；`-selftest`（升级管线内部使用）
 //! - **其它**：`-ShowMachineInfo`；位置参数 zip 一次性拉起（`pek-ragent app.zip urls=http://*:8080`）
 //!
 //! 应用级命令通过本地控制接口（默认 127.0.0.1:5500）与运行中的代理通信，
@@ -11,7 +12,7 @@
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::agent::Agent;
 use crate::config::AgentConfig;
@@ -104,6 +105,9 @@ pub fn run(args: &[String], base: &Path) -> i32 {
             );
             0
         }
+        "selftest" => cmd_selftest(base),
+        "update" => cmd_update(base, args),
+        "ensure-running" => cmd_ensure_running(base),
         _ => {
             if cmd.ends_with(".zip")
                 || args
@@ -336,6 +340,178 @@ fn cmd_svc_ctl(base: &Path, op: SvcOp) -> i32 {
             eprintln!("{}：{}", text, e);
             1
         }
+    }
+}
+
+// ————— 程序升级 —————
+
+/// 影子自检：供升级管线从影子位置验证新版程序可用（不启动服务、不绑定端口）。
+///
+/// 设计原则：只做快速同步检查（配置可解析、程序目录可写），任何情况下都应立即退出，
+/// 避免拖慢升级流程；退出码 0 表示通过。
+fn cmd_selftest(base: &Path) -> i32 {
+    // 配置可解析（兼容旧配置）
+    let _ = AgentConfig::load(base);
+
+    // 程序目录可写（升级暂存、日志等依赖）
+    let probe = base.join(".selftest");
+    if let Err(e) = std::fs::write(&probe, b"ok") {
+        eprintln!("自检失败：程序目录不可写：{e}");
+        return 1;
+    }
+    let _ = std::fs::remove_file(&probe);
+
+    println!("selftest ok（v{}）", env!("CARGO_PKG_VERSION"));
+    0
+}
+
+/// 用新版本文件升级当前程序并重启服务（含影子冒烟，失败时当前程序保持不变）。
+///
+/// 用法：`pek-ragent -update [文件路径]`；省略路径时使用暂存约定路径 `{exe}.new`。
+/// 文件名与目录不限：任意可读文件均可（内部会暂存到程序目录再执行升级管线）。
+fn cmd_update(base: &Path, args: &[String]) -> i32 {
+    let Ok(current) = std::env::current_exe() else {
+        eprintln!("无法定位当前程序文件");
+        return 1;
+    };
+    let exe = util::lexical_normalize(&current);
+    let staged = PathBuf::from(format!("{}.new", exe.display()));
+
+    // 源文件：命令行中的第一个非选项参数（文件名/路径任意）
+    let src = args
+        .iter()
+        .map(|a| a.trim())
+        .find(|a| !a.is_empty() && !a.starts_with('-') && !a.eq_ignore_ascii_case("update"))
+        .map(PathBuf::from);
+
+    if let Some(src) = &src {
+        if *src != staged {
+            if let Err(e) = std::fs::copy(src, &staged) {
+                eprintln!("读取升级文件失败：{}（{e}）", src.display());
+                return 1;
+            }
+        }
+    }
+
+    if !staged.is_file() {
+        eprintln!(
+            "未找到升级文件：{}（用法：pek-ragent -update <文件路径>；或把新版本文件放入 Update 目录）",
+            staged.display()
+        );
+        return 1;
+    }
+
+    // 停止服务释放旧程序文件占用（服务未安装/未运行时忽略错误）
+    let cfg = AgentConfig::load(base);
+    let svc = ServiceManager::new(base, &cfg);
+    let _ = svc.stop();
+
+    match crate::agent::apply_upgrade(&staged, &exe, 0) {
+        Ok(()) => {
+            println!("升级完成：程序文件已替换，正在启动服务……");
+            match svc.start() {
+                Ok(()) => {
+                    println!("服务已启动。");
+                    0
+                }
+                Err(e) => {
+                    eprintln!("程序已更新，但服务启动失败：{e}（可稍后执行 -start 重试）");
+                    1
+                }
+            }
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&staged);
+            eprintln!("升级失败（当前程序保持不变）：{e}");
+            // 恢复服务运行（旧版本）
+            let _ = svc.start();
+            1
+        }
+    }
+}
+
+/// 确保系统服务处于运行状态（升级重启助手）：等待服务管理器自动拉起，超时后显式启动。
+///
+/// 由升级完成后的新版本进程以 `-ensure-running -upgrade` 调用（`-upgrade` 先延迟 3 秒等旧进程退出）：
+/// 1. 服务未安装、或指向其他程序时不做处理；
+/// 2. 等待服务管理器自动拉起（SCM 失败恢复动作有 5s/10s/30s 三档窗口；systemd 通常秒级），
+///    最长等待 40 秒，一旦运行立即完成；
+/// 3. 超时仍未运行则显式启动（此时恢复动作窗口已过，不会重复拉起）。
+fn cmd_ensure_running(base: &Path) -> i32 {
+    let cfg = AgentConfig::load(base);
+    let svc = ServiceManager::new(base, &cfg);
+
+    if svc.query() == ServiceState::NotInstalled {
+        util::log_info("重启助手：未安装系统服务（前台运行模式），请手动重启程序");
+        println!("未安装系统服务（前台运行模式），请手动重启程序。");
+        return 0;
+    }
+
+    // 服务指向其他程序（非本部署）时不操作
+    let Ok(current) = std::env::current_exe() else {
+        return 1;
+    };
+    let current = util::lexical_normalize(&current);
+    match svc.installed_exe() {
+        Some(path) if same_path(&path, &current) => {}
+        Some(path) => {
+            util::log_info(&format!(
+                "重启助手：系统服务指向其他程序（{}），无需处理",
+                path.display()
+            ));
+            println!("系统服务指向其他程序（{}），无需处理。", path.display());
+            return 0;
+        }
+        None => {
+            util::log_info("重启助手：无法确定系统服务指向的程序，跳过自动拉起（可手动执行 -start）");
+            println!("无法确定系统服务指向的程序，跳过自动拉起（可手动执行 -start）。");
+            return 1;
+        }
+    }
+
+    // 等待服务管理器自动拉起（覆盖 SCM 5s/10s/30s 三档恢复窗口）
+    let deadline = Instant::now() + Duration::from_secs(40);
+    loop {
+        if svc.query() == ServiceState::Running {
+            util::log_info("重启助手：服务已由服务管理器自动拉起");
+            println!("服务已由服务管理器自动拉起。");
+            return 0;
+        }
+        if Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_secs(2));
+    }
+
+    // 超时：显式启动（恢复动作窗口已过，不会重复拉起）
+    match svc.start() {
+        Ok(()) => {
+            util::log_info("重启助手：服务已显式启动（新版本）");
+            println!("服务已显式启动（新版本）。");
+            0
+        }
+        Err(e) => {
+            if svc.query() == ServiceState::Running {
+                util::log_info("重启助手：服务已在运行");
+                println!("服务已在运行。");
+                return 0;
+            }
+            util::log_error(&format!("重启助手：服务自动拉起失败：{e}（请手动执行 -start 重试）"));
+            eprintln!("服务自动拉起失败：{e}（请手动执行 -start 重试）");
+            1
+        }
+    }
+}
+
+/// 路径是否指向同一程序（Windows 大小写不敏感）。
+fn same_path(a: &Path, b: &Path) -> bool {
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
     }
 }
 
@@ -847,6 +1023,12 @@ fn print_help() {
   pek-ragent app.zip urls=http://*:8080
   pek-ragent app.zip -name myapp -shadow /data/shadow
 
+程序升级：
+  pek-ragent -update <文件路径>      用新版本文件升级并重启服务（推荐）
+  （也可将新版本文件直接放入程序目录的 Update 子目录，自动热检测升级；
+     Web 面板登录后可在"程序升级"卡片直接上传，无需任何文件名约定）
+  （-selftest / -ensure-running 为升级管线内部命令，由程序自动调用）
+
 其它：
   pek-ragent -ShowMachineInfo       显示本机信息
   pek-ragent -help                  显示本帮助
@@ -856,4 +1038,29 @@ fn print_help() {
 "#,
         version = env!("CARGO_PKG_VERSION")
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ensure_running_skips_other_or_missing_service() {
+        // 服务未安装（或指向其他程序）时应快速返回，不进入等待循环
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-ensure-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let code = cmd_ensure_running(&dir);
+
+        assert_eq!(code, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
