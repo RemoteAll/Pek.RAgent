@@ -23,7 +23,7 @@
 | 本地 HTTP 控制接口 | 默认 `127.0.0.1:5500`，兼容 DHDeploy 的调用契约；仅本机访问（可配） |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/Agent.json` 被外部修改后自动重新加载并应用 |
-| 日志 | 控制台 + `Logs/` 目录按天文件；`RUST_LOG=debug` 调整级别 |
+| 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
 
@@ -151,7 +151,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | `StartWait` | `3000` | 健康检查等待时间（毫秒） |
 | `MaxFails` | `20` | 最大失败次数，超过后不再自动拉起 |
 | `GuardPeriod` | `30000` | 守护检查周期（毫秒） |
-| `Debug` | `false` | 调试输出（多次重启时应用输出重定向到 `Logs/app-*.log`） |
+| `Debug` | `false` | 调试输出（多次重启时应用输出重定向到 `Log/app-*.log`） |
 | `Server` / `Project` | 空 | 预留；`-server` / `-project` 参数会保存于此，暂不对接 |
 | `StartupHook` | `false` | 对未引用星尘 SDK 的 .NET 应用注入 `Stardust.dll` |
 | `Apps` | 示例 | 应用列表 |
@@ -175,7 +175,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | `OomScoreAdjust` | `0` | OOM 分值（仅 Linux） |
 | `HealthCheck` | 空 | 健康检查：`http://…` 或 `tcp://host:port` |
 | `Overwrite` | 空 | 部署包内需拷贝覆盖到工作目录的文件/子目录，`;` 分隔，支持 `*` |
-| `Debug` | `false` | 应用输出重定向到 `Logs/app-{Name}.log` |
+| `Debug` | `false` | 应用输出重定向到 `Log/app-{Name}.log` |
 
 ### 5.3 示例
 
@@ -218,7 +218,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 ### 6.1 目录布局（shadow 模式示例）
 
 ```text
-├─ StarAgent/            ← 程序目录（Config/Agent.json、Logs、data）
+├─ StarAgent/            ← 程序目录（Config/Agent.json、Log、data）
 └─ apps/
    └─ webapp/            ← 工作目录（部署包、配置文件、数据）——应用运行时不占用其中任何文件
 └─ apps/shadow/
@@ -359,7 +359,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（16 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定等）；
+- 单元测试：`cargo test`（22 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用 5500 接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管。
 
 ---

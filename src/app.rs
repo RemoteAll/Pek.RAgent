@@ -213,7 +213,7 @@ impl AppRuntime {
         }
 
         let log_file = if cfg.debug || (retry && global.debug) {
-            Some(self.base.join("Logs").join(format!("app-{}.log", cfg.name)))
+            Some(self.base.join("Log").join(format!("app-{}.log", cfg.name)))
         } else {
             None
         };

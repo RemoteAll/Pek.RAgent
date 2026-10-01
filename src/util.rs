@@ -59,9 +59,10 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
     }
 }
 
-/// 初始化全局日志：控制台 + 文件（`Logs/` 目录，按天一个文件）。
+/// 初始化全局日志：控制台 + 文件（`Log/` 目录，按天一个文件）。
 ///
-/// 服务模式（无控制台）下控制台日志写不出去但不影响文件日志；
+/// 行格式 `HH:mm:ss.fff 线程ID 类型 名称 正文` 与文件头字段均对齐 DH.NCore
+/// （由 dhrust::logs 实现）；服务模式（无控制台）下控制台日志写不出去但不影响文件日志。
 /// Windows 下启用 UTF-8 代码页，保证中文菜单与日志正常。
 pub fn init_logging(base: &Path, use_console: bool, level: LogLevel) {
     #[cfg(windows)]
@@ -71,7 +72,7 @@ pub fn init_logging(base: &Path, use_console: bool, level: LogLevel) {
     if use_console {
         logs.push(Arc::new(ConsoleLog::with_color(true)));
     }
-    logs.push(TextFileLog::create(base.join("Logs")) as Arc<dyn ILog>);
+    logs.push(TextFileLog::create(base.join("Log")) as Arc<dyn ILog>);
 
     dhrust::logs::set_log(Arc::new(CompositeLog::new(logs)));
     dhrust::logs::set_level(level);

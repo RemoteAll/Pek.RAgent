@@ -36,7 +36,7 @@ pub struct AgentConfig {
     pub max_fails: i32,
     /// 守护检查周期（毫秒），默认 30000
     pub guard_period: u64,
-    /// 调试开关。开启后应用输出重定向到 Logs 目录
+    /// 调试开关。开启后应用输出重定向到 Log 目录
     pub debug: bool,
     /// 星尘服务端地址。暂未对接，保留字段以便脚本兼容（`-server` 参数可写入）
     pub server: String,
@@ -103,7 +103,7 @@ pub struct AppConfig {
     pub health_check: Option<String>,
     /// 覆盖文件。部署包内需拷贝覆盖到工作目录的文件或子目录，`;` 分隔，支持 `*` 模糊匹配
     pub overwrite: Option<String>,
-    /// 调试输出。输出重定向到 `Logs/app-{Name}.log`
+    /// 调试输出。输出重定向到 `Log/app-{Name}.log`
     pub debug: bool,
 }
 

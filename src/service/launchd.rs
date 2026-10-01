@@ -54,8 +54,8 @@ fn plist_text(mgr: &ServiceManager) -> String {
   <key>WorkingDirectory</key><string>{base}</string>\n\
   <key>RunAtLoad</key><true/>\n\
   <key>KeepAlive</key><true/>\n\
-  <key>StandardOutPath</key><string>{base}/Logs/launchd.out.log</string>\n\
-  <key>StandardErrorPath</key><string>{base}/Logs/launchd.err.log</string>\n\
+  <key>StandardOutPath</key><string>{base}/Log/launchd.out.log</string>\n\
+  <key>StandardErrorPath</key><string>{base}/Log/launchd.err.log</string>\n\
 </dict>\n\
 </plist>\n",
         name = xml_escape(&mgr.name),

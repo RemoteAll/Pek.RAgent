@@ -28,7 +28,7 @@ fn main() {
     // 统一工作目录到基础目录（与 C# StarAgent 一致，配置中的相对路径据此解析）
     let _ = std::env::set_current_dir(&base);
 
-    // 日志：控制台 + 文件（Logs/）；级别取 RUST_LOG
+    // 日志：控制台 + 文件（Log/，行格式与文件头对齐 DH.NCore）；级别取 RUST_LOG
     let level = dhrust::logs::level_from_env();
     util::init_logging(&base, true, level);
 

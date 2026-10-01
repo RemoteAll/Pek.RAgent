@@ -2,7 +2,7 @@
 //!
 //! 设计要点：
 //! - 启动的子进程默认重定向到空设备，避免服务模式无控制台时输出异常；
-//!   应用调试输出（`Debug=true`）追加到 `Logs/app-{Name}.log`；
+//!   应用调试输出（`Debug=true`）追加到 `Log/app-{Name}.log`；
 //! - 停止先温和（Unix SIGTERM / Windows taskkill），超时后强制（SIGKILL / taskkill /F）；
 //! - 内存读取：Linux `/proc/{pid}/statm`、Windows `GetProcessMemoryInfo`、macOS `ps`。
 
