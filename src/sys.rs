@@ -751,6 +751,141 @@ pub(crate) fn host_uptime_seconds() -> u64 {
     }
 }
 
+/// 拆分毫秒时间戳为（整秒、纳秒）；负数按欧几里得取整（用于 Unix `timespec`）。
+pub(crate) fn split_epoch_ms(epoch_ms: i64) -> (i64, u32) {
+    (
+        epoch_ms.div_euclid(1000),
+        (epoch_ms.rem_euclid(1000) * 1_000_000) as u32,
+    )
+}
+
+/// 设置系统 UTC 时间（毫秒时间戳；Web 面板“同步时间”按钮，以浏览器时间为准）。
+///
+/// 只校正时钟、不改时区；需要相应权限：
+/// - Unix：root（`clock_settime(CLOCK_REALTIME)`，非 root 返回明确提示）；
+/// - Windows：服务账户/管理员（`SetSystemTime` 需要 `SeSystemtimePrivilege`，此处临时启用）。
+pub(crate) fn set_system_time(epoch_ms: i64) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        let (secs, nanos) = split_epoch_ms(epoch_ms);
+        // 64 位目标上 `time_t` 恒为 i64（= c_long）：直接赋 i64，
+        // 避免引用 musl 目标上已被标记弃用的 `libc::time_t` 别名
+        let ts = libc::timespec {
+            tv_sec: secs,
+            tv_nsec: nanos as libc::c_long,
+        };
+        let rc = unsafe { libc::clock_settime(libc::CLOCK_REALTIME, &ts) };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            return Err(match error.raw_os_error() {
+                Some(libc::EPERM) => {
+                    "权限不足：同步系统时间需要 root（请以 root 运行代理）".to_string()
+                }
+                Some(libc::EINVAL) => "时间超出内核允许范围".to_string(),
+                _ => format!("设置系统时间失败：{error}"),
+            });
+        }
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_NOT_ALL_ASSIGNED};
+        use windows_sys::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, SE_PRIVILEGE_ENABLED,
+            TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::SystemInformation::SetSystemTime;
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        // SetSystemTime 依赖 SE_SYSTEMTIME_NAME 特权（管理员/系统账户持有但默认禁用）
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            ) == 0
+            {
+                return Err(format!(
+                    "打开进程令牌失败：{}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+
+            let privilege: Vec<u16> = "SeSystemtimePrivilege\0".encode_utf16().collect();
+            let mut luid = windows_sys::Win32::Foundation::LUID {
+                LowPart: 0,
+                HighPart: 0,
+            };
+            let looked_up =
+                LookupPrivilegeValueW(std::ptr::null(), privilege.as_ptr(), &mut luid) != 0;
+
+            let mut state = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [windows_sys::Win32::Security::LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
+            };
+            let adjusted = looked_up
+                && AdjustTokenPrivileges(
+                    token,
+                    0,
+                    &mut state,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                ) != 0;
+            // AdjustTokenPrivileges 即便返回成功，也可能因未持有特权而什么都未启用
+            let last = GetLastError();
+            CloseHandle(token);
+
+            if !adjusted || last == ERROR_NOT_ALL_ASSIGNED {
+                return Err("权限不足：同步系统时间需要管理员/服务账户权限".to_string());
+            }
+        }
+
+        let Some(system_time) = epoch_ms_to_systemtime(epoch_ms) else {
+            return Err("时间戳超出可表示范围".to_string());
+        };
+        if unsafe { SetSystemTime(&system_time) } == 0 {
+            return Err(format!(
+                "设置系统时间失败：{}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = epoch_ms;
+        Err("当前平台不支持同步系统时间".to_string())
+    }
+}
+
+/// 毫秒时间戳 → UTC `SYSTEMTIME`（Windows `SetSystemTime` 入参）。
+#[cfg(windows)]
+fn epoch_ms_to_systemtime(epoch_ms: i64) -> Option<windows_sys::Win32::Foundation::SYSTEMTIME> {
+    use chrono::{Datelike, Timelike};
+    use windows_sys::Win32::Foundation::SYSTEMTIME;
+
+    let (secs, nanos) = split_epoch_ms(epoch_ms);
+    let dt = chrono::DateTime::from_timestamp(secs, nanos)?;
+    Some(SYSTEMTIME {
+        wYear: dt.year() as u16,
+        wMonth: dt.month() as u16,
+        wDayOfWeek: dt.weekday().num_days_from_sunday() as u16,
+        wDay: dt.day() as u16,
+        wHour: dt.hour() as u16,
+        wMinute: dt.minute() as u16,
+        wSecond: dt.second() as u16,
+        wMilliseconds: dt.timestamp_subsec_millis() as u16,
+    })
+}
+
 /// 系统负载（1/5/15 分钟平均值）。Windows 无此概念，返回 `None`。
 #[cfg(target_os = "linux")]
 pub(crate) fn load_average() -> Option<(f64, f64, f64)> {
@@ -2145,5 +2280,32 @@ Shmem:            100000 kB
             assert!(used <= total, "磁盘已用不应超过总量");
             assert!(!name.is_empty(), "磁盘名称不应为空");
         }
+    }
+
+    #[test]
+    fn split_epoch_ms_handles_fractions_and_negatives() {
+        assert_eq!(split_epoch_ms(946_730_096_789), (946_730_096, 789_000_000));
+        assert_eq!(split_epoch_ms(0), (0, 0));
+        assert_eq!(split_epoch_ms(-1), (-1, 999_000_000));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn systemtime_conversion_uses_utc() {
+        // 946 730 096 789 ms = 2000-01-01 12:34:56.789 UTC（周六）
+        let st = epoch_ms_to_systemtime(946_730_096_789).unwrap();
+        assert_eq!(
+            (
+                st.wYear,
+                st.wMonth,
+                st.wDayOfWeek,
+                st.wDay,
+                st.wHour,
+                st.wMinute,
+                st.wSecond,
+                st.wMilliseconds
+            ),
+            (2000, 1, 6, 1, 12, 34, 56, 789)
+        );
     }
 }

@@ -485,7 +485,7 @@ function buildDashboard(d,health){
  if(d.totalMemory)html+=infoRow('物理内存',d.totalMemory+(d.availableMemory?' — 可用 '+d.availableMemory+(d.freeMemory?' / 空闲 '+d.freeMemory:''):''));
  if(d.board)html+=infoRow('主板',d.board);
  if(d.machineGuid)html+=infoRow('设备 ID',d.machineGuid,'font-mono');
- if(d.localTime)html+=infoRow('服务器时间',d.localTime,'font-mono','svc-time');
+ if(d.localTime)html+=`<tr><td>服务器时间</td><td><span id="svc-time" class="font-mono">${esc(d.localTime)}</span><button class="btn btn-ghost btn-sm" style="margin-left:10px;padding:2px 10px;font-size:12px" onclick="syncServerTime(this)" title="将本机（浏览器）时间同步到服务器（需管理员/root 权限）">⟳ 同步时间</button></td></tr>`;
  html+=`</table></div>`;
 
  // 本机信息（折叠区块）
@@ -942,6 +942,19 @@ async function freeMemory(){
   setTimeout(()=>{loadDashboard();},1000);
  }catch(e){showToast('❌ 请求失败','error')}
  finally{if(btn)btn.disabled=false;_freeMemRunning=false}
+}
+
+let _syncingTime=false;
+
+async function syncServerTime(btn){
+ if(_syncingTime)return;_syncingTime=true;if(btn)btn.disabled=true;
+ showToast('正在同步系统时间...','info');
+ try{
+  const j=await api('/api/syncTime',{method:'POST',body:JSON.stringify({timeMs:Date.now()})});
+  if(j.code===0){showToast('✅ '+(j.message||'系统时间已同步'),'success');loadDashboard()}
+  else showToast('❌ '+(j.message||'同步失败（需管理员/root 权限）'),'error');
+ }catch(e){showToast('❌ 同步失败','error')}
+ finally{_syncingTime=false;if(btn)btn.disabled=false}
 }
 
 async function changePassword(){

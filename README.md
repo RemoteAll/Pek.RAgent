@@ -23,7 +23,7 @@
 | 本地 HTTP 控制接口 | 默认 `0.0.0.0:5500`（`LocalOnly=true` 时仅 `127.0.0.1`），兼容 DHDeploy 的调用契约 |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
-| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
+| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗/服务器校时；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
@@ -407,6 +407,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 | `GET /api/freeMemory` | 释放内存 |
 | `GET /api/configMetadata`、`POST /api/updateConfig`、`POST /api/changePassword` | 配置元数据 / 更新 / 修改密码 |
 | `GET /api/logs`、`GET /api/logFiles`、`GET /api/watchdog` | 日志内容 / 文件列表 / 看门狗 |
+| `POST /api/syncTime` | 同步系统时间（`{"timeMs": 毫秒时间戳}`，以浏览器机时间为准；Linux 需 root、Windows 需服务账户/管理员） |
 | `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
 | `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
@@ -488,7 +489,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（65 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/系统采集解析等）；
+- 单元测试：`cargo test`（69 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/系统采集解析等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ---

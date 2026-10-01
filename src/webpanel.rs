@@ -2,7 +2,7 @@
 //!
 //! **对齐 C# 契约**（StarAgent / DH.NAgent 面板；前端 `index.html` 直接复用）：
 //! - `/api/*`：login / logout / status / control / freeMemory / configMetadata /
-//!   updateConfig / changePassword / logs / logFiles / health / watchdog
+//!   updateConfig / changePassword / logs / logFiles / health / watchdog / syncTime
 //! - `/star/*`：services / startService / stopService / restartService / addService /
 //!   removeService / getStarConfig / updateStarConfig / machine / getProcessList
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
@@ -319,6 +319,8 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("watchdog", move |ctx| watchdog(&p, ctx));
     let p = panel.clone();
     controller = controller.post("upgrade", move |ctx| upgrade(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("syncTime", move |ctx| sync_time(&p, ctx));
     controller.post("control", move |ctx| control(&panel, ctx))
 }
 
@@ -683,6 +685,44 @@ fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         },
         Some(json!({ "beforeMB": before, "afterMB": after, "freedMB": freed })),
     )
+}
+
+/// 同步系统时间（`{"timeMs": 毫秒时间戳}`；Web 面板“同步时间”按钮）。
+///
+/// 以**访问面板的浏览器所在机器**时间为准（通常已由 NTP 保持准确），
+/// 只校正时钟、不改时区；需要相应权限（Unix root / Windows 管理员或服务账户）。
+fn sync_time(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+
+    let Some(epoch_ms) = arg_i64(ctx, "timeMs") else {
+        return json_error(400, "Missing timeMs");
+    };
+
+    // 合理区间护栏（2000-01-01 ~ 2100-01-01 UTC）：防止误传把时钟改坏
+    const MIN_MS: i64 = 946_684_800_000;
+    const MAX_MS: i64 = 4_102_444_800_000;
+    if !(MIN_MS..=MAX_MS).contains(&epoch_ms) {
+        return json_error(400, "时间戳超出允许范围（2000~2100 年）");
+    }
+
+    let ip = WebPanel::client_ip(ctx);
+    match sys::set_system_time(epoch_ms) {
+        Ok(()) => {
+            let local = Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
+            util::log_format("Web 面板同步系统时间成功：{}（{}）", &[&local, &ip]);
+            json_result(
+                0,
+                &format!("系统时间已同步：{local}"),
+                Some(json!({ "localTime": local })),
+            )
+        }
+        Err(message) => {
+            util::log_format("Web 面板同步系统时间失败：{}（{}）", &[&message, &ip]);
+            json_error(500, &message)
+        }
+    }
 }
 
 /// 面板配置元数据（排除密码字段，走 ChangePassword 接口）。
@@ -1781,6 +1821,32 @@ mod tests {
 
         let result = services(&panel, &context("GET", "/star/services", "", None));
         assert_eq!(body_json(result)["code"], 401);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sync_time_validates_payload_and_auth() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // 未登录：拒绝
+        let result = sync_time(
+            &panel,
+            &context("POST", "/api/syncTime", r#"{"timeMs":946684800000}"#, None),
+        );
+        assert_eq!(body_json(result)["code"], 401);
+
+        // 缺少 timeMs：400
+        let result = sync_time(&panel, &context("POST", "/api/syncTime", "{}", Some(&token)));
+        assert_eq!(body_json(result)["code"], 400);
+
+        // 越界时间戳（1970 年）：400（校验先行，不会真正改时钟）
+        let result = sync_time(
+            &panel,
+            &context("POST", "/api/syncTime", r#"{"timeMs":12345}"#, Some(&token)),
+        );
+        assert_eq!(body_json(result)["code"], 400);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
