@@ -22,7 +22,7 @@
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
 | 本地 HTTP 控制接口 | 默认 `127.0.0.1:5500`，兼容 DHDeploy 的调用契约；仅本机访问（可配） |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
-| 配置热更新 | `Config/Agent.json` 被外部修改后自动重新加载并应用 |
+| 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
 | Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗；默认 `admin`/`admin`，Bearer Token 鉴权，前端页编译期内嵌 |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
@@ -70,8 +70,38 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 1. 把 `pek-ragent` 可执行文件放到部署目录（如 `C:\StarAgent`、`/opt/staragent`）；
 2. 运行 `pek-ragent` 打开**控制台菜单**，选择 `2` 安装并启动服务；或直接执行 `pek-ragent -install`（Linux 需 `sudo`）；
-3. 编辑 `Config/Agent.json` 添加应用（见第 5 节），执行 `pek-ragent -restart` 生效；
+3. 编辑 `Config/StarAgent.config` 添加应用（见第 5 节），执行 `pek-ragent -restart` 生效；
 4. 验证：`pek-ragent -ListServices`，或 `curl http://127.0.0.1:5500/GetServices`。
+
+### 3.1 Linux 部署（静态单文件）
+
+发布包（`dist/`）按架构选择：`uname -m` 输出 `x86_64` → `pek-ragent-v0.1.0-x86_64-unknown-linux-musl.tar.gz`；`aarch64`（ARM64）→ `...-aarch64-unknown-linux-musl.tar.gz`；另提供 `riscv64gc` / `loongarch64` 包。均为 **静态 musl 单文件**（约 3MB，零运行库依赖），压缩包内即一个 `pek-ragent`。
+
+```bash
+# 本机（Windows PowerShell）上传；dist 下同名 .tar.gz 解压后即 pek-ragent + install.sh
+scp dist/pek-ragent-v0.1.0-x86_64-unknown-linux-musl.tar.gz root@server:/tmp/
+
+# 服务器上解压安装（systemd：Restart=always / KillMode=process / OOMScoreAdjust=-1000 随单元自动生成）
+sudo mkdir -p /opt/staragent
+sudo tar -xzf /tmp/pek-ragent-*.tar.gz -C /opt/staragent
+cd /opt/staragent
+sudo bash install.sh              # 一键：补可执行位并安装启动服务
+./pek-ragent -status              # 状态；日志在 Log/ 目录
+```
+
+> 包内文件已带可执行位（`tar -xzf` 解压即用）；若通过 scp 直接传**单个文件**等不保留权限的途径获取，会出现 `-bash: ./pek-ragent: Permission denied`，执行一次 `chmod +x pek-ragent` 即可（或直接用包内 `bash install.sh`，它自动补权限）。
+
+**访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=true`，仅监听 `127.0.0.1:5500`）：
+
+```bash
+# 方式一（推荐）：SSH 隧道 —— 本地浏览器直接打开 http://127.0.0.1:5500/（admin/admin）
+ssh -L 5500:127.0.0.1:5500 root@server
+
+# 方式二：允许远程直连（默认密码 admin/admin，开放前务必先改用户名/密码，并自行加 HTTPS 反代等防护）
+vi Config/StarAgent.config  # 将 "LocalOnly" 改为 false
+./pek-ragent -restart
+firewall-cmd --add-port=5500/tcp   # firewalld；ufw 对应 sudo ufw allow 5500
+```
 
 ---
 
@@ -83,7 +113,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 | 命令 | 说明 |
 |------|------|
-| `-status` | 显示服务状态（安装/运行/路径/端口/子服务概览） |
+| `-status` | 显示服务状态（服务管理器类型/运行状态/路径/配置/端口/子服务概览 + 最近日志 + 版本与发布时间） |
 | `-install` | 安装**并启动**系统服务（可附 `-server URL`，暂仅保存） |
 | `-i` | 仅安装系统服务 |
 | `-reinstall` | 重新安装（卸载 → 安装 → 启动） |
@@ -92,6 +122,25 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | `-start` / `-stop` / `-restart` | 启动 / 停止 / 重启系统服务 |
 | `-run` | 前台运行（模拟运行；回车或 Ctrl+C 退出） |
 | `-s` | 以服务方式运行（由系统服务管理器调用） |
+
+输出示例（逐行对齐 C# `ShowStatus` 的结构：服务/描述/状态/路径 + 空行 + 版本行；其后为 Pek.RAgent 附加信息）：
+
+```text
+$ pek-ragent -status
+服务：星尘代理(StarAgent)
+描述：星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。
+状态：systemd 运行中
+路径：/www/Agent/pek-ragent
+
+Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
+
+配置：/www/Agent/Config/StarAgent.config
+本地端口：5500（仅本机：是）
+子服务：2 个，运行中 1
+
+最近日志（2026_10_01.log）：
+11:49:41.564 04 N dhrust-conn Web 面板登录成功：admin（127.0.0.1）
+```
 
 ### 4.2 应用级（经本地控制接口）
 
@@ -112,13 +161,15 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 ### 4.4 控制台菜单
 
-无参数启动进入菜单（自动识别状态：第 2、3 项随服务的安装/运行状态切换；已安装时页首显示服务**实际安装目录**（读取服务注册信息）；第 6–9 项子服务操作仅在**代理运行中**——本地控制接口可达（服务或前台模式均可）——时显示）：
+无参数启动时，先输出与 C# `ShowStatus` 相同的**状态块**（服务/描述/状态/路径 + 版本行），再进入菜单循环（第 2、3 项随服务的安装/运行状态切换；第 6–9 项子服务操作仅在**代理运行中**——本地控制接口可达（服务或前台模式均可）——时显示）：
 
 ```text
-================= Pek.RAgent 星尘代理 v0.1.0 =================
- 服务：星尘代理（StarAgent）
- 安装目录：C:\StarAgent
- 状态：运行中
+服务：星尘代理(StarAgent)
+描述：星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。
+状态：systemd 运行中
+路径：/www/Agent/pek-ragent
+
+Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 
  序号 功能名称            命令行参数
  1、 显示状态            -status
@@ -136,9 +187,14 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 ---
 
-## 5. 配置文件 `Config/Agent.json`
+## 5. 配置文件 `Config/StarAgent.config`
 
-放置在**程序所在目录**的 `Config/Agent.json`（首次运行自动生成示例）。字段名为 PascalCase，与 C# `ServiceInfo` 语义对齐；缺省字段自动取默认值。
+放置在**程序所在目录**的 `Config/StarAgent.config`（XML 格式，**与 C# StarAgent 同名同格式，双端完全互通**，可直接相互接管同一份配置；**首次运行自动生成带中文注释的完整模板**）。字段名为 PascalCase，与 C# `StarAgentSetting`/`ServiceInfo` 对齐；缺省字段自动取默认值。
+
+- **注释保留**：通过程序（含 Web 面板）修改配置值时，文件中的注释与排版会保留；也支持手工编辑（保存后自动重新加载）；
+- **C# 字段保留**：C# 特有字段（`Code`/`Secret`/`Channel`/`SyncTime`/`UseAutorun`/`UserName`/`Dpi`/`Resolution` 等）及 `ServiceInfo` 上 Rust 不认识的属性（如 `AutoStart`/`Priority`）读写时均原样保留不丢失；
+- **双向互通**：Rust 新增字段以平级元素/属性形式写入（C# `XmlSerializer` 对未知元素/属性自动忽略），C# 保存的文件 Rust 照常读取；部署模式 `Mode` 按 C# 数值（10-13）写入；
+- **旧版迁移**：检测到旧 `Config/Agent.toml`（TOML 版）或 `Config/Agent.json` 时自动转换为 XML，原文件改名 `.toml.bak` / `.json.bak`。
 
 ### 5.1 全局字段
 
@@ -156,9 +212,12 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | `Debug` | `false` | 调试输出（多次重启时应用输出重定向到 `Log/app-*.log`） |
 | `Server` / `Project` | 空 | 预留；`-server` / `-project` 参数会保存于此，暂不对接 |
 | `StartupHook` | `false` | 对未引用星尘 SDK 的 .NET 应用注入 `Stardust.dll` |
-| `Apps` | 示例 | 应用列表 |
+| `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
+| `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（配置页可在线修改密码） |
+| `WebAuthLevel` | `LocalOnly` | 面板鉴权级别（None/LocalOnly/Full，预留） |
+| `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
-### 5.2 应用字段（`Apps[]`）
+### 5.2 应用字段（`<ServiceInfo>` 属性）
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
@@ -168,7 +227,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 | `WorkingDirectory` | `../apps/{Name}` | 工作目录；相对路径按程序目录解析 |
 | `UserName` | 空 | 运行用户（仅 Linux 尽力支持） |
 | `Enable` | `false` | 启用；`-StartService` 自动置 true，`-StopService` 自动置 false 并持久化 |
-| `Mode` | `shadow` | 部署模式：`shadow` / `standard` / `hosted` / `task`（兼容 C# 数值 0-4、10-13） |
+| `Mode` | `shadow` | 部署模式：`shadow` / `standard` / `hosted` / `task`（保存时写 C# 数值 10-13；兼容旧数值 0-4） |
 | `AllowMultiple` | `false` | 允许多实例（多实例时健康检查不按进程名匹配） |
 | `Environments` | 空 | 环境变量，形如 `A=1;B=2` |
 | `AutoStop` | `false` | 随宿主退出时同时停止该应用 |
@@ -181,30 +240,21 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 ### 5.3 示例
 
-```json
-{
-  "ServiceName": "StarAgent",
-  "LocalPort": 5500,
-  "Apps": [
-    {
-      "Name": "webapp",
-      "FileName": "webapp.zip",
-      "Arguments": "urls=http://*:8080",
-      "WorkingDirectory": "apps/webapp",
-      "Mode": "shadow",
-      "Enable": true,
-      "AutoStop": true,
-      "MaxMemory": 2048
-    },
-    {
-      "Name": "test",
-      "FileName": "ping",
-      "Arguments": "newlifex.com",
-      "Enable": false
-    }
-  ]
-}
+```xml
+<?xml version="1.0" encoding="utf-8"?>
+<StarAgent>
+  <!--本地端口。默认5500-->
+  <LocalPort>5500</LocalPort>
+
+  <!--应用服务集合-->
+  <Services>
+    <ServiceInfo Name="webapp" FileName="webapp.zip" Arguments="urls=http://*:8080" Enable="true" Mode="11" AutoStop="true" MaxMemory="2048" />
+    <ServiceInfo Name="test" FileName="ping" Arguments="newlifex.com" Enable="false" />
+  </Services>
+</StarAgent>
 ```
+
+> `Mode` 写 C# 数值（10=standard，11=shadow，12=hosted，13=task）；手工编写时也可用文本名（`shadow` 等），旧版 0-4 数值同样兼容。
 
 ---
 
@@ -220,7 +270,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 ### 6.1 目录布局（shadow 模式示例）
 
 ```text
-├─ StarAgent/            ← 程序目录（Config/Agent.json、Log、data）
+├─ StarAgent/            ← 程序目录（Config/StarAgent.config、Log、data）
 └─ apps/
    └─ webapp/            ← 工作目录（部署包、配置文件、数据）——应用运行时不占用其中任何文件
 └─ apps/shadow/
@@ -297,7 +347,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 
 - **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
 - **状态**：运行时长、进程内存/线程/句柄、系统 CPU 使用率、TCP 连接数、机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
-- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/Agent.json`）；
+- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
 - **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
 - **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
@@ -369,7 +419,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 | StarServer / StarWeb 对接 | **暂未实现**；`-server` 参数仅保存到配置 |
 | Web 管理面板 | **已实现**（对齐 C# 契约，前端直接复用）；差异：无 GC 统计（`gcTotalMemory`/`gcCollections` 恒为 0）、磁盘 IOPS 恒为 0、网卡收发包字节未统计、无“扩展面板”接口 |
 | 本地 RPC | 原 UDP 5500 的 RPC 尚未实现（UDP 服务待补）；TCP 5500 已提供 HTTP 契约（DHDeploy + Web 面板），并对 DHDeploy 保持兼容 |
-| 配置格式 | 本项目使用 `Config/Agent.json`（新增 `WebUserName`/`WebPassword`/`WebAuthLevel`/`WatchDog`）；未兼容 C# 的 XML 配置 |
+| 配置格式 | **与 C# 完全互通**：使用同名同格式的 `Config/StarAgent.config`（XML，带中文注释）；C# 特有字段/属性读写均保留；本项目扩展字段以 C# 可忽略的形式写入；支持从旧版 `Agent.toml`（TOML）/`Agent.json` 自动迁移 |
 | 未实现功能 | Nginx 配置生成、防火墙端口自动开放、阿里云 DNS、自身升级/修复、`-watch` 看门狗服务 |
 | 状态存储 | `data/state.json` 记录运行中 PID（用于接管），原 `Service.csv` 不再使用 |
 
@@ -391,11 +441,11 @@ src/
 ├─ service/      平台服务管理（windows / systemd / launchd / unsupported）
 ├─ sys.rs        平台进程/机器工具（存活/内存/信号/进程枚举/机器信息/工作集回收）
 ├─ netc.rs       极简 HTTP 客户端 / TCP 连通检查
-├─ config.rs     配置模型（Config/Agent.json）
+├─ config.rs     配置模型（Config/StarAgent.config，XML 注释保留/迁移，与 C# 完全互通）
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（39 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权/限流/子服务 CRUD/日志/机器信息等）；
+- 单元测试：`cargo test`（45 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权/限流/子服务 CRUD/日志/机器信息等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ---

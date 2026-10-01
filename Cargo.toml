@@ -8,8 +8,9 @@ license = "MIT"
 
 [dependencies]
 # DH 基础库（DH.RustBase）：日志（XTrace 等价）、线程定时调度（Timer/TimerScheduler）、
-# 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）
-dhrust = { path = "../DH.RustBase", features = ["net"] }
+# 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）、
+# TOML 配置管线（保注释的读写，用于 Config/Agent.toml）
+dhrust = { path = "../DH.RustBase", features = ["net", "toml"] }
 # 配置序列化（Config/Agent.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

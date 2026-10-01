@@ -6,6 +6,11 @@ fn unsupported() -> Result<(), String> {
     Err("当前平台暂不支持服务化安装（仅支持 Windows / Linux / macOS）".to_string())
 }
 
+/// 服务管理器类型名（用于状态显示）。
+pub fn init_name() -> &'static str {
+    "（未支持）"
+}
+
 /// 查询状态。
 pub fn query(_mgr: &ServiceManager) -> ServiceState {
     ServiceState::NotInstalled

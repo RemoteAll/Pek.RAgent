@@ -134,35 +134,16 @@ fn agent_run(base: &Path, service_mode: bool) -> i32 {
 
 // ————— 服务级命令 —————
 
-/// 显示状态。
+/// 显示状态（`-status`；输出结构对齐 C# `ShowStatus`：状态块 + 附加信息 + 最近日志）。
 fn cmd_status(base: &Path) -> i32 {
     let cfg = AgentConfig::load(base);
     let svc = ServiceManager::new(base, &cfg);
     let state = svc.query();
 
-    println!("服务：{}（{}）", cfg.display_name, svc.name);
-    println!("描述：{}", cfg.description);
+    print_status_core(&cfg, &svc, state);
 
-    // Windows 附加管理员/普通用户提示（unix 无此区分）
-    #[cfg(windows)]
-    let text = format!(
-        "{}{}",
-        state.text(),
-        if is_elevated() {
-            "（管理员）"
-        } else {
-            "（普通用户）"
-        }
-    );
-    #[cfg(not(windows))]
-    let text = state.text().to_string();
-    println!("状态：{}", text);
-
-    if state != ServiceState::NotInstalled {
-        // 优先显示服务注册的实际程序路径（当前进程可能是从开发输出目录等其它位置启动的）
-        let exe = svc.installed_exe().unwrap_or_else(|| svc.exe.clone());
-        println!("程序：{}", exe.display());
-    }
+    // —— 以下为 Pek.RAgent 附加信息（配置/端口/子服务/日志） ——
+    println!();
     println!("配置：{}", crate::config::config_path(base).display());
     println!(
         "本地端口：{}（仅本机：{}）",
@@ -183,7 +164,89 @@ fn cmd_status(base: &Path) -> i32 {
         }
     }
 
+    // 最近日志（对齐 C# 状态输出附带的日志尾）
+    print_recent_logs(base, 5);
+
     0
+}
+
+/// 状态块（对齐 C# `ShowStatus`：服务/描述/状态/路径 + 空行 + 版本行）。
+///
+/// 菜单启动与 `-status` 共用（C# 无参数运行时会先输出该块再进入菜单）。
+fn print_status_core(cfg: &AgentConfig, svc: &ServiceManager, state: ServiceState) {
+    println!();
+    // 显示名与服务名相同时只显示一个（同 C#）
+    if cfg.display_name == svc.name {
+        println!("服务：{}", svc.name);
+    } else {
+        println!("服务：{}({})", cfg.display_name, svc.name);
+    }
+    println!("描述：{}", cfg.description);
+
+    // 状态：{管理器} {状态}；Windows 附加管理员/普通用户提示（unix 无此区分）
+    #[cfg(windows)]
+    let status = format!(
+        "{}{}",
+        state.text(),
+        if is_elevated() {
+            "（管理员）"
+        } else {
+            "（普通用户）"
+        }
+    );
+    #[cfg(not(windows))]
+    let status = state.text().to_string();
+    println!("状态：{} {}", svc.init_name(), status);
+
+    if state != ServiceState::NotInstalled {
+        // 优先显示服务注册的实际程序路径（当前进程可能是从开发输出目录等其它位置启动的）
+        let exe = svc.installed_exe().unwrap_or_else(|| svc.exe.clone());
+        println!("路径：{}", exe.display());
+    }
+
+    // 版本与发布时间（对齐 C#：`{名称}\t版本：{x}\t发布：{yyyy-MM-dd HH:mm:ss}`）
+    println!();
+    println!(
+        "Pek.RAgent\t版本：{}\t发布：{}",
+        env!("CARGO_PKG_VERSION"),
+        build_time_text()
+    );
+}
+
+/// 打印最近日志尾（`-status` 附带显示，对齐 C# 状态输出中的日志行）。
+fn print_recent_logs(base: &Path, count: usize) {
+    let dir = base.join("Log");
+    let Some(path) = util::latest_log_file(&dir) else {
+        return;
+    };
+    let lines = util::read_tail(&path, count);
+    if lines.is_empty() {
+        return;
+    }
+
+    println!();
+    println!(
+        "最近日志（{}）：",
+        path.file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default()
+    );
+    for line in lines {
+        println!("{line}");
+    }
+}
+
+/// 构建时间文本（`build.rs` 注入的 Unix 秒，本地时区格式化）。
+fn build_time_text() -> String {
+    std::option_env!("PEK_RAGENT_BUILD_UNIX")
+        .and_then(|s| s.parse::<i64>().ok())
+        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
+        .map(|utc| {
+            utc.with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_default()
 }
 
 /// 安装服务。
@@ -369,6 +432,17 @@ fn cmd_app_op(base: &Path, op: AppOp, name: &str) -> i32 {
 
 /// 控制台菜单（无参数启动）。
 fn menu(base: &Path) -> i32 {
+    // 启动时输出一次状态块（对齐 C#：无参数运行先 ShowStatus，再进入菜单循环）
+    {
+        let cfg = AgentConfig::load(base);
+        let svc = ServiceManager::new(base, &cfg);
+        let state = svc.query();
+        print_status_core(&cfg, &svc, state);
+        if !cfg.server.is_empty() {
+            println!("服务端：{}（当前版本暂不对接）", cfg.server);
+        }
+    }
+
     loop {
         let cfg = AgentConfig::load(base);
         let svc = ServiceManager::new(base, &cfg);
@@ -378,25 +452,7 @@ fn menu(base: &Path) -> i32 {
         // 代理运行中判定（探测本地控制接口——服务模式与前台模拟运行模式均可探测到）
         let agent_alive = probe_agent_alive(base);
 
-        println!();
-        println!(
-            "================= Pek.RAgent 星尘代理 v{} =================",
-            env!("CARGO_PKG_VERSION")
-        );
-        println!(" 服务：{}（{}）", cfg.display_name, svc.name);
-        // 已安装时显示服务实际安装目录（从其它目录启动菜单时一眼看清服务装在哪）
-        if installed {
-            if let Some(dir) = svc
-                .installed_exe()
-                .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
-            {
-                println!(" 安装目录：{}", dir.display());
-            }
-        }
-        if !cfg.server.is_empty() {
-            println!(" 服务端：{}（当前版本暂不对接）", cfg.server);
-        }
-        println!(" 状态：{}", state.text());
+        // 菜单列表（每轮重绘；服务状态信息在启动时已输出，与 C# 一致）
         println!();
         println!(" 序号 功能名称            命令行参数");
         println!(" 1、 显示状态            -status");
@@ -425,8 +481,11 @@ fn menu(base: &Path) -> i32 {
         let _ = std::io::stdout().flush();
 
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
-            return 1;
+        match std::io::stdin().read_line(&mut line) {
+            // EOF（无终端 / 管道输入结束）：退出菜单，避免空输入死循环刷屏
+            Ok(0) => return 0,
+            Ok(_) => {}
+            Err(_) => return 1,
         }
 
         let key = line.trim().to_ascii_lowercase();
@@ -793,7 +852,7 @@ fn print_help() {
   pek-ragent -ShowMachineInfo       显示本机信息
   pek-ragent -help                  显示本帮助
 
-配置文件：Config/Agent.json（应用列表、服务名、端口等）
+配置文件：Config/Agent.toml（应用列表、服务名、端口等）
 本地控制接口：http://127.0.0.1:5500（RestartService / StartService / StopService 等，兼容 DHDeploy）
 "#,
         version = env!("CARGO_PKG_VERSION")

@@ -3,7 +3,7 @@
 //! - 守护周期：`GuardPeriod`（默认 30 秒），检查退出/内存/文件变动并按需拉起；
 //! - 状态持久化：`data/state.json` 记录运行中 PID，代理重启后“接管”避免重复拉起；
 //! - 看门狗：应用通过 `/Ping` 喂狗，超时未喂则重启对应应用；
-//! - 配置热更新：`Config/Agent.json` 被外部修改后自动重新加载并应用。
+//! - 配置热更新：`Config/Agent.toml` 被外部修改后自动重新加载并应用。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

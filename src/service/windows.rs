@@ -19,6 +19,11 @@ fn run(program: &str, args: &[&str]) -> (i32, String, String) {
     }
 }
 
+/// 服务管理器类型名（用于状态显示）。
+pub fn init_name() -> &'static str {
+    "Windows 服务"
+}
+
 /// 查询服务状态。
 pub fn query(mgr: &ServiceManager) -> ServiceState {
     let (code, stdout, stderr) = run("sc", &["query", &mgr.name]);

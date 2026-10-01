@@ -223,6 +223,36 @@ pub fn md5_file(path: &Path) -> std::io::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
+/// 日志目录中最新（文件名最大）的 `.log` 文件。
+pub fn latest_log_file(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(String, PathBuf)> = None;
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.to_ascii_lowercase().ends_with(".log") {
+            continue;
+        }
+        if best.as_ref().map(|(b, _)| name > *b).unwrap_or(true) {
+            best = Some((name, path));
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// 读取文件尾部若干行（整文件读入；日志文件规模下可接受）。
+pub fn read_tail(path: &Path, count: usize) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(count);
+    lines[start..].iter().map(|s| s.to_string()).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -257,5 +287,28 @@ mod tests {
         assert!(wildcard_match("app.*", "APP.exe"));
         assert!(wildcard_match("*", "anything"));
         assert!(!wildcard_match("app.*", "xapp.exe"));
+    }
+
+    #[test]
+    fn log_tail_and_latest_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-util-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026_01_01.log"), "a\nb\nc\n").unwrap();
+        std::fs::write(dir.join("2026_01_02.log"), "x\ny\n").unwrap();
+        std::fs::write(dir.join("ignore.txt"), "no\n").unwrap();
+
+        let latest = latest_log_file(&dir).expect("应找到最新日志");
+        assert!(latest.ends_with("2026_01_02.log"));
+        assert_eq!(read_tail(&latest, 1), vec!["y".to_string()]);
+        assert_eq!(read_tail(&latest, 10).len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

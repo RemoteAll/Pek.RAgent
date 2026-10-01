@@ -1,13 +1,22 @@
-//! 配置：`Config/Agent.json`。
+//! 配置：`Config/StarAgent.config`（XML，与 C# StarAgent **同名同格式，双端完全互通**，带中文注释）。
 //!
-//! 字段名沿用 C# `ServiceInfo` 语义（PascalCase），便于熟悉星尘的运维人员迁移；
-//! 所有字段缺省即用默认值，新增字段可直接追加，不破坏旧文件。
+//! - 字段名与 C# `StarAgentSetting`/`ServiceInfo` 对齐（PascalCase）；C# 特有字段
+//!   （Code/Secret/Channel/SyncTime/UseAutorun 等）读写时原样保留不丢失；
+//! - 注释由内置模板（`res/StarAgent.config.template`）保障：首次生成即带完整字段说明，
+//!   程序修改配置值（含 Web 面板）时按元素就地更新、注释与排版保留（dhrust::config XML 管线）；
+//! - 兼容迁移：旧 `Config/Agent.toml`（TOML 版）与 `Config/Agent.json` 自动转换（原文件改名 `.bak`）。
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+use dhrust::config::toml;
 use serde::{Deserialize, Serialize};
+use serde_json::Value as Json;
 
 use crate::util;
+
+/// 内置配置模板（C# StarAgent.config 风格、带中文注释；值须与 `Default::default()` 一致）。
+const TEMPLATE: &str = include_str!("../res/StarAgent.config.template");
 
 /// 默认服务名（Windows 服务 / systemd 单元 / launchd 任务）。
 pub const DEFAULT_SERVICE_NAME: &str = "StarAgent";
@@ -174,57 +183,84 @@ fn sample_apps() -> Vec<AppConfig> {
     ]
 }
 
-/// 配置文件路径。
+/// 配置文件路径（与 C# StarAgent 同名同格式，双端可共用同一份文件）。
 pub fn config_path(base: &Path) -> PathBuf {
+    base.join("Config").join("StarAgent.config")
+}
+
+/// 旧版 TOML 配置路径（存在时自动迁移为 XML）。
+pub fn legacy_toml_path(base: &Path) -> PathBuf {
+    base.join("Config").join("Agent.toml")
+}
+
+/// 旧版 JSON 配置路径（存在时自动迁移为 XML）。
+pub fn legacy_json_path(base: &Path) -> PathBuf {
     base.join("Config").join("Agent.json")
 }
 
 impl AgentConfig {
-    /// 加载配置。文件不存在时生成默认配置并落盘；内容损坏时备份为 `.bad` 并用默认配置继续。
+    /// 加载配置。
+    ///
+    /// - `StarAgent.config`（XML，与 C# 同格式）存在：直接读取（损坏时备份 `.bad` 并用默认配置重建）；
+    /// - 否则 `Agent.toml`（旧版）存在：自动迁移为 XML（原文件改名 `.toml.bak`）；
+    /// - 否则 `Agent.json`（旧版）存在：自动迁移为 XML（原文件改名 `.json.bak`）；
+    /// - 都没有：从内置模板生成带注释的默认配置。
     pub fn load(base: &Path) -> AgentConfig {
         let path = config_path(base);
 
-        let mut cfg = if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    let text = text.trim_start_matches('\u{feff}');
-                    match serde_json::from_str::<AgentConfig>(text) {
-                        Ok(cfg) => cfg,
-                        Err(e) => {
-                            let bad = PathBuf::from(format!("{}.bad", path.display()));
-                            let _ = std::fs::rename(&path, &bad);
-                            util::log_error(&format!(
-                                "配置文件解析失败，已备份到 {}：{}",
-                                bad.display(),
-                                e
-                            ));
-                            AgentConfig::default()
-                        }
-                    }
-                }
+        let (mut cfg, need_save) = if path.exists() {
+            match read_xml_config(&path) {
+                Ok(cfg) => (cfg, false),
                 Err(e) => {
-                    util::log_error(&format!("读取配置文件失败：{}", e));
-                    AgentConfig::default()
+                    let bad = PathBuf::from(format!("{}.bad", path.display()));
+                    let _ = std::fs::rename(&path, &bad);
+                    util::log_error(&format!(
+                        "配置文件解析失败，已备份到 {}：{}",
+                        bad.display(),
+                        e
+                    ));
+                    (AgentConfig::default(), true)
+                }
+            }
+        } else if legacy_toml_path(base).exists() {
+            match migrate_from_toml(base) {
+                Ok(cfg) => (cfg, true),
+                Err(e) => {
+                    util::log_error(&format!("迁移旧版 Agent.toml 失败：{}", e));
+                    (AgentConfig::default(), true)
+                }
+            }
+        } else if legacy_json_path(base).exists() {
+            match migrate_from_json(base) {
+                Ok(cfg) => (cfg, true),
+                Err(e) => {
+                    util::log_error(&format!("迁移旧版 Agent.json 失败：{}", e));
+                    (AgentConfig::default(), true)
                 }
             }
         } else {
-            let cfg = AgentConfig::default();
+            (AgentConfig::default(), true)
+        };
+
+        cfg.normalize();
+
+        if need_save {
             if let Err(e) = cfg.save(base) {
                 util::log_error(&format!("生成默认配置失败：{}", e));
             } else {
                 util::log_info(&format!("已生成默认配置 {}", path.display()));
             }
-            cfg
-        };
-
-        cfg.normalize();
+        }
         cfg
     }
 
-    /// 保存配置（美化 JSON）。
+    /// 保存配置（按元素就地更新：保留现有文件中的注释、排版与 C# 特有字段；
+    /// 缺失字段按模板格式插入；`Services` 节整段重建）。
     pub fn save(&self, base: &Path) -> std::io::Result<()> {
         let path = config_path(base);
-        let text = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
+        let current = std::fs::read_to_string(&path).ok();
+        let text = render_xml(self, current.as_deref())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         util::write_file_atomic(&path, &text)
     }
 
@@ -309,6 +345,400 @@ impl AgentConfig {
     }
 }
 
+// ————— XML 读写与迁移辅助（模板保注释；dhrust::config XML 管线，对齐 C# StarAgent.config） —————
+
+/// 读取 XML 配置（键值 + `Services/ServiceInfo` 属性列表）。
+fn read_xml_config(path: &Path) -> Result<AgentConfig, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
+    let json = dhrust::config::read_xml_to_json(&text).map_err(|e| e.to_string())?;
+    let root = json
+        .as_object()
+        .and_then(|o| o.values().next())
+        .cloned()
+        .unwrap_or(Json::Null);
+    if !root.is_object() {
+        return Err("未识别的配置结构（缺少根节点）".to_string());
+    }
+    Ok(config_from_json(&root))
+}
+
+/// XML（JSON 形态）→ 配置。缺失键取默认值；C# 特有字段忽略但保留在文件中。
+fn config_from_json(root: &Json) -> AgentConfig {
+    let mut cfg = AgentConfig::default();
+    let Some(obj) = root.as_object() else {
+        return cfg;
+    };
+
+    fn text_of(obj: &serde_json::Map<String, Json>, key: &str) -> Option<String> {
+        obj.get(key).and_then(|v| v.as_str()).map(|s| s.to_string())
+    }
+    fn text_nonempty(obj: &serde_json::Map<String, Json>, key: &str) -> Option<String> {
+        text_of(obj, key).filter(|s| !s.trim().is_empty())
+    }
+    fn bool_of(obj: &serde_json::Map<String, Json>, key: &str) -> Option<bool> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().eq_ignore_ascii_case("true"))
+    }
+    fn parse_of<T: std::str::FromStr>(obj: &serde_json::Map<String, Json>, key: &str) -> Option<T> {
+        obj.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|s| s.trim().parse::<T>().ok())
+    }
+
+    // C# StarAgentSetting 字段
+    if let Some(v) = bool_of(obj, "Debug") {
+        cfg.debug = v;
+    }
+    if let Some(v) = parse_of::<u16>(obj, "LocalPort") {
+        cfg.local_port = v;
+    }
+    if let Some(v) = text_of(obj, "Project") {
+        cfg.project = v;
+    }
+    if let Some(v) = parse_of::<u64>(obj, "Delay") {
+        cfg.delay = v;
+    }
+    if let Some(v) = bool_of(obj, "StartupHook") {
+        cfg.startup_hook = v;
+    }
+
+    // Pek.RAgent 扩展字段
+    if let Some(v) = text_nonempty(obj, "ServiceName") {
+        cfg.service_name = v;
+    }
+    if let Some(v) = text_nonempty(obj, "DisplayName") {
+        cfg.display_name = v;
+    }
+    if let Some(v) = text_nonempty(obj, "Description") {
+        cfg.description = v;
+    }
+    if let Some(v) = bool_of(obj, "LocalOnly") {
+        cfg.local_only = v;
+    }
+    if let Some(v) = parse_of::<u64>(obj, "StartWait") {
+        cfg.start_wait = v;
+    }
+    if let Some(v) = parse_of::<i32>(obj, "MaxFails") {
+        cfg.max_fails = v;
+    }
+    if let Some(v) = parse_of::<u64>(obj, "GuardPeriod") {
+        cfg.guard_period = v;
+    }
+    if let Some(v) = text_of(obj, "WatchDog") {
+        cfg.watch_dog = v;
+    }
+    if let Some(v) = text_nonempty(obj, "WebUserName") {
+        cfg.web_user_name = v;
+    }
+    if let Some(v) = text_of(obj, "WebPassword").filter(|s| !s.is_empty()) {
+        cfg.web_user_password = v;
+    }
+    if let Some(v) = text_nonempty(obj, "WebAuthLevel") {
+        cfg.web_auth_level = v;
+    }
+
+    // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
+    let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
+    let items: Vec<&Json> = match services {
+        Some(Json::Array(list)) => list.iter().collect(),
+        Some(single @ Json::Object(_)) => vec![single],
+        _ => Vec::new(),
+    };
+    let mut apps = Vec::new();
+    for item in items {
+        if let Some(app) = app_from_json(item) {
+            apps.push(app);
+        }
+    }
+    if !apps.is_empty() {
+        cfg.apps = apps;
+    }
+
+    cfg
+}
+
+/// `ServiceInfo`（属性形式）→ 应用配置。
+fn app_from_json(item: &Json) -> Option<AppConfig> {
+    let svc = item.as_object()?;
+    let name = svc
+        .get("Name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let text = |key: &str| {
+        svc.get(key)
+            .and_then(|v| v.as_str())
+            .map(|v| v.to_string())
+            .filter(|v| !v.trim().is_empty())
+    };
+    let flag = |key: &str| {
+        svc.get(key)
+            .and_then(|v| v.as_str())
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    };
+    let num = |key: &str| {
+        svc.get(key)
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.trim().parse::<u64>().ok())
+    };
+
+    Some(AppConfig {
+        name,
+        file_name: text("FileName").unwrap_or_default(),
+        arguments: text("Arguments"),
+        working_directory: text("WorkingDirectory"),
+        user_name: text("UserName"),
+        enable: flag("Enable"),
+        // 保留原始形态（C# 数值 10-13/0-4 或文本），由 `DeployMode::parse` 归一化
+        mode: text("Mode").unwrap_or_else(|| "shadow".to_string()),
+        allow_multiple: flag("AllowMultiple"),
+        environments: text("Environments"),
+        auto_stop: flag("AutoStop"),
+        reload_on_change: flag("ReloadOnChange"),
+        max_memory: num("MaxMemory").unwrap_or(0) as u32,
+        oom_score_adjust: svc
+            .get("OomScoreAdjust")
+            .and_then(|v| v.as_str())
+            .and_then(|v| v.trim().parse::<i32>().ok())
+            .unwrap_or(0),
+        health_check: text("HealthCheck"),
+        overwrite: text("Overwrite"), // Pek.RAgent 扩展属性
+        debug: flag("Debug"),         // Pek.RAgent 扩展属性
+    })
+}
+
+/// 渲染配置为 XML 文本：以现有文件（或内置模板）为骨架——
+/// 标量键 upsert（保留注释与排版），`Services` 节整段重建（保留旧条目的未知属性）。
+fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String> {
+    let base = current.unwrap_or(TEMPLATE);
+
+    // 标量键（含扩展）；缺失时插入并带模板注释
+    let comments = template_comments();
+    let mut items: Vec<(String, String, String)> = Vec::new();
+    {
+        let mut push = |key: &str, value: String| {
+            let comment = comments.get(key).cloned().unwrap_or_default();
+            items.push((key.to_string(), value, comment));
+        };
+        push("Debug", bool_text(cfg.debug));
+        push("Project", cfg.project.clone());
+        push("LocalPort", cfg.local_port.to_string());
+        push("Delay", cfg.delay.to_string());
+        push("StartupHook", bool_text(cfg.startup_hook));
+        push("ServiceName", cfg.service_name.clone());
+        push("DisplayName", cfg.display_name.clone());
+        push("Description", cfg.description.clone());
+        push("LocalOnly", bool_text(cfg.local_only));
+        push("StartWait", cfg.start_wait.to_string());
+        push("MaxFails", cfg.max_fails.to_string());
+        push("GuardPeriod", cfg.guard_period.to_string());
+        push("WatchDog", cfg.watch_dog.clone());
+        push("WebUserName", cfg.web_user_name.clone());
+        push("WebPassword", cfg.web_user_password.clone());
+        push("WebAuthLevel", cfg.web_auth_level.clone());
+    }
+    let after_scalars =
+        dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
+
+    // Services 节重建（保留旧文件里 Rust 不认识的属性，如 C# 的 AutoStart/Priority）
+    let previous = service_attrs(&after_scalars);
+    let inner = render_services(&previous, &cfg.apps);
+    dhrust::config::replace_root_section(&after_scalars, "Services", &inner)
+        .map_err(|e| e.to_string())
+}
+
+/// 从模板提取“键 → 注释”映射（元素前最近的单行注释）。
+fn template_comments() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    let mut pending: Option<String> = None;
+    for line in TEMPLATE.lines() {
+        let trimmed = line.trim();
+        if let Some(comment) = trimmed
+            .strip_prefix("<!--")
+            .and_then(|s| s.strip_suffix("-->"))
+        {
+            pending = Some(comment.to_string());
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('<') {
+            if let Some(end) = rest.find('>') {
+                let name = &rest[..end];
+                if !name.starts_with('/') && !name.starts_with('?') {
+                    if let Some(comment) = pending.take() {
+                        map.insert(name.to_string(), comment);
+                    }
+                }
+            }
+        }
+    }
+    map
+}
+
+/// 旧文件中的 `ServiceInfo` 属性表（按出现顺序；用于保留 Rust 不认识的属性）。
+fn service_attrs(text: &str) -> Vec<Json> {
+    let Ok(json) = dhrust::config::read_xml_to_json(text) else {
+        return Vec::new();
+    };
+    let services = json
+        .as_object()
+        .and_then(|o| o.values().next())
+        .and_then(|root| root.get("Services"))
+        .and_then(|s| s.get("ServiceInfo"));
+    match services {
+        Some(Json::Array(list)) => list.clone(),
+        Some(single @ Json::Object(_)) => vec![single.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Rust 认识的 `ServiceInfo` 属性（重建时覆盖；其余属性原样保留以兼容 C#）。
+const KNOWN_SERVICE_ATTRS: [&str; 16] = [
+    "Name",
+    "FileName",
+    "Arguments",
+    "WorkingDirectory",
+    "UserName",
+    "Enable",
+    "Mode",
+    "AllowMultiple",
+    "Environments",
+    "AutoStop",
+    "ReloadOnChange",
+    "MaxMemory",
+    "OomScoreAdjust",
+    "HealthCheck",
+    "Overwrite",
+    "Debug",
+];
+
+/// 生成 `<Services>` 节内段（4 空格缩进，每应用单行）。
+fn render_services(previous: &[Json], apps: &[AppConfig]) -> String {
+    let mut inner = String::new();
+    for app in apps {
+        // 旧属性为底：保留未知属性（C# 的 AutoStart/Priority 等）
+        let mut attrs: Vec<(String, String)> = Vec::new();
+        if let Some(old) = previous.iter().find(|o| {
+            o.get("Name")
+                .and_then(|v| v.as_str())
+                .map(|n| n.eq_ignore_ascii_case(&app.name))
+                .unwrap_or(false)
+        }) {
+            if let Some(obj) = old.as_object() {
+                for (key, value) in obj {
+                    if !KNOWN_SERVICE_ATTRS.contains(&key.as_str()) {
+                        attrs.push((key.clone(), value.as_str().unwrap_or("").to_string()));
+                    }
+                }
+            }
+        }
+
+        // Rust 字段（固定顺序，对齐 C# `ServiceInfo` 声明序；Mode 写 C# 数值 10-13）
+        attrs.push(("Name".to_string(), app.name.clone()));
+        attrs.push(("FileName".to_string(), app.file_name.clone()));
+        attrs.push((
+            "Arguments".to_string(),
+            app.arguments.clone().unwrap_or_default(),
+        ));
+        attrs.push((
+            "WorkingDirectory".to_string(),
+            app.working_directory.clone().unwrap_or_default(),
+        ));
+        attrs.push(("UserName".to_string(), app.user_name.clone().unwrap_or_default()));
+        attrs.push(("Enable".to_string(), bool_text(app.enable)));
+        attrs.push(("Mode".to_string(), mode_number(&app.mode_text())));
+        attrs.push(("AllowMultiple".to_string(), bool_text(app.allow_multiple)));
+        attrs.push((
+            "Environments".to_string(),
+            app.environments.clone().unwrap_or_default(),
+        ));
+        attrs.push(("AutoStop".to_string(), bool_text(app.auto_stop)));
+        attrs.push(("ReloadOnChange".to_string(), bool_text(app.reload_on_change)));
+        attrs.push(("MaxMemory".to_string(), app.max_memory.to_string()));
+        attrs.push((
+            "OomScoreAdjust".to_string(),
+            app.oom_score_adjust.to_string(),
+        ));
+        attrs.push((
+            "HealthCheck".to_string(),
+            app.health_check.clone().unwrap_or_default(),
+        ));
+        // Pek.RAgent 扩展属性（C# XmlSerializer 读取时忽略未知属性）
+        attrs.push(("Overwrite".to_string(), app.overwrite.clone().unwrap_or_default()));
+        attrs.push(("Debug".to_string(), bool_text(app.debug)));
+
+        inner.push_str("    <ServiceInfo");
+        for (key, value) in &attrs {
+            inner.push(' ');
+            inner.push_str(key);
+            inner.push_str("=\"");
+            inner.push_str(&escape_attr(value));
+            inner.push('"');
+        }
+        inner.push_str(" />\n");
+    }
+    inner
+}
+
+/// 布尔 → XML 文本。
+fn bool_text(value: bool) -> String {
+    if value { "true" } else { "false" }.to_string()
+}
+
+/// 部署模式 → C# `DeployMode` 数值（10=Standard，11=Shadow，12=Hosted，13=Task）。
+fn mode_number(mode: &str) -> String {
+    (crate::deploy::DeployMode::parse(mode) as i32).to_string()
+}
+
+/// XML 属性值转义。
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// 迁移旧版 TOML 配置：读入后原文件改名 `.toml.bak`（避免再次迁移）。
+fn migrate_from_toml(base: &Path) -> Result<AgentConfig, String> {
+    let path = legacy_toml_path(base);
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let text = text.trim_start_matches('\u{feff}');
+    let doc = toml::parse_document(text)?;
+    let value = toml::document_to_json(&doc)?;
+    let cfg: AgentConfig = serde_json::from_value(value).map_err(|e| e.to_string())?;
+
+    let bak = PathBuf::from(format!("{}.bak", path.display()));
+    let _ = std::fs::rename(&path, &bak);
+    util::log_format(
+        "配置已从 Agent.toml 迁移为 StarAgent.config（原文件备份为 {}）",
+        &[&bak.display().to_string()],
+    );
+    Ok(cfg)
+}
+
+/// 迁移旧版 JSON 配置：读入后原文件改名 `.json.bak`（避免再次迁移）。
+fn migrate_from_json(base: &Path) -> Result<AgentConfig, String> {
+    let path = legacy_json_path(base);
+    let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let text = text.trim_start_matches('\u{feff}');
+    let cfg: AgentConfig = serde_json::from_str(text).map_err(|e| e.to_string())?;
+
+    let bak = PathBuf::from(format!("{}.bak", path.display()));
+    let _ = std::fs::rename(&path, &bak);
+    util::log_format(
+        "配置已从 Agent.json 迁移为 StarAgent.config（原文件备份为 {}）",
+        &[&bak.display().to_string()],
+    );
+    Ok(cfg)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -347,5 +777,160 @@ mod tests {
         assert_eq!(cfg.apps[0].file_name, "app1.zip");
         assert_eq!(cfg.apps[0].working_directory.as_deref(), Some("../apps/app1"));
         assert_eq!(cfg.apps[0].mode_text(), "shadow");
+    }
+
+    /// 独立临时目录（含 Config 子目录）。
+    fn temp_base(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-config-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(dir.join("Config")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn generates_xml_with_comments() {
+        let base = temp_base("gen");
+        let cfg = AgentConfig::load(&base);
+        assert_eq!(cfg.service_name, "StarAgent");
+        assert_eq!(cfg.local_port, DEFAULT_LOCAL_PORT);
+
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(text.contains("<!--本地端口"), "应带注释：\n{text}");
+        assert!(text.contains("<ServiceName>StarAgent</ServiceName>"), "{text}");
+        assert!(text.contains("<Services>"), "{text}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn save_keeps_comments_and_updates_values() {
+        let base = temp_base("keep");
+        let mut cfg = AgentConfig::load(&base);
+        cfg.local_port = 5599;
+        cfg.apps[0].enable = true;
+        cfg.save(&base).unwrap();
+
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(text.contains("<LocalPort>5599</LocalPort>"), "值应更新：\n{text}");
+        assert!(text.contains("<!--本地端口"), "注释应保留：\n{text}");
+        assert!(text.contains("Enable=\"true\""), "应用值应更新：\n{text}");
+        assert!(text.contains("<ServiceInfo"), "应用条目应存在：\n{text}");
+
+        let back = AgentConfig::load(&base);
+        assert_eq!(back.local_port, 5599);
+        assert!(back.apps[0].enable);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrates_from_legacy_json() {
+        let base = temp_base("migrate");
+        let mut old = AgentConfig::default();
+        old.local_port = 5601;
+        old.apps = vec![AppConfig {
+            name: "legacy".to_string(),
+            file_name: "legacy.zip".to_string(),
+            enable: true,
+            ..Default::default()
+        }];
+        std::fs::write(
+            legacy_json_path(&base),
+            serde_json::to_string_pretty(&old).unwrap(),
+        )
+        .unwrap();
+
+        let cfg = AgentConfig::load(&base);
+        assert_eq!(cfg.local_port, 5601);
+        assert_eq!(cfg.apps.len(), 1);
+        assert_eq!(cfg.apps[0].name, "legacy");
+
+        assert!(config_path(&base).exists(), "应生成 StarAgent.config");
+        assert!(
+            PathBuf::from(format!("{}.bak", legacy_json_path(&base).display())).exists(),
+            "旧文件应备份为 .json.bak"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn migrates_from_legacy_toml() {
+        let base = temp_base("migrate-toml");
+        // 手写最小 TOML（模拟旧版 Pek.RAgent 配置）
+        std::fs::write(
+            legacy_toml_path(&base),
+            "ServiceName = \"StarAgent\"\nLocalPort = 5602\n\n[[Apps]]\nName = \"legacy\"\nFileName = \"legacy.zip\"\nEnable = true\n",
+        )
+        .unwrap();
+
+        let cfg = AgentConfig::load(&base);
+        assert_eq!(cfg.local_port, 5602);
+        assert_eq!(cfg.apps.len(), 1);
+        assert_eq!(cfg.apps[0].name, "legacy");
+
+        assert!(config_path(&base).exists(), "应生成 StarAgent.config");
+        assert!(
+            PathBuf::from(format!("{}.bak", legacy_toml_path(&base).display())).exists(),
+            "旧文件应备份为 .toml.bak"
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn reads_csharp_file_and_preserves_csharp_fields() {
+        let base = temp_base("csharp");
+        // 一份典型的 C# StarAgent.config（含 Rust 不认识的字段/属性）
+        let xml = r#"<?xml version="1.0" encoding="utf-8"?>
+<StarAgent>
+  <Debug>true</Debug>
+  <Code>abc123</Code>
+  <Channel>Release</Channel>
+  <LocalPort>5700</LocalPort>
+  <Project>demo</Project>
+  <Delay>5000</Delay>
+  <Services>
+    <ServiceInfo Name="StarServer" FileName="dotnet" Arguments="StarServer.dll" WorkingDirectory="..\server" Enable="true" MaxMemory="128" Priority="2" />
+    <ServiceInfo Name="StarWeb" FileName="StarWeb.zip" Arguments="urls=http://*:6680" Enable="false" />
+  </Services>
+</StarAgent>"#;
+        std::fs::write(config_path(&base), xml).unwrap();
+
+        let mut cfg = AgentConfig::load(&base);
+        assert!(cfg.debug);
+        assert_eq!(cfg.local_port, 5700);
+        assert_eq!(cfg.project, "demo");
+        assert_eq!(cfg.delay, 5000);
+        assert_eq!(cfg.apps.len(), 2);
+        assert_eq!(cfg.apps[0].name, "StarServer");
+        assert_eq!(cfg.apps[0].file_name, "dotnet");
+        assert_eq!(cfg.apps[0].max_memory, 128);
+        assert!(cfg.apps[0].enable);
+        assert_eq!(cfg.apps[1].arguments.as_deref(), Some("urls=http://*:6680"));
+
+        // 保存后：C# 特有字段保留、未知属性（Priority）保留、Mode 写 C# 数值
+        cfg.local_port = 5711;
+        cfg.save(&base).unwrap();
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(text.contains("<LocalPort>5711</LocalPort>"), "{text}");
+        assert!(text.contains("<Code>abc123</Code>"), "C# 字段应保留：\n{text}");
+        assert!(text.contains("<Channel>Release</Channel>"), "C# 字段应保留：\n{text}");
+        assert!(text.contains("Priority=\"2\""), "未知属性应保留：\n{text}");
+        assert!(text.contains("Mode=\"11\""), "Mode 应写 C# 数值：\n{text}");
+
+        // 回读一致
+        let back = AgentConfig::load(&base);
+        assert_eq!(back.local_port, 5711);
+        assert_eq!(back.apps.len(), 2);
+        assert_eq!(back.apps[0].max_memory, 128);
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

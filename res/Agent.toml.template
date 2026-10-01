@@ -1,0 +1,96 @@
+# Pek.RAgent 配置文件（TOML）
+#
+# 本文件由 Pek.RAgent 生成与维护：首次生成即带全部字段说明注释；
+# 通过程序（含 Web 管理面板）修改配置值时，注释与排版会被保留。
+# 也可以直接用编辑器手工修改（支持注释），保存后程序会自动重新加载。
+
+# 服务名。默认 StarAgent，与现有部署脚本/服务名保持一致
+ServiceName = "StarAgent"
+# 显示名
+DisplayName = "星尘代理"
+# 服务描述
+Description = "星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。"
+# 本地控制端口。默认 5500，DHDeploy 依赖该端口
+LocalPort = 5500
+# 仅本机访问。默认 true（只绑定 127.0.0.1）
+LocalOnly = true
+# 重启进程或服务的延迟时间（毫秒），默认 3000
+Delay = 3000
+# 启动等待时间（毫秒）。该时间内进程退出视为启动失败，默认 3000
+StartWait = 3000
+# 最大失败次数。超过后不再尝试启动，默认 20
+MaxFails = 20
+# 守护检查周期（毫秒），默认 30000
+GuardPeriod = 30000
+# 调试开关。开启后应用输出重定向到 Log 目录
+Debug = false
+# 星尘服务端地址。暂未对接，保留字段以便脚本兼容（`-server` 参数可写入）
+Server = ""
+# 项目名。暂未对接，保留字段（`-project` 参数可写入）
+Project = ""
+# 启动挂钩。对 .NET 应用注入 Stardust.dll（未引用星尘 SDK 时）
+StartupHook = false
+# 看门狗。保护其它服务，每分钟检查一次；多个进程名逗号分隔
+WatchDog = ""
+# Web 面板用户名。默认 admin
+WebUserName = "admin"
+# Web 面板密码。默认 admin
+WebPassword = "admin"
+# Web 面板鉴权级别（None/LocalOnly/Full）。默认 LocalOnly
+WebAuthLevel = "LocalOnly"
+
+# ————— 应用服务集合（每个应用一个 [[Apps]] 段；可复制段新增应用） —————
+
+# 应用 #1（示例，默认禁用）
+[[Apps]]
+# 名称。全局唯一
+Name = "test"
+# 文件名。可执行文件、zip 包或系统命令；为空时默认 `{Name}.zip`
+FileName = "ping"
+# 启动参数。原样透传（按空白与双引号切分）
+Arguments = "newlifex.com"
+# 工作目录。相对路径按程序目录解析；为空时默认 `../apps/{Name}`
+WorkingDirectory = "../apps/test"
+# 运行用户（仅 Linux 有效，尽力而为）
+UserName = ""
+# 启用。停止服务时会置为 false，启动服务时置为 true
+Enable = false
+# 部署模式：shadow（默认，影子目录）/ standard / hosted / task
+Mode = "shadow"
+# 允许多实例。健康检查时不再按进程名匹配
+AllowMultiple = false
+# 环境变量。形如 `A=1;B=2`
+Environments = ""
+# 自动停止。随宿主退出时同时停止应用进程
+AutoStop = false
+# 检测文件变动自动重启（轮询 *.dll;*.exe;*.zip;*.jar）
+ReloadOnChange = false
+# 最大内存（MB）。超过上限自动重启，0 不限制
+MaxMemory = 0
+# OOM 分值（仅 Linux）。-1000 禁止被杀，0 普通
+OomScoreAdjust = 0
+# 健康检查。http/tcp 地址，如 `http://localhost:6600/health`
+HealthCheck = ""
+# 覆盖文件。部署包内需拷贝覆盖到工作目录的文件或子目录，`;` 分隔，支持 `*` 模糊匹配
+Overwrite = ""
+# 调试输出。输出重定向到 `Log/app-{Name}.log`
+Debug = false
+
+# 应用 #2（示例，默认禁用）
+[[Apps]]
+Name = "webapp"
+FileName = "webapp.zip"
+Arguments = "urls=http://*:8080"
+WorkingDirectory = "../apps/webapp"
+UserName = ""
+Enable = false
+Mode = "shadow"
+AllowMultiple = false
+Environments = ""
+AutoStop = false
+ReloadOnChange = false
+MaxMemory = 0
+OomScoreAdjust = 0
+HealthCheck = ""
+Overwrite = ""
+Debug = false

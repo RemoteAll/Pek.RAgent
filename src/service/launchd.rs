@@ -79,6 +79,11 @@ fn plist_text(mgr: &ServiceManager) -> String {
     )
 }
 
+/// 服务管理器类型名（用于状态显示）。
+pub fn init_name() -> &'static str {
+    "launchd"
+}
+
 /// 查询状态。
 pub fn query(mgr: &ServiceManager) -> ServiceState {
     if !plist_path(&mgr.name).exists() {

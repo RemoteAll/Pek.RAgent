@@ -543,7 +543,7 @@ fn logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let log_dir = panel.base.join("Log");
     let path = if file.trim().is_empty() {
         // 最新文件：按文件名倒序（与 C# 的 OrderByDescending 一致）
-        latest_log_file(&log_dir)
+        util::latest_log_file(&log_dir)
     } else {
         // 安全：只取文件名部分，防目录穿越
         match Path::new(file.trim()).file_name() {
@@ -560,7 +560,7 @@ fn logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     };
 
     let mut lines = match &path {
-        Some(p) => read_tail(p, count),
+        Some(p) => util::read_tail(p, count),
         None => Vec::new(),
     };
     if !level.trim().is_empty() {
@@ -933,7 +933,7 @@ fn update_star_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 
     util::log_info("Web 面板更新星尘配置");
-    json_result(0, "配置已保存到: Agent.json", None)
+    json_result(0, "配置已保存到: StarAgent.config", None)
 }
 
 /// 本机详细信息。
@@ -1257,38 +1257,6 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
-}
-
-/// 日志目录中最新（文件名最大）的日志文件。
-fn latest_log_file(dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(String, PathBuf)> = None;
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return None;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() {
-            continue;
-        }
-        let name = entry.file_name().to_string_lossy().to_string();
-        if !name.to_ascii_lowercase().ends_with(".log") {
-            continue;
-        }
-        if best.as_ref().map(|(b, _)| name > *b).unwrap_or(true) {
-            best = Some((name, path));
-        }
-    }
-    best.map(|(_, path)| path)
-}
-
-/// 读取文件尾部若干行。
-fn read_tail(path: &Path, count: usize) -> Vec<String> {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return Vec::new();
-    };
-    let lines: Vec<&str> = text.lines().collect();
-    let start = lines.len().saturating_sub(count);
-    lines[start..].iter().map(|s| s.to_string()).collect()
 }
 
 /// 计划服务重启：分离进程延迟 2 秒后停止并启动系统服务。

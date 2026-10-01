@@ -196,16 +196,23 @@ if ($linuxTargets.Count -gt 0) {
     $helper = Join-Path $env:TEMP 'pek-ragent-tar.py'
     if ($py) {
         $pyCode = @'
-import os, tarfile, time, sys
-src, dst, name = sys.argv[1], sys.argv[2], sys.argv[3]
-ti = tarfile.TarInfo(name)
-ti.size = os.path.getsize(src)
-ti.mode = 0o755
-ti.mtime = int(time.time())
-ti.uname = 'root'
-ti.gname = 'root'
-with open(src, 'rb') as f, tarfile.open(dst, 'w:gz') as t:
-    t.addfile(ti, f)
+import io, tarfile, time, sys
+# 用法：python helper <dst.tar.gz> <path> <name> [<path> <name> ...]
+# .sh 文件行尾归一化为 LF（Windows 工作区可能是 CRLF）；统一 0755/root 属主
+dst, args = sys.argv[1], sys.argv[2:]
+with tarfile.open(dst, 'w:gz') as t:
+    for path, name in zip(args[0::2], args[1::2]):
+        with open(path, 'rb') as f:
+            data = f.read()
+        if name.endswith('.sh'):
+            data = data.replace(b'\r\n', b'\n')
+        ti = tarfile.TarInfo(name)
+        ti.size = len(data)
+        ti.mode = 0o755
+        ti.mtime = int(time.time())
+        ti.uname = 'root'
+        ti.gname = 'root'
+        t.addfile(ti, io.BytesIO(data))
 '@
         Set-Content -Path $helper -Value $pyCode -Encoding ASCII
     }
@@ -226,7 +233,8 @@ with open(src, 'rb') as f, tarfile.open(dst, 'w:gz') as t:
         $tgz = "dist\pek-ragent-v$ver-$t.tar.gz"
         $packed = $false
         if ($py) {
-            & $py $helper $bin $tgz 'pek-ragent'
+            # 附带 install.sh：`bash install.sh` 一键补可执行位并安装（解决 scp/网盘传输丢可执行位）
+            & $py $helper $tgz $bin 'pek-ragent' 'packaging\install.sh' 'install.sh'
             $packed = ($LASTEXITCODE -eq 0)
         }
         if (-not $packed) {

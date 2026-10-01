@@ -100,6 +100,12 @@ impl ServiceManager {
         platform::query(self)
     }
 
+    /// 服务管理器类型名（`systemd` / `procd` / `SysVinit` / `launchd` / `Windows 服务`），
+    /// 用于状态行显示（对齐 C# `-status` 的“状态：systemd ...”风格）。
+    pub fn init_name(&self) -> &'static str {
+        platform::init_name()
+    }
+
     /// 安装（`start` 为 true 时安装并启动）。
     pub fn install(&self, start: bool) -> Result<(), String> {
         platform::install(self, start)

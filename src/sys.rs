@@ -967,8 +967,18 @@ pub(crate) fn empty_working_set() -> bool {
 
     #[cfg(target_os = "linux")]
     {
-        // glibc：将空闲堆归还系统（等价于 C# GC + 释放虚拟内存的尽力而为）
-        unsafe { libc::malloc_trim(0) != 0 }
+        // glibc 的 malloc_trim 将空闲堆归还系统（等价于 C# GC + 释放虚拟内存的尽力而为）；
+        // musl 无此扩展（交叉编译到 musl 目标时因缺符号失败过），按"空操作成功"处理
+        // （面板显示释放 0MB，而非误报失败）。
+        #[cfg(target_env = "gnu")]
+        {
+            unsafe { libc::malloc_trim(0) != 0 }
+        }
+
+        #[cfg(not(target_env = "gnu"))]
+        {
+            true
+        }
     }
 
     #[cfg(not(any(windows, target_os = "linux")))]
@@ -1367,6 +1377,7 @@ pub(crate) fn format_gmk(bytes: u64) -> String {
 }
 
 /// MAC 地址格式（`xx-xx-xx-xx-xx-xx`）。
+#[cfg_attr(not(windows), allow(dead_code))]
 fn format_mac(bytes: &[u8]) -> String {
     bytes
         .iter()
