@@ -350,39 +350,124 @@ fn run_capture(program: &str, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).to_string())
 }
 
-/// 机器信息文本（用于 `-ShowMachineInfo` 与状态输出）。
+/// 机器信息文本（用于 `-ShowMachineInfo`）。
+///
+/// 信息面对齐 C# `ShowMachineInfo`（MachineInfo + 网络接口 + 磁盘列表）；
+/// 星尘节点/心跳字段（NodeInfo/PingInfo）待对接星尘服务端后补充。
 pub fn machine_info() -> String {
     let mut text = String::new();
+
+    // —— 基本信息 ——
     text.push_str(&format!(
         "系统：{} {}\n",
-        std::env::consts::OS,
+        os_description(),
         std::env::consts::ARCH
     ));
 
     let host = hostname();
-    if !host.is_empty() {
-        text.push_str(&format!("主机：{}\n", host));
+    let user = user_name();
+    if !host.is_empty() && !user.is_empty() {
+        text.push_str(&format!("主机：{host}  用户：{user}\n"));
+    } else if !host.is_empty() {
+        text.push_str(&format!("主机：{host}\n"));
     }
 
     let cpus = std::thread::available_parallelism()
         .map(|e| e.get())
         .unwrap_or(0);
-    text.push_str(&format!("处理器：{} 核心\n", cpus));
-
-    if let Some(mb) = total_memory_mb() {
-        text.push_str(&format!("内存：{} MB\n", mb));
+    match cpu_model() {
+        Some(model) => text.push_str(&format!("处理器：{model}（{cpus} 逻辑核心）\n")),
+        None => text.push_str(&format!("处理器：{cpus} 核心\n")),
     }
 
-    if let Some(ip) = dhrust::net::my_ip() {
-        text.push_str(&format!("本机IP：{}\n", ip));
+    if let Some((total, avail)) = memory_info() {
+        if total > 0 && avail > 0 {
+            let used_pct = (total - avail) as f64 * 100.0 / total as f64;
+            text.push_str(&format!(
+                "内存：{}（可用 {}，已用 {used_pct:.1}%）\n",
+                format_gmk(total),
+                format_gmk(avail)
+            ));
+        } else {
+            text.push_str(&format!("内存：{}\n", format_gmk(total)));
+        }
     }
 
+    if let Some(uptime) = uptime_text() {
+        text.push_str(&format!("启动：已运行 {uptime}\n"));
+    }
+
+    // —— 程序与目录 ——
     if let Ok(exe) = std::env::current_exe() {
         text.push_str(&format!(
             "程序：{} v{}\n",
             exe.display(),
             env!("CARGO_PKG_VERSION")
         ));
+        if let Some(parent) = exe.parent() {
+            text.push_str(&format!("基础目录：{}\n", parent.display()));
+        }
+    }
+    text.push_str(&format!("临时目录：{}\n", std::env::temp_dir().display()));
+
+    if let Some(ip) = dhrust::net::my_ip() {
+        text.push_str(&format!("本机IP：{ip}\n"));
+    }
+
+    // —— 网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡） ——
+    let nets = network_interfaces();
+    if !nets.is_empty() {
+        text.push('\n');
+        text.push_str(&format!("网络接口（{}）：\n", nets.len()));
+        for net in &nets {
+            let desc = if net.description.is_empty() {
+                net.name.clone()
+            } else {
+                format!("{}  {}", net.name, net.description)
+            };
+            text.push_str(&format!(
+                "  {}  {}\n",
+                desc,
+                if net.up { "已连接" } else { "未连接" }
+            ));
+            if net.speed_mbps > 0 {
+                text.push_str(&format!("    速率：{} Mbps\n", net.speed_mbps));
+            }
+            if !net.mac.is_empty() {
+                text.push_str(&format!("    MAC：{}\n", net.mac));
+            }
+            if !net.ips.is_empty() {
+                text.push_str(&format!("    IP：{}\n", net.ips.join(", ")));
+            }
+            if !net.gateways.is_empty() {
+                text.push_str(&format!("    网关：{}\n", net.gateways.join(", ")));
+            }
+            if !net.dns.is_empty() {
+                text.push_str(&format!("    DNS：{}\n", net.dns.join(", ")));
+            }
+        }
+    }
+
+    // —— 磁盘列表（对齐 C#：全量枚举并标注类型） ——
+    let disks = disks();
+    if !disks.is_empty() {
+        text.push('\n');
+        text.push_str("磁盘：\n");
+        for d in &disks {
+            if d.ready {
+                text.push_str(&format!("  {}  {}  {}", d.name, d.kind, d.format));
+                if !d.label.is_empty() {
+                    text.push_str(&format!("  \"{}\"", d.label));
+                }
+                text.push_str(&format!(
+                    "  {}（可用 {}）\n",
+                    format_gmk(d.total),
+                    format_gmk(d.free)
+                ));
+            } else {
+                text.push_str(&format!("  {}  {}  [未就绪]\n", d.name, d.kind));
+            }
+        }
     }
 
     text
@@ -408,18 +493,198 @@ fn hostname() -> String {
     }
 }
 
-/// 物理内存总量（MB）。
-fn total_memory_mb() -> Option<u64> {
+// ————— 机器信息辅助（-ShowMachineInfo） —————
+
+/// 网络接口信息。
+struct NetInterface {
+    /// 接口名称（中文系统为“以太网/WLAN”等；Linux 为 eth0 等）
+    name: String,
+    /// 描述（网卡型号；Linux 通常为空）
+    description: String,
+    /// 是否已连接
+    up: bool,
+    /// 链路速率（Mbps；0 表示未知）
+    speed_mbps: u64,
+    /// MAC 地址（`xx-xx-xx-xx-xx-xx`）
+    mac: String,
+    /// IPv4 地址列表
+    ips: Vec<String>,
+    /// 网关列表
+    gateways: Vec<String>,
+    /// DNS 服务器列表
+    dns: Vec<String>,
+}
+
+/// 磁盘信息。
+struct DiskItem {
+    /// 盘符（`C:\`）或挂载点
+    name: String,
+    /// 类型（固定/可移动/网络/光驱等）
+    kind: String,
+    /// 文件系统（NTFS/ext4 等）
+    format: String,
+    /// 卷标
+    label: String,
+    /// 总字节（未就绪为 0）
+    total: u64,
+    /// 可用字节
+    free: u64,
+    /// 是否就绪（光驱无盘等）
+    ready: bool,
+}
+
+/// 当前用户名。
+fn user_name() -> String {
+    std::env::var("USERNAME")
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_default()
+}
+
+/// 操作系统描述（Windows 形如 `Microsoft Windows NT 10.0.26200.0`，与 .NET `OSDescription` 一致）。
+fn os_description() -> String {
     #[cfg(windows)]
     {
-        use windows_sys::Win32::System::SystemInformation::{
-            GlobalMemoryStatusEx, MEMORYSTATUSEX,
+        // 与 dhrust::logs 的实现同源（RtlGetVersion）；待公共化后统一下沉
+        use windows_sys::Win32::System::SystemInformation::OSVERSIONINFOW;
+
+        #[link(name = "ntdll")]
+        unsafe extern "system" {
+            fn RtlGetVersion(version_info: *mut OSVERSIONINFOW) -> i32;
+        }
+
+        unsafe {
+            let mut info: OSVERSIONINFOW = std::mem::zeroed();
+            info.dwOSVersionInfoSize = std::mem::size_of::<OSVERSIONINFOW>() as u32;
+            if RtlGetVersion(&mut info) == 0 {
+                return format!(
+                    "Microsoft Windows NT {}.{}.{}.0",
+                    info.dwMajorVersion, info.dwMinorVersion, info.dwBuildNumber
+                );
+            }
+        }
+        "Windows".to_string()
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(text) = std::fs::read_to_string("/etc/os-release") {
+            for line in text.lines() {
+                if let Some(value) = line.strip_prefix("PRETTY_NAME=") {
+                    return value.trim().trim_matches('"').to_string();
+                }
+            }
+        }
+        "Linux".to_string()
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        "macOS".to_string()
+    }
+
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        std::env::consts::OS.to_string()
+    }
+}
+
+/// CPU 型号（Windows 读注册表 ProcessorNameString；Linux 读 /proc/cpuinfo；macOS 读 sysctl）。
+fn cpu_model() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::NO_ERROR;
+        use windows_sys::Win32::System::Registry::{
+            HKEY, HKEY_LOCAL_MACHINE, KEY_READ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
         };
+
+        fn wide(text: &str) -> Vec<u16> {
+            text.encode_utf16().chain(std::iter::once(0)).collect()
+        }
+
+        let sub = wide("HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0");
+        let value = wide("ProcessorNameString");
+        unsafe {
+            let mut hkey: HKEY = std::ptr::null_mut();
+            if RegOpenKeyExW(HKEY_LOCAL_MACHINE, sub.as_ptr(), 0, KEY_READ, &mut hkey) != NO_ERROR {
+                return None;
+            }
+
+            let mut size = 0u32;
+            let mut kind = 0u32;
+            let mut model = None;
+            if RegQueryValueExW(
+                hkey,
+                value.as_ptr(),
+                std::ptr::null(),
+                &mut kind,
+                std::ptr::null_mut(),
+                &mut size,
+            ) == NO_ERROR
+                && size > 2
+            {
+                let mut buf = vec![0u8; size as usize];
+                if RegQueryValueExW(
+                    hkey,
+                    value.as_ptr(),
+                    std::ptr::null(),
+                    &mut kind,
+                    buf.as_mut_ptr(),
+                    &mut size,
+                ) == NO_ERROR
+                {
+                    let wide_text: &[u16] =
+                        std::slice::from_raw_parts(buf.as_ptr() as *const u16, size as usize / 2);
+                    let end = wide_text
+                        .iter()
+                        .position(|&c| c == 0)
+                        .unwrap_or(wide_text.len());
+                    let text = String::from_utf16_lossy(&wide_text[..end]);
+                    if !text.trim().is_empty() {
+                        model = Some(text.trim().to_string());
+                    }
+                }
+            }
+            RegCloseKey(hkey);
+            model
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string("/proc/cpuinfo").ok()?;
+        for line in text.lines() {
+            for key in ["model name", "Hardware", "Model"] {
+                if let Some(rest) = line.strip_prefix(key) {
+                    if let Some((_, value)) = rest.split_once(':') {
+                        let value = value.trim();
+                        if !value.is_empty() {
+                            return Some(value.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        run_capture("sysctl", &["-n", "machdep.cpu.brand_string"])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    }
+}
+
+/// 物理内存（总量、可用；字节）。
+fn memory_info() -> Option<(u64, u64)> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
         unsafe {
             let mut status: MEMORYSTATUSEX = std::mem::zeroed();
             status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
             if GlobalMemoryStatusEx(&mut status) != 0 {
-                return Some(status.ullTotalPhys / 1024 / 1024);
+                return Some((status.ullTotalPhys, status.ullAvailPhys));
             }
         }
         None
@@ -428,20 +693,392 @@ fn total_memory_mb() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
         let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+        let parse_kb = |line: &str, key: &str| {
+            line.strip_prefix(key).and_then(|rest| {
+                rest.split_whitespace()
+                    .next()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|kb| kb * 1024)
+            })
+        };
+        let mut total = None;
+        let mut avail = None;
         for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("MemTotal:") {
-                let kb: u64 = rest.split_whitespace().next()?.parse().ok()?;
-                return Some(kb / 1024);
+            if total.is_none() {
+                total = parse_kb(line, "MemTotal:");
+            }
+            if avail.is_none() {
+                avail = parse_kb(line, "MemAvailable:");
+            }
+            if total.is_some() && avail.is_some() {
+                break;
             }
         }
-        None
+        total.map(|t| (t, avail.unwrap_or(0)))
     }
 
     #[cfg(target_os = "macos")]
     {
         let text = run_capture("sysctl", &["-n", "hw.memsize"])?;
         let bytes: u64 = text.trim().parse().ok()?;
-        Some(bytes / 1024 / 1024)
+        Some((bytes, 0))
+    }
+}
+
+/// 系统运行时长文本（如 `21天13小时`）。
+fn uptime_text() -> Option<String> {
+    #[cfg(windows)]
+    let millis: Option<u64> =
+        Some(unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() });
+
+    #[cfg(target_os = "linux")]
+    let millis: Option<u64> = std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|text| {
+            text.split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<f64>().ok())
+        })
+        .map(|secs| (secs * 1000.0) as u64);
+
+    #[cfg(target_os = "macos")]
+    let millis: Option<u64> = None;
+
+    let millis = millis?;
+    let total_minutes = millis / 60_000;
+    let days = total_minutes / 1440;
+    let hours = (total_minutes % 1440) / 60;
+    let minutes = total_minutes % 60;
+    if days > 0 {
+        Some(format!("{days}天{hours}小时"))
+    } else if hours > 0 {
+        Some(format!("{hours}小时{minutes}分"))
+    } else {
+        Some(format!("{minutes}分"))
+    }
+}
+
+/// 字节数友好格式（对齐 C# `ToGMK`：1024 进制，保留 1 位小数，如 `63.7G`）。
+fn format_gmk(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut value = bytes as f64;
+    let mut idx = 0usize;
+    while value >= 1024.0 && idx < UNITS.len() - 1 {
+        value /= 1024.0;
+        idx += 1;
+    }
+    if idx == 0 {
+        format!("{bytes}B")
+    } else {
+        format!("{:.1}{}", value, UNITS[idx])
+    }
+}
+
+/// MAC 地址格式（`xx-xx-xx-xx-xx-xx`）。
+fn format_mac(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<Vec<_>>()
+        .join("-")
+}
+
+/// 排除的虚拟/过滤类网卡关键字（对齐 C# `ShowMachineInfo._Excludes`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+const VIRTUAL_ADAPTER_EXCLUDES: [&str; 14] = [
+    "Loopback",
+    "VMware",
+    "VBox",
+    "Virtual",
+    "Teredo",
+    "Tunnel",
+    "VPN",
+    "VNIC",
+    "IEEE",
+    "Filter",
+    "Npcap",
+    "QoS",
+    "Miniport",
+    "Kernel Debug",
+];
+
+/// 是否为虚拟/过滤类网卡（按描述匹配，忽略大小写）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_virtual_adapter(description: &str) -> bool {
+    let lower = description.to_ascii_lowercase();
+    VIRTUAL_ADAPTER_EXCLUDES
+        .iter()
+        .any(|e| lower.contains(&e.to_ascii_lowercase()))
+}
+
+/// 枚举网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡，取 IPv4）。
+fn network_interfaces() -> Vec<NetInterface> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{ERROR_BUFFER_OVERFLOW, NO_ERROR};
+        use windows_sys::Win32::NetworkManagement::IpHelper::{
+            GAA_FLAG_INCLUDE_GATEWAYS, GetAdaptersAddresses, IP_ADAPTER_ADDRESSES_LH,
+        };
+        use windows_sys::Win32::Networking::WinSock::{AF_INET, AF_UNSPEC, SOCKADDR, SOCKADDR_IN};
+
+        /// 从 `SOCKET_ADDRESS` 提取 IPv4（非 IPv4 返回 None）。
+        fn sockaddr_ipv4(addr: *const SOCKADDR) -> Option<String> {
+            unsafe {
+                if addr.is_null() || (*addr).sa_family != AF_INET {
+                    return None;
+                }
+                let sin = &*(addr as *const SOCKADDR_IN);
+                let b = sin.sin_addr.S_un.S_addr.to_ne_bytes();
+                Some(format!("{}.{}.{}.{}", b[0], b[1], b[2], b[3]))
+            }
+        }
+
+        /// 读取 PWSTR（UTF-16）到 String。
+        fn pwstr(ptr: *const u16) -> String {
+            unsafe {
+                if ptr.is_null() {
+                    return String::new();
+                }
+                let mut len = 0usize;
+                while *ptr.add(len) != 0 && len < 512 {
+                    len += 1;
+                }
+                String::from_utf16_lossy(std::slice::from_raw_parts(ptr, len))
+            }
+        }
+
+        let mut out = Vec::new();
+        unsafe {
+            let mut size: u32 = 16 * 1024;
+            let mut buf: Vec<u8> = vec![0; size as usize];
+            let mut ret = GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                GAA_FLAG_INCLUDE_GATEWAYS,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            );
+            if ret == ERROR_BUFFER_OVERFLOW {
+                buf = vec![0; size as usize];
+                ret = GetAdaptersAddresses(
+                    AF_UNSPEC as u32,
+                    GAA_FLAG_INCLUDE_GATEWAYS,
+                    std::ptr::null(),
+                    buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                    &mut size,
+                );
+            }
+            if ret != NO_ERROR {
+                return out;
+            }
+
+            let mut adapter = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+            while !adapter.is_null() {
+                let a = &*adapter;
+                adapter = a.Next;
+
+                // 过滤：软件回环（IfType=24）/ 隧道（131）与虚拟网卡（对齐 C# 排除表）
+                let description = pwstr(a.Description);
+                if a.IfType == 24 || a.IfType == 131 || is_virtual_adapter(&description) {
+                    continue;
+                }
+
+                let mut ips = Vec::new();
+                let mut ua = a.FirstUnicastAddress;
+                while !ua.is_null() {
+                    if let Some(ip) = sockaddr_ipv4((*ua).Address.lpSockaddr) {
+                        if !ips.contains(&ip) {
+                            ips.push(ip);
+                        }
+                    }
+                    ua = (*ua).Next;
+                }
+
+                let mut gateways = Vec::new();
+                let mut ga = a.FirstGatewayAddress;
+                while !ga.is_null() {
+                    if let Some(ip) = sockaddr_ipv4((*ga).Address.lpSockaddr) {
+                        gateways.push(ip);
+                    }
+                    ga = (*ga).Next;
+                }
+
+                let mut dns = Vec::new();
+                let mut da = a.FirstDnsServerAddress;
+                while !da.is_null() {
+                    if let Some(ip) = sockaddr_ipv4((*da).Address.lpSockaddr) {
+                        dns.push(ip);
+                    }
+                    da = (*da).Next;
+                }
+
+                let mac_len = (a.PhysicalAddressLength as usize).min(a.PhysicalAddress.len());
+                out.push(NetInterface {
+                    name: pwstr(a.FriendlyName),
+                    description,
+                    up: a.OperStatus == 1, // IfOperStatusUp
+                    speed_mbps: a.TransmitLinkSpeed / 1_000_000,
+                    mac: format_mac(&a.PhysicalAddress[..mac_len]),
+                    ips,
+                    gateways,
+                    dns,
+                });
+            }
+        }
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let Ok(dir) = std::fs::read_dir("/sys/class/net") else {
+            return out;
+        };
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let read = |file: &str| {
+                std::fs::read_to_string(base.join(file))
+                    .map(|s| s.trim().to_string())
+                    .ok()
+            };
+            let mac = read("address").unwrap_or_default();
+            if mac.is_empty() || mac == "00:00:00:00:00:00" {
+                continue; // 虚拟接口常见全零 MAC
+            }
+            out.push(NetInterface {
+                name,
+                description: String::new(),
+                up: read("operstate").as_deref() == Some("up"),
+                speed_mbps: read("speed")
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(0),
+                mac: mac.to_uppercase().replace(':', "-"),
+                ips: Vec::new(),
+                gateways: Vec::new(),
+                dns: Vec::new(),
+            });
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Vec::new() // macOS 待实机补充（需 ifconfig/netstat 解析）
+    }
+}
+
+/// 枚举磁盘（对齐 C# `ShowMachineInfo`：全量枚举并标注类型）。
+fn disks() -> Vec<DiskItem> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::{
+            GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+        };
+
+        fn utf16z(buf: &[u16]) -> String {
+            let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
+            String::from_utf16_lossy(&buf[..end])
+        }
+
+        let mut out = Vec::new();
+        let mask = unsafe { GetLogicalDrives() };
+        for i in 0..26u32 {
+            if mask & (1 << i) == 0 {
+                continue;
+            }
+            let letter = (b'A' + i as u8) as char;
+            let root = format!("{letter}:\\");
+            let root_w: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+
+            let kind = match unsafe { GetDriveTypeW(root_w.as_ptr()) } {
+                2 => "可移动",
+                3 => "固定",
+                4 => "网络",
+                5 => "光驱",
+                6 => "内存盘",
+                _ => "其它",
+            };
+
+            let mut label_buf = [0u16; 128];
+            let mut fs_buf = [0u16; 32];
+            let ok = unsafe {
+                GetVolumeInformationW(
+                    root_w.as_ptr(),
+                    label_buf.as_mut_ptr(),
+                    label_buf.len() as u32,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    fs_buf.as_mut_ptr(),
+                    fs_buf.len() as u32,
+                )
+            } != 0;
+
+            let mut free = 0u64;
+            let mut total = 0u64;
+            let mut total_free = 0u64;
+            let got = unsafe {
+                GetDiskFreeSpaceExW(root_w.as_ptr(), &mut free, &mut total, &mut total_free)
+            } != 0;
+
+            out.push(DiskItem {
+                name: root,
+                kind: kind.to_string(),
+                format: if ok { utf16z(&fs_buf) } else { String::new() },
+                label: if ok { utf16z(&label_buf) } else { String::new() },
+                total: if got { total } else { 0 },
+                free: if got { free } else { 0 },
+                ready: ok,
+            });
+        }
+        out
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let mut out = Vec::new();
+        let Ok(mounts) = std::fs::read_to_string("/proc/mounts") else {
+            return out;
+        };
+        for line in mounts.lines() {
+            let mut cols = line.split_whitespace();
+            let (Some(dev), Some(mp), Some(fs)) = (cols.next(), cols.next(), cols.next()) else {
+                continue;
+            };
+            if !dev.starts_with("/dev/") {
+                continue;
+            }
+            let mut stat: libc::statvfs = unsafe { std::mem::zeroed() };
+            let Ok(path) = std::ffi::CString::new(mp) else {
+                continue;
+            };
+            let ok = unsafe { libc::statvfs(path.as_ptr(), &mut stat) } == 0;
+            let (total, free) = if ok {
+                let block = stat.f_frsize as u64;
+                (stat.f_blocks as u64 * block, stat.f_bavail as u64 * block)
+            } else {
+                (0, 0)
+            };
+            out.push(DiskItem {
+                name: mp.to_string(),
+                kind: "固定".to_string(),
+                format: fs.to_string(),
+                label: String::new(),
+                total,
+                free,
+                ready: ok,
+            });
+        }
+        out
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Vec::new() // macOS 待实机补充
     }
 }
 
@@ -476,5 +1113,31 @@ mod tests {
         let pid = child.id();
         assert!(!is_alive(pid), "僵尸进程被误判为存活");
         let _ = child.wait();
+    }
+
+    #[test]
+    fn format_gmk_units() {
+        assert_eq!(format_gmk(512), "512B");
+        assert_eq!(format_gmk(1024), "1.0K");
+        assert_eq!(format_gmk(63 * 1024 * 1024 * 1024), "63.0G");
+        assert_eq!(format_gmk(3 * 1024u64 * 1024 * 1024 * 1024), "3.0T");
+    }
+
+    #[test]
+    fn format_mac_shape() {
+        assert_eq!(
+            format_mac(&[0x8c, 0x32, 0x23, 0x17, 0x8d, 0x54]),
+            "8c-32-23-17-8d-54"
+        );
+        assert_eq!(format_mac(&[]), "");
+    }
+
+    #[test]
+    fn machine_info_contains_core_lines() {
+        let text = machine_info();
+        for key in ["系统：", "处理器：", "内存：", "程序："] {
+            assert!(text.contains(key), "缺少 {key}:\n{text}");
+        }
+        assert!(!os_description().is_empty());
     }
 }

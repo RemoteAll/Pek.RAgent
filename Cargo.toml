@@ -33,6 +33,12 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_Console",
+    # 机器信息（-ShowMachineInfo）：网卡枚举 / 磁盘枚举 / CPU 型号注册表读取
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
 ] }
 
 [profile.release]

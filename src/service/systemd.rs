@@ -28,6 +28,12 @@ pub fn query(mgr: &ServiceManager) -> ServiceState {
 }
 
 /// 等待状态。
+/// 查询服务实际注册的程序路径（读单元文件解析 `ExecStart=`；失败返回 `None`）。
+pub fn query_installed_exe(mgr: &ServiceManager) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(unit_path(&mgr.name)).ok()?;
+    super::inits::parse_exec_start(&text)
+}
+
 fn wait_state(mgr: &ServiceManager, expected: ServiceState, timeout_ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     while Instant::now() < deadline {

@@ -159,7 +159,9 @@ fn cmd_status(base: &Path) -> i32 {
     println!("状态：{}", text);
 
     if state != ServiceState::NotInstalled {
-        println!("程序：{}", svc.exe.display());
+        // 优先显示服务注册的实际程序路径（当前进程可能是从开发输出目录等其它位置启动的）
+        let exe = svc.installed_exe().unwrap_or_else(|| svc.exe.clone());
+        println!("程序：{}", exe.display());
     }
     println!("配置：{}", crate::config::config_path(base).display());
     println!(
@@ -373,6 +375,8 @@ fn menu(base: &Path) -> i32 {
         let state = svc.query();
         let installed = state != ServiceState::NotInstalled;
         let running = state == ServiceState::Running;
+        // 代理运行中判定（探测本地控制接口——服务模式与前台模拟运行模式均可探测到）
+        let agent_alive = probe_agent_alive(base);
 
         println!();
         println!(
@@ -380,6 +384,15 @@ fn menu(base: &Path) -> i32 {
             env!("CARGO_PKG_VERSION")
         );
         println!(" 服务：{}（{}）", cfg.display_name, svc.name);
+        // 已安装时显示服务实际安装目录（从其它目录启动菜单时一眼看清服务装在哪）
+        if installed {
+            if let Some(dir) = svc
+                .installed_exe()
+                .and_then(|exe| exe.parent().map(|p| p.to_path_buf()))
+            {
+                println!(" 安装目录：{}", dir.display());
+            }
+        }
         if !cfg.server.is_empty() {
             println!(" 服务端：{}（当前版本暂不对接）", cfg.server);
         }
@@ -399,10 +412,13 @@ fn menu(base: &Path) -> i32 {
         }
         println!(" 4、 重启服务            -restart");
         println!(" 5、 模拟运行            -run");
-        println!(" 6、 查看子服务          -ListServices");
-        println!(" 7、 启动子服务          -StartService");
-        println!(" 8、 停止子服务          -StopService");
-        println!(" 9、 重启子服务          -RestartService");
+        // 子服务操作依赖运行中的代理（本地控制接口）；未运行时隐藏，避免“选中必失败”的无意义项
+        if agent_alive {
+            println!(" 6、 查看子服务          -ListServices");
+            println!(" 7、 启动子服务          -StartService");
+            println!(" 8、 停止子服务          -StopService");
+            println!(" 9、 重启子服务          -RestartService");
+        }
         println!(" t、 服务器信息          -ShowMachineInfo");
         println!(" 0、 退出");
         print!(" 请输入命令序号：");
@@ -677,6 +693,14 @@ fn fetch_services(base: &Path) -> Option<Vec<(String, bool, bool, u32, String, S
         ));
     }
     Some(out)
+}
+
+/// 探测代理是否运行中（本地控制接口可达）。
+///
+/// 代理可能以服务方式或前台模拟运行方式在跑，仅查服务状态无法覆盖后者，
+/// 因此以控制接口探测为准；短超时（500ms）避免菜单卡顿（本机回环上无监听会即时失败）。
+fn probe_agent_alive(base: &Path) -> bool {
+    api_get(base, "Ping", Duration::from_millis(500)).is_ok()
 }
 
 /// 代理未运行时的提示。

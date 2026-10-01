@@ -105,6 +105,14 @@ impl ServiceManager {
         platform::install(self, start)
     }
 
+    /// 查询服务实际注册的程序路径（读取服务注册信息；未安装或读取失败返回 `None`）。
+    ///
+    /// 与 [`ServiceManager::exe`]（当前进程路径）不同：服务可能安装在其他目录
+    /// （如从开发输出目录启动菜单时），用于展示真实安装位置。
+    pub fn installed_exe(&self) -> Option<PathBuf> {
+        platform::query_installed_exe(self)
+    }
+
     /// 重新安装（先卸载再安装并启动）。
     pub fn reinstall(&self) -> Result<(), String> {
         platform::reinstall(self)

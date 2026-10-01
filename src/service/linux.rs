@@ -35,6 +35,14 @@ pub fn query(mgr: &ServiceManager) -> ServiceState {
 }
 
 /// 安装（`start` 为 true 时安装并启动）。
+/// 查询服务实际注册的程序路径（systemd 读单元文件；其他 init 暂缺，返回 `None`）。
+pub fn query_installed_exe(mgr: &ServiceManager) -> Option<std::path::PathBuf> {
+    match detect_init() {
+        InitKind::Systemd => systemd::query_installed_exe(mgr),
+        _ => None,
+    }
+}
+
 pub fn install(mgr: &ServiceManager, start: bool) -> Result<(), String> {
     let kind = detect_init();
     util::log_format("检测到 init 系统：{}", &[kind.text()]);

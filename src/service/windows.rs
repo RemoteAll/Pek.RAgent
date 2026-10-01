@@ -38,6 +38,53 @@ pub fn query(mgr: &ServiceManager) -> ServiceState {
     }
 }
 
+/// 查询服务实际注册的可执行文件路径（`sc qc` 的二进制路径列）。
+///
+/// 与 [`ServiceManager::exe`]（当前进程路径）不同：服务可能安装在其他目录，
+/// 从开发输出目录启动菜单时用它识别真实安装位置；未安装或读取失败返回 `None`。
+pub fn query_installed_exe(mgr: &ServiceManager) -> Option<std::path::PathBuf> {
+    let (code, stdout, stderr) = run("sc", &["qc", &mgr.name]);
+    if code != 0 {
+        return None;
+    }
+    parse_bin_path(&format!("{stdout}\n{stderr}"))
+}
+
+/// 从 `sc qc` 输出解析注册的程序路径。
+///
+/// 不依赖字段名（避免系统语言差异）：定位首个 `.exe`，优先取引号包裹的完整路径
+/// （安装时写入的 `"{exe}" -s` 形态），无引号时取到空白前的连续段。
+fn parse_bin_path(output: &str) -> Option<std::path::PathBuf> {
+    for line in output.lines() {
+        let lower = line.to_ascii_lowercase();
+        let Some(pos) = lower.find(".exe") else {
+            continue;
+        };
+        let end = pos + 4;
+
+        // 引号包裹（路径含空格时的标准形态）：`"C:\dir\app.exe" -s`
+        if line[end..].trim_start().starts_with('"') {
+            if let Some(open) = line[..pos].rfind('"') {
+                let path = line[open + 1..end].trim();
+                if !path.is_empty() {
+                    return Some(std::path::PathBuf::from(path));
+                }
+            }
+        }
+
+        // 无引号：取 `.exe` 结尾的连续非空白段
+        let start = line[..end]
+            .rfind(char::is_whitespace)
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let path = line[start..end].trim_matches('"');
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
 /// 等待服务到达期望状态。
 fn wait_state(mgr: &ServiceManager, expected: ServiceState, timeout_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);
@@ -291,3 +338,33 @@ mod host {
 
 #[cfg(windows)]
 pub use host::run_as_service;
+
+#[cfg(test)]
+mod tests {
+    use super::parse_bin_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn parse_bin_path_quoted_with_spaces() {
+        let out = "[SC] QueryServiceConfig SUCCESS\n\nSERVICE_NAME: StarAgent\n        BINARY_PATH_NAME   : \"C:\\Program Files\\Star Agent\\pek-ragent.exe\" -s\n";
+        assert_eq!(
+            parse_bin_path(out),
+            Some(PathBuf::from("C:\\Program Files\\Star Agent\\pek-ragent.exe"))
+        );
+    }
+
+    #[test]
+    fn parse_bin_path_plain() {
+        let out = "        BINARY_PATH_NAME   : C:\\StarAgent\\pek-ragent.exe -s\n";
+        assert_eq!(
+            parse_bin_path(out),
+            Some(PathBuf::from("C:\\StarAgent\\pek-ragent.exe"))
+        );
+    }
+
+    #[test]
+    fn parse_bin_path_not_installed() {
+        let out = "[SC] OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n";
+        assert_eq!(parse_bin_path(out), None);
+    }
+}

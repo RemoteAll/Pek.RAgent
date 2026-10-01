@@ -12,6 +12,11 @@ pub fn query(_mgr: &ServiceManager) -> ServiceState {
 }
 
 /// 安装。
+/// 查询服务实际注册的程序路径（平台不支持服务化，恒为 `None`）。
+pub fn query_installed_exe(_mgr: &ServiceManager) -> Option<std::path::PathBuf> {
+    None
+}
+
 pub fn install(_mgr: &ServiceManager, _start: bool) -> Result<(), String> {
     unsupported()
 }

@@ -42,6 +42,21 @@ fn xml_escape(text: &str) -> String {
 }
 
 /// plist 内容。
+/// 查询服务实际注册的程序路径（解析 plist 的 `ProgramArguments` 首项；失败返回 `None`）。
+pub fn query_installed_exe(mgr: &ServiceManager) -> Option<std::path::PathBuf> {
+    let text = std::fs::read_to_string(plist_path(&mgr.name)).ok()?;
+    parse_program_argument(&text).map(std::path::PathBuf::from)
+}
+
+/// 解析 plist 文本中 `ProgramArguments` 数组的首个 `<string>` 值。
+fn parse_program_argument(text: &str) -> Option<String> {
+    let key = text.find("<key>ProgramArguments</key>")?;
+    let after = &text[key..];
+    let start = after.find("<string>")? + "<string>".len();
+    let end = after[start..].find("</string>")? + start;
+    Some(after[start..end].to_string())
+}
+
 fn plist_text(mgr: &ServiceManager) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

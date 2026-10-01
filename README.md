@@ -105,17 +105,18 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 | 命令 | 说明 |
 |------|------|
-| `-ShowMachineInfo` | 显示本机信息（系统/主机/核心数/内存/IP） |
+| `-ShowMachineInfo` | 显示本机信息（系统/主机/用户/CPU 型号/内存使用/运行时长 + 网络接口 + 磁盘列表；信息面对齐 C# StarAgent `ShowMachineInfo`） |
 | `pek-ragent app.zip 参数…` | 位置参数 zip 一次性拉起（影子目录；支持 `-name`、`-shadow`） |
 | `-help` / `-version` | 帮助 / 版本 |
 
 ### 4.4 控制台菜单
 
-无参数启动进入菜单（自动识别服务是否已安装/运行，第 2、3 项随状态切换）：
+无参数启动进入菜单（自动识别状态：第 2、3 项随服务的安装/运行状态切换；已安装时页首显示服务**实际安装目录**（读取服务注册信息）；第 6–9 项子服务操作仅在**代理运行中**——本地控制接口可达（服务或前台模式均可）——时显示）：
 
 ```text
 ================= Pek.RAgent 星尘代理 v0.1.0 =================
  服务：星尘代理（StarAgent）
+ 安装目录：C:\StarAgent
  状态：运行中
 
  序号 功能名称            命令行参数

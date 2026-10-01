@@ -95,6 +95,27 @@ WantedBy=multi-user.target\n",
     )
 }
 
+/// 解析 systemd 单元文件文本中的 `ExecStart=` 程序路径（与 [`systemd_unit_text`] 生成格式对称）。
+///
+/// 支持 `ExecStart="/path/exe" -s` 与 `ExecStart=/path/exe -s` 两种形态。
+pub fn parse_exec_start(text: &str) -> Option<std::path::PathBuf> {
+    for line in text.lines() {
+        let Some(rest) = line.trim().strip_prefix("ExecStart=") else {
+            continue;
+        };
+        let rest = rest.trim();
+        let path = if let Some(stripped) = rest.strip_prefix('"') {
+            stripped.split('"').next().unwrap_or("")
+        } else {
+            rest.split_whitespace().next().unwrap_or("")
+        };
+        if !path.is_empty() {
+            return Some(std::path::PathBuf::from(path));
+        }
+    }
+    None
+}
+
 /// procd（OpenWrt）init 脚本内容。
 pub fn procd_script_text(mgr: &ServiceManager) -> String {
     PROCD_TEMPLATE.replace("@@EXE@@", &mgr.exe.display().to_string())
@@ -253,6 +274,21 @@ mod tests {
         assert!(text.contains("ExecStart=\"/opt/staragent/pek-ragent\" -s"));
         assert!(text.contains("WorkingDirectory=\"/opt/staragent\""));
         assert!(text.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn parse_exec_start_roundtrip() {
+        // 与 unit 文本生成对称：生成后解析应还原程序路径
+        let text = systemd_unit_text(&mgr());
+        assert_eq!(
+            parse_exec_start(&text),
+            Some(std::path::PathBuf::from("/opt/staragent/pek-ragent"))
+        );
+        assert_eq!(
+            parse_exec_start("ExecStart=/usr/local/bin/app -s\n"),
+            Some(std::path::PathBuf::from("/usr/local/bin/app"))
+        );
+        assert_eq!(parse_exec_start("[Unit]\nDescription=x\n"), None);
     }
 
     #[test]
