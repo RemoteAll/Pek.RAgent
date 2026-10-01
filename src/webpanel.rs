@@ -7,6 +7,9 @@
 //!   removeService / getStarConfig / updateStarConfig / machine / getProcessList
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
 //!
+//! 鉴权级别由 `WebAuthLevel` 控制（对齐 C# `ParseAuthLevel`）：`None` 全部放行 /
+//! `LocalOnly`（默认）本机回环地址免鉴权、远程需令牌 / `Full` 一律需令牌。
+//!
 //! 登录爆破防护按客户端 IP 计数（5 次失败封禁 5 分钟，窗口 15 分钟），与 C# 面板一致。
 
 use std::collections::HashMap;
@@ -35,6 +38,28 @@ const MAX_ATTEMPTS: u32 = 5;
 const ATTEMPT_WINDOW_MINUTES: i64 = 15;
 /// 封禁时长。
 const BLOCK_MINUTES: i64 = 5;
+
+/// Web 面板鉴权级别（对齐 C# `AuthLevel` 与 `ParseAuthLevel`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AuthLevel {
+    /// 不鉴权
+    None,
+    /// 本机免鉴权，远程需鉴权
+    LocalOnly,
+    /// 全部鉴权
+    Full,
+}
+
+impl AuthLevel {
+    /// 解析配置文本（大小写不敏感；未知或空值回退 `LocalOnly`，与 C# 一致）。
+    fn parse(text: &str) -> AuthLevel {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "none" => AuthLevel::None,
+            "full" => AuthLevel::Full,
+            _ => AuthLevel::LocalOnly,
+        }
+    }
+}
 
 /// 登录尝试记录。
 struct Attempt {
@@ -216,11 +241,37 @@ impl WebPanel {
     }
 
     /// 请求鉴权（`/api/login` 与 `/api/logout` 除外）。
+    ///
+    /// 级别由 `WebAuthLevel` 决定（对齐 C# `AgentWebPanel` 语义，修改后自动生效）：
+    /// - `None`：全部放行（不鉴权）；
+    /// - `LocalOnly`（默认）：本机回环地址免鉴权，其余需有效令牌；
+    /// - `Full`：一律校验令牌。
     fn check_auth(&self, ctx: &Ctx) -> bool {
+        match self.auth_level() {
+            AuthLevel::None => true,
+            AuthLevel::LocalOnly => {
+                Self::is_loopback(&Self::client_ip(ctx)) || self.check_token(ctx)
+            }
+            AuthLevel::Full => self.check_token(ctx),
+        }
+    }
+
+    /// 当前鉴权级别（动态读取配置）。
+    fn auth_level(&self) -> AuthLevel {
+        AuthLevel::parse(&self.manager.config().web_auth_level)
+    }
+
+    /// 校验 Bearer 令牌。
+    fn check_token(&self, ctx: &Ctx) -> bool {
         match Self::bearer_token(ctx) {
             Some(token) => self.validate_token(&token),
             None => false,
         }
+    }
+
+    /// 是否本机回环地址（`127.0.0.0/8`、`::1` 及 IPv4-mapped 形式）。
+    fn is_loopback(ip: &str) -> bool {
+        ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
     }
 
     /// 客户端 IP（无端口）。
@@ -498,9 +549,9 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.manager.config();
     let items = vec![
         config_item("WebUserName", "面板用户名", "String", cfg.web_user_name.clone(), "Web 管理面板的登录用户名"),
-        config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权，LocalOnly本地免鉴权，Full全部鉴权（预留）"),
+        config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
-        config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1；修改需重启服务后生效"),
+        config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
         config_item("MaxFails", "最大失败次数", "Int32", cfg.max_fails.to_string(), "超过后不再尝试启动，默认20"),
         config_item("GuardPeriod", "守护周期(ms)", "Int32", cfg.guard_period.to_string(), "服务守护检查周期，默认30000；修改需重启服务后生效"),
@@ -1407,9 +1458,13 @@ mod tests {
     use super::*;
     use dhrust::net::http::HttpRequest;
 
-    /// 构造测试上下文。
+    /// 构造来自远程地址的测试上下文（默认配置下需令牌的场景）。
     fn context(method: &str, path: &str, body: &str, token: Option<&str>) -> Ctx {
-        use dhrust::net::router::Ctx;
+        context_from("192.168.1.100:50000", method, path, body, token)
+    }
+
+    /// 构造指定来源地址的测试上下文。
+    fn context_from(remote: &str, method: &str, path: &str, body: &str, token: Option<&str>) -> Ctx {
         let headers = match token {
             Some(token) => vec![("Authorization".to_string(), format!("Bearer {token}"))],
             None => Vec::new(),
@@ -1420,7 +1475,7 @@ mod tests {
             query: String::new(),
             headers,
             body: body.to_string().into(),
-            remote_addr: Some("127.0.0.1:50000".to_string()),
+            remote_addr: Some(remote.to_string()),
         })
     }
 
@@ -1766,7 +1821,106 @@ mod tests {
 
     #[test]
     fn client_ip_strips_port() {
-        let ctx = context("GET", "/", "", None);
+        let ctx = context_from("127.0.0.1:50000", "GET", "/", "", None);
         assert_eq!(WebPanel::client_ip(&ctx), "127.0.0.1");
+    }
+
+    #[test]
+    fn auth_level_local_only_allows_loopback_and_requires_token_remotely() {
+        let (panel, dir) = panel_with_default_password();
+
+        // 默认 LocalOnly：本机回环地址（含 127.0.0.0/8 与 IPv6 形式）无令牌放行
+        for ip in [
+            "127.0.0.1:50000",
+            "127.0.0.53:50000",
+            "[::1]:50000",
+            "[::ffff:127.0.0.1]:50000",
+        ] {
+            let result = status(&panel, &context_from(ip, "GET", "/api/status", "", None));
+            assert_eq!(body_json(result)["code"], 0, "本机地址应免鉴权：{ip}");
+        }
+
+        // 远程无令牌：拒绝
+        let result = status(
+            &panel,
+            &context_from("192.168.1.100:50000", "GET", "/api/status", "", None),
+        );
+        assert_eq!(body_json(result)["code"], 401);
+
+        // 远程持有效令牌：放行
+        let token = panel.issue_token("admin", "admin").unwrap();
+        let result = status(
+            &panel,
+            &context_from("192.168.1.100:50000", "GET", "/api/status", "", Some(&token)),
+        );
+        assert_eq!(body_json(result)["code"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_level_full_requires_token_even_on_loopback() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        let result = update_config(
+            &panel,
+            &context(
+                "POST",
+                "/api/updateConfig",
+                r#"{"WebAuthLevel":"Full"}"#,
+                Some(&token),
+            ),
+        );
+        assert_eq!(body_json(result)["code"], 0);
+
+        // 本机无令牌：拒绝；持令牌：放行
+        let result = status(
+            &panel,
+            &context_from("127.0.0.1:50000", "GET", "/api/status", "", None),
+        );
+        assert_eq!(body_json(result)["code"], 401);
+        let result = status(
+            &panel,
+            &context_from("127.0.0.1:50000", "GET", "/api/status", "", Some(&token)),
+        );
+        assert_eq!(body_json(result)["code"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_level_none_allows_remote_without_token() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        let result = update_config(
+            &panel,
+            &context(
+                "POST",
+                "/api/updateConfig",
+                r#"{"WebAuthLevel":"none"}"#,
+                Some(&token),
+            ),
+        );
+        assert_eq!(body_json(result)["code"], 0);
+
+        let result = status(
+            &panel,
+            &context_from("192.168.1.100:50000", "GET", "/api/status", "", None),
+        );
+        assert_eq!(body_json(result)["code"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn auth_level_parse_matches_csharp_fallback() {
+        assert_eq!(AuthLevel::parse("none"), AuthLevel::None);
+        assert_eq!(AuthLevel::parse("None"), AuthLevel::None);
+        assert_eq!(AuthLevel::parse(" FULL "), AuthLevel::Full);
+        assert_eq!(AuthLevel::parse("localonly"), AuthLevel::LocalOnly);
+        assert_eq!(AuthLevel::parse(""), AuthLevel::LocalOnly);
+        assert_eq!(AuthLevel::parse("unknown"), AuthLevel::LocalOnly);
     }
 }

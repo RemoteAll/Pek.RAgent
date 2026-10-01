@@ -30,8 +30,8 @@
   <DisplayName>星尘代理</DisplayName>
   <!--服务描述-->
   <Description>星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。</Description>
-  <!--仅本机访问。默认 true（只绑定 127.0.0.1）-->
-  <LocalOnly>true</LocalOnly>
+  <!--仅本机访问。true 时只绑定 127.0.0.1；默认 false（允许远程访问——无头服务器需远程管理面板，请确保面板密码安全）-->
+  <LocalOnly>false</LocalOnly>
   <!--启动等待时间（毫秒）。该时间内进程退出视为启动失败，默认 3000-->
   <StartWait>3000</StartWait>
   <!--最大失败次数。超过后不再尝试启动，默认 20-->
@@ -44,7 +44,7 @@
   <WebUserName>admin</WebUserName>
   <!--Web 面板密码。默认 admin-->
   <WebPassword>admin</WebPassword>
-  <!--Web 面板鉴权级别（None/LocalOnly/Full）。默认 LocalOnly-->
+  <!--Web 面板鉴权级别。None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录-->
   <WebAuthLevel>LocalOnly</WebAuthLevel>
 
   <!--应用服务集合-->

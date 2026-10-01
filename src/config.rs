@@ -35,7 +35,8 @@ pub struct AgentConfig {
     pub description: String,
     /// 本地控制端口。默认 5500，DHDeploy 依赖该端口
     pub local_port: u16,
-    /// 仅本机访问。默认 true（只绑定 127.0.0.1）
+    /// 仅本机访问。true 时只绑定 127.0.0.1；false 绑定 0.0.0.0（允许远程，面板鉴权兜底）。
+    /// 默认 false——与 C# 行为一致，无头服务器需远程访问管理面板
     pub local_only: bool,
     /// 重启进程或服务的延迟时间（毫秒），默认 3000
     pub delay: u64,
@@ -59,7 +60,7 @@ pub struct AgentConfig {
     pub web_user_name: String,
     /// Web 面板密码。默认 admin
     pub web_user_password: String,
-    /// Web 面板鉴权级别（None/LocalOnly/Full）。默认 LocalOnly
+    /// Web 面板鉴权级别。None 不鉴权；LocalOnly 本地免鉴权、远程需鉴权（默认）；Full 全部鉴权
     pub web_auth_level: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,

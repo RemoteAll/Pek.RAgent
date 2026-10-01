@@ -1069,6 +1069,18 @@ window.matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{
 
 token=sessionStorage.getItem('agent_token')||'';
 if(token)showApp();
+else probeAuthlessAccess();
+
+// 免鉴权探测：WebAuthLevel=LocalOnly 时本机（回环）免登录，None 时全部免登录；
+// 匿名访问成功则直接进入面板，失败（401/网络错误）停留登录页。
+async function probeAuthlessAccess(){
+ try{
+  const r=await fetch('/api/status');
+  if(!r.ok)return;
+  const j=await r.json();
+  if(j&&j.code===0)showApp();
+ }catch(e){}
+}
 </script>
 </body>
 </html>

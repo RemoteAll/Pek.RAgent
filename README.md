@@ -20,10 +20,10 @@
 | 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
-| 本地 HTTP 控制接口 | 默认 `127.0.0.1:5500`，兼容 DHDeploy 的调用契约；仅本机访问（可配） |
+| 本地 HTTP 控制接口 | 默认 `0.0.0.0:5500`（`LocalOnly=true` 时仅 `127.0.0.1`），兼容 DHDeploy 的调用契约 |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
-| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗；默认 `admin`/`admin`，Bearer Token 鉴权，前端页编译期内嵌 |
+| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
@@ -107,6 +107,8 @@ ssh -L 5500:127.0.0.1:5500 root@server   # 然后打开 http://127.0.0.1:5500/
 ```
 
 > 旧版本生成的配置若为 `LocalOnly=true`，改回 `false` 并重启即可远程访问。
+
+> 面板鉴权级别由 `WebAuthLevel` 控制（默认 `LocalOnly`）：服务器本机访问免登录，远程访问需 `admin` 登录（Bearer Token）；改为 `Full` 则全部需登录。
 
 ### 3.2 运行时升级（"上传即升级"，不停止、不改名）
 
@@ -245,7 +247,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `DisplayName` | `星尘代理` | 显示名 |
 | `Description` | … | 服务描述 |
 | `LocalPort` | `5500` | 本地控制接口端口（DHDeploy 依赖 5500） |
-| `LocalOnly` | `true` | 仅绑定 127.0.0.1；置 false 绑定 0.0.0.0（无鉴权，慎用） |
+| `LocalOnly` | `false` | 为 true 时仅绑定 127.0.0.1（远程不可达）；默认 false 绑定 0.0.0.0（允许远程访问，面板凭据兜底） |
 | `Delay` | `3000` | 重启/文件变动后重新启动的延迟（毫秒） |
 | `StartWait` | `3000` | 健康检查等待时间（毫秒） |
 | `MaxFails` | `20` | 最大失败次数，超过后不再自动拉起 |
@@ -255,7 +257,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `StartupHook` | `false` | 对未引用星尘 SDK 的 .NET 应用注入 `Stardust.dll` |
 | `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
 | `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（配置页可在线修改密码） |
-| `WebAuthLevel` | `LocalOnly` | 面板鉴权级别（None/LocalOnly/Full，预留） |
+| `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）
@@ -386,7 +388,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 
 内置管理面板，浏览器访问 `http://127.0.0.1:5500/`（`LocalOnly=false` 时允许远程）：
 
-- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
+- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
 - **状态**：运行时长、进程内存/线程/句柄、系统 CPU 使用率、TCP 连接数、机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
 - **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
@@ -410,7 +412,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
 | `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
 
-> 鉴权：除 `login` 外所有端点需 `Authorization: Bearer <token>`；未通过返回 `{code:401}`。
+> 鉴权：级别由 `WebAuthLevel` 控制——`None` 全部放行；`LocalOnly`（默认）本机回环地址免登录、远程需 `Authorization: Bearer <token>`；`Full` 全部需令牌。未通过返回 `{code:401}`；本机免登录场景下前端自动跳过登录页。
 
 ---
 
@@ -486,7 +488,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（45 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权/限流/子服务 CRUD/日志/机器信息等）；
+- 单元测试：`cargo test`（53 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ---
