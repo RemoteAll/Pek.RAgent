@@ -485,7 +485,7 @@ function buildDashboard(d,health){
  if(d.totalMemory)html+=infoRow('物理内存',d.totalMemory+(d.availableMemory?' — 可用 '+d.availableMemory+(d.freeMemory?' / 空闲 '+d.freeMemory:''):''));
  if(d.board)html+=infoRow('主板',d.board);
  if(d.machineGuid)html+=infoRow('设备 ID',d.machineGuid,'font-mono');
- if(d.hostUptime)html+=infoRow('主机运行',d.hostUptime);
+ if(d.localTime)html+=infoRow('服务器时间',d.localTime,'font-mono','svc-time');
  html+=`</table></div>`;
 
  // 本机信息（折叠区块）
@@ -528,6 +528,7 @@ function updateDashboard(d,health){
  setText('conn-val', d.tcpConnections||0);
  setConnColor('conn-val', d.tcpConnections||0);
  setText('disk-iops', formatIops(d.diskIops));
+ setText('svc-time', d.localTime||'');
  if(health){
   if(health.gcCollections){
    setText('gc-gen0',health.gcCollections.gen0);
@@ -646,7 +647,7 @@ function updateGauge(id,pctVal,val,max){
 function statCard(lbl,val,cls='',id='',valCls=''){
  return `<div class="stat"${id?` id="${id}-card"`:''}><div class="stat-val ${valCls||cls}"${id?` id="${id}"`:''}>${esc(val)}</div><div class="stat-lbl">${lbl}</div></div>`;
 }
-function infoRow(lbl,val,cls=''){return `<tr><td>${esc(lbl)}</td><td><span${cls?` class="${cls}"`:''}>${esc(val)}</span></td></tr>`}
+function infoRow(lbl,val,cls='',id=''){return `<tr><td>${esc(lbl)}</td><td><span${id?` id="${id}"`:''}${cls?` class="${cls}"`:''}>${esc(val)}</span></td></tr>`}
 function gcStat(lbl,val,id=''){return `<div class="gc-stat"><div class="gc-val"${id?` id="${id}"`:''}>${esc(val)}</div><div class="gc-lbl">${lbl}</div></div>`}
 function pct(v,max){return max>0?Math.min(100,Math.round(v/max*100)):0}
 function fmtMem(mb){return mb>=1024?(mb/1024).toFixed(1)+' GB':Math.round(mb)+' MB'}

@@ -474,6 +474,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "load5": load.map(|l| l.1),
         "load15": load.map(|l| l.2),
         "hostUptime": format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
+        // 服务器本地时间（含时区偏移；顶部机器概览以 3 秒粒度刷新，用于时间/时区核对）
+        "localTime": chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string(),
         "port": panel.port(),
         // 默认凭据提示：面板顶部横幅数据（remoteAccess=允许远程访问时风险更高）
         "defaultPassword": uses_default_credentials(&cfg),
@@ -1976,6 +1978,13 @@ mod tests {
         let total = d["memoryTotalMB"].as_u64().unwrap_or(0);
         assert!(total > 0, "应返回整机总内存");
         assert!(used > 0 && used <= total, "整机已用内存应介于 0 与总量之间：{used}/{total}");
+
+        // 服务器本地时间（含时区；供顶部机器概览展示）
+        let lt = d["localTime"].as_str().unwrap_or_default();
+        assert!(
+            lt.contains('-') && lt.contains(':'),
+            "应返回服务器本地时间：{lt}"
+        );
 
         // 磁盘列表：数组，每项总量为正、已用不超过总量、名称非空
         let disks = d["disks"].as_array().expect("应返回磁盘数组");
