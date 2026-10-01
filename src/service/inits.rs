@@ -69,30 +69,80 @@ pub fn decide(
 }
 
 /// systemd 单元文件内容。
+///
+/// **保守原则**（真实发行版首验后收紧）：仅保留最标准的指令与 ASCII 内容——
+/// 路径按需加引号、无注释、无中文（避免任何可能的发行版差异）；
+/// `KillMode=process` 必须保留（停止时不误杀子应用，对齐 C# StarAgent 语义）。
+/// 其余元素（如 OOMScoreAdjust）待自动诊断确认发行版兼容性后再逐步引入。
 pub fn systemd_unit_text(mgr: &ServiceManager) -> String {
     format!(
         "[Unit]\n\
-Description={display}\n\
+Description={name}\n\
 After=network.target\n\
 \n\
 [Service]\n\
 Type=simple\n\
-WorkingDirectory=\"{base}\"\n\
-ExecStart=\"{exe}\" -s\n\
+WorkingDirectory={workdir}\n\
+ExecStart={exe} -s\n\
 Restart=always\n\
 RestartSec=5\n\
-# 只杀主进程，避免误杀应用进程（对齐 C# StarAgent 的 KillMode=process）\n\
 KillMode=process\n\
-# 禁止被 OOM 杀死\n\
-OOMScoreAdjust=-1000\n\
 LimitNOFILE=65535\n\
 \n\
 [Install]\n\
 WantedBy=multi-user.target\n",
-        display = mgr.display,
-        base = mgr.base.display(),
-        exe = mgr.exe.display()
+        name = mgr.name,
+        workdir = quote_path(&mgr.base.display().to_string()),
+        exe = quote_path(&mgr.exe.display().to_string()),
     )
+}
+
+/// 路径引号（仅含空白时加引号；避免无必要的引号——部分环境下对带引号的首参数
+/// 存在兼容性差异）。
+pub fn quote_path(path: &str) -> String {
+    if path.chars().any(|c| c.is_whitespace()) {
+        format!("\"{path}\"")
+    } else {
+        path.to_string()
+    }
+}
+
+/// 控制字符可视化（排查单元文件里“看不见的问题”）：`\r`/NUL/BOM/其它控制符转义显示。
+pub fn visualize_invisibles(text: &str, max: usize) -> String {
+    let mut out = String::new();
+    for ch in text.chars() {
+        match ch {
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            '\u{feff}' => out.push_str("\\u{feff}(BOM)"),
+            c if c.is_control() && c != '\n' => out.push_str(&format!("\\u{{{:x}}}", c as u32)),
+            c => out.push(c),
+        }
+        if out.len() >= max {
+            out.push_str("\n…（截断）");
+            break;
+        }
+    }
+    out
+}
+
+/// 截断到约 `max` 字节（按字符边界回退），超出追加省略标记。
+pub fn clip(text: &str, max: usize) -> String {
+    if text.len() <= max {
+        return text.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n…（截断）", &text[..end])
+}
+
+/// 取文本尾部 `n` 行。
+pub fn tail_lines(text: &str, n: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    let start = lines.len().saturating_sub(n);
+    lines[start..].join("\n")
 }
 
 /// 解析 systemd 单元文件文本中的 `ExecStart=` 程序路径（与 [`systemd_unit_text`] 生成格式对称）。
@@ -271,9 +321,64 @@ mod tests {
     fn systemd_unit_contains_key_items() {
         let text = systemd_unit_text(&mgr());
         assert!(text.contains("[Unit]"));
-        assert!(text.contains("ExecStart=\"/opt/staragent/pek-ragent\" -s"));
-        assert!(text.contains("WorkingDirectory=\"/opt/staragent\""));
+        assert!(text.contains("ExecStart=/opt/staragent/pek-ragent -s"));
+        assert!(text.contains("WorkingDirectory=/opt/staragent"));
         assert!(text.contains("WantedBy=multi-user.target"));
+    }
+
+    #[test]
+    fn systemd_unit_full_text_is_stable() {
+        // 全量断言：任何模板改动必须显式更新本测试（服务安装真实首验翻车过，格式变更应当被看见）
+        let expected = "[Unit]\n\
+Description=staragent\n\
+After=network.target\n\
+\n\
+[Service]\n\
+Type=simple\n\
+WorkingDirectory=/opt/staragent\n\
+ExecStart=/opt/staragent/pek-ragent -s\n\
+Restart=always\n\
+RestartSec=5\n\
+KillMode=process\n\
+LimitNOFILE=65535\n\
+\n\
+[Install]\n\
+WantedBy=multi-user.target\n";
+        assert_eq!(systemd_unit_text(&mgr()), expected);
+        // 行尾必须是 LF，不得含隐式回车（systemd 对 \r 敏感）；且保持纯 ASCII（最大兼容）
+        let text = systemd_unit_text(&mgr());
+        assert!(!text.contains('\r'));
+        assert!(text.is_ascii(), "单元文件应保持 ASCII：{text}");
+    }
+
+    #[test]
+    fn quote_path_only_when_needed() {
+        assert_eq!(quote_path("/opt/staragent/pek-ragent"), "/opt/staragent/pek-ragent");
+        assert_eq!(quote_path("/opt/my agent/app"), "\"/opt/my agent/app\"");
+    }
+
+    #[test]
+    fn diagnose_helpers() {
+        // 控制字符可视化：\r/ NUL / BOM 转义；换行保留
+        let text = "A\r\nB\u{feff}C\0D";
+        let out = visualize_invisibles(text, 1000);
+        assert!(out.contains("A\\r"), "{out}");
+        assert!(out.contains("B\\u{feff}(BOM)"), "{out}");
+        assert!(out.contains("C\\0D"), "{out}");
+        assert!(out.contains('\n'));
+
+        // 截断（含 UTF-8 多字节边界安全）
+        assert_eq!(clip("short", 100), "short");
+        let c = clip(&"x".repeat(50), 20);
+        assert!(c.starts_with(&"x".repeat(20)) && c.contains("截断"));
+        let zh = "中".repeat(20);
+        let c2 = clip(&zh, 10); // 10 非 3 的倍数 → 回退到 9 字节
+        assert!(c2.starts_with(&"中".repeat(3)), "{c2}");
+
+        // 尾部行
+        let text = "1\n2\n3\n4\n5";
+        assert_eq!(tail_lines(text, 2), "4\n5");
+        assert_eq!(tail_lines(text, 99), text);
     }
 
     #[test]

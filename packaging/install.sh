@@ -29,4 +29,7 @@ if [ -f pek-ragent.new ]; then
     echo "已替换，继续安装/重启服务。"
 fi
 
-exec ./pek-ragent -install "$@"
+# 幂等安装：先卸载同名旧服务（含上次安装失败残留的单元文件）再安装启动；
+# 未安装时卸载为空操作。安装/启动失败时，错误信息内置自动诊断（单元文件/verify/status/journal），
+# 无需手工排查。
+exec ./pek-ragent -reinstall "$@"
