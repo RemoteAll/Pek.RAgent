@@ -38,6 +38,27 @@ cargo build --release
 
 > 依赖：`dhrust`（DH.RustBase，path 依赖，提供日志 / 定时器 / HTTP 服务端内核）、`windows-service`（Windows 服务运行时）、`zip`、`serde`、`md-5`、`libc`（Unix）等。
 
+### 2.1 一键打包（Windows + Linux）
+
+```powershell
+# 全部平台（Windows 本机 MSVC + Linux musl 交叉编译），产物输出到 dist\
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1
+
+# 可选：-Targets windows|linux 只建某个平台；-Clean 先清旧产物与 zig 缓存；
+#       -CleanAll 额外 cargo clean（清空全部编译缓存，最省磁盘，下次全量重建）
+powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linux -Clean
+```
+
+| 产物（`dist\`，含 `SHA256SUMS.txt`） | 说明 |
+|------|------|
+| `pek-ragent-v{x}-x86_64-pc-windows-msvc.zip` | Windows 可执行文件 |
+| `pek-ragent-v{x}-x86_64-unknown-linux-musl.tar.gz` | Linux 静态单文件（已带执行位，解压即用） |
+
+- 已启用 **release 增量编译**（`[profile.release] incremental = true`），重复打包只重编改动部分；
+- Linux 交叉编译一次性准备：`cargo install --locked cargo-zigbuild`、`rustup target add x86_64-unknown-linux-musl`（国内可加 `RUSTUP_DIST_SERVER=https://mirrors.tuna.tsinghua.edu.cn/rustup`）、安装 zig（本机位于 `G:\Tools\zig\zig-0.16.0`，或用 `CARGO_ZIGBUILD_ZIG_PATH` 指定）；
+- 磁盘占用受控：zig 交叉缓存经 `.cargo/config.toml` 的 `[env]` 重定向到 `target\zig-cache\`，随 `-Clean` / `-CleanAll` 一键回收；
+- 提示：zig 链接时可能输出 `ignoring deprecated linker optimization setting`，属工具链无害提示。
+
 ---
 
 ## 3. 快速开始

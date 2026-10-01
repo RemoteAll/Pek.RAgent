@@ -21,7 +21,8 @@ pub struct Agent {
     pub config: AgentConfig,
     /// 应用管理器
     pub manager: Arc<AppManager>,
-    /// 平台服务管理
+    /// 平台服务管理（仅 Windows 服务模式读取服务名）
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub svc: ServiceManager,
 }
 
@@ -110,8 +111,8 @@ impl Agent {
     fn install_signal_handlers(&self) {
         #[cfg(unix)]
         unsafe {
-            libc::signal(libc::SIGTERM, on_signal as usize);
-            libc::signal(libc::SIGINT, on_signal as usize);
+            libc::signal(libc::SIGTERM, on_signal as *const () as usize);
+            libc::signal(libc::SIGINT, on_signal as *const () as usize);
         }
 
         #[cfg(windows)]

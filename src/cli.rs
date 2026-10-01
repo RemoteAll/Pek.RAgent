@@ -143,15 +143,19 @@ fn cmd_status(base: &Path) -> i32 {
     println!("服务：{}（{}）", cfg.display_name, svc.name);
     println!("描述：{}", cfg.description);
 
-    let mut text = state.text().to_string();
+    // Windows 附加管理员/普通用户提示（unix 无此区分）
     #[cfg(windows)]
-    {
-        text.push_str(if is_elevated() {
+    let text = format!(
+        "{}{}",
+        state.text(),
+        if is_elevated() {
             "（管理员）"
         } else {
             "（普通用户）"
-        });
-    }
+        }
+    );
+    #[cfg(not(windows))]
+    let text = state.text().to_string();
     println!("状态：{}", text);
 
     if state != ServiceState::NotInstalled {

@@ -61,7 +61,8 @@ pub struct ServiceManager {
     pub name: String,
     /// 显示名
     pub display: String,
-    /// 描述
+    /// 描述（仅 Windows 安装时写入服务描述）
+    #[cfg_attr(not(windows), allow(dead_code))]
     pub description: String,
     /// 代理可执行文件
     pub exe: PathBuf,

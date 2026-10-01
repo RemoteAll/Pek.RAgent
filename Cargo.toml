@@ -38,3 +38,5 @@ windows-sys = { version = "0.59", features = [
 [profile.release]
 lto = "thin"
 strip = true
+# 启用增量编译：重打包时只重编改动部分（缓存位于 target/*/release/incremental）
+incremental = true

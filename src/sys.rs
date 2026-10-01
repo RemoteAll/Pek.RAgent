@@ -93,6 +93,7 @@ pub fn spawn(req: &SpawnRequest) -> std::io::Result<Child> {
             cmd.pre_exec(move || {
                 // 独立会话：避免随宿主进程组收到终端信号，也便于一次性拉起的应用继续运行
                 libc::setsid();
+                Ok(())
             });
             let _ = detached;
         }
@@ -338,7 +339,8 @@ pub fn raise_priority() {
     }
 }
 
-/// 执行外部命令并捕获标准输出（失败返回 None）。
+/// 执行外部命令并捕获标准输出（失败返回 None；Linux 下读取 /proc，无调用方）。
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 fn run_capture(program: &str, args: &[&str]) -> Option<String> {
     let output = Command::new(program)
         .args(args)
