@@ -612,13 +612,11 @@ fn scan_files(dir: &Path, files: &mut HashMap<PathBuf, u64>) -> bool {
 fn health_check(spec: &str) -> Result<(), String> {
     let spec = spec.trim();
 
-    if let Some(url) = spec.strip_prefix("http://") {
-        let (host_port, path) = match url.find('/') {
-            Some(i) => (&url[..i], &url[i..]),
-            None => (url, "/"),
-        };
-        let (host, port) = crate::netc::split_host_port(host_port, 80);
-        return crate::netc::http_get(&host, port, path, Duration::from_millis(5_000)).map(|_| ());
+    if spec.starts_with("http://") || spec.starts_with("https://") {
+        // 支持 https（dhrust::net::http_client 含 TLS）；非 2xx 亦视为"有响应=存活"（与旧行为一致）
+        return dhrust::net::http_client::blocking_get_text(spec, Duration::from_millis(5_000))
+            .map(|_| ())
+            .map_err(|e| e.to_string());
     }
 
     let host_port = spec.strip_prefix("tcp://").unwrap_or(spec);

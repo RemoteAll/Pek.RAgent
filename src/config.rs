@@ -261,7 +261,7 @@ impl AgentConfig {
         let current = std::fs::read_to_string(&path).ok();
         let text = render_xml(self, current.as_deref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        util::write_file_atomic(&path, &text)
+        dhrust::io::write_all_text_atomic(&path, &text)
     }
 
     /// 归一化：补默认值，修正应用的缺省文件名与工作目录（与 C# `ServiceManager.Fix` 一致）。

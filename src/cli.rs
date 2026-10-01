@@ -16,7 +16,6 @@ use std::time::Duration;
 use crate::agent::Agent;
 use crate::config::AgentConfig;
 use crate::deploy::{self, PrepareContext};
-use crate::netc;
 use crate::service::{ServiceManager, ServiceState};
 use crate::sys::{self, SpawnRequest};
 use crate::util;
@@ -216,10 +215,10 @@ fn print_status_core(cfg: &AgentConfig, svc: &ServiceManager, state: ServiceStat
 /// 打印最近日志尾（`-status` 附带显示，对齐 C# 状态输出中的日志行）。
 fn print_recent_logs(base: &Path, count: usize) {
     let dir = base.join("Log");
-    let Some(path) = util::latest_log_file(&dir) else {
+    let Some(path) = dhrust::io::latest_file_by_ext(&dir, ".log") else {
         return;
     };
-    let lines = util::read_tail(&path, count);
+    let lines = dhrust::io::read_tail(&path, count);
     if lines.is_empty() {
         return;
     }
@@ -730,7 +729,7 @@ fn zip_deploy(base: &Path, args: &[String]) -> i32 {
 fn api_get(base: &Path, action: &str, timeout: Duration) -> Result<String, String> {
     let cfg = AgentConfig::load(base);
     let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
-    netc::http_get_url(&url, timeout)
+    dhrust::net::http_client::blocking_get_text(&url, timeout).map_err(|e| e.to_string())
 }
 
 /// 拉取子服务列表：`(名称, 启用, 运行中, 进程Id, 进程名称, 启动时间)`。

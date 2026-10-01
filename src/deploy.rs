@@ -155,7 +155,7 @@ pub fn prepare(ctx: &PrepareContext, app: &AppConfig) -> Result<Prepared, String
     match mode {
         DeployMode::Shadow => {
             if let Some(z) = &zip {
-                let hash = util::md5_file(z).map_err(|e| format!("计算压缩包哈希失败：{}", e))?;
+                let hash = dhrust::sign::md5_file_hex(z).map_err(|e| format!("计算压缩包哈希失败：{}", e))?;
                 let hash8 = hash.get(..8).unwrap_or(&hash).to_ascii_lowercase();
 
                 let sdir = match ctx.shadow_override {
@@ -217,7 +217,7 @@ pub fn prepare(ctx: &PrepareContext, app: &AppConfig) -> Result<Prepared, String
                 }
             } else {
                 // 不含路径分隔符的简单命令名（如 ping），按系统命令通过 PATH 解析
-                (file_name.clone(), util::split_args(&args_text), None)
+                (file_name.clone(), dhrust::io::split_args(&args_text), None)
             }
         }
     };
@@ -244,7 +244,7 @@ fn build_program(run_file: PathBuf, args_text: &str) -> (String, Vec<String>, Op
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())
         .unwrap_or_default();
-    let mut args = util::split_args(args_text);
+    let mut args = dhrust::io::split_args(args_text);
 
     match ext.as_str() {
         "dll" => {
@@ -283,7 +283,7 @@ fn build_envs(
     let mut envs = vec![("BasePath".to_string(), work.to_string_lossy().into_owned())];
 
     if let Some(text) = app.environments.as_deref() {
-        envs.extend(util::parse_environments(text));
+        envs.extend(dhrust::io::parse_environments(text));
     }
 
     let run_is_dll = run_file
@@ -402,7 +402,7 @@ fn copy_overwrite_files(shadow: &Path, work: &Path, overwrite: Option<&str>) {
 
         let matched = patterns.iter().any(|pat| {
             let pat_clean = pat.trim_end_matches(['*', '/']).trim_end_matches('/');
-            util::wildcard_match(pat, &name)
+            dhrust::io::wildcard_match(pat, &name)
                 || pat_clean.eq_ignore_ascii_case(&name)
                 || pat.trim_end_matches('*').trim_end_matches('/').eq_ignore_ascii_case(&name)
         });

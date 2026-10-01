@@ -198,7 +198,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
 
 /// 操作类型。
 #[derive(Clone, Copy)]
-enum OpKind {
+pub(crate) enum OpKind {
     Start,
     Stop,
     Restart,
@@ -214,28 +214,32 @@ fn app_operation(manager: Arc<AppManager>, ctx: Ctx, kind: OpKind) -> HttpOutcom
         return result(false, "服务名称不能为空".to_string(), "");
     }
 
-    let (ok, message) = match kind {
-        OpKind::Start => match manager.start_app(&name) {
+    let (ok, message) = apply_operation(&manager, &name, kind);
+    result(ok, message, &name)
+}
+
+/// 应用操作核心（HTTP 控制接口与 UDP RPC 服务端共用；消息语义对齐 C# StarService）。
+pub(crate) fn apply_operation(manager: &AppManager, name: &str, kind: OpKind) -> (bool, String) {
+    match kind {
+        OpKind::Start => match manager.start_app(name) {
             Ok(true) => (true, "服务启动成功".to_string()),
             Ok(false) => (true, "服务已在运行".to_string()),
             Err(e) if e.starts_with("服务不存在") => (false, "服务启动失败或服务不存在".to_string()),
             Err(e) => (false, format!("启动服务时发生错误: {}", e)),
         },
-        OpKind::Stop => match manager.stop_app(&name, "API调用停止") {
+        OpKind::Stop => match manager.stop_app(name, "API调用停止") {
             Ok(true) => (true, "服务停止成功".to_string()),
             Ok(false) => (false, "服务停止失败".to_string()),
             Err(e) if e.starts_with("服务不存在") => (false, "服务停止失败或服务不存在".to_string()),
             Err(e) => (false, format!("停止服务时发生错误: {}", e)),
         },
-        OpKind::Restart => match manager.restart_app(&name, "API调用重启") {
+        OpKind::Restart => match manager.restart_app(name, "API调用重启") {
             Ok(true) => (true, "服务重启成功".to_string()),
             Ok(false) => (false, "服务重启失败：启动服务失败".to_string()),
             Err(e) if e.starts_with("服务不存在") => (false, "服务不存在".to_string()),
             Err(e) => (false, format!("重启服务时发生错误: {}", e)),
         },
-    };
-
-    result(ok, message, &name)
+    }
 }
 
 /// 组装操作结果响应。
@@ -399,7 +403,7 @@ fn kill_and_start(ctx: Ctx) -> HttpOutcome {
                 req.working_directory.clone()
             };
             let cwd = std::path::PathBuf::from(&cwd_text);
-            let args = util::split_args(&req.arguments);
+            let args = dhrust::io::split_args(&req.arguments);
             let envs = vec![("BasePath".to_string(), cwd_text.clone())];
 
             let spawn_req = crate::sys::SpawnRequest {

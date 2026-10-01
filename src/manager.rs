@@ -143,7 +143,7 @@ impl AppManager {
 
         let path = self.base.join("data").join("state.json");
         let text = serde_json::to_string_pretty(&state).unwrap_or_else(|_| "{}".to_string());
-        let _ = util::write_file_atomic(&path, &text);
+        let _ = dhrust::io::write_all_text_atomic(&path, &text);
     }
 
     /// 启动全部启用应用（代理启动时调用）。

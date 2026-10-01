@@ -17,7 +17,7 @@
 | 安全文件替换 | 目标文件被占用时先改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件），应用停止后自动清理 |
 | 内存限制 | `MaxMemory` 超限自动重启应用（Windows 读私有内存、Linux 读 `/proc`） |
 | 文件变动重启 | `ReloadOnChange=true` 时按 5 秒周期监视 `*.dll;*.exe;*.zip;*.jar`，变更后停止应用，稳定 `Delay` 毫秒后重启 |
-| 健康检查 | 启动后按 `HealthCheck`（http/tcp 地址）探测，失败仅记录日志（对齐 C# 行为） |
+| 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
 | 本地 HTTP 控制接口 | 默认 `127.0.0.1:5500`，兼容 DHDeploy 的调用契约；仅本机访问（可配） |
@@ -234,7 +234,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `ReloadOnChange` | `false` | 文件变动自动重启（5 秒周期轮询） |
 | `MaxMemory` | `0` | 最大内存（MB），超限重启；0 不限制 |
 | `OomScoreAdjust` | `0` | OOM 分值（仅 Linux） |
-| `HealthCheck` | 空 | 健康检查：`http://…` 或 `tcp://host:port` |
+| `HealthCheck` | 空 | 健康检查：`http://…`、`https://…`（含 TLS）或 `tcp://host:port` |
 | `Overwrite` | 空 | 部署包内需拷贝覆盖到工作目录的文件/子目录，`;` 分隔，支持 `*` |
 | `Debug` | `false` | 应用输出重定向到 `Log/app-{Name}.log` |
 
@@ -418,7 +418,7 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 |----|------|
 | StarServer / StarWeb 对接 | **暂未实现**；`-server` 参数仅保存到配置 |
 | Web 管理面板 | **已实现**（对齐 C# 契约，前端直接复用）；差异：无 GC 统计（`gcTotalMemory`/`gcCollections` 恒为 0）、磁盘 IOPS 恒为 0、网卡收发包字节未统计、无“扩展面板”接口 |
-| 本地 RPC | 原 UDP 5500 的 RPC 尚未实现（UDP 服务待补）；TCP 5500 已提供 HTTP 契约（DHDeploy + Web 面板），并对 DHDeploy 保持兼容 |
+| 本地 RPC | **UDP 5500 已实现**（NewLife ApiClient 二进制协议，与 C# StarAgent 同契约；仅限本机）：`StartService`/`StopService`/`RestartService` 完整实现，`Ping`/`Info`/`GetServices`/`SetServer` 简化实现（待 StarServer 对接时补齐数据形态）；协议实现与 DHDeploy.Agent.Rust 客户端同源（`dhrust::net::api_rpc`）；TCP 5500 提供 HTTP 面板契约（Web 面板 + 旧版 DHDeploy HTTP 契约） |
 | 配置格式 | **与 C# 完全互通**：使用同名同格式的 `Config/StarAgent.config`（XML，带中文注释）；C# 特有字段/属性读写均保留；本项目扩展字段以 C# 可忽略的形式写入；支持从旧版 `Agent.toml`（TOML）/`Agent.json` 自动迁移 |
 | 未实现功能 | Nginx 配置生成、防火墙端口自动开放、阿里云 DNS、自身升级/修复、`-watch` 看门狗服务 |
 | 状态存储 | `data/state.json` 记录运行中 PID（用于接管），原 `Service.csv` 不再使用 |
@@ -454,7 +454,7 @@ src/
 
 - [ ] StarServer / StarWeb 对接（登录、心跳、指令下发）
 - [x] Web 管理面板（子服务 CRUD / 日志 / 配置在线修改 / 看门狗 / 本机信息）
-- [ ] UDP 5500 本地 RPC（与 C# StarAgent 的 UDP 指令互通）
+- [x] UDP 5500 本地 RPC（与 C# StarAgent 的 UDP 指令互通；DHDeploy 新版链路实测打通）
 - [ ] 自身升级（`-upgrade` 完整实现）与 `-repair`
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
 - [ ] 进程按名称接管 / 多实例精确匹配

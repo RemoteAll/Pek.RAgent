@@ -9,14 +9,13 @@ license = "MIT"
 [dependencies]
 # DH 基础库（DH.RustBase）：日志（XTrace 等价）、线程定时调度（Timer/TimerScheduler）、
 # 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）、
-# TOML 配置管线（保注释的读写，用于 Config/Agent.toml）
+# 配置兼容（XML 主配置 Config/StarAgent.config + 旧版 TOML 迁移）
 dhrust = { path = "../DH.RustBase", features = ["net", "toml"] }
-# 配置序列化（Config/Agent.json）
+# 配置与状态序列化（AgentConfig / data/state.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 chrono = "0.4"
-# MD5 摘要（影子目录命名 {name}-{hash}，与 C# StarAgent 对齐）
-md-5 = "0.10"
+
 # 部署包解压（与 Pek.RCode 同版本同特性；纯 Rust deflate）
 zip = { version = "2", default-features = false, features = ["deflate"] }
 # HTTP 服务端宿主运行时（dhrust::net::http 基于 hyper/tokio）

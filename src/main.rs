@@ -13,6 +13,7 @@ mod netc;
 mod server;
 mod service;
 mod sys;
+mod udp_rpc;
 mod util;
 mod webpanel;
 

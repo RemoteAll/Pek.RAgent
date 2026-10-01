@@ -543,7 +543,7 @@ fn logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let log_dir = panel.base.join("Log");
     let path = if file.trim().is_empty() {
         // 最新文件：按文件名倒序（与 C# 的 OrderByDescending 一致）
-        util::latest_log_file(&log_dir)
+        dhrust::io::latest_file_by_ext(&log_dir, ".log")
     } else {
         // 安全：只取文件名部分，防目录穿越
         match Path::new(file.trim()).file_name() {
@@ -560,7 +560,7 @@ fn logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     };
 
     let mut lines = match &path {
-        Some(p) => util::read_tail(p, count),
+        Some(p) => dhrust::io::read_tail(p, count),
         None => Vec::new(),
     };
     if !level.trim().is_empty() {

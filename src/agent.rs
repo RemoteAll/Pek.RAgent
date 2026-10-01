@@ -130,6 +130,9 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     // 2) 本地控制接口（线程持有；进程退出即结束）
     let _http = crate::server::start(manager.clone(), port, local_only);
 
+    // 2.1) 本地 UDP RPC 服务端（NewLife ApiClient 协议；DHDeploy 重启/拉起链路依赖）
+    let _udp = crate::udp_rpc::start(manager.clone(), port);
+
     // 3) 守护定时器（状态检查/退避重启）
     let guard = manager.clone();
     let timer = Timer::new(1_000, guard_period as i64, move |_| guard.check_all());
