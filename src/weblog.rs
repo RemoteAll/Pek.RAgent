@@ -710,8 +710,9 @@ fn parse_nginx_vhosts(text: &str) -> Vec<(String, PathBuf)> {
                 }
                 Collect::AccessLog => {
                     if access_log.is_none() {
-                        if token.eq_ignore_ascii_case("off") {
-                            // 显式关闭：标记为“不收集”继续吃参数
+                        // `off` 与 `/dev/null` 均视为不记录日志（宝塔等默认配置常见，勿作日志源）
+                        if token.eq_ignore_ascii_case("off") || token == "/dev/null" {
+                            // 继续吃参数，不收集
                         } else if looks_like_abs_path(token) {
                             access_log = Some(PathBuf::from(token));
                         }
@@ -1132,6 +1133,71 @@ http {
         assert_eq!(got.len(), 1, "只应取到带 server_name 与 access_log 的块：{got:?}");
         assert_eq!(got[0].0, "example.com");
         assert_eq!(got[0].1, PathBuf::from("/www/wwwlogs/example.com.log"));
+    }
+
+    #[test]
+    fn extracts_baota_style_vhost() {
+        // 宝塔面板生成的站点配置（真实结构：server 块末尾 access_log + location 内 /dev/null）
+        let text = r#"
+server
+{
+    listen 80;
+    server_name example.com www.example.com;
+    index index.php index.html;
+    root /www/wwwroot/example.com;
+
+    #SSL-START SSL相关配置，请勿删除
+    #error_page 404/404.html;
+    #SSL-END
+
+    include enable-php-74.conf;
+
+    location ~ .*\.(gif|jpg|jpeg|png|bmp|swf)$
+    {
+        expires      30d;
+        error_log /dev/null;
+        access_log /dev/null;
+    }
+
+    location ~ .*\.(js|css)?$
+    {
+        expires      12h;
+        error_log /dev/null;
+        access_log /dev/null;
+    }
+
+    access_log  /www/wwwlogs/example.com.log;
+    error_log  /www/wwwlogs/example.com.error.log;
+}
+"#;
+        let got = parse_nginx_vhosts(text);
+        assert_eq!(
+            got.len(),
+            1,
+            "应只提取 server 直接子层的真实日志：{got:?}"
+        );
+        assert_eq!(got[0].0, "example.com");
+        assert_eq!(got[0].1, PathBuf::from("/www/wwwlogs/example.com.log"));
+
+        // 80→443 跳转块无 access_log：跳过；/dev/null 不得被收集
+        let text = r#"
+server
+{
+    listen 80;
+    server_name shop.example.com;
+    return 301 https://$host$request_uri;
+}
+server
+{
+    listen 443 ssl;
+    server_name shop.example.com;
+    access_log /dev/null;
+    access_log /www/wwwlogs/shop.example.com.log;
+}
+"#;
+        let got = parse_nginx_vhosts(text);
+        assert_eq!(got.len(), 1, "跳转块应跳过：{got:?}");
+        assert_eq!(got[0].1, PathBuf::from("/www/wwwlogs/shop.example.com.log"));
     }
 
     #[test]
