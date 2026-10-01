@@ -13,6 +13,7 @@ mod config;
 mod deploy;
 mod manager;
 mod netc;
+mod sampler;
 mod server;
 mod service;
 mod sys;

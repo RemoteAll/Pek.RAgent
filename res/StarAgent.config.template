@@ -46,6 +46,8 @@
   <WebPassword>admin</WebPassword>
   <!--Web 面板鉴权级别。None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录-->
   <WebAuthLevel>LocalOnly</WebAuthLevel>
+  <!--后台资源采样间隔（毫秒）。默认 1000（与任务管理器/宝塔同粒度）；0 = 关闭后台采样（改为面板请求时现采）-->
+  <SampleInterval>1000</SampleInterval>
 
   <!--应用服务集合-->
   <Services></Services>

@@ -809,7 +809,7 @@ function renderServices(){
  if(svcs.length===0){
   html+=`<div class="empty-state"><div class="empty-icon">📦</div><p>暂无子服务</p><p style="font-size:11px;margin-top:4px">点击"添加服务"按钮创建第一个子服务</p></div>`;
  }else{
-  html+=`<table class="svc-table"><thead><tr><th>名称</th><th>文件</th><th>启用</th><th>状态</th><th>进程</th><th style="min-width:180px">操作</th></tr></thead><tbody>`;
+  html+=`<table class="svc-table"><thead><tr><th>名称</th><th>文件</th><th>启用</th><th>状态</th><th>进程</th><th>资源</th><th style="min-width:180px">操作</th></tr></thead><tbody>`;
   svcs.forEach((s,idx)=>{
    const run=s.Running;
    html+=`<tr><td><div class="svc-name">${esc(s.Name)}</div></td>`;
@@ -817,6 +817,7 @@ function renderServices(){
    html+=`<td><span class="badge ${s.Enable?'badge-green':'badge-gray'}">${s.Enable?'启用':'禁用'}</span></td>`;
    html+=`<td><span class="badge ${run?'badge-green':'badge-red'}">${run?'运行中':'已停止'}</span></td>`;
    html+=`<td style="font-family:var(--font-mono);font-size:12px">${run?(s.ProcessId||'')+(s.ProcessName?' '+esc(s.ProcessName):''):'-'}</td>`;
+   html+=`<td style="font-size:12px;white-space:nowrap">${run?(s.CpuRate!=null?s.CpuRate.toFixed(1)+'%':'—')+(s.MemoryMB!=null?' · '+fmtMem(s.MemoryMB):''):'-'}</td>`;
    html+=`<td><div class="svc-actions">`;
    html+=`<button class="btn btn-primary btn-sm" onclick="doSvcAction('start','${escAttr(s.Name)}')" ${run?'disabled':''}>▶ 启动</button>`;
    html+=`<button class="btn btn-danger btn-sm" onclick="doSvcAction('stop','${escAttr(s.Name)}')" ${!run?'disabled':''}>⏹ 停止</button>`;

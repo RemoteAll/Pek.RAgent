@@ -24,6 +24,7 @@
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
 | Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗/服务器校时；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
+| 资源采样器 | 后台线程按 `SampleInterval`（默认 1 秒）采样整机 CPU/网络/磁盘/TCP/线程句柄并缓存；面板请求读快照（多客户端读数一致、请求零采集；CPU 与任务管理器/宝塔同粒度）；`SampleInterval=0` 可关闭改由请求时现采 |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 
 ---
@@ -258,6 +259,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
 | `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（配置页可在线修改密码） |
 | `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
+| `SampleInterval` | `1000` | 后台资源采样间隔（毫秒）：面板 CPU/网络/磁盘速率按此窗口差分；`0`=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）
@@ -413,6 +415,8 @@ curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
 | `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
 
+> `GET /star/services` 对运行中的应用额外返回 `CpuRate`（占整机 CPU %，按面板轮询间隔差分）与 `MemoryMB`（Rust 扩展字段；C# 面板反序列化忽略未知字段）。
+
 > 鉴权：级别由 `WebAuthLevel` 控制——`None` 全部放行；`LocalOnly`（默认）本机回环地址免登录、远程需 `Authorization: Bearer <token>`；`Full` 全部需令牌。未通过返回 `{code:401}`；本机免登录场景下前端自动跳过登录页。
 
 ---
@@ -489,7 +493,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（69 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/系统采集解析等）；
+- 单元测试：`cargo test`（71 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ---

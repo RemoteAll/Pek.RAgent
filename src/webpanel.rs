@@ -27,6 +27,7 @@ use serde_json::{json, Value as Json};
 use crate::agent;
 use crate::config::AgentConfig;
 use crate::manager::AppManager;
+use crate::sampler;
 use crate::sys;
 use crate::util;
 
@@ -397,7 +398,11 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     let cfg = panel.manager.config();
     let pid = std::process::id();
-    let (threads, handles) = sys::process_stats(pid).unwrap_or((0, 0));
+    // 整机/网络/磁盘/TCP/线程句柄等指标来自后台 1 秒采样器：
+    // 多客户端读数一致、请求路径零采集；CPU 为 1 秒窗口（与任务管理器/宝塔同粒度）
+    let sample = sampler::current();
+    let threads = sample.agent_threads;
+    let handles = sample.agent_handles;
     let memory_mb = sys::memory_mb(pid).unwrap_or(0);
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
@@ -405,11 +410,11 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     // 进程 CPU 时间：供内嵌 health 字段使用（复用本次采集，避免前端第二次请求）
     let (cpu_total, cpu_kernel, cpu_user) = sys::process_cpu_seconds();
     let load = sys::load_average();
-    let cpu_rate = sys::system_cpu_rate();
-    let (tcp_estab, tcp_time_wait, tcp_close_wait) = sys::tcp_counts();
-    // 网络速率（两次请求差分；网页关闭时无请求 = 零开销）
-    let (net_up, net_down) = net_speed();
-    let (net_rx_total, net_tx_total) = sys::net_total_bytes().unwrap_or((0, 0));
+    let cpu_rate = sample.cpu_rate;
+    let (tcp_estab, tcp_time_wait, tcp_close_wait) =
+        (sample.tcp_estab, sample.tcp_time_wait, sample.tcp_close_wait);
+    let (net_up, net_down) = (sample.net_up_bps, sample.net_down_bps);
+    let (net_rx_total, net_tx_total) = (sample.net_rx_total, sample.net_tx_total);
     let (
         disk_iops_rate,
         disk_read_bps,
@@ -417,13 +422,20 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         disk_latency_ms,
         disk_read_bytes,
         disk_write_bytes,
-    ) = disk_rates();
+    ) = (
+        sample.disk_iops,
+        sample.disk_read_bps,
+        sample.disk_write_bps,
+        sample.disk_latency_ms,
+        sample.disk_read_bytes,
+        sample.disk_write_bytes,
+    );
     let uptime = panel.uptime();
     let cpu_count = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(0);
-    // 进程自身 CPU 占用（占整机百分比：与网络速率同模式按请求间隔差分；首帧为自启动以来的平均值）
-    let proc_cpu = process_cpu_rate(cpu_total, uptime.as_secs_f64());
+    // 代理自身 CPU 占用（占整机百分比；采样器 1 秒窗口差分）
+    let proc_cpu = sample.agent_cpu_rate;
 
     let data = json!({
         "serviceName": cfg.service_name,
@@ -530,62 +542,6 @@ fn health(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(data))
 }
 
-/// 进程 CPU 占用百分比（占整机口径：CPU 时间 / 经过时间 / 逻辑核数 × 100，钳制到 100）。
-fn process_cpu_percent(cpu_seconds: f64, elapsed_secs: f64, cores: usize) -> f64 {
-    if elapsed_secs <= 0.0 || cores == 0 {
-        return 0.0;
-    }
-    ((cpu_seconds / elapsed_secs) / cores as f64 * 100.0).clamp(0.0, 100.0)
-}
-
-/// 请求时差分的进程 CPU 占用百分比；首次调用无差分基线时返回“自启动以来的平均占用”。
-fn process_cpu_rate(total_seconds: f64, uptime_secs: f64) -> f64 {
-    static PROC_CPU_LAST: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
-    let cores = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
-    let now = Instant::now();
-    let mut last = PROC_CPU_LAST.lock().expect("process cpu sample");
-    let pct = match last.as_ref() {
-        Some((t0, c0)) => process_cpu_percent(
-            (total_seconds - c0).max(0.0),
-            now.duration_since(*t0).as_secs_f64(),
-            cores,
-        ),
-        None => process_cpu_percent(total_seconds, uptime_secs, cores),
-    };
-    *last = Some((now, total_seconds));
-    pct
-}
-
-/// 上次网络采样（时间, 接收字节, 发送字节）——面板速率差分用。
-static NET_LAST: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
-
-/// 计算上下行速率（字节/秒）；首次调用无基线返回 (0, 0)。
-fn net_speed() -> (u64, u64) {
-    let Some((rx, tx)) = sys::net_total_bytes() else {
-        return (0, 0);
-    };
-    let now = Instant::now();
-    let mut slot = NET_LAST.lock().unwrap();
-    let (up, down) = match *slot {
-        Some((t, lrx, ltx)) => {
-            let dt = now.duration_since(t).as_secs_f64();
-            if dt >= 0.2 {
-                (
-                    ((tx.saturating_sub(ltx)) as f64 / dt) as u64,
-                    ((rx.saturating_sub(lrx)) as f64 / dt) as u64,
-                )
-            } else {
-                (0, 0)
-            }
-        }
-        None => (0, 0),
-    };
-    *slot = Some((now, rx, tx));
-    (up, down)
-}
-
 /// 速率格式化（人类可读）。
 fn format_speed(bps: u64) -> String {
     const KB: f64 = 1024.0;
@@ -611,50 +567,6 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
     }
-}
-
-/// 上次磁盘 IO 采样（时间, 累计统计）——面板速率差分用。
-static DISK_LAST: Mutex<Option<(Instant, sys::DiskIo)>> = Mutex::new(None);
-
-/// 磁盘速率差分：返回 `(iops, 读字节/秒, 写字节/秒, 平均延迟毫秒, 累计读字节, 累计写字节)`；
-/// 首次调用或无数据返回全 0。
-fn disk_rates() -> (u64, u64, u64, f64, u64, u64) {
-    let Some(io) = sys::disk_io() else {
-        return (0, 0, 0, 0.0, 0, 0);
-    };
-    let now = Instant::now();
-    let mut slot = DISK_LAST.lock().unwrap();
-    let (iops, read_bps, write_bps, latency) = match *slot {
-        Some((t, last)) => {
-            let dt = now.duration_since(t).as_secs_f64();
-            if dt >= 0.2 {
-                let ops = (io.reads + io.writes).saturating_sub(last.reads + last.writes);
-                let latency = if ops > 0 {
-                    io.ms_total.saturating_sub(last.ms_total) as f64 / ops as f64
-                } else {
-                    0.0
-                };
-                (
-                    ops as f64 / dt,
-                    io.read_bytes.saturating_sub(last.read_bytes) as f64 / dt,
-                    io.write_bytes.saturating_sub(last.write_bytes) as f64 / dt,
-                    latency,
-                )
-            } else {
-                (0.0, 0.0, 0.0, 0.0)
-            }
-        }
-        None => (0.0, 0.0, 0.0, 0.0),
-    };
-    *slot = Some((now, io));
-    (
-        iops as u64,
-        read_bps as u64,
-        write_bps as u64,
-        (latency * 10.0).round() / 10.0,
-        io.read_bytes,
-        io.write_bytes,
-    )
 }
 
 /// 释放内存（尽力回收工作集）。
@@ -735,6 +647,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let items = vec![
         config_item("WebUserName", "面板用户名", "String", cfg.web_user_name.clone(), "Web 管理面板的登录用户名"),
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
+        config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -969,6 +882,12 @@ fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         if st.running {
             running += 1;
         }
+        // 运行中应用：CPU（占整机 %，按面板轮询间隔差分）与内存占用（面板“资源”列）
+        let (cpu_rate, memory_mb) = if st.running && st.pid > 0 {
+            (app_cpu_rate(st.pid), sys::memory_mb(st.pid))
+        } else {
+            (None, None)
+        };
         services.push(json!({
             "Name": cfg.name,
             "FileName": cfg.file_name,
@@ -985,6 +904,9 @@ fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "OomScoreAdjust": cfg.oom_score_adjust,
             "priority": "Normal",
             "UserName": cfg.user_name,
+            // 资源占用（Rust 扩展字段；C# 面板反序列化忽略未知字段）
+            "CpuRate": cpu_rate.map(|v| (v * 10.0).round() / 10.0),
+            "MemoryMB": memory_mb,
             "Running": st.running,
             "ProcessId": st.pid,
             "ProcessName": st.process_name,
@@ -997,6 +919,29 @@ fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "",
         Some(json!({ "services": services, "total": list.len(), "running": running })),
     )
+}
+
+/// 子应用 CPU 占用（占整机 %，按面板轮询间隔差分；首次采样无基线返回 None，下一轮即出数）。
+fn app_cpu_rate(pid: u32) -> Option<f64> {
+    let total = sys::process_cpu_split(pid)?.0;
+    let cores = std::thread::available_parallelism()
+        .map(|v| v.get())
+        .unwrap_or(1);
+    let now = Instant::now();
+    static APP_CPU_LAST: Mutex<Option<HashMap<u32, (Instant, f64)>>> = Mutex::new(None);
+    let mut slot = APP_CPU_LAST.lock().expect("app cpu sample");
+    let map = slot.get_or_insert_with(HashMap::new);
+    // 清理长时间未刷新的基线（应用已退出/不再上报）
+    map.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(600));
+    let pct = map.get(&pid).map(|(t0, c0)| {
+        sampler::process_cpu_percent(
+            (total - c0).max(0.0),
+            now.duration_since(*t0).as_secs_f64(),
+            cores,
+        )
+    });
+    map.insert(pid, (now, total));
+    pct
 }
 
 /// 子服务操作类型。
@@ -1289,7 +1234,7 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cpu_count = std::thread::available_parallelism()
         .map(|v| v.get())
         .unwrap_or(0);
-    let cpu_rate = sys::system_cpu_rate();
+    let cpu_rate = sampler::current().cpu_rate;
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let mem_used = mem_total.saturating_sub(mem_avail);
     let mem_rate = if mem_total > 0 {
@@ -1597,6 +1542,7 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
             _ => false,
         },
         "guardperiod" => set_u64(value, |v| cfg.guard_period = v),
+        "sampleinterval" => set_u64(value, |v| cfg.sample_interval = v),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -1872,6 +1818,8 @@ mod tests {
             "ProcessName",
             "StartTime",
             "priority",
+            "CpuRate",
+            "MemoryMB",
         ] {
             assert!(first.get(key).is_some(), "缺少字段 {key}：{first}");
         }
@@ -2104,20 +2052,6 @@ mod tests {
         assert!(!uses_default_credentials(&panel.manager.config()));
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn process_cpu_percent_computes_and_clamps() {
-        // 1 秒间隔消耗 0.5 秒 CPU、单核 → 50%
-        assert!((process_cpu_percent(0.5, 1.0, 1) - 50.0).abs() < 0.01);
-        // 8 核下 0.4 秒 CPU / 1 秒 → 5%（占整机口径）
-        assert!((process_cpu_percent(0.4, 1.0, 8) - 5.0).abs() < 0.01);
-        // 异常输入：零间隔 / 零核
-        assert_eq!(process_cpu_percent(1.0, 0.0, 8), 0.0);
-        assert_eq!(process_cpu_percent(1.0, 1.0, 0), 0.0);
-        // 负数增量（时钟噪声）钳制为 0，超界钳制为 100
-        assert_eq!(process_cpu_percent(-1.0, 1.0, 8), 0.0);
-        assert_eq!(process_cpu_percent(16.0, 1.0, 8), 100.0);
     }
 
     #[test]

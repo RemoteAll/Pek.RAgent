@@ -33,6 +33,10 @@ struct ServiceOperationResult {
 
 /// 启动 HTTP 控制服务。返回线程句柄（进程退出时自然结束）。
 pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thread::JoinHandle<()> {
+    // 资源采样器：按配置间隔（默认 1 秒）采样整机指标，面板接口读快照
+    // （多客户端读数一致、请求零采集；SampleInterval=0 时关闭，改由请求时现采）
+    crate::sampler::start(manager.config().sample_interval);
+
     let addr = if local_only {
         format!("127.0.0.1:{}", port)
     } else {

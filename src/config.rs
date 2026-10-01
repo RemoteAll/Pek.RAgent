@@ -62,6 +62,8 @@ pub struct AgentConfig {
     pub web_user_password: String,
     /// Web 面板鉴权级别。None 不鉴权；LocalOnly 本地免鉴权、远程需鉴权（默认）；Full 全部鉴权
     pub web_auth_level: String,
+    /// 后台资源采样间隔（毫秒）。默认 1000；0 = 关闭后台采样（回退为面板请求时现采）
+    pub sample_interval: u64,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -88,6 +90,7 @@ impl Default for AgentConfig {
             web_user_name: "admin".to_string(),
             web_user_password: "admin".to_string(),
             web_auth_level: "LocalOnly".to_string(),
+            sample_interval: 1000,
             apps: sample_apps(),
         }
     }
@@ -300,6 +303,10 @@ impl AgentConfig {
         if self.web_auth_level.trim().is_empty() {
             self.web_auth_level = "LocalOnly".to_string();
         }
+        // 采样间隔：0 = 关闭后台采样；非 0 时限定 200ms~60s（防误配打爆 CPU 或采样过粗）
+        if self.sample_interval != 0 {
+            self.sample_interval = self.sample_interval.clamp(200, 60_000);
+        }
 
         for app in &mut self.apps {
             let name = app.name.trim().to_string();
@@ -487,6 +494,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_nonempty(obj, "WebAuthLevel") {
         cfg.web_auth_level = v;
     }
+    if let Some(v) = parse_of::<u64>(obj, "SampleInterval") {
+        cfg.sample_interval = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -594,6 +604,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebUserName", cfg.web_user_name.clone());
         push("WebPassword", cfg.web_user_password.clone());
         push("WebAuthLevel", cfg.web_auth_level.clone());
+        push("SampleInterval", cfg.sample_interval.to_string());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -813,6 +824,35 @@ mod tests {
         assert_eq!(cfg.service_name, "X");
         assert_eq!(cfg.local_port, DEFAULT_LOCAL_PORT);
         assert_eq!(cfg.delay, 3000);
+    }
+
+    #[test]
+    fn sample_interval_reads_clamps_and_renders() {
+        // XML 读取路径（扩展区配置项；XML 值在 JSON 形态下是字符串）
+        let json: Json = serde_json::from_str(r#"{ "SampleInterval": "2500" }"#).unwrap();
+        let cfg = config_from_json(&json);
+        assert_eq!(cfg.sample_interval, 2500);
+
+        // 归一化：下限/上限保护；0 = 关闭后台采样
+        let mut cfg = AgentConfig::default();
+        cfg.sample_interval = 50;
+        cfg.normalize();
+        assert_eq!(cfg.sample_interval, 200);
+        cfg.sample_interval = 999_999;
+        cfg.normalize();
+        assert_eq!(cfg.sample_interval, 60_000);
+        cfg.sample_interval = 0;
+        cfg.normalize();
+        assert_eq!(cfg.sample_interval, 0);
+
+        // 渲染：写入模板骨架（保留注释）
+        let mut cfg = AgentConfig::default();
+        cfg.sample_interval = 2500;
+        let text = render_xml(&cfg, None).unwrap();
+        assert!(
+            text.contains("<SampleInterval>2500</SampleInterval>"),
+            "{text}"
+        );
     }
 
     #[test]
