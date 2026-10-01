@@ -16,7 +16,7 @@
 | **运行中文件可替换** | 可执行文件运行在影子目录，工作目录中的部署包/文件在应用运行期间**可随意上传覆盖**，不会被占用；重启后自动切换到新影子目录并清理旧版 |
 | 安全文件替换 | 目标文件被占用时先改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件），应用停止后自动清理 |
 | 内存限制 | `MaxMemory` 超限自动重启应用（Windows 读私有内存、Linux 读 `/proc`） |
-| 文件变动重启 | `ReloadOnChange=true` 时按 5 秒周期监视 `*.dll;*.exe;*.zip;*.jar`，变更后停止应用，稳定 `Delay` 毫秒后重启 |
+| 文件变动重启 | `ReloadOnChange=true`（默认）时按 5 秒周期监视**配置的程序文件本身**（含无扩展名的 Linux 可执行文件），变更后停止应用，稳定 `Delay` 毫秒后重启 |
 | 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
@@ -282,7 +282,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `AllowMultiple` | `false` | 允许多实例（多实例时健康检查不按进程名匹配） |
 | `Environments` | 空 | 环境变量，形如 `A=1;B=2` |
 | `AutoStop` | `false` | 随宿主退出时同时停止该应用 |
-| `ReloadOnChange` | `false` | 文件变动自动重启（5 秒周期轮询） |
+| `ReloadOnChange` | `true` | 文件变动自动重启（5 秒周期监视程序文件本身） |
 | `MaxMemory` | `0` | 最大内存（MB），超限重启；0 不限制 |
 | `OomScoreAdjust` | `0` | OOM 分值（仅 Linux） |
 | `HealthCheck` | 空 | 健康检查：`http://…`、`https://…`（含 TLS）或 `tcp://host:port` |
