@@ -318,8 +318,8 @@ async function logout(){
 
 function showApp(){
  $('login').style.display='none';$('app').style.display='block';
- loadDashboard();timer=setInterval(loadDashboard,10000);
- loadServices();svcTimer=setInterval(loadServices,10000);
+ loadDashboard();timer=setInterval(loadDashboard,3000);
+ loadServices();svcTimer=setInterval(loadServices,3000);
 }
 
 async function api(url,opt={}){

@@ -1415,6 +1415,62 @@ fn is_virtual_adapter(description: &str) -> bool {
 }
 
 /// 枚举网络接口（对齐 C# `ShowMachineInfo`：排除回环/虚拟网卡，取 IPv4）。
+/// 本机网络总流量（接收字节, 发送字节）。用于面板速率差分计算。
+pub(crate) fn net_total_bytes() -> Option<(u64, u64)> {
+    #[cfg(target_os = "linux")]
+    {
+        // /sys/class/net/<if>/statistics/{rx_bytes,tx_bytes}（排除 lo）
+        let dir = std::fs::read_dir("/sys/class/net").ok()?;
+        let mut rx_total = 0u64;
+        let mut tx_total = 0u64;
+        for entry in dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name == "lo" {
+                continue;
+            }
+            let base = entry.path();
+            let read = |file: &str| {
+                std::fs::read_to_string(base.join(file))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+            };
+            rx_total += read("statistics/rx_bytes")?;
+            tx_total += read("statistics/tx_bytes")?;
+        }
+        Some((rx_total, tx_total))
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::NetworkManagement::IpHelper::{FreeMibTable, GetIfTable2, MIB_IF_TABLE2};
+
+        let mut table: *mut MIB_IF_TABLE2 = std::ptr::null_mut();
+        let ret = unsafe { GetIfTable2(&mut table) };
+        if ret != 0 || table.is_null() {
+            return None;
+        }
+        let mut rx_total = 0u64;
+        let mut tx_total = 0u64;
+        unsafe {
+            let t = &*table;
+            for i in 0..t.NumEntries as usize {
+                let row = &*t.Table.as_ptr().add(i);
+                // 过滤软件回环（IfType=24）
+                if row.Type == 24 {
+                    continue;
+                }
+                rx_total += row.InOctets;
+                tx_total += row.OutOctets;
+            }
+            FreeMibTable(table as *const _);
+        }
+        Some((rx_total, tx_total))
+    }
+    #[cfg(not(any(target_os = "linux", windows)))]
+    {
+        None
+    }
+}
+
 pub(crate) fn network_interfaces() -> Vec<NetInterface> {
     #[cfg(windows)]
     {

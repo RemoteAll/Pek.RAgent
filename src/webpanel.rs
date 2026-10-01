@@ -344,6 +344,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let cpu_rate = sys::system_cpu_rate();
     let (tcp_estab, tcp_time_wait, tcp_close_wait) = sys::tcp_counts();
+    // 网络速率（两次请求差分；网页关闭时无请求 = 零开销）
+    let (net_up, net_down) = net_speed();
     let uptime = panel.uptime();
     let cpu_count = std::thread::available_parallelism()
         .map(|v| v.get())
@@ -374,8 +376,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "freeMemory": format!("{} GB", mem_avail / 1024 / 1024 / 1024),
         "board": "",
         "machineGuid": sys::machine_guid().unwrap_or_default(),
-        "uplinkSpeed": "",
-        "downlinkSpeed": "",
+        "uplinkSpeed": format_speed(net_up),
+        "downlinkSpeed": format_speed(net_down),
         "tcpConnections": tcp_estab,
         "tcpTimeWait": tcp_time_wait,
         "tcpCloseWait": tcp_close_wait,
@@ -413,6 +415,48 @@ fn health(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     });
 
     json_result(0, "", Some(data))
+}
+
+/// 上次网络采样（时间, 接收字节, 发送字节）——面板速率差分用。
+static NET_LAST: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
+
+/// 计算上下行速率（字节/秒）；首次调用无基线返回 (0, 0)。
+fn net_speed() -> (u64, u64) {
+    let Some((rx, tx)) = sys::net_total_bytes() else {
+        return (0, 0);
+    };
+    let now = Instant::now();
+    let mut slot = NET_LAST.lock().unwrap();
+    let (up, down) = match *slot {
+        Some((t, lrx, ltx)) => {
+            let dt = now.duration_since(t).as_secs_f64();
+            if dt >= 0.2 {
+                (
+                    ((tx.saturating_sub(ltx)) as f64 / dt) as u64,
+                    ((rx.saturating_sub(lrx)) as f64 / dt) as u64,
+                )
+            } else {
+                (0, 0)
+            }
+        }
+        None => (0, 0),
+    };
+    *slot = Some((now, rx, tx));
+    (up, down)
+}
+
+/// 速率格式化（人类可读）。
+fn format_speed(bps: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    let v = bps as f64;
+    if v >= MB {
+        format!("{:.1} MB/s", v / MB)
+    } else if v >= KB {
+        format!("{:.1} KB/s", v / KB)
+    } else {
+        format!("{v:.0} B/s")
+    }
 }
 
 /// 释放内存（尽力回收工作集）。
