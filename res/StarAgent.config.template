@@ -24,10 +24,10 @@
   <StartupHook>false</StartupHook>
 
   <!--———————————————— 以下为 Pek.RAgent 扩展配置（C# StarAgent 会忽略未知项） ————————————————-->
-  <!--服务名。默认 StarAgent，与现有部署脚本/服务名保持一致-->
-  <ServiceName>StarAgent</ServiceName>
+  <!--服务名。默认 StarAgentRust（与 C# 版 StarAgent 错开，可同机并存；改名后安装会自动清理指向本程序的旧注册）-->
+  <ServiceName>StarAgentRust</ServiceName>
   <!--显示名-->
-  <DisplayName>星尘代理</DisplayName>
+  <DisplayName>星尘代理(Rust)</DisplayName>
   <!--服务描述-->
   <Description>星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。</Description>
   <!--仅本机访问。true 时只绑定 127.0.0.1；默认 false（允许远程访问——无头服务器需远程管理面板，请确保面板密码安全）-->

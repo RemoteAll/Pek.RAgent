@@ -2,7 +2,7 @@
 
 部署在每台应用服务器 / 边缘节点上的节点守护代理，以系统服务方式运行，负责**多应用进程守护、影子目录部署、运行中文件替换与本地控制接口**。
 
-当前版本**暂不对接 StarServer / StarWeb**，定位为独立可用的本地代理；`DHDeploy` 所需的本地命令接口（默认 `localhost:5501` 上的 `RestartService / StartService / StopService`）已完整提供——默认端口与 **C# 版 StarAgent（5500）错开**，两者可同时安装、并行运行；DHDeploy.Agent.Rust 按节点类型调用（Rust 类型节点 → 5501；非 Rust/空 → 5500）。
+当前版本**暂不对接 StarServer / StarWeb**，定位为独立可用的本地代理；`DHDeploy` 所需的本地命令接口（默认 `localhost:5501` 上的 `RestartService / StartService / StopService`）已完整提供——默认端口（5501）与服务名（`StarAgentRust`）均与 **C# 版 StarAgent（5500 / StarAgent）错开**，两者可同时安装、并行运行；DHDeploy.Agent.Rust 按节点类型调用（Rust 类型节点 → 5501；非 Rust/空 → 5500）。
 
 ---
 
@@ -93,6 +93,8 @@ sudo bash install.sh              # 一键：补可执行位并安装启动服�
 
 > 包内文件已带可执行位（`tar -xzf` 解压即用）；若通过 scp 直接传**单个文件**等不保留权限的途径获取，会出现 `-bash: ./pek-ragent: Permission denied`，执行一次 `chmod +x pek-ragent` 即可（或直接用包内 `bash install.sh`，它自动补权限）。
 
+> **从旧服务名迁移（已装过旧版的机器）**：默认服务名已改为 `StarAgentRust`（C# 版为 `StarAgent`，两者可同机并存）。迁移：编辑 `Config/StarAgent.config` 的 `<ServiceName>`/`<DisplayName>` 为新值 → `sudo bash install.sh`（或 `./pek-ragent -reinstall`）。安装时**自动清理**指向本程序的旧名服务（systemd 单元 / init.d / Windows 服务 / launchd 任务）；若旧注册指向 C# 版星尘（不同程序），保留不动。不迁移也可：旧配置读取后按旧名继续运行。
+
 **访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=false`，监听 `0.0.0.0:5501`，可直接通过服务器 IP 访问）：
 
 ```bash
@@ -171,7 +173,7 @@ sudo /www/Agent/pek-ragent -update /tmp/pek-ragent-new    # 升级 + 重启服�
 
 ```text
 $ pek-ragent -status
-服务：星尘代理(StarAgent)
+服务：星尘代理(Rust)(StarAgentRust)
 描述：星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
@@ -209,7 +211,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 无参数启动时，先输出与 C# `ShowStatus` 相同的**状态块**（服务/描述/状态/路径 + 版本行），再进入菜单循环（第 2、3 项随服务的安装/运行状态切换；第 6–9 项子服务操作仅在**代理运行中**——本地控制接口可达（服务或前台模式均可）——时显示）：
 
 ```text
-服务：星尘代理(StarAgent)
+服务：星尘代理(Rust)(StarAgentRust)
 描述：星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
@@ -245,8 +247,8 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 
 | 字段 | 默认 | 说明 |
 |------|------|------|
-| `ServiceName` | `StarAgent` | 服务名（Windows 服务名 / systemd 单元名 / launchd 标签） |
-| `DisplayName` | `星尘代理` | 显示名 |
+| `ServiceName` | `StarAgentRust` | 服务名（Windows 服务名 / systemd 单元名 / launchd 标签）。与 C# 版 `StarAgent` 错开，可同机并存；旧名 `StarAgent` 若指向本程序，安装时自动清理 |
+| `DisplayName` | `星尘代理(Rust)` | 显示名 |
 | `Description` | … | 服务描述 |
 | `LocalPort` | `5501` | 本地控制接口端口（TCP 面板与 UDP RPC 共用）。默认 5501：与 C# 版 StarAgent（5500）错开，二者可同时并存；DHDeploy.Agent.Rust 按节点类型调用（Rust→5501，非 Rust/空→5500） |
 | `LocalOnly` | `false` | 为 true 时仅绑定 127.0.0.1（远程不可达）；默认 false 绑定 0.0.0.0（允许远程访问，面板凭据兜底） |

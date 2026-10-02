@@ -26,6 +26,9 @@ pub fn install(_mgr: &ServiceManager, _start: bool) -> Result<(), String> {
     unsupported()
 }
 
+/// 清理旧服务名（平台不支持服务化，空操作）。
+pub fn cleanup_legacy(_mgr: &ServiceManager) {}
+
 /// 重新安装。
 pub fn reinstall(_mgr: &ServiceManager) -> Result<(), String> {
     unsupported()

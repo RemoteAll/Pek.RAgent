@@ -107,7 +107,11 @@ impl ServiceManager {
     }
 
     /// 安装（`start` 为 true 时安装并启动）。
+    ///
+    /// 安装前先做旧服务名清理（best-effort）：旧默认名 `StarAgent` 若指向本程序
+    /// （改名迁移场景），自动停止并删除其注册；若指向其它程序（如 C# 版星尘），保留不动。
     pub fn install(&self, start: bool) -> Result<(), String> {
+        platform::cleanup_legacy(self);
         platform::install(self, start)
     }
 
@@ -120,7 +124,10 @@ impl ServiceManager {
     }
 
     /// 重新安装（先卸载再安装并启动）。
+    ///
+    /// 与 [`ServiceManager::install`] 相同：安装前先做旧服务名清理（best-effort）。
     pub fn reinstall(&self) -> Result<(), String> {
+        platform::cleanup_legacy(self);
         platform::reinstall(self)
     }
 
@@ -142,5 +149,66 @@ impl ServiceManager {
     /// 重启。
     pub fn restart(&self) -> Result<(), String> {
         platform::restart(self)
+    }
+}
+
+// ————— 旧服务名清理（默认名迁移）与程序身份比对 —————
+
+/// 判断服务注册的程序路径与本程序是否指向同一文件（`canonicalize` 后比较文本）。
+pub(crate) fn same_exe(registered: &Path, current: &Path) -> bool {
+    let a = std::fs::canonicalize(registered).unwrap_or_else(|_| registered.to_path_buf());
+    let b = std::fs::canonicalize(current).unwrap_or_else(|_| current.to_path_buf());
+    same_exe_text(&a.to_string_lossy(), &b.to_string_lossy())
+}
+
+/// 程序路径文本比较（Windows 大小写不敏感；其它平台大小写敏感）。
+pub(crate) fn same_exe_text(a: &str, b: &str) -> bool {
+    if cfg!(windows) {
+        a.eq_ignore_ascii_case(b)
+    } else {
+        a == b
+    }
+}
+
+/// 旧注册是否属于本程序（迁移清理的安全校验）：
+/// 同一文件，或其文件名与本程序一致（开发目录与部署目录的同名副本）。
+pub(crate) fn is_same_program(registered: &Path, current: &Path) -> bool {
+    if same_exe(registered, current) {
+        return true;
+    }
+    match (
+        registered.file_name().and_then(|s| s.to_str()),
+        current.file_name().and_then(|s| s.to_str()),
+    ) {
+        (Some(a), Some(b)) => a.eq_ignore_ascii_case(b),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_exe_text_respects_platform_case_rules() {
+        if cfg!(windows) {
+            assert!(same_exe_text("C:\\Dir\\App.exe", "c:\\dir\\app.exe"));
+        } else {
+            assert!(!same_exe_text("/opt/App", "/opt/app"));
+        }
+    }
+
+    #[test]
+    fn is_same_program_matches_same_file_name() {
+        // 文件名一致（开发目录 vs 部署目录的同名副本）→ 视为本程序
+        assert!(is_same_program(
+            Path::new("C:\\deploy\\pek-ragent.exe"),
+            Path::new("G:\\target\\release\\pek-ragent.exe")
+        ));
+        // 文件名不同（如 C# 版 StarAgent.exe）→ 不视为本程序
+        assert!(!is_same_program(
+            Path::new("C:\\StarAgent\\StarAgent.exe"),
+            Path::new("C:\\StarAgent\\pek-ragent.exe")
+        ));
     }
 }

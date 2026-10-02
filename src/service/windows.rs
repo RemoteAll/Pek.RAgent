@@ -90,6 +90,52 @@ fn parse_bin_path(output: &str) -> Option<std::path::PathBuf> {
     None
 }
 
+/// 清理旧服务名（默认名迁移，best-effort）：旧注册**指向本程序**时停止并删除；
+/// 指向其它程序（如 C# 版星尘 `StarAgent.exe`）时保留不动，二者可继续并存。
+pub fn cleanup_legacy(mgr: &ServiceManager) {
+    let legacy = crate::config::LEGACY_SERVICE_NAME;
+    if mgr.name.eq_ignore_ascii_case(legacy) {
+        return;
+    }
+    let (code, stdout, stderr) = run("sc", &["qc", legacy]);
+    if code != 0 {
+        return; // 旧服务不存在
+    }
+    let Some(path) = parse_bin_path(&format!("{stdout}\n{stderr}")) else {
+        return;
+    };
+    if !super::is_same_program(&path, &mgr.exe) {
+        util::log_format(
+            "检测到旧服务名 {}（指向 {}，可能为 C# 版星尘），保留不动",
+            &[legacy, &path.display().to_string()],
+        );
+        return;
+    }
+
+    // 停止旧服务（≤15 秒），随后删除注册
+    let _ = run("sc", &["stop", legacy]);
+    let deadline = std::time::Instant::now() + Duration::from_millis(15_000);
+    while std::time::Instant::now() < deadline {
+        let (c, o, e) = run("sc", &["query", legacy]);
+        let text = format!("{o}{e}").to_uppercase();
+        if c != 0 || text.contains("STOPPED") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+    let (code, stdout, stderr) = run("sc", &["delete", legacy]);
+    let detail = format!("{stdout}{stderr}");
+    let detail = detail.trim();
+    if code == 0 {
+        util::log_format("已自动清理旧服务名 {}（原指向本程序，已停止并删除）", &[legacy]);
+    } else {
+        util::log_format(
+            "旧服务名 {} 清理失败：{}（如仍存在请手工执行 sc delete {}）",
+            &[legacy, detail, legacy],
+        );
+    }
+}
+
 /// 等待服务到达期望状态。
 fn wait_state(mgr: &ServiceManager, expected: ServiceState, timeout_ms: u64) -> bool {
     let deadline = std::time::Instant::now() + Duration::from_millis(timeout_ms);

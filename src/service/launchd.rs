@@ -57,6 +57,36 @@ fn parse_program_argument(text: &str) -> Option<String> {
     Some(after[start..end].to_string())
 }
 
+/// 清理旧服务名（默认名迁移，best-effort）：旧 plist 指向本程序时卸载并删除；
+/// 指向其它程序时保留不动。
+pub fn cleanup_legacy(mgr: &ServiceManager) {
+    let legacy = crate::config::LEGACY_SERVICE_NAME;
+    if mgr.name == legacy {
+        return;
+    }
+    let path = plist_path(legacy);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return;
+    };
+    let Some(exe) = parse_program_argument(&text) else {
+        return;
+    };
+    let exe = std::path::PathBuf::from(exe);
+    if !super::is_same_program(&exe, &mgr.exe) {
+        util::log_format(
+            "检测到旧 launchd 任务 {}（指向 {}，可能为 C# 版星尘），保留不动",
+            &[&path.display().to_string(), &exe.display().to_string()],
+        );
+        return;
+    }
+    let _ = run(&["bootout", &format!("system/{legacy}")]);
+    let _ = std::fs::remove_file(&path);
+    util::log_format(
+        "已自动清理旧 launchd 任务 {}（原指向本程序，已卸载并删除）",
+        &[&path.display().to_string()],
+    );
+}
+
 fn plist_text(mgr: &ServiceManager) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\

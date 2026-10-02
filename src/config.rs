@@ -19,7 +19,13 @@ use crate::util;
 const TEMPLATE: &str = include_str!("../res/StarAgent.config.template");
 
 /// 默认服务名（Windows 服务 / systemd 单元 / launchd 任务）。
-pub const DEFAULT_SERVICE_NAME: &str = "StarAgent";
+///
+/// 用 `StarAgentRust` 与 C# 版 StarAgent（服务名 `StarAgent`、端口 5500）错开：
+/// 服务名与端口双重区分后，两版星尘可在**同一台机器同时安装、并行运行**。
+pub const DEFAULT_SERVICE_NAME: &str = "StarAgentRust";
+/// 旧默认服务名（与 C# 版同名）。安装新名服务前会清理**指向本程序**的旧注册，
+/// 避免两套服务指向同一 exe 造成重复拉起（见 `service` 模块 `cleanup_legacy`）。
+pub const LEGACY_SERVICE_NAME: &str = "StarAgent";
 /// 本地控制端口默认值。5501：与 C# 版 StarAgent（5500）错开，二者可同时并存；
 /// DHDeploy.Agent.Rust 按节点类型调用（Rust 类型节点 → 5501；非 Rust/空 → 5500）。
 pub const DEFAULT_LOCAL_PORT: u16 = 5501;
@@ -28,7 +34,7 @@ pub const DEFAULT_LOCAL_PORT: u16 = 5501;
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "PascalCase", default)]
 pub struct AgentConfig {
-    /// 服务名。默认 StarAgent，与现有部署脚本/服务名保持一致
+    /// 服务名。默认 StarAgentRust（与 C# 版 StarAgent 错开，可同机并存）
     pub service_name: String,
     /// 显示名
     pub display_name: String,
@@ -84,7 +90,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             service_name: DEFAULT_SERVICE_NAME.to_string(),
-            display_name: "星尘代理".to_string(),
+            display_name: "星尘代理(Rust)".to_string(),
             description: "星尘节点守护代理（Pek.RAgent）。提供进程守护、影子目录部署与本地控制接口。".to_string(),
             local_port: DEFAULT_LOCAL_PORT,
             // 默认允许远程访问（服务器部署多为无头环境；面板有密码鉴权）。
@@ -298,7 +304,7 @@ impl AgentConfig {
         }
         self.service_name = self.service_name.trim().to_string();
         if self.display_name.trim().is_empty() {
-            self.display_name = "星尘代理".to_string();
+            self.display_name = "星尘代理(Rust)".to_string();
         }
         if self.local_port == 0 {
             self.local_port = DEFAULT_LOCAL_PORT;
@@ -1023,12 +1029,13 @@ mod tests {
     fn generates_xml_with_comments() {
         let base = temp_base("gen");
         let cfg = AgentConfig::load(&base);
-        assert_eq!(cfg.service_name, "StarAgent");
+        assert_eq!(cfg.service_name, "StarAgentRust");
+        assert_ne!(DEFAULT_SERVICE_NAME, LEGACY_SERVICE_NAME);
         assert_eq!(cfg.local_port, DEFAULT_LOCAL_PORT);
 
         let text = std::fs::read_to_string(config_path(&base)).unwrap();
         assert!(text.contains("<!--本地端口"), "应带注释：\n{text}");
-        assert!(text.contains("<ServiceName>StarAgent</ServiceName>"), "{text}");
+        assert!(text.contains("<ServiceName>StarAgentRust</ServiceName>"), "{text}");
         assert!(text.contains("<Services>"), "{text}");
 
         let _ = std::fs::remove_dir_all(&base);
