@@ -10,8 +10,8 @@
   <Project></Project>
   <!--星尘服务端地址。预留（`-server` 参数写入，C# StarAgent 会忽略）-->
   <Server></Server>
-  <!--本地端口。默认5500-->
-  <LocalPort>5500</LocalPort>
+  <!--本地端口。默认5501（与 C# 版 StarAgent 的 5500 错开，可同时并存）-->
+  <LocalPort>5501</LocalPort>
   <!--更新通道。默认Release-->
   <Channel>Release</Channel>
   <!--Windows自启动。自启动需要用户登录桌面，默认false使用系统服务-->

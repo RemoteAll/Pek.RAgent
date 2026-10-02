@@ -1,8 +1,9 @@
 //! 本地 UDP RPC 服务端（NewLife ApiClient 二进制协议；与 C# StarAgent 的 UDP 5500 同契约）。
 //!
-//! 背景：新版 DHDeploy 走 `udp://127.0.0.1:5500`（`ApiClient.Invoke`），C# StarAgent 的 UDP RPC
-//! 由 `StarService` 提供；本模块补齐该服务端，协议实现复用 [`dhrust::net::api_rpc`]
-//! （客户端/服务端同源，杜绝双端分叉）。
+//! 背景：DHDeploy 的 Agent 走 `udp://127.0.0.1:5500`（`ApiClient.Invoke`）调用本地星尘，C# StarAgent
+//! 的 UDP RPC 由 `StarService` 提供；本模块补齐该服务端（默认端口 5501，与 C# 版错开可并存；
+//! DHDeploy.Agent.Rust 按节点类型调用：Rust→5501、非 Rust/空→5500）。协议实现复用
+//! [`dhrust::net::api_rpc`]（客户端/服务端同源，杜绝双端分叉）。
 //!
 //! 动作面（对齐 C# `StarService`）：
 //! - `StartService` / `StopService` / `RestartService`：完整实现（复用 HTTP 控制接口的核心逻辑，

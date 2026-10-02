@@ -7,8 +7,8 @@
 //! - **升级**：`-update [文件]`（用新版本文件升级当前程序并重启服务）；`-selftest`（升级管线内部使用）
 //! - **其它**：`-ShowMachineInfo`；位置参数 zip 一次性拉起（`pek-ragent app.zip urls=http://*:8080`）
 //!
-//! 应用级命令通过本地控制接口（默认 127.0.0.1:5500）与运行中的代理通信，
-//! 与 DHDeploy 使用同一契约。
+//! 应用级命令通过本地控制接口（默认 127.0.0.1:5501，与 C# 版 StarAgent 错开可并存）
+//! 与运行中的代理通信，与 DHDeploy 使用同一契约。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -1106,7 +1106,7 @@ fn print_help() {
   pek-ragent -help                  显示本帮助
 
 配置文件：Config/StarAgent.config（XML，与 C# StarAgent 同格式互通）
-本地控制接口：http://127.0.0.1:5500（RestartService / StartService / StopService 等，兼容 DHDeploy）
+本地控制接口：http://127.0.0.1:5501（默认端口；RestartService / StartService / StopService 等，兼容 DHDeploy）
 "#,
         version = env!("CARGO_PKG_VERSION")
     );

@@ -36,6 +36,6 @@ systemctl start StarAgent
 sleep 3
 
 echo '[5] 验证：两边当前值'
-curl -s http://127.0.0.1:5500/star/webTraffic | grep -o 'todayBytes[^,]*' || true
+curl -s http://127.0.0.1:5501/star/webTraffic | grep -o 'todayBytes[^,]*' || true
 grep -E 'traffic|requests' "$BT"
 echo '[6] done'

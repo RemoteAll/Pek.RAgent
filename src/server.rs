@@ -1,4 +1,4 @@
-//! 本地 HTTP 控制接口（默认 `127.0.0.1:5500`）。
+//! 本地 HTTP 控制接口（默认 `127.0.0.1:5501`；与 C# 版 StarAgent 的 5500 错开，可同时并存）。
 //!
 //! **DHDeploy 兼容契约（必须保持）**：
 //! ```text
@@ -7,7 +7,8 @@
 //! GET /StopService?serviceName=X
 //! → 200 {"Success":bool,"Message":"...","ServiceName":"X"}   （PascalCase；业务失败也返回 200）
 //! ```
-//! （来源：DHDeploy.Agent 的 `ApiHttpClient("http://localhost:5500/")` 调用，参数走 URL。）
+//! （来源：DHDeploy.Agent（C#）的 `ApiHttpClient("http://localhost:5500/")` 调用 C# 版星尘、参数走 URL；
+//! DHDeploy.Agent.Rust 按节点类型选择端口——Rust 类型节点 → 本代理 5501，非 Rust/空 → 5500。）
 //!
 //! 另提供 `/GetServices`、`/Info`、`/Ping`、`/KillAndStart` 供菜单、看门狗与后续集成使用。
 

@@ -20,8 +20,9 @@ const TEMPLATE: &str = include_str!("../res/StarAgent.config.template");
 
 /// 默认服务名（Windows 服务 / systemd 单元 / launchd 任务）。
 pub const DEFAULT_SERVICE_NAME: &str = "StarAgent";
-/// 本地控制端口（DHDeploy 依赖 5500 调用 RestartService/StartService/StopService）。
-pub const DEFAULT_LOCAL_PORT: u16 = 5500;
+/// 本地控制端口默认值。5501：与 C# 版 StarAgent（5500）错开，二者可同时并存；
+/// DHDeploy.Agent.Rust 按节点类型调用（Rust 类型节点 → 5501；非 Rust/空 → 5500）。
+pub const DEFAULT_LOCAL_PORT: u16 = 5501;
 
 /// 代理配置。
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -33,7 +34,7 @@ pub struct AgentConfig {
     pub display_name: String,
     /// 服务描述
     pub description: String,
-    /// 本地控制端口。默认 5500，DHDeploy 依赖该端口
+    /// 本地控制端口。默认 5501（与 C# 版 StarAgent 的 5500 错开，二者可同时并存）
     pub local_port: u16,
     /// 仅本机访问。true 时只绑定 127.0.0.1；false 绑定 0.0.0.0（允许远程，面板鉴权兜底）。
     /// 默认 false——与 C# 行为一致，无头服务器需远程访问管理面板

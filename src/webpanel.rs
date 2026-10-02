@@ -696,7 +696,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
         config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
-        config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5500；修改需重启服务后生效"),
+        config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
         config_item("MaxFails", "最大失败次数", "Int32", cfg.max_fails.to_string(), "超过后不再尝试启动，默认20"),
@@ -1149,7 +1149,7 @@ fn get_star_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 {
                     "name": "LocalPort", "displayName": "本地端口(UDP)", "value": cfg.local_port,
                     "type": "Int32",
-                    "description": "本地API通信端口（UDP），默认5500。与 Web 面板端口共用，UDP 用于本地 RPC，TCP 用于 Web 面板"
+                    "description": "本地API通信端口（UDP），默认5501（与 C# 版 StarAgent 5500 错开）。与 Web 面板端口共用，UDP 用于本地 RPC，TCP 用于 Web 面板"
                 },
                 {
                     "name": "Project", "displayName": "项目名", "value": cfg.project,
@@ -1683,7 +1683,7 @@ mod tests {
 
         let cfg = AgentConfig::default();
         let manager = AppManager::new(&dir, cfg);
-        let panel = WebPanel::new(manager, &dir, 5500);
+        let panel = WebPanel::new(manager, &dir, 5501);
         (panel, dir)
     }
 
@@ -1730,7 +1730,7 @@ mod tests {
         let status = status(&panel, &context("GET", "/api/status", "", Some(&token)));
         let status = body_json(status);
         assert_eq!(status["code"], 0);
-        assert_eq!(status["data"]["port"], 5500);
+        assert_eq!(status["data"]["port"], 5501);
         assert_eq!(status["data"]["running"], true);
 
         // 注销后失效

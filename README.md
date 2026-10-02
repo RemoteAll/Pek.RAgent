@@ -2,7 +2,7 @@
 
 部署在每台应用服务器 / 边缘节点上的节点守护代理，以系统服务方式运行，负责**多应用进程守护、影子目录部署、运行中文件替换与本地控制接口**。
 
-当前版本**暂不对接 StarServer / StarWeb**，定位为独立可用的本地代理；`DHDeploy` 所需的本地命令接口（`localhost:5500` 的 `RestartService / StartService / StopService`）已完整提供。
+当前版本**暂不对接 StarServer / StarWeb**，定位为独立可用的本地代理；`DHDeploy` 所需的本地命令接口（默认 `localhost:5501` 上的 `RestartService / StartService / StopService`）已完整提供——默认端口与 **C# 版 StarAgent（5500）错开**，两者可同时安装、并行运行；DHDeploy.Agent.Rust 按节点类型调用（Rust 类型节点 → 5501；非 Rust/空 → 5500）。
 
 ---
 
@@ -20,7 +20,7 @@
 | 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
-| 本地 HTTP 控制接口 | 默认 `0.0.0.0:5500`（`LocalOnly=true` 时仅 `127.0.0.1`），兼容 DHDeploy 的调用契约 |
+| 本地 HTTP 控制接口 | 默认 `0.0.0.0:5501`（`LocalOnly=true` 时仅 `127.0.0.1`；与 C# 版 StarAgent 的 5500 错开可并存），兼容 DHDeploy 的调用契约 |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
 | Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/控制/配置/星尘设置/日志/看门狗/服务器校时；默认 `admin`/`admin`；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌），前端页编译期内嵌 |
@@ -73,7 +73,7 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 1. 把 `pek-ragent` 可执行文件放到部署目录（如 `C:\StarAgent`、`/opt/staragent`）；
 2. 运行 `pek-ragent` 打开**控制台菜单**，选择 `2` 安装并启动服务；或直接执行 `pek-ragent -install`（Linux 需 `sudo`）；
 3. 编辑 `Config/StarAgent.config` 添加应用（见第 5 节），执行 `pek-ragent -restart` 生效；
-4. 验证：`pek-ragent -ListServices`，或 `curl http://127.0.0.1:5500/GetServices`。
+4. 验证：`pek-ragent -ListServices`，或 `curl http://127.0.0.1:5501/GetServices`。
 
 ### 3.1 Linux 部署（静态单文件）
 
@@ -93,19 +93,19 @@ sudo bash install.sh              # 一键：补可执行位并安装启动服�
 
 > 包内文件已带可执行位（`tar -xzf` 解压即用）；若通过 scp 直接传**单个文件**等不保留权限的途径获取，会出现 `-bash: ./pek-ragent: Permission denied`，执行一次 `chmod +x pek-ragent` 即可（或直接用包内 `bash install.sh`，它自动补权限）。
 
-**访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=false`，监听 `0.0.0.0:5500`，可直接通过服务器 IP 访问）：
+**访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=false`，监听 `0.0.0.0:5501`，可直接通过服务器 IP 访问）：
 
 ```bash
-# 默认：浏览器打开 http://服务器IP:5500/（admin/admin）
+# 默认：浏览器打开 http://服务器IP:5501/（admin/admin）
 # 安全提醒：仍使用默认密码时启动日志会明确提示；请尽快修改密码，
 #           并放行防火墙与云安全组：
-firewall-cmd --add-port=5500/tcp   # firewalld；ufw 对应 sudo ufw allow 5500
-# 云服务器还需在控制台安全组放行 5500/TCP
+firewall-cmd --add-port=5501/tcp   # firewalld；ufw 对应 sudo ufw allow 5501
+# 云服务器还需在控制台安全组放行 5501/TCP
 
 # 可选（更安全）：仅本机访问 + SSH 隧道
 vi Config/StarAgent.config         # 将 "LocalOnly" 改为 true
 ./pek-ragent -restart
-ssh -L 5500:127.0.0.1:5500 root@server   # 然后打开 http://127.0.0.1:5500/
+ssh -L 5501:127.0.0.1:5501 root@server   # 然后打开 http://127.0.0.1:5501/
 ```
 
 > 旧版本生成的配置若为 `LocalOnly=true`，改回 `false` 并重启即可远程访问。
@@ -179,7 +179,7 @@ $ pek-ragent -status
 Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 
 配置：/www/Agent/Config/StarAgent.config
-本地端口：5500（仅本机：是）
+本地端口：5501（仅本机：是）
 子服务：2 个，运行中 1
 
 最近日志（2026_10_01.log）：
@@ -248,7 +248,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `ServiceName` | `StarAgent` | 服务名（Windows 服务名 / systemd 单元名 / launchd 标签） |
 | `DisplayName` | `星尘代理` | 显示名 |
 | `Description` | … | 服务描述 |
-| `LocalPort` | `5500` | 本地控制接口端口（DHDeploy 依赖 5500） |
+| `LocalPort` | `5501` | 本地控制接口端口（TCP 面板与 UDP RPC 共用）。默认 5501：与 C# 版 StarAgent（5500）错开，二者可同时并存；DHDeploy.Agent.Rust 按节点类型调用（Rust→5501，非 Rust/空→5500） |
 | `LocalOnly` | `false` | 为 true 时仅绑定 127.0.0.1（远程不可达）；默认 false 绑定 0.0.0.0（允许远程访问，面板凭据兜底） |
 | `Delay` | `3000` | 重启/文件变动后重新启动的延迟（毫秒） |
 | `StartWait` | `3000` | 健康检查等待时间（毫秒） |
@@ -294,8 +294,8 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 ```xml
 <?xml version="1.0" encoding="utf-8"?>
 <StarAgent>
-  <!--本地端口。默认5500-->
-  <LocalPort>5500</LocalPort>
+  <!--本地端口。默认5501（与 C# 版 StarAgent 的 5500 错开，可同时并存）-->
+  <LocalPort>5501</LocalPort>
 
   <!--应用服务集合-->
   <Services>
@@ -344,7 +344,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 
 ## 7. 本地 HTTP 控制接口
 
-默认监听 `127.0.0.1:5500`（`LocalOnly=true`）。**DHDeploy 通过 `ApiHttpClient("http://localhost:5500/")` 调用下面 3 个接口，格式必须保持兼容。**
+默认监听 `127.0.0.1:5501`（`LocalOnly=true`）。**C# 版 DHDeploy 通过 `ApiHttpClient("http://localhost:5500/")` 固定调用 5500（C# 星尘）；DHDeploy.Agent.Rust 按节点类型选择（Rust 类型节点 → 5501 本代理；非 Rust/空 → 5500）。接口格式必须保持兼容；UDP RPC 与 TCP 共用同一端口。**
 
 ### 7.1 契约（DHDeploy 兼容）
 
@@ -380,21 +380,21 @@ GET /StopService?serviceName=X
 
 ```powershell
 # 重启应用（DHDeploy 同款调用）
-Invoke-RestMethod 'http://localhost:5500/RestartService?serviceName=webapp'
+Invoke-RestMethod 'http://localhost:5501/RestartService?serviceName=webapp'
 
 # 查看子服务
-Invoke-RestMethod 'http://localhost:5500/GetServices' | ConvertTo-Json -Depth 5
+Invoke-RestMethod 'http://localhost:5501/GetServices' | ConvertTo-Json -Depth 5
 ```
 
 ```bash
-curl 'http://127.0.0.1:5500/RestartService?serviceName=webapp'
+curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 ```
 
 ---
 
 ## 8. Web 管理面板
 
-内置管理面板，浏览器访问 `http://127.0.0.1:5500/`（`LocalOnly=false` 时允许远程）：
+内置管理面板，浏览器访问 `http://127.0.0.1:5501/`（`LocalOnly=false` 时允许远程）：
 
 - **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
 - **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
@@ -418,7 +418,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 
 > 标准 combined 行尾是带引号的 UA，扩展格式行尾是纯数字（`$bytes_sent` 或 `$bytes_sent $request_length`），两者不会混淆；改动只影响新写入的日志行，历史数据不受影响；`nginx -t && nginx -s reload` 生效。
 
-接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。面板页签由 URL hash 记忆（如 `http://127.0.0.1:5500/#traffic`），刷新/重新登录后停留在当前页。
+接口契约与 C# 面板一致（统一 `{code, message?, data?}` 信封），前端页面（`web/index.html`）直接复用 C# 版并通过 `include_bytes!` 编译期内嵌——单文件部署开箱即用，亦可在运行目录放 `wwwroot/index.html` 覆盖。面板页签由 URL hash 记忆（如 `http://127.0.0.1:5501/#traffic`），刷新/重新登录后停留在当前页。
 
 | 端点 | 说明 |
 |------|------|
@@ -487,7 +487,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 |----|------|
 | StarServer / StarWeb 对接 | **暂未实现**；`-server` 参数仅保存到配置 |
 | Web 管理面板 | **已实现**（对齐 C# 契约，前端直接复用）；差异：无 GC 统计（`gcTotalMemory`/`gcCollections` 恒为 0）、磁盘 IOPS 恒为 0、网卡收发包字节未统计、无“扩展面板”接口 |
-| 本地 RPC | **UDP 5500 已实现**（NewLife ApiClient 二进制协议，与 C# StarAgent 同契约；仅限本机）：`StartService`/`StopService`/`RestartService` 完整实现，`Ping`/`Info`/`GetServices`/`SetServer` 简化实现（待 StarServer 对接时补齐数据形态）；协议实现与 DHDeploy.Agent.Rust 客户端同源（`dhrust::net::api_rpc`）；TCP 5500 提供 HTTP 面板契约（Web 面板 + 旧版 DHDeploy HTTP 契约） |
+| 本地 RPC | **UDP 5501 已实现**（NewLife ApiClient 二进制协议，与 C# StarAgent 同契约；仅限本机；默认端口与 C# 版 5500 错开，可同时并存）：`StartService`/`StopService`/`RestartService` 完整实现，`Ping`/`Info`/`GetServices`/`SetServer` 简化实现（待 StarServer 对接时补齐数据形态）；协议实现与 DHDeploy.Agent.Rust 客户端同源（`dhrust::net::api_rpc`）；同端口 TCP 提供 HTTP 面板契约（Web 面板 + DHDeploy HTTP 契约） |
 | 配置格式 | **与 C# 完全互通**：使用同名同格式的 `Config/StarAgent.config`（XML，带中文注释）；C# 特有字段/属性读写均保留；本项目扩展字段以 C# 可忽略的形式写入；支持从旧版 `Agent.toml`（TOML）/`Agent.json` 自动迁移 |
 | 未实现功能 | Nginx 配置生成、防火墙端口自动开放、阿里云 DNS、自身升级/修复、`-watch` 看门狗服务 |
 | 状态存储 | `data/state.json` 记录运行中 PID（用于接管），原 `Service.csv` 不再使用 |
@@ -523,7 +523,7 @@ src/
 
 - [ ] StarServer / StarWeb 对接（登录、心跳、指令下发）
 - [x] Web 管理面板（子服务 CRUD / 日志 / 配置在线修改 / 看门狗 / 本机信息）
-- [x] UDP 5500 本地 RPC（与 C# StarAgent 的 UDP 指令互通；DHDeploy 新版链路实测打通）
+- [x] UDP 本地 RPC（默认 5501；与 C# StarAgent 的 UDP 指令互通、默认端口错开可同时并存；DHDeploy 新版链路实测打通）
 - [x] 流量统计（网站：访问日志增量解析+持久化续读；端口：Linux nftables 计数表/连接视图；每日归档 SQLite（Pek.RCode + XCode 模型 Model.xml，旧版 JSON 自动迁移）+ 面板历史趋势）
 - [ ] 自身升级（`-upgrade` 完整实现）与 `-repair`
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
