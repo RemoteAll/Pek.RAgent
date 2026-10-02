@@ -660,6 +660,310 @@ pub(crate) fn day_ports(base: &Path, date: &str) -> BTreeMap<String, PortCounter
     out
 }
 
+// ————— 数据库管理（面板“数据库”页：只读查询 / 备份 / 还原） —————
+
+/// 物理表名（`Entity/Model.xml` 的 `TableName`；清空与信息统计用）。
+const DB_TABLE_WEB: &str = "Agent_WebTrafficDaily";
+/// 物理表名（端口表）。
+const DB_TABLE_PORTS: &str = "Agent_PortTrafficDaily";
+
+/// 只读查询校验（安全闸门）：仅放行单条 `SELECT` 文本。
+///
+/// 规则（宁可误杀不可放过）：
+/// - 非空、长度 ≤ 4000 字符；
+/// - 不允许包含 `;`（阻断多语句注入；字符串字面量内的分号一并拒绝）；
+/// - 忽略前导空白后必须以 `SELECT` 关键字开头且后跟空白（挡住 `WITH`/`PRAGMA`/`SELECTX` 等路径）。
+pub fn validate_readonly_sql(sql: &str) -> Result<(), String> {
+    let s = sql.trim();
+    if s.is_empty() {
+        return Err("SQL 不能为空".into());
+    }
+    if s.len() > 4000 {
+        return Err("SQL 过长（上限 4000 字符）".into());
+    }
+    if s.contains(';') {
+        return Err("仅支持单条查询：SQL 中不允许出现分号（字符串内的分号也会被拒绝）".into());
+    }
+    // 必须以 SELECT 关键字开头，且其后紧跟空白或字符串结束（拒绝 "SELECTX" 之类）。
+    let is_select = match s.get(..6) {
+        Some(head) if head.eq_ignore_ascii_case("SELECT") => s
+            .as_bytes()
+            .get(6)
+            .is_none_or(|b| b.is_ascii_whitespace()),
+        _ => false,
+    };
+    if !is_select {
+        return Err("仅允许 SELECT 只读查询（当前版本不开放增删改与建表操作）".into());
+    }
+    Ok(())
+}
+
+/// 数据库概况（面板“数据库”页）：文件路径、大小与两张表的行数。
+pub fn database_info(base: &Path) -> Json {
+    let db_path = base.join("Data").join(DB_FILE);
+    let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
+    let path_text = db_path.display().to_string();
+    let mut tables: Vec<Json> = Vec::new();
+    let mut error: Option<String> = None;
+    match storage(base) {
+        Ok(store) => {
+            for (entity, physical) in [(TABLE_WEB, DB_TABLE_WEB), (TABLE_PORTS, DB_TABLE_PORTS)] {
+                let rows = store.dal.open_session().ok().and_then(|mut session| {
+                    store
+                        .dal
+                        .table(entity)
+                        .ok()
+                        .and_then(|t| t.count(session.as_mut(), None).ok())
+                });
+                tables.push(json!({ "name": physical, "rows": rows }));
+            }
+        }
+        Err(e) => error = Some(e),
+    }
+    json!({
+        "path": path_text,
+        "sizeBytes": size,
+        "provider": "SQLite",
+        "tables": tables,
+        "error": error,
+    })
+}
+
+/// `DbValue` → JSON（面板展示；BLOB 仅显示尺寸避免大对象）。
+fn db_value_json(value: &DbValue) -> Json {
+    match value {
+        DbValue::Null => Json::Null,
+        DbValue::Bool(b) => json!(b),
+        DbValue::Int(i) => json!(i),
+        DbValue::Float(f) => json!(f),
+        DbValue::Decimal(d) => json!(d.to_string()),
+        DbValue::Text(s) => json!(s),
+        DbValue::Blob(b) => json!(format!("<BLOB {} B>", b.len())),
+        DbValue::DateTime(dt) => json!(dt.format("%Y-%m-%d %H:%M:%S").to_string()),
+    }
+}
+
+/// 只读执行 SQL（面板）：安全前置 [`validate_readonly_sql`]；结果最多返回 500 行（截断标记）。
+pub fn query_readonly(base: &Path, sql: &str) -> Result<Json, String> {
+    validate_readonly_sql(sql)?;
+    let store = storage(base)?;
+    let started = std::time::Instant::now();
+    let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+    let set = session.query(sql, &[]).map_err(|e| e.to_string())?;
+    let elapsed_ms = started.elapsed().as_millis() as u64;
+
+    const MAX_ROWS: usize = 500;
+    let truncated = set.rows.len() > MAX_ROWS;
+    let rows: Vec<Json> = set
+        .rows
+        .iter()
+        .take(MAX_ROWS)
+        .map(|row| {
+            Json::Array(
+                (0..set.columns.len())
+                    .map(|i| row.get(i).map(db_value_json).unwrap_or(Json::Null))
+                    .collect(),
+            )
+        })
+        .collect();
+    Ok(json!({
+        "columns": set.columns.as_ref(),
+        "rows": rows,
+        "rowCount": rows.len(),
+        "truncated": truncated,
+        "elapsedMs": elapsed_ms,
+    }))
+}
+
+/// 备份两张流量表为 DbTable zip 包（`backup_schema=true` 带模型 XML；与 C# 生态互通）。
+pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
+    let store = storage(base)?;
+    let _guard = LOCK.lock().unwrap();
+    let tmp = base.join("Data").join(format!(
+        ".traffic-backup-{}.zip",
+        Local::now().format("%Y%m%d%H%M%S%3f")
+    ));
+    let result = store
+        .dal
+        .backup_all(&[TABLE_WEB, TABLE_PORTS], &tmp, true)
+        .map_err(|e| format!("备份失败：{e}"))
+        .and_then(|count| {
+            if count < 2 {
+                Err(format!("备份失败：仅成功 {count}/2 张表"))
+            } else {
+                std::fs::read(&tmp).map_err(|e| format!("读取备份文件失败：{e}"))
+            }
+        });
+    let _ = std::fs::remove_file(&tmp);
+    result
+}
+
+/// 从 DbTable zip 包还原两张流量表：先全量解码校验（不合格不动现有数据），再清空导入。
+/// 返回各表恢复行数；完成后失效实体缓存。
+pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
+    let store = storage(base)?;
+
+    // 1) 结构预校验：zip 内两张表的 DbTable 流必须完整可解码（不合格不动现有数据）
+    {
+        use std::io::Read;
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+            .map_err(|e| format!("不是有效的备份包（zip）：{e}"))?;
+        for entity in [TABLE_WEB, TABLE_PORTS] {
+            let entry_name = format!("{entity}.table");
+            let mut entry = zip
+                .by_name(&entry_name)
+                .map_err(|_| format!("备份包缺少数据项 {entry_name}"))?;
+            let mut data = Vec::new();
+            entry
+                .read_to_end(&mut data)
+                .map_err(|e| format!("读取 {entry_name} 失败：{e}"))?;
+            pek_rcode::dbtable::decode_rowset(&data)
+                .map_err(|e| format!("{entry_name} 解码校验失败：{e}"))?;
+        }
+    }
+
+    // 2) 落临时文件
+    let tmp = base.join("Data").join(".traffic-restore.zip");
+    std::fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
+
+    // 3) 清空 + 导入（与写路径共用串行锁；完成后失效实体缓存）
+    let outcome = (|| -> Result<(Vec<String>, Json), String> {
+        let _guard = LOCK.lock().unwrap();
+        let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+        for physical in [DB_TABLE_WEB, DB_TABLE_PORTS] {
+            session
+                .execute(&format!("DELETE FROM \"{physical}\""), &[])
+                .map_err(|e| format!("清空 {physical} 失败：{e}"))?;
+        }
+        drop(session);
+        let done = store
+            .dal
+            .restore_all(&tmp, Some(&[TABLE_WEB, TABLE_PORTS]), false)
+            .map_err(|e| format!("导入失败：{e}"))?;
+        if done.len() < 2 {
+            return Err(format!(
+                "导入不完整：成功 {}/2 张表（请重新还原）",
+                done.len()
+            ));
+        }
+        let mut rows = serde_json::Map::new();
+        for (entity, physical) in [(TABLE_WEB, DB_TABLE_WEB), (TABLE_PORTS, DB_TABLE_PORTS)] {
+            let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+            let n = store
+                .dal
+                .table(entity)
+                .map_err(|e| e.to_string())?
+                .count(session.as_mut(), None)
+                .map_err(|e| e.to_string())?;
+            rows.insert(physical.to_string(), json!(n));
+        }
+        for entity in [TABLE_WEB, TABLE_PORTS] {
+            store.dal.invalidate_cache(entity);
+        }
+        Ok((done, Json::Object(rows)))
+    })();
+
+    let _ = std::fs::remove_file(&tmp);
+    let (done, rows) = outcome?;
+    util::log_info(&format!(
+        "Web 面板数据库还原完成：表 {done:?}，行数 {rows}"
+    ));
+    Ok(json!({ "tables": done, "rows": rows }))
+}
+
+/// 服务器端备份目录：`{base}/Data/Backup`。
+fn backup_dir(base: &Path) -> PathBuf {
+    base.join("Data").join("Backup")
+}
+
+/// 备份文件名校验（安全闸门）：仅允许简单文件名（防路径穿越；`[A-Za-z0-9._-]` 且以 `.zip` 结尾）。
+pub fn validate_backup_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 128
+        && name.ends_with(".zip")
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.');
+    if ok {
+        Ok(())
+    } else {
+        Err("备份文件名无效".into())
+    }
+}
+
+/// 创建服务器端备份文件（`Data/Backup/traffic-{时间}.zip`），返回文件信息。
+pub fn create_backup(base: &Path) -> Result<Json, String> {
+    let bytes = backup_zip(base)?;
+    let dir = backup_dir(base);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建备份目录失败：{e}"))?;
+    let stamp = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let mut name = format!("traffic-{stamp}.zip");
+    let mut path = dir.join(&name);
+    let mut n = 1;
+    while path.exists() {
+        n += 1;
+        name = format!("traffic-{stamp}-{n}.zip");
+        path = dir.join(&name);
+    }
+    std::fs::write(&path, &bytes).map_err(|e| format!("写入备份文件失败：{e}"))?;
+    util::log_info(&format!(
+        "Web 面板数据库备份已创建：{name}（{} 字节）",
+        bytes.len()
+    ));
+    Ok(json!({ "name": name, "sizeBytes": bytes.len() }))
+}
+
+/// 服务器端备份文件列表（按创建时间倒序）。
+pub fn list_backups(base: &Path) -> Json {
+    let dir = backup_dir(base);
+    let mut items: Vec<Json> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if name.starts_with('.') || validate_backup_name(&name).is_err() {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            if !meta.is_file() {
+                continue;
+            }
+            let created = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            items.push(json!({ "name": name, "sizeBytes": meta.len(), "created": created }));
+        }
+    }
+    items.sort_by_key(|item| std::cmp::Reverse(item["created"].as_u64().unwrap_or(0)));
+    json!({ "dir": dir.display().to_string(), "items": items })
+}
+
+/// 读取服务器端备份文件（下载）。
+pub fn read_backup(base: &Path, name: &str) -> Result<Vec<u8>, String> {
+    validate_backup_name(name)?;
+    std::fs::read(backup_dir(base).join(name)).map_err(|e| format!("读取备份文件失败：{e}"))
+}
+
+/// 从服务器端备份文件还原（覆盖式；预校验不合格不动数据）。
+pub fn restore_backup(base: &Path, name: &str) -> Result<Json, String> {
+    let bytes = read_backup(base, name)?;
+    let result = restore_zip(base, &bytes)?;
+    util::log_info(&format!("Web 面板已从备份文件还原：{name}"));
+    Ok(result)
+}
+
+/// 删除服务器端备份文件。
+pub fn delete_backup(base: &Path, name: &str) -> Result<(), String> {
+    validate_backup_name(name)?;
+    std::fs::remove_file(backup_dir(base).join(name))
+        .map_err(|e| format!("删除备份文件失败：{e}"))?;
+    util::log_info(&format!("Web 面板已删除备份文件：{name}"));
+    Ok(())
+}
+
 // ————— 路径与工具 —————
 
 /// 旧版 JSON 归档目录：`{base}/Data/traffic`（仅用于首轮迁移）。
@@ -1053,5 +1357,118 @@ mod tests {
         assert!(parse_port_key("tcp").is_none());
         assert!(parse_port_key(":80").is_none());
         assert!(parse_port_key("tcp:abc").is_none());
+    }
+
+    #[test]
+    fn readonly_sql_guard_rejects_writes() {
+        assert!(validate_readonly_sql("SELECT 1").is_ok());
+        assert!(validate_readonly_sql("  select * from t ").is_ok());
+        for bad in [
+            "DELETE FROM t",
+            "UPDATE t SET a=1",
+            "INSERT INTO t VALUES(1)",
+            "DROP TABLE t",
+            "ALTER TABLE t ADD COLUMN c",
+            "PRAGMA journal_mode=WAL",
+            "WITH x AS (SELECT 1) SELECT * FROM x",
+            "SELECT 1; DROP TABLE t",
+            "SELECT ';'",
+            "SELECTX",
+            "",
+            "  ",
+        ] {
+            assert!(validate_readonly_sql(bad).is_err(), "应拒绝：{bad}");
+        }
+        assert!(validate_readonly_sql(&format!("SELECT {}", "1".repeat(5000))).is_err());
+    }
+
+    #[test]
+    fn backup_restore_roundtrip() {
+        let base = temp_dir("bakrestore");
+
+        let mut ports = BTreeMap::new();
+        ports.insert("tcp:80".to_string(), PortCounters { rx: 100, tx: 200 });
+        update_ports(&base, "2026-10-01", &ports);
+        let mut sites = BTreeMap::new();
+        sites.insert("a.com".to_string(), site(7, 700, 3));
+        update_web(&base, "2026-10-01", &sites);
+
+        // 备份
+        let zip_bytes = backup_zip(&base).expect("备份应成功");
+        assert!(zip_bytes.starts_with(b"PK"), "应为 zip 包");
+
+        // 备份后再修改数据（模拟后续变更）
+        let mut ports2 = BTreeMap::new();
+        ports2.insert("tcp:80".to_string(), PortCounters { rx: 1, tx: 1 });
+        update_ports(&base, "2026-10-01", &ports2);
+        assert_eq!(day_ports(&base, "2026-10-01")["tcp:80"], PortCounters { rx: 1, tx: 1 });
+
+        // 还原 → 回到备份时点
+        let result = restore_zip(&base, &zip_bytes).expect("还原应成功");
+        assert_eq!(result["rows"][DB_TABLE_PORTS], 1);
+        assert_eq!(result["rows"][DB_TABLE_WEB], 1);
+        assert_eq!(
+            day_ports(&base, "2026-10-01")["tcp:80"],
+            PortCounters { rx: 100, tx: 200 }
+        );
+        assert_eq!(day_web_sites(&base, "2026-10-01")["a.com"].hits, 7);
+
+        // 非法包被拒且现有数据不动
+        let before = day_ports(&base, "2026-10-01");
+        assert!(restore_zip(&base, b"not a zip").is_err());
+        assert_eq!(day_ports(&base, "2026-10-01"), before);
+
+        cleanup(&base);
+    }
+
+    #[test]
+    fn backup_files_lifecycle() {
+        let base = temp_dir("bakfiles");
+        let mut ports = BTreeMap::new();
+        ports.insert("tcp:80".to_string(), PortCounters { rx: 10, tx: 20 });
+        update_ports(&base, "2026-10-02", &ports);
+
+        // 创建（服务器端档案）
+        let info = create_backup(&base).expect("创建备份应成功");
+        let name = info["name"].as_str().unwrap().to_string();
+        assert!(name.starts_with("traffic-") && name.ends_with(".zip"));
+        assert!(info["sizeBytes"].as_u64().unwrap() > 0);
+
+        // 列表
+        let list = list_backups(&base);
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"].as_str(), Some(name.as_str()));
+        assert!(list["dir"].as_str().unwrap().ends_with("Backup"));
+
+        // 名安全闸门（防路径穿越）
+        let too_long = "x".repeat(200);
+        for bad in [
+            "../x.zip",
+            "a/b.zip",
+            "a\\b.zip",
+            "x.txt",
+            "",
+            "..zip",
+            "a..zip",
+            too_long.as_str(),
+        ] {
+            assert!(validate_backup_name(bad).is_err(), "应拒绝：{bad}");
+        }
+        assert!(validate_backup_name("traffic-20261002-110524.zip").is_ok());
+
+        // 读取（下载）
+        let bytes = read_backup(&base, &name).unwrap();
+        assert!(bytes.starts_with(b"PK"));
+
+        // 从档案还原
+        let result = restore_backup(&base, &name).expect("还原应成功");
+        assert_eq!(result["rows"][DB_TABLE_PORTS], 1);
+
+        // 删除
+        delete_backup(&base, &name).unwrap();
+        assert!(list_backups(&base)["items"].as_array().unwrap().is_empty());
+
+        cleanup(&base);
     }
 }

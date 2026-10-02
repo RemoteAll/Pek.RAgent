@@ -5,7 +5,8 @@
 //!   updateConfig / changePassword / logs / logFiles / health / watchdog / syncTime
 //! - `/star/*`：services / startService / stopService / restartService / addService /
 //!   removeService / getStarConfig / updateStarConfig / machine / webTraffic / portTraffic /
-//!   trafficHistory / getProcessList
+//!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
+//!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
 //!
 //! 鉴权级别由 `WebAuthLevel` 控制（对齐 C# `ParseAuthLevel`）：`None` 全部放行 /
@@ -22,6 +23,7 @@ use chrono::{DateTime, Local};
 use dhrust::net::controller::{
     arg, arg_i64, json_body, json_error, json_result, ActionResult, Controller,
 };
+use dhrust::net::http::HttpResponse;
 use dhrust::net::router::Ctx;
 use serde_json::{json, Value as Json};
 
@@ -354,6 +356,24 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("portTraffic", move |ctx| port_traffic(&p, ctx));
     let p = panel.clone();
     controller = controller.get("trafficHistory", move |ctx| traffic_history(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("dbInfo", move |ctx| db_info(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("dbQuery", move |ctx| db_query(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("dbBackup", move |ctx| db_backup(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("dbRestore", move |ctx| db_restore(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("dbListBackups", move |ctx| db_list_backups(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("dbCreateBackup", move |ctx| db_create_backup(&p, ctx));
+    let p = panel.clone();
+    controller = controller.get("dbDownloadBackup", move |ctx| db_download_backup(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("dbRestoreBackup", move |ctx| db_restore_backup(&p, ctx));
+    let p = panel.clone();
+    controller = controller.post("dbDeleteBackup", move |ctx| db_delete_backup(&p, ctx));
     controller.get("getProcessList", move |ctx| get_process_list(&panel, ctx))
 }
 
@@ -583,6 +603,169 @@ fn traffic_history(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             cfg.traffic_history_days,
         )),
     )
+}
+
+// ————— 数据库管理（/star/db*：只读查询 / 备份 / 还原） —————
+
+/// 数据库概况：文件路径/大小/表行数。
+fn db_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    json_result(
+        0,
+        "",
+        Some(crate::history::database_info(panel.manager.base())),
+    )
+}
+
+/// 只读 SQL 查询（仅 SELECT；安全校验 + 500 行上限）。
+fn db_query(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let sql = json_body(ctx)
+        .and_then(|v| {
+            v.get("sql")
+                .and_then(|s| s.as_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_default();
+    if let Err(e) = crate::history::validate_readonly_sql(&sql) {
+        return json_error(400, &e);
+    }
+    match crate::history::query_readonly(panel.manager.base(), &sql) {
+        Ok(data) => json_result(0, "", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 备份下载：DbTable zip 包（含两张表与模型 XML，与 C# 生态互通）。
+fn db_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::history::backup_zip(panel.manager.base()) {
+        Ok(bytes) => {
+            let name = format!("traffic-backup-{}.zip", Local::now().format("%Y%m%d-%H%M%S"));
+            util::log_format(
+                "Web 面板数据库备份下载：{}（{} 字节）",
+                &[&name, &bytes.len().to_string()],
+            );
+            ActionResult::Response(
+                HttpResponse::bytes(200, "application/zip", bytes).with_header(
+                    "Content-Disposition",
+                    &format!("attachment; filename=\"{name}\""),
+                ),
+            )
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 上传还原：请求体即备份 zip 包（先校验，后清空现有两张表并导入）。
+fn db_restore(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let body = &ctx.req.body;
+    const MAX_SIZE: usize = 64 * 1024 * 1024;
+    if body.len() < 512 {
+        return json_error(400, "备份文件过小或为空（请上传“备份下载”导出的 zip 包）");
+    }
+    if body.len() > MAX_SIZE {
+        return json_error(400, "备份文件过大（上限 64MB）");
+    }
+    if !body.starts_with(b"PK") {
+        return json_error(400, "文件格式校验失败：不是 zip 备份包");
+    }
+    match crate::history::restore_zip(panel.manager.base(), body.as_ref()) {
+        Ok(data) => json_result(0, "还原完成", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 服务器端备份文件列表。
+fn db_list_backups(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    json_result(
+        0,
+        "",
+        Some(crate::history::list_backups(panel.manager.base())),
+    )
+}
+
+/// 创建服务器端备份文件（`Data/Backup`）。
+fn db_create_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::history::create_backup(panel.manager.base()) {
+        Ok(data) => json_result(0, "备份完成", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 下载服务器端备份文件（`?name=`）。
+fn db_download_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let name = arg(ctx, "name").unwrap_or_default();
+    if let Err(e) = crate::history::validate_backup_name(&name) {
+        return json_error(400, &e);
+    }
+    match crate::history::read_backup(panel.manager.base(), &name) {
+        Ok(bytes) => {
+            util::log_format(
+                "Web 面板数据库备份下载：{}（{} 字节）",
+                &[&name, &bytes.len().to_string()],
+            );
+            ActionResult::Response(
+                HttpResponse::bytes(200, "application/zip", bytes).with_header(
+                    "Content-Disposition",
+                    &format!("attachment; filename=\"{name}\""),
+                ),
+            )
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 从服务器端备份文件还原（JSON `{name}`）。
+fn db_restore_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let name = json_body(ctx)
+        .and_then(|v| v.get("name").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_default();
+    if let Err(e) = crate::history::validate_backup_name(&name) {
+        return json_error(400, &e);
+    }
+    match crate::history::restore_backup(panel.manager.base(), &name) {
+        Ok(data) => json_result(0, "还原完成", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 删除服务器端备份文件（JSON `{name}`）。
+fn db_delete_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let name = json_body(ctx)
+        .and_then(|v| v.get("name").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_default();
+    if let Err(e) = crate::history::validate_backup_name(&name) {
+        return json_error(400, &e);
+    }
+    match crate::history::delete_backup(panel.manager.base(), &name) {
+        Ok(()) => json_result(0, "已删除", None),
+        Err(e) => json_error(500, &e),
+    }
 }
 
 /// 速率格式化（人类可读）。
@@ -1669,6 +1852,22 @@ mod tests {
         })
     }
 
+    /// 构造二进制请求体的测试上下文（数据库还原上传用）。
+    fn context_bytes(method: &str, path: &str, body: Vec<u8>, token: Option<&str>) -> Ctx {
+        let headers = match token {
+            Some(token) => vec![("Authorization".to_string(), format!("Bearer {token}"))],
+            None => Vec::new(),
+        };
+        Ctx::build(HttpRequest {
+            method: method.to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            headers,
+            body: body.into(),
+            remote_addr: Some("192.168.1.100:50000".to_string()),
+        })
+    }
+
     /// 构建独立临时目录的面板。
     fn panel_with_default_password() -> (Arc<WebPanel>, PathBuf) {
         let dir = std::env::temp_dir().join(format!(
@@ -2165,6 +2364,160 @@ mod tests {
     fn client_ip_strips_port() {
         let ctx = context_from("127.0.0.1:50000", "GET", "/", "", None);
         assert_eq!(WebPanel::client_ip(&ctx), "127.0.0.1");
+    }
+
+    /// 数据库管理端点：只读闸门、查询、备份与还原全链路。
+    #[test]
+    fn db_admin_endpoints_query_backup_restore() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // 只读闸门：写语句拒绝
+        let r = db_query(
+            &panel,
+            &context(
+                "POST",
+                "/star/dbQuery",
+                r#"{"sql":"DELETE FROM x"}"#,
+                Some(&token),
+            ),
+        );
+        assert_eq!(body_json(r)["code"], 400);
+
+        // 查询（含列名与值）
+        let r = db_query(
+            &panel,
+            &context(
+                "POST",
+                "/star/dbQuery",
+                r#"{"sql":"SELECT 1 AS a"}"#,
+                Some(&token),
+            ),
+        );
+        let j = body_json(r);
+        assert_eq!(j["code"], 0);
+        assert_eq!(j["data"]["columns"][0], "a");
+        assert_eq!(j["data"]["rows"][0][0], 1);
+
+        // 概况
+        let j = body_json(db_info(
+            &panel,
+            &context("GET", "/star/dbInfo", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        assert_eq!(j["data"]["provider"], "SQLite");
+        assert_eq!(j["data"]["tables"].as_array().map(|a| a.len()), Some(2));
+
+        // 备份下载
+        let r = db_backup(&panel, &context("GET", "/star/dbBackup", "", Some(&token)));
+        let bytes = match r {
+            ActionResult::Response(resp) => resp.body,
+            _ => panic!("应为二进制响应"),
+        };
+        assert!(bytes.starts_with(b"PK"));
+
+        // 还原（上传备份包；空库往返）
+        let r = db_restore(
+            &panel,
+            &context_bytes("POST", "/star/dbRestore", bytes.to_vec(), Some(&token)),
+        );
+        let j = body_json(r);
+        assert_eq!(j["code"], 0, "还原应成功：{j}");
+        assert_eq!(j["data"]["rows"]["Agent_WebTrafficDaily"], 0);
+
+        // 非法包（非 zip 内容）被拒
+        let r = db_restore(
+            &panel,
+            &context_bytes("POST", "/star/dbRestore", vec![0u8; 600], Some(&token)),
+        );
+        assert_eq!(body_json(r)["code"], 400);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 服务器端备份档案端点：创建 / 列表 / 下载 / 还原 / 删除。
+    #[test]
+    fn db_backup_files_endpoints() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // 创建
+        let j = body_json(db_create_backup(
+            &panel,
+            &context("POST", "/star/dbCreateBackup", "{}", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0, "创建备份应成功：{j}");
+        let name = j["data"]["name"].as_str().unwrap().to_string();
+        assert!(name.ends_with(".zip"), "备份名：{name}");
+
+        // 列表
+        let j = body_json(db_list_backups(
+            &panel,
+            &context("GET", "/star/dbListBackups", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        let items = j["data"]["items"].as_array().unwrap();
+        assert!(items
+            .iter()
+            .any(|it| it["name"].as_str() == Some(name.as_str())));
+
+        // 下载（query 参数）
+        let headers = vec![("Authorization".to_string(), format!("Bearer {token}"))];
+        let ctx = Ctx::build(HttpRequest {
+            method: "GET".to_string(),
+            path: "/star/dbDownloadBackup".to_string(),
+            query: format!("name={name}"),
+            headers: headers.clone(),
+            body: Vec::new().into(),
+            remote_addr: Some("192.168.1.100:50000".to_string()),
+        });
+        match db_download_backup(&panel, &ctx) {
+            ActionResult::Response(resp) => assert!(resp.body.starts_with(b"PK")),
+            _ => panic!("应为二进制响应"),
+        }
+
+        // 非法名称被拒
+        let ctx = Ctx::build(HttpRequest {
+            method: "GET".to_string(),
+            path: "/star/dbDownloadBackup".to_string(),
+            query: "name=evil.txt".to_string(),
+            headers,
+            body: Vec::new().into(),
+            remote_addr: Some("192.168.1.100:50000".to_string()),
+        });
+        assert_eq!(body_json(db_download_backup(&panel, &ctx))["code"], 400);
+
+        // 从档案还原
+        let j = body_json(db_restore_backup(
+            &panel,
+            &context(
+                "POST",
+                "/star/dbRestoreBackup",
+                &format!(r#"{{"name":"{name}"}}"#),
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 0, "还原应成功：{j}");
+        assert_eq!(j["data"]["rows"]["Agent_WebTrafficDaily"], 0);
+
+        // 删除
+        let j = body_json(db_delete_backup(
+            &panel,
+            &context(
+                "POST",
+                "/star/dbDeleteBackup",
+                &format!(r#"{{"name":"{name}"}}"#),
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 0);
+        let j = body_json(db_list_backups(
+            &panel,
+            &context("GET", "/star/dbListBackups", "", Some(&token)),
+        ));
+        assert!(j["data"]["items"].as_array().unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

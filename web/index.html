@@ -272,6 +272,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="starconfig">🌐 星尘设置</a>
 <a data-panel="logs">📋 日志</a>
 <a data-panel="watchdog">🐕 看门狗</a>
+<a data-panel="database">🗄 数据库</a>
 </nav>
 
 <div id="sec-banner" class="sec-banner hidden"></div>
@@ -285,6 +286,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-starconfig" class="panel"></div>
 <div id="panel-logs" class="panel"></div>
 <div id="panel-watchdog" class="panel"></div>
+<div id="panel-database" class="panel"></div>
 </main>
 </div>
 
@@ -384,7 +386,8 @@ function switchPanel(name){
   config:loadConfig,
   starconfig:loadStarConfig,
   logs:loadLogs,
-  watchdog:loadWatchDog
+  watchdog:loadWatchDog,
+  database:loadDatabase
  };
  if(loaders[name])loaders[name]();
  if(name==='traffic'){applyTrafficSub(trafficSubFromHash());trafficTimer=setInterval(loadTraffic,3000);}
@@ -999,6 +1002,173 @@ function portDetailTable(){
  });
  html+=`<tr><td style="${TH}">合计（${cnt} 个活跃日）</td><td style="${TH}">${fmtBytes(rx)}</td><td style="${TH}">${fmtBytes(tx)}</td><td style="${TH}">${fmtBytes(rx+tx)}</td></tr>`;
  return html+`</table>`;
+}
+
+/* ── 数据库管理（只读 SQL 查询 / 备份 / 还原） ── */
+function ensureDbShell(){
+ if($('db-info-body'))return;
+ $('panel-database').innerHTML=`
+  <div class="glass-card card">
+   <h2>🗄 数据库 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">流量历史库（SQLite · Pek.RCode/XCode 模型管理）</span></h2>
+   <div id="db-info-body"><p class="text-muted">加载中…</p></div>
+  </div>
+  <div class="glass-card card">
+   <h2>🔍 SQL 查询 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">仅允许单条 SELECT（不开放增删改；最多显示 500 行）</span></h2>
+   <textarea id="db-sql" spellcheck="false" placeholder="SELECT * FROM Agent_PortTrafficDaily ORDER BY StatDate DESC LIMIT 20" style="width:100%;min-height:88px;box-sizing:border-box;font-family:var(--font-mono);font-size:12px;background:transparent;color:inherit;border:1px solid #8883;border-radius:6px;padding:8px"></textarea>
+   <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
+    <button class="btn btn-primary btn-sm" onclick="runDbQuery()">▶ 执行查询</button>
+    <button class="btn btn-ghost btn-sm" onclick="dbSample('web')">示例：网站表</button>
+    <button class="btn btn-ghost btn-sm" onclick="dbSample('ports')">示例：端口表</button>
+    <span id="db-query-meta" class="text-muted" style="font-size:12px"></span>
+   </div>
+   <div id="db-query-result" class="mt-16"></div>
+  </div>
+  <div class="glass-card card">
+   <h2>💾 备份与还原 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">备份文件保存在服务器 Data/Backup 目录（XCode DbTable 包，与 C# 生态互通）</span></h2>
+   <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+    <button class="btn btn-primary btn-sm" onclick="createDbBackup()">➕ 立即备份</button>
+    <label class="btn btn-ghost btn-sm" style="cursor:pointer;display:inline-block">📤 上传还原<input type="file" id="db-restore-file" accept=".zip" style="display:none" onchange="uploadDbRestore(this)"></label>
+    <span class="text-muted" style="font-size:12px">还原会先清空两张流量表再导入备份数据（覆盖操作，请谨慎）</span>
+   </div>
+   <div id="db-backup-list" class="mt-16"><p class="text-muted">加载中…</p></div>
+  </div>`;
+}
+async function loadDatabase(){
+ ensureDbShell();
+ await loadDbInfo();
+ await loadDbBackups();
+}
+async function loadDbInfo(){
+ const el=$('db-info-body');if(!el)return;
+ try{
+  const r=await api('/star/dbInfo');
+  if(r.code!==0){el.innerHTML=`<p class="text-muted">${esc(r.message||'读取失败')}</p>`;return}
+  const d=r.data||{};
+  let html=`<table class="info-table">`;
+  html+=`<tr><td style="${TH}">数据库</td><td style="font-family:var(--font-mono);font-size:12px">${esc(d.path||'—')}</td></tr>`;
+  html+=`<tr><td style="${TH}">类型 / 大小</td><td>${esc(d.provider||'')} · ${fmtBytes(d.sizeBytes||0)}</td></tr>`;
+  (d.tables||[]).forEach(t=>{html+=`<tr><td style="${TH}">${esc(t.name)}</td><td>${t.rows==null?'—':t.rows+' 行'}</td></tr>`});
+  html+=`</table>`;
+  if(d.error)html+=`<p class="text-muted" style="margin-top:8px">⚠ ${esc(d.error)}</p>`;
+  el.innerHTML=html;
+ }catch(e){el.innerHTML='<p class="text-muted">加载失败</p>'}
+}
+function dbSample(which){
+ const el=$('db-sql');if(!el)return;
+ el.value=which==='ports'
+  ?'SELECT * FROM Agent_PortTrafficDaily ORDER BY StatDate DESC, Rx DESC LIMIT 20'
+  :'SELECT * FROM Agent_WebTrafficDaily ORDER BY StatDate DESC LIMIT 20';
+ el.focus();
+}
+async function runDbQuery(){
+ const sql=($('db-sql')||{}).value||'';
+ const meta=$('db-query-meta'),out=$('db-query-result');
+ if(!sql.trim()){showToast('请输入 SQL','error');return}
+ if(sql.includes(';')){showToast('不允许分号（仅支持单条 SELECT）','error');return}
+ if(meta)meta.textContent='执行中…';
+ try{
+  const r=await api('/star/dbQuery',{method:'POST',body:JSON.stringify({sql})});
+  if(r.code!==0){if(meta)meta.textContent='';if(out)out.innerHTML=`<p class="text-muted">${esc(r.message||'执行失败')}</p>`;return}
+  const d=r.data||{};
+  if(meta)meta.textContent=`${d.rowCount||0} 行${d.truncated?'（已截断，仅显示前 500 行）':''} · ${d.elapsedMs||0} ms`;
+  renderDbResult(d);
+ }catch(e){if(meta)meta.textContent=''}
+}
+function renderDbResult(d){
+ const el=$('db-query-result');if(!el)return;
+ const cols=d.columns||[],rows=d.rows||[];
+ if(!cols.length){el.innerHTML='<p class="text-muted">（无结果集）</p>';return}
+ let html=`<table class="info-table"><tr>`+cols.map(c=>`<td style="${TH}">${esc(c)}</td>`).join('')+`</tr>`;
+ rows.forEach(r=>{
+  html+='<tr>'+r.map(v=>{
+   if(v==null)return '<td class="text-muted">NULL</td>';
+   if(typeof v==='object')v=JSON.stringify(v);
+   return `<td style="font-size:12px;word-break:break-all;max-width:420px">${esc(String(v))}</td>`;
+  }).join('')+'</tr>';
+ });
+ el.innerHTML=html+'</table>';
+}
+async function createDbBackup(){
+ try{
+  showToast('正在创建备份…');
+  const r=await api('/star/dbCreateBackup',{method:'POST'});
+  if(r.code===0){showToast('备份完成：'+((r.data||{}).name||''),'success');loadDbBackups();}
+  else showToast('备份失败：'+(r.message||''),'error');
+ }catch(e){showToast('备份失败：'+e.message,'error')}
+}
+async function loadDbBackups(){
+ const el=$('db-backup-list');if(!el)return;
+ try{
+  const r=await api('/star/dbListBackups');
+  if(r.code!==0){el.innerHTML=`<p class="text-muted">${esc(r.message||'读取失败')}</p>`;return}
+  const d=r.data||{},items=d.items||[];
+  let html=`<p class="text-muted" style="font-size:12px;margin:0 0 6px">备份目录：${esc(d.dir||'')}${items.length?'（'+items.length+' 个）':''}</p>`;
+  if(!items.length){el.innerHTML=html+'<p class="text-muted" style="font-size:12px">暂无备份文件，点击“立即备份”创建。</p>';return}
+  html+=`<table class="info-table"><tr><td style="${TH}">文件</td><td style="${TH}">大小</td><td style="${TH}">时间</td><td style="${TH}">操作</td></tr>`;
+  items.forEach(it=>{
+   const n=it.name;
+   html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(n)}</td><td>${fmtBytes(it.sizeBytes||0)}</td><td style="font-size:12px">${fmtDbTime(it.created)}</td><td style="white-space:nowrap">`+
+    `<button class="btn btn-ghost btn-sm" onclick="downloadDbBackupFile('${n}')">下载</button>`+
+    `<button class="btn btn-ghost btn-sm" onclick="restoreDbBackupFile('${n}')">还原</button>`+
+    `<button class="btn btn-ghost btn-sm" onclick="deleteDbBackupFile('${n}')">删除</button>`+
+    `</td></tr>`;
+  });
+  el.innerHTML=html+`</table>`;
+ }catch(e){el.innerHTML='<p class="text-muted">加载失败</p>'}
+}
+function fmtDbTime(sec){
+ if(!sec)return '—';
+ const d=new Date(sec*1000),p=n=>String(n).padStart(2,'0');
+ return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+async function downloadDbBackupFile(name){
+ try{
+  const r=await fetch('/star/dbDownloadBackup?name='+encodeURIComponent(name),{headers:token?{'Authorization':'Bearer '+token}:{}});
+  if(!r.ok){showToast('下载失败（HTTP '+r.status+'）','error');return}
+  const blob=await r.blob();
+  const url=URL.createObjectURL(blob);
+  const a=document.createElement('a');a.href=url;a.download=name;document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(url);a.remove()},1000);
+  showToast('已开始下载：'+name,'success');
+ }catch(e){showToast('下载失败：'+e.message,'error')}
+}
+function restoreDbBackupFile(name){
+ showModal('从备份还原',
+  `将使用服务器备份 <b>${esc(name)}</b> <b>覆盖</b>当前两张流量表：<br>清空现有数据后导入备份内容，此操作不可撤销。确定继续？`,
+  '确定还原', async()=>{
+   try{
+    showToast('正在还原…');
+    const r=await api('/star/dbRestoreBackup',{method:'POST',body:JSON.stringify({name})});
+    if(r.code===0){showToast('还原完成','success');loadDbInfo();loadDbBackups();}
+    else showToast('还原失败：'+(r.message||''),'error');
+   }catch(e){showToast('还原失败：'+e.message,'error')}
+  });
+}
+function deleteDbBackupFile(name){
+ showModal('删除备份',`确定删除服务器上的备份文件 <b>${esc(name)}</b>？删除后无法恢复。`,'确定删除', async()=>{
+  try{
+   const r=await api('/star/dbDeleteBackup',{method:'POST',body:JSON.stringify({name})});
+   if(r.code===0){showToast('已删除','success');loadDbBackups();}
+   else showToast('删除失败：'+(r.message||''),'error');
+  }catch(e){showToast('删除失败：'+e.message,'error')}
+ });
+}
+function uploadDbRestore(input){
+ const file=input.files&&input.files[0];input.value='';
+ if(!file)return;
+ if(!/\.zip$/i.test(file.name)){showToast('请选择备份 zip 包','error');return}
+ if(file.size>64*1024*1024){showToast('文件过大（上限 64MB）','error');return}
+ showModal('数据库还原',
+  `将上传 <b>${esc(file.name)}</b>（${fmtBytes(file.size)}）并<b>覆盖</b>当前两张流量表：<br>清空现有数据后导入备份内容，此操作不可撤销。确定继续？`,
+  '确定还原', async()=>{
+   try{
+    showToast('正在上传并还原…');
+    const r=await fetch('/star/dbRestore',{method:'POST',headers:Object.assign({'Content-Type':'application/zip'},token?{'Authorization':'Bearer '+token}:{}),body:file});
+    const j=await r.json();
+    if(j.code===0){showToast('还原完成','success');loadDbInfo();}
+    else showToast('还原失败：'+(j.message||''),'error');
+   }catch(e){showToast('还原失败：'+e.message,'error')}
+  });
 }
 
 function formatIops(v){
