@@ -91,23 +91,24 @@ static INTERCEPTORS: Once = Once::new();
 static OPEN_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
 /// 获取（或首次打开）某数据目录的数据访问层。
+///
+/// 打开（含 `sync_schema` 建表）在注册表锁内**串行执行**：多个采样线程
+/// （网站流量 / 端口流量）同时首开同一数据库时只能有一个执行建表，
+/// 否则并发 `CREATE TABLE` 会撞 “table already exists”
+/// （2026-10-02 服务器实测：两线程首开竞态，后到者建表失败）。
 fn storage(base: &Path) -> Result<Arc<Storage>, String> {
-    let key = base.to_path_buf();
-    {
-        let registry = REGISTRY.lock().unwrap();
-        if let Some(existing) = registry.get(&key) {
-            return Ok(existing.clone());
-        }
+    let mut registry = REGISTRY.lock().unwrap();
+    if let Some(existing) = registry.get(base) {
+        return Ok(existing.clone());
     }
 
-    match open_storage(&key) {
+    match open_storage(base) {
         Ok(opened) => {
             if OPEN_ERROR.lock().unwrap().take().is_some() {
                 util::log_info("流量历史数据库已恢复可用");
             }
-            let mut registry = REGISTRY.lock().unwrap();
-            let entry = registry.entry(key).or_insert_with(|| opened.clone());
-            Ok(entry.clone())
+            registry.insert(base.to_path_buf(), opened.clone());
+            Ok(opened)
         }
         Err(e) => {
             let mut last = OPEN_ERROR.lock().unwrap();
@@ -1469,6 +1470,24 @@ mod tests {
         delete_backup(&base, &name).unwrap();
         assert!(list_backups(&base)["items"].as_array().unwrap().is_empty());
 
+        cleanup(&base);
+    }
+
+    /// 并发首开单飞：多线程同时首次打开同一库，只允许一个执行建表，其余复用连接。
+    #[test]
+    fn concurrent_first_open_is_single_flight() {
+        let base = temp_dir("openrace");
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let dir = base.clone();
+            handles.push(std::thread::spawn(move || {
+                let opened = storage(&dir);
+                assert!(opened.is_ok(), "线程 {i} 打开失败：{:?}", opened.err());
+            }));
+        }
+        for handle in handles {
+            handle.join().unwrap();
+        }
         cleanup(&base);
     }
 }
