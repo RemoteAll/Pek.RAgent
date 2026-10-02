@@ -387,16 +387,26 @@ function switchPanel(name){
   watchdog:loadWatchDog
  };
  if(loaders[name])loaders[name]();
- if(name==='traffic')trafficTimer=setInterval(loadTraffic,3000);
- // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录）
- if(location.hash!=='#'+name)history.replaceState(null,'','#'+name);
+ if(name==='traffic'){applyTrafficSub(trafficSubFromHash());trafficTimer=setInterval(loadTraffic,3000);}
+ // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录；流量页含子页后缀）
+ let want='#'+name;
+ if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
+ if(location.hash!==want)history.replaceState(null,'',want);
 }
 
 // 从 URL hash 解析页签名（非法/缺省返回空串；与导航实际页签比对，避免选择器注入）
+// 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports
 function panelFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
  if(!h)return '';
- return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===h)?h:'';
+ if(h==='ports')return 'traffic';
+ const name=h.split('.')[0];
+ return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name)?name:'';
+}
+// 流量页子页签（site 网站流量 / ports 端口流量）
+function trafficSubFromHash(){
+ const h=(location.hash||'').replace(/^#\/?/,'');
+ return (h==='traffic.ports'||h==='ports')?'ports':'site';
 }
 // 恢复上次所在页签；缺省/状态页时不切换（仅规范化 hash）
 function restorePanelFromHash(){
@@ -415,6 +425,7 @@ window.addEventListener('hashchange',()=>{
  if(!h)return;
  const link=[...document.querySelectorAll('nav a[data-panel]')].find(a=>a.dataset.panel===h);
  if(link&&!link.classList.contains('active'))switchPanel(h);
+ else if(h==='traffic'&&$('traffic-sub-site'))applyTrafficSub(trafficSubFromHash()); // 流量页内子页签同步
 });
 
 /* ── Dashboard ── */
@@ -665,27 +676,64 @@ function fmtRate(v){return v==null?'—':fmtBytes(v)+'/s'}
 function ensureTrafficShell(){
  if($('web-traffic-body'))return;
  $('panel-traffic').innerHTML=`
-  <div class="glass-card card">
-   <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy）· 今日与累计</span></h2>
-   <div id="web-traffic-body"><p class="text-muted">加载中…</p></div>
+  <div class="chart-tabs" id="traffic-sub-tabs" style="margin-bottom:14px">
+   <span class="chart-tab active" data-sub="site" onclick="trafficSubSwitch('site')">📈 网站流量</span>
+   <span class="chart-tab" data-sub="ports" onclick="trafficSubSwitch('ports')">🔌 端口流量</span>
   </div>
-  <div class="glass-card card">
-   <h2>🔌 端口流量 <span id="port-traffic-mode" style="font-size:11px;font-weight:400;color:var(--text-tertiary)"></span></h2>
-   <div id="port-traffic-body"><p class="text-muted">加载中…</p></div>
-  </div>
-  <div class="glass-card card">
-   <h2>🗓 历史数据 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">每日归档（跨天自动保存）· 保留 <span id="hist-retention">—</span> 天</span></h2>
-   <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px">
-    <span class="chart-tabs" id="hist-ranges"></span>
-    <select id="hist-site" onchange="histSite=this.value;renderHistChart();renderHistTable();" style="max-width:240px"></select>
-    <span style="flex:1"></span>
-    <button class="btn btn-ghost btn-sm" onclick="loadTrafficHistory(true)">🔄 刷新</button>
+  <div id="traffic-sub-site">
+   <div class="glass-card card">
+    <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy）· 今日与累计</span></h2>
+    <div id="web-traffic-body"><p class="text-muted">加载中…</p></div>
    </div>
-   <div id="hist-chart"><p class="text-muted">加载中…</p></div>
-   <div id="traffic-history-body" class="mt-16"></div>
-   <div class="section-title mt-16">端口每日流量（Linux nftables 计数 · 仅含有流量的端口）</div>
-   <div id="port-history-body"><p class="text-muted">加载中…</p></div>
+   <div class="glass-card card">
+    <h2>🗓 历史数据 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">每日归档（跨天自动保存）· 保留 <span id="hist-retention">—</span> 天</span></h2>
+    <div style="display:flex;align-items:center;gap:18px;flex-wrap:wrap;margin-bottom:12px">
+     <span class="chart-tabs" id="hist-ranges"></span>
+     <select id="hist-site" onchange="histSite=this.value;renderHistChart();renderHistTable();" style="max-width:240px"></select>
+     <span style="flex:1"></span>
+     <button class="btn btn-ghost btn-sm" onclick="loadTrafficHistory(true)">🔄 刷新</button>
+    </div>
+    <div id="hist-chart"><p class="text-muted">加载中…</p></div>
+    <div id="traffic-history-body" class="mt-16"></div>
+   </div>
+  </div>
+  <div id="traffic-sub-ports" style="display:none">
+   <div class="glass-card card">
+    <h2>🔌 端口流量 <span id="port-traffic-mode" style="font-size:11px;font-weight:400;color:var(--text-tertiary)"></span></h2>
+    <div id="port-traffic-body"><p class="text-muted">加载中…</p></div>
+   </div>
+   <div class="glass-card card">
+    <h2>🧭 端口每日数据 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">按端口查看每日收发（nftables 计数归档 · 点击端口行钻取）</span></h2>
+    <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:12px">
+     <span class="chart-tabs" id="port-ranges"></span>
+     <input id="port-filter" placeholder="筛选端口（如 22、tcp）" oninput="portKeyword=this.value;renderPortSummary()" style="max-width:200px">
+     <span style="flex:1"></span>
+     <span class="text-muted" style="font-size:12px" id="port-page-note"></span>
+     <button class="btn btn-ghost btn-sm" onclick="loadTrafficHistory(true)">🔄 刷新</button>
+    </div>
+    <div id="port-summary-body"><p class="text-muted">加载中…</p></div>
+   </div>
+   <div class="glass-card card" id="port-detail-card" style="display:none">
+    <h2 id="port-detail-title"></h2>
+    <div id="port-detail-body"></div>
+   </div>
+   <div class="glass-card card">
+    <h2>🗓 端口每日流量（按日期） <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">每日总量与端口明细（Linux nftables 计数 · 仅含有流量的端口）</span></h2>
+    <div id="port-history-body"><p class="text-muted">加载中…</p></div>
+   </div>
   </div>`;
+}
+// 流量页内子页签切换（site 网站流量 / ports 端口流量）
+function trafficSubSwitch(sub){
+ applyTrafficSub(sub);
+ const h=sub==='ports'?'#traffic.ports':'#traffic';
+ if(location.hash!==h)history.replaceState(null,'',h);
+}
+function applyTrafficSub(sub){
+ const site=$('traffic-sub-site'),ports=$('traffic-sub-ports');if(!site||!ports)return;
+ site.style.display=sub==='ports'?'none':'';
+ ports.style.display=sub==='ports'?'':'none';
+ document.querySelectorAll('#traffic-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
 }
 async function loadTraffic(){
  ensureTrafficShell();
@@ -761,6 +809,7 @@ async function loadTrafficHistory(force){
 function renderTrafficHistory(){
  const ret=$('hist-retention');if(ret)ret.textContent=(histData&&histData.retentionDays!=null)?histData.retentionDays:'—';
  renderHistRanges();renderHistSites();renderHistChart();renderHistTable();renderPortHistory();
+ if($('port-summary-body'))renderPortPage(); // 端口流量子页面已打开时同步刷新
 }
 function histSetDays(n){histDays=n;renderHistRanges();renderHistChart();renderHistTable()}
 function renderHistRanges(){
@@ -845,6 +894,111 @@ function renderPortHistory(){
   html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td>${fmtBytes(rx)}</td><td>${fmtBytes(tx)}</td><td style="font-size:12px">${text}</td></tr>`;
  });
  el.innerHTML=html+`</table>`;
+}
+
+/* ── 端口流量子页面（每端口每日数据；位于“流量”页签内的子页） ── */
+let portDays=30,portSel='',portKeyword='';
+function portViewDays(){return ((histData&&histData.days)||[]).slice(-portDays)}
+function portDayKeys(d){const ports=d.ports||{};return Object.keys(ports).filter(k=>(ports[k].rx||0)+(ports[k].tx||0)>0)}
+function portAggregate(){
+ const map=new Map();
+ portViewDays().forEach(d=>{
+  portDayKeys(d).forEach(k=>{
+   const c=d.ports[k];let a=map.get(k);
+   if(!a){a={rx:0,tx:0,days:0,last:''};map.set(k,a)}
+   a.rx+=c.rx||0;a.tx+=c.tx||0;a.days++;if(d.date>a.last)a.last=d.date;
+  });
+ });
+ return map;
+}
+function portSetDays(n){portDays=n;renderPortPage()}
+function portSelect(k){portSel=k;renderPortSummary();renderPortDetail()}
+function renderPortPage(){
+ const el=$('port-summary-body');if(!el)return;
+ if(!histData){el.innerHTML='<p class="text-muted">加载中…</p>';return}
+ const ranges=$('port-ranges');
+ if(ranges)ranges.innerHTML=[7,30,90].map(n=>`<span class="chart-tab${n===portDays?' active':''}" onclick="portSetDays(${n})">最近 ${n} 天</span>`).join('');
+ // 默认选中总流量最大的端口（保持已选）
+ const agg=portAggregate();
+ if(!agg.has(portSel)){portSel=agg.size?[...agg.entries()].sort((a,b)=>(b[1].rx+b[1].tx)-(a[1].rx+a[1].tx))[0][0]:''}
+ renderPortSummary();renderPortDetail();
+}
+function renderPortSummary(){
+ const el=$('port-summary-body');if(!el)return;
+ const agg=portAggregate();
+ const days=portViewDays().length;
+ const totalRx=[...agg.values()].reduce((s,a)=>s+a.rx,0),totalTx=[...agg.values()].reduce((s,a)=>s+a.tx,0);
+ const note=$('port-page-note');
+ if(note)note.textContent=agg.size?`共 ${agg.size} 个端口 · 总接收 ${fmtBytes(totalRx)} · 总发送 ${fmtBytes(totalTx)}`:(histData?'无数据':'');
+ if(!agg.size){el.innerHTML='<p class="text-muted">暂无端口历史（仅 Linux nftables 计数模式按天归档；连接视图/Windows 无字节数）</p>';return}
+ const kw=(portKeyword||'').trim().toLowerCase();
+ const rows=[...agg.entries()].filter(([k])=>!kw||k.toLowerCase().includes(kw)).sort((a,b)=>(b[1].rx+b[1].tx)-(a[1].rx+a[1].tx));
+ if(!rows.length){el.innerHTML='<p class="text-muted">无匹配端口（关键词：'+esc(portKeyword)+'）</p>';return}
+ const grand=Math.max(1,totalRx+totalTx),dayCnt=Math.max(1,days);
+ let html=`<table class="info-table"><tr>`+['端口','总接收','总发送','合计','日均','活跃天数','最近活跃','占比'].map(h=>`<td style="${TH}">${h}</td>`).join('')+`</tr>`;
+ rows.forEach(([k,a])=>{
+  const sum=a.rx+a.tx;
+  html+=`<tr style="cursor:pointer${k===portSel?';background:rgba(59,130,246,0.10)':''}" onclick="portSelect('${escAttr(k)}')">
+   <td style="font-family:var(--font-mono);font-size:12px">${esc(k)}</td>
+   <td>${fmtBytes(a.rx)}</td>
+   <td>${fmtBytes(a.tx)}</td>
+   <td><b>${fmtBytes(sum)}</b></td>
+   <td>${fmtBytes(Math.round(sum/dayCnt))}</td>
+   <td>${a.days} / ${days}</td>
+   <td style="font-family:var(--font-mono);font-size:12px">${esc(a.last)}</td>
+   <td>${(sum/grand*100).toFixed(1)}%</td>
+  </tr>`;
+ });
+ el.innerHTML=html+`</table>`;
+}
+function renderPortDetail(){
+ const card=$('port-detail-card');if(!card)return;
+ const agg=portAggregate();
+ const a=agg.get(portSel);
+ if(!agg.size||!a){card.style.display='none';return}
+ const title=$('port-detail-title');
+ if(title)title.innerHTML=`🧭 <span style="font-family:var(--font-mono)">${esc(portSel)}</span> 每日数据 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">最近 ${portDays} 天 · 共接收 ${fmtBytes(a.rx)} / 发送 ${fmtBytes(a.tx)}</span>`;
+ const body=$('port-detail-body');if(!body)return;
+ body.innerHTML=portDetailChart()+portDetailTable();
+ card.style.display='';
+}
+function portDetailChart(){
+ const days=portViewDays();
+ if(!days.length)return '';
+ const rows=days.map(d=>{const c=(d.ports||{})[portSel]||{};return{date:d.date,rx:c.rx||0,tx:c.tx||0}});
+ const max=Math.max(...rows.map(r=>r.rx+r.tx),1);
+ const W=720,H=190,padL=58,padR=10,padT=12,padB=26;
+ const innerW=W-padL-padR,innerH=H-padT-padB,step=innerW/days.length;
+ const bw=Math.max(2,Math.min(26,step-3));
+ let bars='';
+ rows.forEach((r,i)=>{
+  const sum=r.rx+r.tx;if(sum<=0)return;
+  const hTotal=Math.max(2,Math.round(innerH*(sum/max)));
+  const hRx=Math.round(hTotal*(r.rx/sum));
+  const x=padL+i*step+(step-bw)/2,y=H-padB-hTotal;
+  const tip=`${r.date}  收 ${fmtBytes(r.rx)}  发 ${fmtBytes(r.tx)}  合计 ${fmtBytes(sum)}`;
+  bars+=`<g><title>${esc(tip)}</title>`;
+  if(hRx>0)bars+=`<rect x="${x.toFixed(1)}" y="${(y+hTotal-hRx)}" width="${bw.toFixed(1)}" height="${hRx}" rx="1.5" fill="#3b82f6" opacity="0.85"/>`;
+  if(hTotal-hRx>0)bars+=`<rect x="${x.toFixed(1)}" y="${y}" width="${bw.toFixed(1)}" height="${hTotal-hRx}" rx="1.5" fill="#f59e0b" opacity="0.85"/>`;
+  bars+=`</g>`;
+ });
+ let grid='';[0,0.5,1].forEach(f=>{const y=H-padB-innerH*f;grid+=`<line x1="${padL}" y1="${y}" x2="${W-padR}" y2="${y}" stroke="rgba(128,128,128,0.25)" stroke-width="1"${f===0?'':' stroke-dasharray="3,3"'}/><text x="${padL-8}" y="${y+3}" text-anchor="end" font-size="10" fill="var(--text-tertiary)">${fmtBytes(Math.round(max*f))}</text>`});
+ let xs='';const skip=Math.max(1,Math.ceil(days.length/7));
+ days.forEach((d,i)=>{if(i%skip===0||i===days.length-1){const x=padL+i*step+step/2;xs+=`<text x="${x.toFixed(1)}" y="${H-8}" text-anchor="middle" font-size="10" fill="var(--text-tertiary)">${esc(d.date.slice(5))}</text>`}});
+ return `<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:auto">${grid}${bars}${xs}</svg>
+  <div class="text-muted" style="font-size:11px;margin:2px 0 12px"><span style="color:#3b82f6">■</span> 接收　<span style="color:#f59e0b">■</span> 发送　（堆叠柱，悬停查看当日明细）</div>`;
+}
+function portDetailTable(){
+ const days=portViewDays().slice().reverse();
+ let rx=0,tx=0,cnt=0;
+ let html=`<table class="info-table"><tr>`+['日期','接收','发送','合计'].map(h=>`<td style="${TH}">${h}</td>`).join('')+`</tr>`;
+ days.forEach(d=>{
+  const c=(d.ports||{})[portSel]||{};const r=c.rx||0,t=c.tx||0,sum=r+t;
+  if(sum>0){rx+=r;tx+=t;cnt++}
+  html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(d.date)}</td><td>${sum>0?fmtBytes(r):'—'}</td><td>${sum>0?fmtBytes(t):'—'}</td><td>${sum>0?'<b>'+fmtBytes(sum)+'</b>':'—'}</td></tr>`;
+ });
+ html+=`<tr><td style="${TH}">合计（${cnt} 个活跃日）</td><td style="${TH}">${fmtBytes(rx)}</td><td style="${TH}">${fmtBytes(tx)}</td><td style="${TH}">${fmtBytes(rx+tx)}</td></tr>`;
+ return html+`</table>`;
 }
 
 function formatIops(v){

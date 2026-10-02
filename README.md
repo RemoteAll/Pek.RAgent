@@ -404,7 +404,7 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 - **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
 - **日志**：`Log/` 目录文件列表与尾部内容查看（支持行数/文件/级别过滤）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
-- **流量**：**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细 + 端口每日流量，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
+- **流量**：页签内分为 **📈 网站流量 / 🔌 端口流量** 两个子页面（URL hash 记忆：`#traffic` / `#traffic.ports`）。**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图；**按端口每日数据**：端口汇总表（总接收/发送/日均/活跃天数/占比，支持 7/30/90 天与关键词筛选）→ 点击端口钻取**该端口每日收发**（堆叠柱状图 + 逐日明细表）；另有按日期的端口每日流量总表）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
 
 **网站流量统计口径**：默认取日志中的响应体字节（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）。如需统计 **nginx 实际发送流量（响应头+响应体）**，为站点启用扩展日志格式（行尾追加 `$bytes_sent $request_length`），本代理自动识别并改用 `$bytes_sent`：
 
