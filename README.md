@@ -94,6 +94,8 @@ sudo bash install.sh              # 一键：补可执行位并安装启动服�
 > 包内文件已带可执行位（`tar -xzf` 解压即用）；若通过 scp 直接传**单个文件**等不保留权限的途径获取，会出现 `-bash: ./pek-ragent: Permission denied`，执行一次 `chmod +x pek-ragent` 即可（或直接用包内 `bash install.sh`，它自动补权限）。
 
 > **从旧服务名迁移（已装过旧版的机器）**：默认服务名已改为 `StarAgentRust`（C# 版为 `StarAgent`，两者可同机并存）。迁移：编辑 `Config/StarAgent.config` 的 `<ServiceName>`/`<DisplayName>` 为新值 → `sudo bash install.sh`（或 `./pek-ragent -reinstall`）。安装时**自动清理**指向本程序的旧名服务（systemd 单元 / init.d / Windows 服务 / launchd 任务）；若旧注册指向 C# 版星尘（不同程序），保留不动。不迁移也可：旧配置读取后按旧名继续运行。
+>
+> **防误删**：若配置中的服务名与其它程序（如 C# 版）的注册同名冲突，`-uninstall`/`-reinstall` 会**拒绝执行**并提示改名——绝不会删除其它程序的注册。
 
 **访问 Web 管理面板**（`Config/StarAgent.config` 默认 `LocalOnly=false`，监听 `0.0.0.0:5501`，可直接通过服务器 IP 访问）：
 

@@ -99,6 +99,19 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // 归属校验：仅允许卸载**指向本程序**的单元（防误删其它程序的同名注册，如 C# 版星尘）
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(exe) = super::inits::parse_exec_start(&text) {
+            if !super::is_same_program(&exe, &mgr.exe) {
+                return Err(super::ownership_conflict_message(
+                    &mgr.name,
+                    &exe.display().to_string(),
+                    &format!("systemctl disable --now {} && rm {}", mgr.name, path.display()),
+                ));
+            }
+        }
+    }
+
     if stop {
         let _ = run("systemctl", &["stop", &mgr.name]);
     }

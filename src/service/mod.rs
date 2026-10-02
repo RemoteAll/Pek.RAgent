@@ -185,6 +185,15 @@ pub(crate) fn is_same_program(registered: &Path, current: &Path) -> bool {
     }
 }
 
+/// 卸载归属冲突时的拒绝信息：服务名被其它程序占用（防误删，如 C# 版星尘的同名注册）。
+pub(crate) fn ownership_conflict_message(service: &str, owner: &str, manual: &str) -> String {
+    format!(
+        "服务名 {service} 已被其它程序占用（{owner}），已拒绝卸载以避免误删。\n\
+如需与 C# 版星尘并存：请将 Config/StarAgent.config 中的 <ServiceName> 改为 StarAgentRust 后重试；\n\
+确需用本程序接管该服务名：请先手工执行 {manual}，再重新安装。"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

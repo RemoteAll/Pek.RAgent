@@ -94,6 +94,23 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // 归属校验：脚本不含本程序文件名时视为其它程序（防误删）
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        let ours = mgr
+            .exe
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(|n| text.contains(n))
+            .unwrap_or(false);
+        if !ours {
+            return Err(super::ownership_conflict_message(
+                &mgr.name,
+                &format!("非本程序（{}）", path.display()),
+                &format!("rm {} && {} disable", path.display(), path.display()),
+            ));
+        }
+    }
+
     if stop {
         let _ = ctl(mgr, "stop");
         let _ = wait_state(mgr, ServiceState::Stopped, 5_000);

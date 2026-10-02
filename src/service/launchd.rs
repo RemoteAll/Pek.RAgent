@@ -198,6 +198,19 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // 归属校验：仅允许卸载指向本程序的 plist（防误删）
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if let Some(exe) = parse_program_argument(&text).map(std::path::PathBuf::from) {
+            if !super::is_same_program(&exe, &mgr.exe) {
+                return Err(super::ownership_conflict_message(
+                    &mgr.name,
+                    &exe.display().to_string(),
+                    &format!("launchctl bootout system/{} && rm {}", mgr.name, path.display()),
+                ));
+            }
+        }
+    }
+
     if stop {
         let _ = run(&["kill", "SIGTERM", &format!("system/{}", mgr.name)]);
     }

@@ -217,6 +217,17 @@ pub fn uninstall(mgr: &ServiceManager, stop: bool) -> Result<(), String> {
         return Ok(());
     }
 
+    // 归属校验：仅允许卸载**指向本程序**的服务（防误删其它程序的同名服务，如 C# 版星尘）
+    if let Some(path) = query_installed_exe(mgr) {
+        if !super::is_same_program(&path, &mgr.exe) {
+            return Err(super::ownership_conflict_message(
+                &mgr.name,
+                &path.display().to_string(),
+                &format!("sc delete {}", mgr.name),
+            ));
+        }
+    }
+
     if stop && query(mgr) == ServiceState::Running {
         let _ = stop_service(mgr);
     }
