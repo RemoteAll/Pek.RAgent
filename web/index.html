@@ -383,6 +383,7 @@ function switchPanel(name){
   dashboard:loadDashboard,
   services:loadServices,
   traffic:loadTraffic,
+  control:updateControlStatus,
   config:loadConfig,
   starconfig:loadStarConfig,
   logs:loadLogs,
@@ -1555,7 +1556,8 @@ async function changePassword(){
   html+=`<div class="cmd-item"><span class="cmd-time">${esc(h.time)}</span><span class="cmd-action">${esc(h.action)}</span><span class="cmd-result">${esc(h.result)}</span></div>`;
  });
  html+=`</div></div>`;$('panel-control').innerHTML=html;
- setInterval(updateControlStatus,5000);updateControlStatus();
+ // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
+ setInterval(updateControlStatus,3000);updateControlStatus();
 })();
 
 async function updateControlStatus(){
