@@ -611,11 +611,11 @@ fn health_check(spec: &str) -> Result<(), String> {
 
     let host_port = spec.strip_prefix("tcp://").unwrap_or(spec);
     if host_port.contains(':') {
-        let (host, port) = crate::netc::split_host_port(host_port, 0);
+        let (host, port) = dhrust::net::split_host_port(host_port, 0);
         if port == 0 {
             return Err(format!("健康检查地址缺少端口：{}", spec));
         }
-        return crate::netc::tcp_check(&host, port, Duration::from_millis(5_000));
+        return dhrust::net::tcp_check(&host, port, Duration::from_millis(5_000));
     }
 
     Err(format!("不支持的健康检查地址：{}", spec))

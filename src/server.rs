@@ -195,18 +195,32 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| async move { kill_and_start(ctx) }),
     );
 
-    // 静态资源：优先嵌入的面板首页（单文件部署稳定），其次 wwwroot 目录
-    let statics = StaticFiles::new("wwwroot").embed(
-        "/index.html",
-        include_bytes!("../web/index.html"),
-        "text/html; charset=utf-8",
-    );
+    // 静态资源：优先嵌入的面板首页（单文件部署稳定），其次 wwwroot 目录。
+    // SPA 回退：面板为纯前端应用——非 /api、/star 的未知路径（无扩展名或浏览器
+    // 导航 Accept: text/html）回退面板首页；后端命名空间保持 JSON 404
+    // （对齐 ASP.NET Core 的 UseStaticFiles + MapFallbackToFile 管线）。
+    let statics = StaticFiles::new("wwwroot")
+        .embed(
+            "/index.html",
+            include_bytes!("../web/index.html"),
+            "text/html; charset=utf-8",
+        )
+        .spa_fallback(true)
+        .spa_excludes(&["/api", "/star"]);
 
     // 404（静态未命中时）
     router.fallback(route(move |ctx| {
         let statics = statics.clone();
         async move {
-            if let Some(response) = statics.try_serve(&ctx.req.path) {
+            // GET/HEAD：文件 → SPA 回退；其他方法只允许命中真实文件
+            let method_ok = ctx.req.method.eq_ignore_ascii_case("GET")
+                || ctx.req.method.eq_ignore_ascii_case("HEAD");
+            let served = if method_ok {
+                statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+            } else {
+                statics.try_serve_file(&ctx.req.path)
+            };
+            if let Some(response) = served {
                 return HttpOutcome::Response(response);
             }
             HttpOutcome::Response(HttpResponse::json(

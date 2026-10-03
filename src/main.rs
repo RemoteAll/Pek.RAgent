@@ -13,7 +13,6 @@ mod config;
 mod deploy;
 mod history;
 mod manager;
-mod netc;
 mod portstat;
 mod sampler;
 mod server;

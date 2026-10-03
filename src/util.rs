@@ -6,7 +6,7 @@
 //! 与 C# StarAgent 对齐：基础目录即程序所在目录（`".".GetBasePath()`），
 //! 启动时把当前目录切换到基础目录，配置中的相对路径（如 `../apps/xxx`）据此解析。
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dhrust::logs::{ConsoleLog, CompositeLog, ILog, LogLevel, TextFileLog};
@@ -29,28 +29,9 @@ pub fn base_dir() -> PathBuf {
     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
 
-/// 词法归一化路径。不访问文件系统，可处理尚不存在的路径；消除 `.` 与 `..`。
-pub fn lexical_normalize(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => match out.components().next_back() {
-                Some(Component::Normal(_)) => {
-                    out.pop();
-                }
-                _ => out.push(".."),
-            },
-            other => out.push(other.as_os_str()),
-        }
-    }
-
-    if out.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        out
-    }
-}
+/// 词法归一化路径（不访问文件系统，可处理尚不存在的路径；消除 `.` 与 `..`）。
+/// 实现已下沉 `dhrust::io::lexical_normalize`（2026-10-03）。
+pub use dhrust::io::lexical_normalize;
 
 /// 相对路径按基础目录解析为绝对路径。
 pub fn resolve(base: &Path, path: &str) -> PathBuf {
@@ -122,8 +103,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn lexical_normalize_handles_parent() {
-        assert_eq!(lexical_normalize(Path::new("a/b/../c")), PathBuf::from("a/c"));
-        assert_eq!(lexical_normalize(Path::new("../apps/x")), PathBuf::from("../apps/x"));
+    fn lexical_normalize_reexport_works() {
+        // 实现已下沉 dhrust::io；此处验证再导出可用（用例细节在 dhrust 侧）
+        assert_eq!(
+            lexical_normalize(Path::new("a/b/../c")),
+            PathBuf::from("a/c")
+        );
     }
 }

@@ -204,6 +204,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "libc",
  "md-5",
  "quick-xml",
  "rand 0.8.8",
