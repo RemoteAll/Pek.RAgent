@@ -141,7 +141,7 @@ fn agent_run(base: &Path, service_mode: bool) -> i32 {
 /// 显示状态（`-status`；输出结构对齐 C# `ShowStatus`：状态块 + 附加信息 + 最近日志）。
 fn cmd_status(base: &Path) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
     let state = svc.query();
 
     print_status_core(&cfg, &svc, state);
@@ -256,7 +256,7 @@ fn build_time_text() -> String {
 /// 安装服务。
 fn cmd_install(base: &Path, start: bool) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
 
     println!("正在安装服务 {}（{}）...", cfg.display_name, svc.name);
     match svc.install(start) {
@@ -278,7 +278,7 @@ fn cmd_install(base: &Path, start: bool) -> i32 {
 /// 重新安装服务。
 fn cmd_reinstall(base: &Path) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
 
     println!("正在重新安装服务 {}...", svc.name);
     match svc.reinstall() {
@@ -296,7 +296,7 @@ fn cmd_reinstall(base: &Path) -> i32 {
 /// 卸载服务。
 fn cmd_uninstall(base: &Path, stop: bool) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
 
     println!("正在卸载服务 {}...", svc.name);
     match svc.uninstall(stop) {
@@ -316,7 +316,7 @@ fn cmd_uninstall(base: &Path, stop: bool) -> i32 {
 /// 服务启停控制。
 fn cmd_svc_ctl(base: &Path, op: SvcOp) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
 
     let rs = match op {
         SvcOp::Start => svc.start(),
@@ -406,7 +406,7 @@ fn cmd_update(base: &Path, args: &[String]) -> i32 {
 
     // 停止服务释放旧程序文件占用（服务未安装/未运行时忽略错误）
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
     let _ = svc.stop();
 
     match crate::agent::apply_upgrade(&staged, &exe, 0) {
@@ -442,7 +442,7 @@ fn cmd_update(base: &Path, args: &[String]) -> i32 {
 /// 3. 超时仍未运行则显式启动（此时恢复动作窗口已过，不会重复拉起）。
 fn cmd_ensure_running(base: &Path) -> i32 {
     let cfg = AgentConfig::load(base);
-    let svc = ServiceManager::new(base, &cfg);
+    let svc = crate::service::manager(base, &cfg);
 
     if svc.query() == ServiceState::NotInstalled {
         util::log_info("重启助手：未安装系统服务（前台运行模式），请手动重启程序");
@@ -680,7 +680,7 @@ fn menu(base: &Path) -> i32 {
     // 启动时输出一次状态块（对齐 C#：无参数运行先 ShowStatus，再进入菜单循环）
     {
         let cfg = AgentConfig::load(base);
-        let svc = ServiceManager::new(base, &cfg);
+        let svc = crate::service::manager(base, &cfg);
         let state = svc.query();
         print_status_core(&cfg, &svc, state);
         if !cfg.server.is_empty() {
@@ -690,7 +690,7 @@ fn menu(base: &Path) -> i32 {
 
     loop {
         let cfg = AgentConfig::load(base);
-        let svc = ServiceManager::new(base, &cfg);
+        let svc = crate::service::manager(base, &cfg);
         let state = svc.query();
         let installed = state != ServiceState::NotInstalled;
         let running = state == ServiceState::Running;

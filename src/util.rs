@@ -7,26 +7,12 @@
 //! 启动时把当前目录切换到基础目录，配置中的相对路径（如 `../apps/xxx`）据此解析。
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use dhrust::logs::{ConsoleLog, CompositeLog, ILog, LogLevel, TextFileLog};
+use dhrust::logs::LogLevel;
 
 /// 基础目录：环境变量 `PEK_RAGENT_BASE` 优先（便于开发调试），其次可执行文件目录，最后当前目录。
 pub fn base_dir() -> PathBuf {
-    if let Ok(dir) = std::env::var("PEK_RAGENT_BASE") {
-        let dir = dir.trim();
-        if !dir.is_empty() {
-            return lexical_normalize(Path::new(dir));
-        }
-    }
-
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            return parent.to_path_buf();
-        }
-    }
-
-    std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+    dhrust::io::base_dir(&["PEK_RAGENT_BASE"])
 }
 
 /// 词法归一化路径（不访问文件系统，可处理尚不存在的路径；消除 `.` 与 `..`）。
@@ -49,17 +35,7 @@ pub fn resolve(base: &Path, path: &str) -> PathBuf {
 /// （由 dhrust::logs 实现）；服务模式（无控制台）下控制台日志写不出去但不影响文件日志。
 /// Windows 下启用 UTF-8 代码页，保证中文菜单与日志正常。
 pub fn init_logging(base: &Path, use_console: bool, level: LogLevel) {
-    #[cfg(windows)]
-    dhrust::logs::enable_windows_console();
-
-    let mut logs: Vec<Arc<dyn ILog>> = Vec::new();
-    if use_console {
-        logs.push(Arc::new(ConsoleLog::with_color(true)));
-    }
-    logs.push(TextFileLog::create(base.join("Log")) as Arc<dyn ILog>);
-
-    dhrust::logs::set_log(Arc::new(CompositeLog::new(logs)));
-    dhrust::logs::set_level(level);
+    dhrust::logs::init_console_and_file(base.join("Log"), use_console, level);
 }
 
 /// 写信息日志。

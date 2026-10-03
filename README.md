@@ -39,7 +39,7 @@ cargo build --release
 # 产物：target/release/pek-ragent.exe（Windows）/ target/release/pek-ragent
 ```
 
-> 依赖：`dhrust`（DH.RustBase，path 依赖，提供日志 / 定时器 / HTTP 服务端内核）、`windows-service`（Windows 服务运行时）、`zip`、`serde`、`md-5`、`libc`（Unix）等。
+> 依赖：`dhrust`（DH.RustBase，path 依赖，features `net`/`toml`/`service`/`zip-extract`——提供日志 / 定时器 / HTTP 服务端内核 / **跨平台服务管理**（SCM·systemd·procd·SysV·launchd，见 `dhrust::service`）/ **ZIP 解压**（`dhrust::zip::extract_zip`）/ 面板鉴权与限流）、`zip`、`serde`、`libc`（Unix）等。
 
 ### 2.1 一键打包（Windows + Linux）
 

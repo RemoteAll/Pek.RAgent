@@ -12,7 +12,8 @@
 //! 鉴权级别由 `WebAuthLevel` 控制（对齐 C# `ParseAuthLevel`）：`None` 全部放行 /
 //! `LocalOnly`（默认）本机回环地址免鉴权、远程需令牌 / `Full` 一律需令牌。
 //!
-//! 登录爆破防护按客户端 IP 计数（5 次失败封禁 5 分钟，窗口 15 分钟），与 C# 面板一致。
+//! 登录爆破防护按客户端 IP 计数（5 次失败封禁 5 分钟，窗口 15 分钟），与 C# 面板一致；
+//! 实现已下沉 `dhrust::net::login_guard`（与 HlkProductTool 面板共用）。
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,7 +25,10 @@ use dhrust::net::controller::{
     arg, arg_i64, json_body, json_error, json_result, ActionResult, Controller,
 };
 use dhrust::net::http::HttpResponse;
+use dhrust::net::login_guard::LoginGuard;
+use dhrust::net::panel_auth::{allows, bearer_token, client_ip, AuthLevel, TokenStore};
 use dhrust::net::router::Ctx;
+use dhrust::web::{format_bytes, format_speed};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
@@ -33,47 +37,6 @@ use crate::manager::AppManager;
 use crate::sampler;
 use crate::sys;
 use crate::util;
-
-/// 令牌有效期（小时）。
-const TOKEN_HOURS: i64 = 24;
-/// 最大允许失败次数。
-const MAX_ATTEMPTS: u32 = 5;
-/// 失败统计窗口。
-const ATTEMPT_WINDOW_MINUTES: i64 = 15;
-/// 封禁时长。
-const BLOCK_MINUTES: i64 = 5;
-
-/// Web 面板鉴权级别（对齐 C# `AuthLevel` 与 `ParseAuthLevel`）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum AuthLevel {
-    /// 不鉴权
-    None,
-    /// 本机免鉴权，远程需鉴权
-    LocalOnly,
-    /// 全部鉴权
-    Full,
-}
-
-impl AuthLevel {
-    /// 解析配置文本（大小写不敏感；未知或空值回退 `LocalOnly`，与 C# 一致）。
-    fn parse(text: &str) -> AuthLevel {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "none" => AuthLevel::None,
-            "full" => AuthLevel::Full,
-            _ => AuthLevel::LocalOnly,
-        }
-    }
-}
-
-/// 登录尝试记录。
-struct Attempt {
-    /// 窗口内失败次数
-    count: u32,
-    /// 首次失败时间
-    first: DateTime<Local>,
-    /// 封禁截止时间
-    blocked_until: Option<DateTime<Local>>,
-}
 
 /// 面板共享状态。
 pub struct WebPanel {
@@ -87,10 +50,10 @@ pub struct WebPanel {
     started: Instant,
     /// 进程启动墙钟
     started_at: DateTime<Local>,
-    /// 令牌表（token → 到期时间）
-    tokens: Mutex<HashMap<String, DateTime<Local>>>,
-    /// 登录限流（IP → 尝试记录）
-    attempts: Mutex<HashMap<String, Attempt>>,
+    /// 令牌表（实现下沉 `dhrust::net::panel_auth::TokenStore`，默认 24 小时）
+    tokens: TokenStore,
+    /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
+    logins: LoginGuard,
 }
 
 impl WebPanel {
@@ -102,8 +65,8 @@ impl WebPanel {
             port,
             started: Instant::now(),
             started_at: Local::now(),
-            tokens: Mutex::new(HashMap::new()),
-            attempts: Mutex::new(HashMap::new()),
+            tokens: TokenStore::new(),
+            logins: LoginGuard::new(),
         })
     }
 
@@ -136,113 +99,20 @@ impl WebPanel {
             return None;
         }
 
-        let token = dhrust::random::token();
-        let now = Local::now();
-        let mut tokens = self.tokens.lock().unwrap();
-        // 清理过期令牌（与 C# 一致）
-        tokens.retain(|_, expire| *expire > now);
-        tokens.insert(token.clone(), now + chrono::Duration::hours(TOKEN_HOURS));
-        Some(token)
+        Some(self.tokens.issue())
     }
 
     /// 校验令牌。
     fn validate_token(&self, token: &str) -> bool {
-        if token.is_empty() {
-            return false;
-        }
-
-        let now = Local::now();
-        let mut tokens = self.tokens.lock().unwrap();
-        match tokens.get(token) {
-            Some(expire) if *expire > now => true,
-            Some(_) => {
-                tokens.remove(token);
-                false
-            }
-            None => false,
-        }
+        self.tokens.validate(token)
     }
 
     /// 吊销令牌。
     fn revoke_token(&self, token: &str) {
-        if !token.is_empty() {
-            self.tokens.lock().unwrap().remove(token);
-        }
-    }
-
-    // ————— 登录限流 —————
-
-    /// 指定 IP 是否处于封禁中。
-    fn is_blocked(&self, ip: &str) -> bool {
-        if ip.is_empty() {
-            return false;
-        }
-
-        let now = Local::now();
-        let mut attempts = self.attempts.lock().unwrap();
-        match attempts.get(ip) {
-            Some(info) => match info.blocked_until {
-                Some(until) if now < until => true,
-                Some(_) => {
-                    attempts.remove(ip);
-                    false
-                }
-                None => false,
-            },
-            None => false,
-        }
-    }
-
-    /// 记录一次失败（达到阈值时封禁）。
-    fn record_failure(&self, ip: &str) {
-        if ip.is_empty() {
-            return;
-        }
-
-        let now = Local::now();
-        let mut attempts = self.attempts.lock().unwrap();
-        let info = attempts.entry(ip.to_string()).or_insert(Attempt {
-            count: 0,
-            first: now,
-            blocked_until: None,
-        });
-
-        // 窗口过期，重置计数
-        if now - info.first > chrono::Duration::minutes(ATTEMPT_WINDOW_MINUTES) {
-            info.count = 0;
-            info.first = now;
-            info.blocked_until = None;
-        }
-
-        info.count += 1;
-        if info.count >= MAX_ATTEMPTS {
-            info.blocked_until = Some(now + chrono::Duration::minutes(BLOCK_MINUTES));
-        }
-    }
-
-    /// 记录成功登录，清除该 IP 记录。
-    fn record_success(&self, ip: &str) {
-        if !ip.is_empty() {
-            self.attempts.lock().unwrap().remove(ip);
-        }
+        self.tokens.revoke(token);
     }
 
     // ————— 鉴权辅助 —————
-
-    /// 从请求头解析 Bearer 令牌。
-    fn bearer_token(ctx: &Ctx) -> Option<String> {
-        let auth = ctx.req.header("Authorization")?;
-        let prefix = "Bearer ";
-        if auth.len() <= prefix.len() || !auth[..prefix.len()].eq_ignore_ascii_case(prefix) {
-            return None;
-        }
-        let token = auth[prefix.len()..].trim();
-        if token.is_empty() {
-            None
-        } else {
-            Some(token.to_string())
-        }
-    }
 
     /// 请求鉴权（`/api/login` 与 `/api/logout` 除外）。
     ///
@@ -251,45 +121,12 @@ impl WebPanel {
     /// - `LocalOnly`（默认）：本机回环地址免鉴权，其余需有效令牌；
     /// - `Full`：一律校验令牌。
     fn check_auth(&self, ctx: &Ctx) -> bool {
-        match self.auth_level() {
-            AuthLevel::None => true,
-            AuthLevel::LocalOnly => {
-                Self::is_loopback(&Self::client_ip(ctx)) || self.check_token(ctx)
-            }
-            AuthLevel::Full => self.check_token(ctx),
-        }
+        allows(ctx, self.auth_level(), |t| self.validate_token(t))
     }
 
     /// 当前鉴权级别（动态读取配置）。
     fn auth_level(&self) -> AuthLevel {
         AuthLevel::parse(&self.manager.config().web_auth_level)
-    }
-
-    /// 校验 Bearer 令牌。
-    fn check_token(&self, ctx: &Ctx) -> bool {
-        match Self::bearer_token(ctx) {
-            Some(token) => self.validate_token(&token),
-            None => false,
-        }
-    }
-
-    /// 是否本机回环地址（`127.0.0.0/8`、`::1` 及 IPv4-mapped 形式）。
-    fn is_loopback(ip: &str) -> bool {
-        ip.starts_with("127.") || ip == "::1" || ip.starts_with("::ffff:127.")
-    }
-
-    /// 客户端 IP（无端口）。
-    fn client_ip(ctx: &Ctx) -> String {
-        match ctx.req.remote_addr.as_deref() {
-            Some(addr) => match addr.rsplit_once(':') {
-                Some((host, _)) => host
-                    .trim_start_matches('[')
-                    .trim_end_matches(']')
-                    .to_string(),
-                None => addr.to_string(),
-            },
-            None => "unknown".to_string(),
-        }
     }
 }
 
@@ -381,9 +218,9 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
 
 /// 登录：签发令牌。
 fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    let ip = WebPanel::client_ip(ctx);
+    let ip = client_ip(ctx);
 
-    if panel.is_blocked(&ip) {
+    if panel.logins.is_blocked(&ip) {
         return json_error(429, "Too many failed attempts. Try again later.");
     }
 
@@ -392,12 +229,12 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     match panel.issue_token(&user, &password) {
         Some(token) => {
-            panel.record_success(&ip);
+            panel.logins.record_success(&ip);
             util::log_format("Web 面板登录成功：{}（{}）", &[&user, &ip]);
             json_result(0, "", Some(json!({ "token": token })))
         }
         None => {
-            panel.record_failure(&ip);
+            panel.logins.record_failure(&ip);
             util::log_format("Web 面板登录失败：{}（{}）", &[&user, &ip]);
             json_error(401, "Invalid credentials")
         }
@@ -406,7 +243,7 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
 /// 注销：吊销当前令牌。
 fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    if let Some(token) = WebPanel::bearer_token(ctx) {
+    if let Some(token) = bearer_token(ctx) {
         panel.revoke_token(&token);
     }
     json_result(0, "ok", None)
@@ -768,33 +605,6 @@ fn db_delete_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// 速率格式化（人类可读）。
-fn format_speed(bps: u64) -> String {
-    const KB: f64 = 1024.0;
-    const MB: f64 = 1024.0 * 1024.0;
-    let v = bps as f64;
-    if v >= MB {
-        format!("{:.1} MB/s", v / MB)
-    } else if v >= KB {
-        format!("{:.1} KB/s", v / KB)
-    } else {
-        format!("{v:.0} B/s")
-    }
-}
-
-/// 字节数可读格式（对齐 C# `StarApi.FormatBytes`：1024 进制，B/KB/MB/GB）。
-fn format_bytes(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{bytes} B")
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / 1024.0 / 1024.0)
-    } else {
-        format!("{:.2} GB", bytes as f64 / 1024.0 / 1024.0 / 1024.0)
-    }
-}
-
 /// 释放内存（尽力回收工作集）。
 fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
@@ -845,7 +655,7 @@ fn sync_time(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(400, "时间戳超出允许范围（2000~2100 年）");
     }
 
-    let ip = WebPanel::client_ip(ctx);
+    let ip = client_ip(ctx);
     match sys::set_system_time(epoch_ms) {
         Ok(()) => {
             let local = Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
@@ -2037,7 +1847,8 @@ mod tests {
     fn rate_limiter_blocks_after_failures() {
         let (panel, dir) = panel_with_default_password();
 
-        for _ in 0..MAX_ATTEMPTS {
+        // 默认策略 5 次失败封禁（dhrust::net::login_guard）
+        for _ in 0..5 {
             let result = login(
                 &panel,
                 &context("POST", "/api/login", r#"{"user":"admin","password":"bad"}"#, None),
@@ -2058,8 +1869,8 @@ mod tests {
         assert_eq!(body_json(blocked)["code"], 429);
 
         // 成功记录会清除限流（模拟另一 IP）
-        panel.record_success("10.0.0.1");
-        assert!(!panel.is_blocked("10.0.0.1"));
+        panel.logins.record_success("10.0.0.1");
+        assert!(!panel.logins.is_blocked("10.0.0.1"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2363,7 +2174,7 @@ mod tests {
     #[test]
     fn client_ip_strips_port() {
         let ctx = context_from("127.0.0.1:50000", "GET", "/", "", None);
-        assert_eq!(WebPanel::client_ip(&ctx), "127.0.0.1");
+        assert_eq!(client_ip(&ctx), "127.0.0.1");
     }
 
     /// 数据库管理端点：只读闸门、查询、备份与还原全链路。

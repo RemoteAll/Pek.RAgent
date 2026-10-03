@@ -512,56 +512,8 @@ fn copy_dir_recursive(src: &Path, dst: &Path) {
     }
 }
 
-/// 安全替换文件：
-/// 1. 原子改名（Unix 可直接覆盖；Windows 目标未占用时亦可）；
-/// 2. 目标被占用（运行中）时，把目标改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件）；
-///    `*.del` 删除失败不报错，待应用停止后由 `cleanup_temp_files` 清理。
-pub fn safe_replace_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    if !dst.exists() {
-        return std::fs::rename(src, dst).or_else(|_| {
-            std::fs::copy(src, dst)?;
-            let _ = std::fs::remove_file(src);
-            Ok(())
-        });
-    }
-
-    match std::fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            let bak = del_path(dst);
-            std::fs::rename(dst, &bak)?;
-            match std::fs::rename(src, dst) {
-                Ok(()) => {
-                    // 运行中的文件删除会失败，留给后续清理
-                    let _ = std::fs::remove_file(&bak);
-                    Ok(())
-                }
-                Err(e) => {
-                    // 回滚
-                    let _ = std::fs::rename(&bak, dst);
-                    Err(e)
-                }
-            }
-        }
-    }
-}
-
-/// 生成唯一的 `*.del` 路径。
-fn del_path(dst: &Path) -> PathBuf {
-    let base = PathBuf::from(format!("{}.del", dst.display()));
-    if !base.exists() {
-        return base;
-    }
-
-    for i in 1..10_000 {
-        let candidate = PathBuf::from(format!("{}.{}.del", dst.display(), i));
-        if !candidate.exists() {
-            return candidate;
-        }
-    }
-
-    base
-}
+/// 安全替换文件（实现已下沉 `dhrust::io::safe_replace_file`，2026-10-03；占用→改名 `*.del` 语义不变）。
+pub use dhrust::io::safe_replace_file;
 
 /// 清理目录中的 `*.del` 与 `*.tmp` 临时文件（尽力而为）。
 pub fn cleanup_temp_files(dir: &Path, recursive: bool) {
@@ -584,64 +536,10 @@ pub fn cleanup_temp_files(dir: &Path, recursive: bool) {
 }
 
 /// 解压 zip 到目标目录（防目录穿越；占用文件安全替换；保留可执行位）。
+///
+/// 实现已下沉 `dhrust::zip::extract_zip`（2026-10-03）；本函数为薄壳，保持调用点与测试不变。
 pub fn extract_zip(zip_path: &Path, target: &Path) -> Result<usize, String> {
-    let file = std::fs::File::open(zip_path)
-        .map_err(|e| format!("打开压缩包失败 {}：{}", zip_path.display(), e))?;
-    let mut archive =
-        zip::ZipArchive::new(file).map_err(|e| format!("读取压缩包失败：{}", e))?;
-
-    std::fs::create_dir_all(target).map_err(|e| format!("创建目录失败：{}", e))?;
-
-    let mut count = 0usize;
-    for i in 0..archive.len() {
-        let mut entry = archive
-            .by_index(i)
-            .map_err(|e| format!("读取压缩包条目失败：{}", e))?;
-
-        let Some(rel) = entry.enclosed_name() else {
-            continue; // 目录穿越条目，跳过
-        };
-        let out_path = target.join(rel);
-
-        if entry.is_dir() {
-            std::fs::create_dir_all(&out_path).map_err(|e| format!("创建目录失败：{}", e))?;
-            continue;
-        }
-
-        if let Some(parent) = out_path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("创建目录失败：{}", e))?;
-        }
-
-        let mut data = Vec::with_capacity(entry.size() as usize);
-        std::io::copy(&mut entry, &mut data).map_err(|e| format!("解压数据失败：{}", e))?;
-
-        let tmp = PathBuf::from(format!(
-            "{}.{}.{}.tmp",
-            out_path.display(),
-            std::process::id(),
-            i
-        ));
-        std::fs::write(&tmp, &data).map_err(|e| format!("写入临时文件失败：{}", e))?;
-        safe_replace_file(&tmp, &out_path)
-            .map_err(|e| format!("替换文件失败 {}：{}", out_path.display(), e))?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if let Some(mode) = entry.unix_mode() {
-                if mode & 0o111 != 0 {
-                    let _ = std::fs::set_permissions(
-                        &out_path,
-                        std::fs::Permissions::from_mode(mode | 0o755),
-                    );
-                }
-            }
-        }
-
-        count += 1;
-    }
-
-    Ok(count)
+    dhrust::zip::extract_zip(zip_path, target)
 }
 
 /// 托管模式解压：Windows + IIS（存在 web.config）时先离线再更新，避免文件占用。

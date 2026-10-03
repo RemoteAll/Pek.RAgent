@@ -215,7 +215,9 @@ dependencies = [
  "tokio",
  "toml",
  "toml_edit",
+ "windows-service",
  "windows-sys 0.59.0",
+ "zip",
 ]
 
 [[package]]
@@ -614,7 +616,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
- "windows-service",
  "windows-sys 0.59.0",
  "zip",
 ]

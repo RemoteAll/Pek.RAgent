@@ -41,7 +41,7 @@ impl Agent {
 
         let config = AgentConfig::load(base);
         let manager = AppManager::new(base, config.clone());
-        let svc = ServiceManager::new(base, &config);
+        let svc = crate::service::manager(base, &config);
         Agent {
             config,
             manager,
@@ -93,7 +93,7 @@ impl Agent {
             let run = move || {
                 run_core(manager.clone(), port, local_only, period);
             };
-            crate::service::windows::run_as_service(&self.svc.name, run);
+            crate::service::windows::run_as_service(&self.svc.name, || { SHUTDOWN.store(true, Ordering::SeqCst); }, run);
             0
         }
 

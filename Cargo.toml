@@ -10,7 +10,7 @@ license = "MIT"
 # DH 基础库（DH.RustBase）：日志（XTrace 等价）、线程定时调度（Timer/TimerScheduler）、
 # 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）、
 # 配置兼容（XML 主配置 Config/StarAgent.config + 旧版 TOML 迁移）
-dhrust = { path = "../DH.RustBase", features = ["net", "toml"] }
+dhrust = { path = "../DH.RustBase", features = ["net", "toml", "service", "zip-extract"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
@@ -29,8 +29,7 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-# Windows 服务运行时（与 SCM 交互：StartServiceCtrlDispatcher/HandlerEx/SetServiceStatus）
-windows-service = "0.7"
+# 注：Windows 服务运行时（windows-service）已随 service 模块下沉至 dhrust
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
