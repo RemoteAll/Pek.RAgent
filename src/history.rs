@@ -121,6 +121,23 @@ fn storage(base: &Path) -> Result<Arc<Storage>, String> {
     }
 }
 
+/// 在共享数据访问层上执行一次会话操作（写路径统一经 `LOCK` 串行）。
+///
+/// 供同库其它模块（面板用户 `Agent_PanelUser`、操作审计 `Agent_OperationLog`）复用
+/// 同一连接、同一建表单飞逻辑（防并发 `CREATE TABLE` 竞态）与同一读写锁。
+pub(crate) fn with_store<F, R>(base: &Path, f: F) -> Result<R, String>
+where
+    F: FnOnce(&Dal, &mut dyn SqlSession) -> pek_rcode::Result<R>,
+{
+    let store = storage(base)?;
+    let _guard = LOCK.lock().unwrap();
+    let mut session = store
+        .dal
+        .open_session()
+        .map_err(|e| format!("数据会话创建失败：{e}"))?;
+    f(&store.dal, session.as_mut()).map_err(|e| e.to_string())
+}
+
 /// 打开数据库：解析内嵌模型 → SQLite → 增量同步表结构 → 首轮旧版 JSON 迁移。
 fn open_storage(base: &Path) -> Result<Arc<Storage>, String> {
     INTERCEPTORS.call_once(|| pek_rcode::interceptor::enable_defaults());
@@ -667,6 +684,31 @@ pub(crate) fn day_ports(base: &Path, date: &str) -> BTreeMap<String, PortCounter
 const DB_TABLE_WEB: &str = "Agent_WebTrafficDaily";
 /// 物理表名（端口表）。
 const DB_TABLE_PORTS: &str = "Agent_PortTrafficDaily";
+/// 物理表名（面板用户表）。
+const DB_TABLE_USERS: &str = "Agent_PanelUser";
+/// 物理表名（操作审计表）。
+const DB_TABLE_OPLOG: &str = "Agent_OperationLog";
+
+/// 备份范围内的全部业务表（实体名）——新增表时同步扩展。
+fn backup_tables() -> [&'static str; 4] {
+    [
+        TABLE_WEB,
+        TABLE_PORTS,
+        crate::audit::TABLE_USER,
+        crate::audit::TABLE_OPLOG,
+    ]
+}
+
+/// 实体名 → 物理表名。
+fn physical_table(entity: &str) -> &'static str {
+    match entity {
+        TABLE_WEB => DB_TABLE_WEB,
+        TABLE_PORTS => DB_TABLE_PORTS,
+        crate::audit::TABLE_USER => DB_TABLE_USERS,
+        crate::audit::TABLE_OPLOG => DB_TABLE_OPLOG,
+        _ => "",
+    }
+}
 
 /// 只读查询校验（安全闸门）：仅放行单条 `SELECT` 文本。
 ///
@@ -699,7 +741,7 @@ pub fn validate_readonly_sql(sql: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 数据库概况（面板“数据库”页）：文件路径、大小与两张表的行数。
+/// 数据库概况（面板“数据库”页）：文件路径、大小与各业务表行数。
 pub fn database_info(base: &Path) -> Json {
     let db_path = base.join("Data").join(DB_FILE);
     let size = std::fs::metadata(&db_path).map(|m| m.len()).unwrap_or(0);
@@ -708,7 +750,7 @@ pub fn database_info(base: &Path) -> Json {
     let mut error: Option<String> = None;
     match storage(base) {
         Ok(store) => {
-            for (entity, physical) in [(TABLE_WEB, DB_TABLE_WEB), (TABLE_PORTS, DB_TABLE_PORTS)] {
+            for entity in backup_tables() {
                 let rows = store.dal.open_session().ok().and_then(|mut session| {
                     store
                         .dal
@@ -716,7 +758,7 @@ pub fn database_info(base: &Path) -> Json {
                         .ok()
                         .and_then(|t| t.count(session.as_mut(), None).ok())
                 });
-                tables.push(json!({ "name": physical, "rows": rows }));
+                tables.push(json!({ "name": physical_table(entity), "rows": rows }));
             }
         }
         Err(e) => error = Some(e),
@@ -776,7 +818,7 @@ pub fn query_readonly(base: &Path, sql: &str) -> Result<Json, String> {
     }))
 }
 
-/// 备份两张流量表为 DbTable zip 包（`backup_schema=true` 带模型 XML；与 C# 生态互通）。
+/// 备份全部业务表（含面板用户与操作审计）为 DbTable zip 包（`backup_schema=true` 带模型 XML；与 C# 生态互通）。
 pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
     let store = storage(base)?;
     let _guard = LOCK.lock().unwrap();
@@ -784,13 +826,15 @@ pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
         ".traffic-backup-{}.zip",
         Local::now().format("%Y%m%d%H%M%S%3f")
     ));
+    let tables = backup_tables();
+    let expected = tables.len();
     let result = store
         .dal
-        .backup_all(&[TABLE_WEB, TABLE_PORTS], &tmp, true)
+        .backup_all(&tables, &tmp, true)
         .map_err(|e| format!("备份失败：{e}"))
         .and_then(|count| {
-            if count < 2 {
-                Err(format!("备份失败：仅成功 {count}/2 张表"))
+            if count < expected {
+                Err(format!("备份失败：仅成功 {count}/{expected} 张表"))
             } else {
                 std::fs::read(&tmp).map_err(|e| format!("读取备份文件失败：{e}"))
             }
@@ -799,18 +843,27 @@ pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
     result
 }
 
-/// 从 DbTable zip 包还原两张流量表：先全量解码校验（不合格不动现有数据），再清空导入。
-/// 返回各表恢复行数；完成后失效实体缓存。
+/// 从 DbTable zip 包还原业务表：先全量解码校验（不合格不动现有数据），再清空导入。
+///
+/// **自适应旧备份**：仅处理包内实际存在的表（旧版仅含两张流量表的备份不会清空
+/// 面板用户与审计表）；至少需包含一张已知表。返回各表恢复行数；完成后失效实体缓存。
 pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
     let store = storage(base)?;
 
-    // 1) 结构预校验：zip 内两张表的 DbTable 流必须完整可解码（不合格不动现有数据）
+    // 1) 结构预校验：包内存在的已知表其 DbTable 流必须完整可解码（不合格不动现有数据）
+    let mut present: Vec<&'static str> = Vec::new();
     {
         use std::io::Read;
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes))
             .map_err(|e| format!("不是有效的备份包（zip）：{e}"))?;
-        for entity in [TABLE_WEB, TABLE_PORTS] {
+        let names: Vec<String> = (0..zip.len())
+            .filter_map(|i| zip.by_index(i).ok().map(|f| f.name().to_string()))
+            .collect();
+        for entity in backup_tables() {
             let entry_name = format!("{entity}.table");
+            if !names.iter().any(|n| n == &entry_name) {
+                continue;
+            }
             let mut entry = zip
                 .by_name(&entry_name)
                 .map_err(|_| format!("备份包缺少数据项 {entry_name}"))?;
@@ -820,6 +873,10 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
                 .map_err(|e| format!("读取 {entry_name} 失败：{e}"))?;
             pek_rcode::dbtable::decode_rowset(&data)
                 .map_err(|e| format!("{entry_name} 解码校验失败：{e}"))?;
+            present.push(entity);
+        }
+        if present.is_empty() {
+            return Err("备份包不包含任何已知数据表（WebTrafficDaily/PortTrafficDaily/PanelUser/OperationLog）".into());
         }
     }
 
@@ -828,10 +885,12 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
     std::fs::write(&tmp, bytes).map_err(|e| format!("写入临时文件失败：{e}"))?;
 
     // 3) 清空 + 导入（与写路径共用串行锁；完成后失效实体缓存）
+    let expected = present.len();
     let outcome = (|| -> Result<(Vec<String>, Json), String> {
         let _guard = LOCK.lock().unwrap();
         let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
-        for physical in [DB_TABLE_WEB, DB_TABLE_PORTS] {
+        for entity in &present {
+            let physical = physical_table(entity);
             session
                 .execute(&format!("DELETE FROM \"{physical}\""), &[])
                 .map_err(|e| format!("清空 {physical} 失败：{e}"))?;
@@ -839,16 +898,16 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
         drop(session);
         let done = store
             .dal
-            .restore_all(&tmp, Some(&[TABLE_WEB, TABLE_PORTS]), false)
+            .restore_all(&tmp, Some(&present), false)
             .map_err(|e| format!("导入失败：{e}"))?;
-        if done.len() < 2 {
+        if done.len() < expected {
             return Err(format!(
-                "导入不完整：成功 {}/2 张表（请重新还原）",
+                "导入不完整：成功 {}/{expected} 张表（请重新还原）",
                 done.len()
             ));
         }
         let mut rows = serde_json::Map::new();
-        for (entity, physical) in [(TABLE_WEB, DB_TABLE_WEB), (TABLE_PORTS, DB_TABLE_PORTS)] {
+        for entity in &present {
             let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
             let n = store
                 .dal
@@ -856,9 +915,9 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
                 .map_err(|e| e.to_string())?
                 .count(session.as_mut(), None)
                 .map_err(|e| e.to_string())?;
-            rows.insert(physical.to_string(), json!(n));
+            rows.insert(physical_table(entity).to_string(), json!(n));
         }
-        for entity in [TABLE_WEB, TABLE_PORTS] {
+        for entity in &present {
             store.dal.invalidate_cache(entity);
         }
         Ok((done, Json::Object(rows)))
@@ -1469,6 +1528,62 @@ mod tests {
         // 删除
         delete_backup(&base, &name).unwrap();
         assert!(list_backups(&base)["items"].as_array().unwrap().is_empty());
+
+        cleanup(&base);
+    }
+
+    /// 旧版备份包（仅两张流量表）还原时不得清空面板用户与审计表（自适应恢复）。
+    #[test]
+    fn restore_old_backup_keeps_user_tables() {
+        use crate::audit;
+        let base = temp_dir("bakold");
+
+        // 建一个面板用户 + 一条审计记录
+        audit::save_user(&base, "keepme", Some("pw"), &["dashboard".into()], true, "").unwrap();
+        audit::record(
+            &base,
+            &audit::AuditEntry {
+                user: "tester".to_string(),
+                ip: "127.0.0.1".to_string(),
+                action: "smoke".to_string(),
+                title: "冒烟".to_string(),
+                method: "POST".to_string(),
+                path: "/x".to_string(),
+                detail: String::new(),
+                success: true,
+                code: 0,
+                message: String::new(),
+                elapsed_ms: 1,
+            },
+        );
+
+        // 构造“旧版备份包”：仅两张流量表（模拟升级前产出的备份）
+        let store = storage(&base).unwrap();
+        let tmp = base.join("Data").join(".old-format.zip");
+        {
+            let _guard = LOCK.lock().unwrap();
+            store
+                .dal
+                .backup_all(&[TABLE_WEB, TABLE_PORTS], &tmp, true)
+                .unwrap();
+        }
+        let bytes = std::fs::read(&tmp).unwrap();
+        std::fs::remove_file(&tmp).unwrap();
+
+        // 还原旧包：只恢复包内两张表
+        let result = restore_zip(&base, &bytes).expect("旧包还原应成功");
+        assert!(result["rows"]["Agent_WebTrafficDaily"].is_number());
+        assert!(
+            result["rows"]["Agent_PanelUser"].is_null(),
+            "旧包不含用户表，不应出现在恢复结果中：{result}"
+        );
+
+        // 面板用户未被清空，仍可登录校验通过
+        let u = audit::find_user(&base, "keepme").unwrap().expect("用户应保留");
+        assert!(u.verify("pw"));
+        // 审计记录未被清空
+        let logs = audit::query_logs(&base, 1, 10, "", "", None).unwrap();
+        assert!(logs["total"].as_u64().unwrap() >= 1);
 
         cleanup(&base);
     }

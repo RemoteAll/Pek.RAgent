@@ -8,10 +8,13 @@
 
 mod agent;
 mod app;
+mod audit;
 mod cli;
 mod config;
 mod deploy;
+mod fileman;
 mod history;
+mod logclean;
 mod manager;
 mod portstat;
 mod sampler;

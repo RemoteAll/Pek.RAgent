@@ -58,6 +58,8 @@
   <PortTrafficPorts></PortTrafficPorts>
   <!--流量历史保留天数。每日归档落 SQLite（Data/traffic.db，Pek.RCode 按 Entity/Model.xml 模型管理）；默认 90（7~3650），0 = 永久保留-->
   <TrafficHistoryDays>90</TrafficHistoryDays>
+  <!--日志清理自定义路径。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
+  <LogCleanupPaths></LogCleanupPaths>
 
   <!--应用服务集合-->
   <Services></Services>

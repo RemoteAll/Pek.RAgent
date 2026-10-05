@@ -6,7 +6,10 @@
 //! - `/star/*`：services / startService / stopService / restartService / addService /
 //!   removeService / getStarConfig / updateStarConfig / machine / webTraffic / portTraffic /
 //!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
-//!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup
+//!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup /
+//!   fileList / fileRead / fileWrite / fileMkdir / fileNewFile / fileDelete / fileRename /
+//!   fileMove / fileCopy / fileUpload / fileDownload / fileCompress / fileExtract /
+//!   fileChmod / fileSearch（文件管理）/ logCleanScan / logCleanRun（日志清理）
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
 //!
 //! 鉴权级别由 `WebAuthLevel` 控制（对齐 C# `ParseAuthLevel`）：`None` 全部放行 /
@@ -26,17 +29,36 @@ use dhrust::net::controller::{
 };
 use dhrust::net::http::HttpResponse;
 use dhrust::net::login_guard::LoginGuard;
-use dhrust::net::panel_auth::{allows, bearer_token, client_ip, AuthLevel, TokenStore};
+use dhrust::net::panel_auth::{bearer_token, client_ip, is_loopback, AuthLevel, TokenStore};
 use dhrust::net::router::Ctx;
 use dhrust::web::{format_bytes, format_speed};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
+use crate::audit;
 use crate::config::AgentConfig;
 use crate::manager::AppManager;
 use crate::sampler;
 use crate::sys;
 use crate::util;
+
+/// 请求主体（已认证身份）：内置管理员或数据库面板用户。
+#[derive(Clone, Debug)]
+pub(crate) struct Principal {
+    /// 登录名（审计记录用；`None` 鉴权级别下远程请求记为 `anon`）
+    pub name: String,
+    /// 是否内置管理员（全部权限 + 用户管理）
+    pub is_admin: bool,
+    /// 菜单权限 key 列表（内置管理员为空 = 全部）
+    pub perms: Vec<String>,
+}
+
+impl Principal {
+    /// 是否拥有某菜单权限（管理员恒真）。
+    pub fn allowed(&self, perm: &str) -> bool {
+        self.is_admin || self.perms.iter().any(|p| p == perm)
+    }
+}
 
 /// 面板共享状态。
 pub struct WebPanel {
@@ -54,6 +76,8 @@ pub struct WebPanel {
     tokens: TokenStore,
     /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
     logins: LoginGuard,
+    /// 会话主体（令牌 → 登录用户与权限；随令牌吊销/过期失效）
+    sessions: Mutex<HashMap<String, Principal>>,
 }
 
 impl WebPanel {
@@ -67,6 +91,7 @@ impl WebPanel {
             started_at: Local::now(),
             tokens: TokenStore::new(),
             logins: LoginGuard::new(),
+            sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -75,31 +100,75 @@ impl WebPanel {
         self.port
     }
 
+    /// 程序基础目录（文件管理等模块使用）。
+    pub(crate) fn base(&self) -> &Path {
+        &self.base
+    }
+
+    /// 当前配置（热重载后为最新值；日志清理等模块使用）。
+    pub(crate) fn config(&self) -> AgentConfig {
+        self.manager.config()
+    }
+
     /// 进程运行时长。
     fn uptime(&self) -> Duration {
         self.started.elapsed()
     }
 
-    // ————— 令牌 —————
+    // ————— 令牌与会话 —————
 
-    /// 签发令牌（校验用户名密码；失败返回 None）。
-    fn issue_token(&self, user: &str, password: &str) -> Option<String> {
+    /// 校验凭据并返回主体（不发放令牌；登录动作与测试辅助共用）。
+    ///
+    /// 登录源（按顺序）：
+    /// 1. 配置文件内置管理员（`WebUserName`/`WebPassword`）——超级权限；
+    /// 2. 数据库面板用户（`Agent_PanelUser`）——按菜单权限受限，禁用用户拒绝登录。
+    fn authenticate(&self, user: &str, password: &str) -> Option<Principal> {
         if user.is_empty() || password.is_empty() {
             return None;
         }
-
         let cfg = self.manager.config();
-        if cfg.web_user_name.trim().is_empty() || cfg.web_user_password.is_empty() {
-            return None;
-        }
-        if !user.trim().eq_ignore_ascii_case(cfg.web_user_name.trim()) {
-            return None;
-        }
-        if password != cfg.web_user_password {
-            return None;
+
+        // 内置管理员
+        if !cfg.web_user_name.trim().is_empty()
+            && !cfg.web_user_password.is_empty()
+            && user.trim().eq_ignore_ascii_case(cfg.web_user_name.trim())
+            && password == cfg.web_user_password
+        {
+            return Some(Principal {
+                name: cfg.web_user_name.trim().to_string(),
+                is_admin: true,
+                perms: Vec::new(),
+            });
         }
 
-        Some(self.tokens.issue())
+        // 数据库用户（数据库不可用时仅内置管理员可登录）
+        match audit::verify_login(&self.base, user, password) {
+            Ok(Some(u)) => Some(Principal {
+                name: u.user_name.clone(),
+                is_admin: false,
+                perms: u.permissions.clone(),
+            }),
+            Ok(None) => None,
+            Err(e) => {
+                util::log_error(&format!("登录时读取面板用户失败：{e}"));
+                None
+            }
+        }
+    }
+
+    /// 签发令牌并绑定会话（校验用户名密码；失败返回 None）。
+    ///
+    /// 生产路径登录动作见 [`login`]（先 [`WebPanel::authenticate`] 取主体、再发令牌，
+    /// 以便审计记录登录名）；本方法供测试等场景一步获取令牌。
+    #[cfg(test)]
+    fn issue_token(&self, user: &str, password: &str) -> Option<String> {
+        let principal = self.authenticate(user, password)?;
+        let token = self.tokens.issue();
+        self.sessions
+            .lock()
+            .unwrap()
+            .insert(token.clone(), principal);
+        Some(token)
     }
 
     /// 校验令牌。
@@ -107,9 +176,10 @@ impl WebPanel {
         self.tokens.validate(token)
     }
 
-    /// 吊销令牌。
+    /// 吊销令牌（同时移除会话主体）。
     fn revoke_token(&self, token: &str) {
         self.tokens.revoke(token);
+        self.sessions.lock().unwrap().remove(token);
     }
 
     // ————— 鉴权辅助 —————
@@ -117,11 +187,48 @@ impl WebPanel {
     /// 请求鉴权（`/api/login` 与 `/api/logout` 除外）。
     ///
     /// 级别由 `WebAuthLevel` 决定（对齐 C# `AgentWebPanel` 语义，修改后自动生效）：
-    /// - `None`：全部放行（不鉴权）；
-    /// - `LocalOnly`（默认）：本机回环地址免鉴权，其余需有效令牌；
+    /// - `None`：全部放行（不鉴权；本机回环记内置管理员，远程审计记为 `anon`）；
+    /// - `LocalOnly`（默认）：本机回环地址免鉴权（视为内置管理员），其余需有效令牌；
     /// - `Full`：一律校验令牌。
-    fn check_auth(&self, ctx: &Ctx) -> bool {
-        allows(ctx, self.auth_level(), |t| self.validate_token(t))
+    pub(crate) fn check_auth(&self, ctx: &Ctx) -> bool {
+        self.principal(ctx).is_some()
+    }
+
+    /// 解析请求主体（已认证身份；`None` = 未认证）。
+    ///
+    /// Bearer 令牌有效 → 会话绑定的用户与权限；无令牌时按鉴权级别兜底
+    /// （详见 [`WebPanel::check_auth`]）。
+    pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
+        if let Some(token) = bearer_token(ctx) {
+            if self.validate_token(&token) {
+                return self.sessions.lock().unwrap().get(&token).cloned();
+            }
+        }
+        let cfg = self.manager.config();
+        let mut admin = Principal {
+            name: cfg.web_user_name.trim().to_string(),
+            is_admin: true,
+            perms: Vec::new(),
+        };
+        if admin.name.is_empty() {
+            admin.name = "admin".to_string();
+        }
+        match self.auth_level() {
+            AuthLevel::None => {
+                if !is_loopback(&client_ip(ctx)) {
+                    admin.name = "anon".to_string();
+                }
+                Some(admin)
+            }
+            AuthLevel::LocalOnly => {
+                if is_loopback(&client_ip(ctx)) {
+                    Some(admin)
+                } else {
+                    None
+                }
+            }
+            AuthLevel::Full => None,
+        }
     }
 
     /// 当前鉴权级别（动态读取配置）。
@@ -130,93 +237,479 @@ impl WebPanel {
     }
 }
 
+// ————— 动作守卫（认证 + 权限 + 审计） —————
+
+/// 权限 key（与前端导航 `data-panel` 一致；可授予列表见 [`crate::audit::ALL_PERMISSIONS`]）。
+pub(crate) const PERM_DASHBOARD: &str = "dashboard";
+pub(crate) const PERM_SERVICES: &str = "services";
+pub(crate) const PERM_TRAFFIC: &str = "traffic";
+pub(crate) const PERM_CONTROL: &str = "control";
+pub(crate) const PERM_CONFIG: &str = "config";
+pub(crate) const PERM_STARCONFIG: &str = "starconfig";
+pub(crate) const PERM_LOGS: &str = "logs";
+pub(crate) const PERM_WATCHDOG: &str = "watchdog";
+pub(crate) const PERM_DATABASE: &str = "database";
+pub(crate) const PERM_FILEMAN: &str = "fileman";
+pub(crate) const PERM_CLEANUP: &str = "cleanup";
+pub(crate) const PERM_AUDIT: &str = "audit";
+/// 用户管理：仅内置管理员（不参与授权列表）。
+pub(crate) const PERM_USERS: &str = "users";
+
+/// 包装业务动作为受保护入口：**认证 → 权限 → 执行 → 审计**。
+///
+/// - `perm` 为空串表示“登录即可”（如修改本人密码）；
+/// - 权限不足（403）与全部变更类操作（POST）及敏感读（文件读取/下载、数据库查询/备份）
+///   会写入 `Agent_OperationLog` 审计表（参数摘要脱敏，见 [`summarize_request`]）。
+pub(crate) fn guarded<F>(
+    panel: Arc<WebPanel>,
+    perm: &'static str,
+    action: F,
+) -> impl Fn(&Ctx) -> ActionResult + Send + Sync + 'static
+where
+    F: Fn(&WebPanel, &Ctx) -> ActionResult + Send + Sync + 'static,
+{
+    move |ctx| {
+        let started = Instant::now();
+        let Some(principal) = panel.principal(ctx) else {
+            return json_error(401, "Unauthorized");
+        };
+        let action_name = action_name_of(&ctx.req.path);
+        if !perm.is_empty() && !principal.allowed(perm) {
+            let result = json_error(403, "没有权限执行该操作");
+            record_audit(&panel, ctx, &principal, &action_name, started, true, &result);
+            return result;
+        }
+        let result = action(&panel, ctx);
+        if audit_needed(&ctx.req.method, &action_name) {
+            record_audit(&panel, ctx, &principal, &action_name, started, false, &result);
+        }
+        result
+    }
+}
+
+/// 是否需要审计（写操作与敏感读）。
+fn audit_needed(method: &str, action: &str) -> bool {
+    if method.eq_ignore_ascii_case("POST")
+        || method.eq_ignore_ascii_case("PUT")
+        || method.eq_ignore_ascii_case("DELETE")
+    {
+        return true;
+    }
+    matches!(
+        action,
+        "fileRead" | "fileDownload" | "dbQuery" | "dbBackup" | "dbDownloadBackup"
+    )
+}
+
+/// 写入审计记录（`denied` 表示因权限拒绝而记录）。
+fn record_audit(
+    panel: &WebPanel,
+    ctx: &Ctx,
+    principal: &Principal,
+    action: &str,
+    started: Instant,
+    denied: bool,
+    result: &ActionResult,
+) {
+    let (code, message) = result_info(result);
+    let mut path = ctx.req.path.clone();
+    if !ctx.req.query.is_empty() {
+        path = format!("{}?{}", path, truncate_text(&ctx.req.query, 100));
+    }
+    audit::record(
+        &panel.base,
+        &audit::AuditEntry {
+            user: principal.name.clone(),
+            ip: client_ip(ctx),
+            action: action.to_string(),
+            title: action_title(action),
+            method: ctx.req.method.clone(),
+            path: truncate_text(&path, 200),
+            detail: summarize_request(ctx),
+            success: !denied && code == 0,
+            code: if denied { 403 } else { code },
+            message: truncate_text(&message, 300),
+            elapsed_ms: started.elapsed().as_millis() as i64,
+        },
+    );
+}
+
+/// 从动作结果提取（结果码, 消息）。
+fn result_info(result: &ActionResult) -> (i32, String) {
+    match result {
+        ActionResult::Response(r) => {
+            let is_json = r.headers.iter().any(|(k, v)| {
+                k.eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().contains("json")
+            });
+            if is_json {
+                if let Ok(v) = serde_json::from_slice::<Json>(&r.body) {
+                    let code = v
+                        .get("code")
+                        .and_then(|c| c.as_i64())
+                        .unwrap_or(r.status as i64) as i32;
+                    let message = v
+                        .get("message")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    (code, message)
+                } else {
+                    (r.status as i32, String::new())
+                }
+            } else if r.status < 400 {
+                (0, "二进制响应".to_string())
+            } else {
+                (r.status as i32, String::new())
+            }
+        }
+        ActionResult::View { .. } => (0, String::new()),
+    }
+}
+
+/// 路径最后一段（动作名，如 `/star/fileDelete` → `fileDelete`）。
+fn action_name_of(path: &str) -> String {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// 动作中文名（审计展示；未知动作回退为原名）。
+fn action_title(action: &str) -> String {
+    let title = match action {
+        "login" => "登录",
+        "logout" => "退出登录",
+        "control" => "服务控制",
+        "freeMemory" => "释放内存",
+        "updateConfig" => "更新配置",
+        "changePassword" => "修改密码",
+        "upgrade" => "程序升级",
+        "syncTime" => "同步系统时间",
+        "startService" => "启动子服务",
+        "stopService" => "停止子服务",
+        "restartService" => "重启子服务",
+        "addService" => "添加/更新子服务",
+        "removeService" => "删除子服务",
+        "updateStarConfig" => "更新星尘设置",
+        "dbQuery" => "数据库查询",
+        "dbBackup" => "数据库备份下载",
+        "dbRestore" => "数据库还原",
+        "dbCreateBackup" => "创建数据库备份",
+        "dbDownloadBackup" => "下载数据库备份",
+        "dbRestoreBackup" => "从备份还原数据库",
+        "dbDeleteBackup" => "删除数据库备份",
+        "fileRead" => "读取文件",
+        "fileWrite" => "保存文件",
+        "fileMkdir" => "新建文件夹",
+        "fileNewFile" => "新建文件",
+        "fileDelete" => "删除文件",
+        "fileRename" => "重命名",
+        "fileMove" => "移动文件",
+        "fileCopy" => "复制文件",
+        "fileUpload" => "上传文件",
+        "fileDownload" => "下载文件",
+        "fileCompress" => "压缩文件",
+        "fileExtract" => "解压文件",
+        "fileChmod" => "修改文件权限",
+        "fileSearch" => "搜索文件",
+        "logCleanRun" => "日志清理",
+        "userSave" => "保存面板用户",
+        "userDelete" => "删除面板用户",
+        "userResetPassword" => "重置用户密码",
+        "auditLogs" => "查看操作日志",
+        _ => return format!("操作 {action}"),
+    };
+    title.to_string()
+}
+
+/// 请求参数摘要（查询串 + JSON/表单体；`password`/`secret`/`token` 字段脱敏；截断）。
+fn summarize_request(ctx: &Ctx) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if !ctx.req.query.is_empty() {
+        parts.push(redact_form(&ctx.req.query));
+    }
+    let body = ctx.req.body.as_ref();
+    if !body.is_empty() {
+        let content_type = ctx
+            .header("content-type")
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if content_type.contains("application/json") && body.len() <= 64 * 1024 {
+            match serde_json::from_slice::<Json>(body) {
+                Ok(mut v) => {
+                    redact_json(&mut v);
+                    parts.push(v.to_string());
+                }
+                Err(_) => parts.push(format!("body={} 字节", body.len())),
+            }
+        } else if content_type.contains("x-www-form-urlencoded") {
+            parts.push(redact_form(&String::from_utf8_lossy(body)));
+        } else {
+            parts.push(format!("body={} 字节", body.len()));
+        }
+    }
+    truncate_text(&parts.join(" | "), 400)
+}
+
+/// `k=v&k2=v2` 形式摘要素材的脱敏。
+fn redact_form(text: &str) -> String {
+    text.split('&')
+        .map(|pair| match pair.split_once('=') {
+            Some((k, _)) if is_sensitive_key(k) => format!("{k}=***"),
+            _ => pair.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// JSON 体递归脱敏（键名含 password/secret/token 的值替换为 `***`）。
+fn redact_json(v: &mut Json) {
+    match v {
+        Json::Object(map) => {
+            for (k, val) in map.iter_mut() {
+                if is_sensitive_key(k) {
+                    *val = json!("***");
+                } else {
+                    redact_json(val);
+                }
+            }
+        }
+        Json::Array(items) => {
+            for item in items {
+                redact_json(item);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// 是否敏感键（不区分大小写包含匹配）。
+fn is_sensitive_key(key: &str) -> bool {
+    let k = key.to_ascii_lowercase();
+    k.contains("password") || k.contains("secret") || k.contains("token")
+}
+
+/// 按字符截断（附省略号；不破坏 UTF-8 边界）。
+fn truncate_text(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let clipped: String = text.chars().take(max).collect();
+    format!("{clipped}…")
+}
+
 // ————— 控制器注册 —————
 
-/// 构建 `/api` 控制器。
+/// 构建 `/api` 控制器（动作经 [`guarded`] 统一做 认证+权限+审计）。
 pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     let mut controller = Controller::new("api");
 
+    // 登录/退出：无需令牌（成功与失败均写操作审计）
     let p = panel.clone();
     controller = controller.post("login", move |ctx| login(&p, ctx));
     let p = panel.clone();
     controller = controller.post("logout", move |ctx| logout(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("status", move |ctx| status(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("health", move |ctx| health(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("freeMemory", move |ctx| free_memory(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("configMetadata", move |ctx| config_metadata(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("updateConfig", move |ctx| update_config(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("changePassword", move |ctx| change_password(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("logs", move |ctx| logs(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("logFiles", move |ctx| log_files(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("watchdog", move |ctx| watchdog(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("upgrade", move |ctx| upgrade(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("syncTime", move |ctx| sync_time(&p, ctx));
-    controller.post("control", move |ctx| control(&panel, ctx))
+
+    // 当前主体（前端登录后取权限渲染菜单；仅认证不校验菜单权限）
+    controller = controller.get("me", guarded(panel.clone(), "", me));
+
+    controller = controller.get("status", guarded(panel.clone(), PERM_DASHBOARD, status));
+    controller = controller.get("health", guarded(panel.clone(), PERM_DASHBOARD, health));
+    controller = controller.get("freeMemory", guarded(panel.clone(), PERM_CONTROL, free_memory));
+    controller = controller.get(
+        "configMetadata",
+        guarded(panel.clone(), PERM_CONFIG, config_metadata),
+    );
+    controller = controller.post(
+        "updateConfig",
+        guarded(panel.clone(), PERM_CONFIG, update_config),
+    );
+    controller = controller.post(
+        "changePassword",
+        guarded(panel.clone(), "", change_password),
+    );
+    controller = controller.get("logs", guarded(panel.clone(), PERM_LOGS, logs));
+    controller = controller.get("logFiles", guarded(panel.clone(), PERM_LOGS, log_files));
+    controller = controller.get(
+        "watchdog",
+        guarded(panel.clone(), PERM_WATCHDOG, watchdog),
+    );
+    controller = controller.post("upgrade", guarded(panel.clone(), PERM_CONFIG, upgrade));
+    controller = controller.post(
+        "syncTime",
+        guarded(panel.clone(), PERM_DASHBOARD, sync_time),
+    );
+    controller.post("control", guarded(panel, PERM_CONTROL, control))
 }
 
-/// 构建 `/star` 控制器。
+/// 构建 `/star` 控制器（动作经 [`guarded`] 统一做 认证+权限+审计）。
 pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     let mut controller = Controller::new("star");
 
-    let p = panel.clone();
-    controller = controller.get("services", move |ctx| services(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("startService", move |ctx| service_op(&p, ctx, Op::Start));
-    let p = panel.clone();
-    controller = controller.post("stopService", move |ctx| service_op(&p, ctx, Op::Stop));
-    let p = panel.clone();
-    controller = controller.post("restartService", move |ctx| service_op(&p, ctx, Op::Restart));
-    let p = panel.clone();
-    controller = controller.post("addService", move |ctx| add_service(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("removeService", move |ctx| remove_service(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("getStarConfig", move |ctx| get_star_config(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("updateStarConfig", move |ctx| update_star_config(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("machine", move |ctx| machine(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("webTraffic", move |ctx| web_traffic(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("portTraffic", move |ctx| port_traffic(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("trafficHistory", move |ctx| traffic_history(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("dbInfo", move |ctx| db_info(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("dbQuery", move |ctx| db_query(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("dbBackup", move |ctx| db_backup(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("dbRestore", move |ctx| db_restore(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("dbListBackups", move |ctx| db_list_backups(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("dbCreateBackup", move |ctx| db_create_backup(&p, ctx));
-    let p = panel.clone();
-    controller = controller.get("dbDownloadBackup", move |ctx| db_download_backup(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("dbRestoreBackup", move |ctx| db_restore_backup(&p, ctx));
-    let p = panel.clone();
-    controller = controller.post("dbDeleteBackup", move |ctx| db_delete_backup(&p, ctx));
-    controller.get("getProcessList", move |ctx| get_process_list(&panel, ctx))
+    controller = controller.get("services", guarded(panel.clone(), PERM_SERVICES, services));
+    controller = controller.post(
+        "startService",
+        guarded(panel.clone(), PERM_SERVICES, |p, ctx| {
+            service_op(p, ctx, Op::Start)
+        }),
+    );
+    controller = controller.post(
+        "stopService",
+        guarded(panel.clone(), PERM_SERVICES, |p, ctx| {
+            service_op(p, ctx, Op::Stop)
+        }),
+    );
+    controller = controller.post(
+        "restartService",
+        guarded(panel.clone(), PERM_SERVICES, |p, ctx| {
+            service_op(p, ctx, Op::Restart)
+        }),
+    );
+    controller = controller.post(
+        "addService",
+        guarded(panel.clone(), PERM_SERVICES, add_service),
+    );
+    controller = controller.post(
+        "removeService",
+        guarded(panel.clone(), PERM_SERVICES, remove_service),
+    );
+    controller = controller.get(
+        "getStarConfig",
+        guarded(panel.clone(), PERM_STARCONFIG, get_star_config),
+    );
+    controller = controller.post(
+        "updateStarConfig",
+        guarded(panel.clone(), PERM_STARCONFIG, update_star_config),
+    );
+    controller = controller.get("machine", guarded(panel.clone(), PERM_DASHBOARD, machine));
+    controller = controller.get(
+        "webTraffic",
+        guarded(panel.clone(), PERM_TRAFFIC, web_traffic),
+    );
+    controller = controller.get(
+        "portTraffic",
+        guarded(panel.clone(), PERM_TRAFFIC, port_traffic),
+    );
+    controller = controller.get(
+        "trafficHistory",
+        guarded(panel.clone(), PERM_TRAFFIC, traffic_history),
+    );
+    controller = controller.get("dbInfo", guarded(panel.clone(), PERM_DATABASE, db_info));
+    controller = controller.post("dbQuery", guarded(panel.clone(), PERM_DATABASE, db_query));
+    controller = controller.get("dbBackup", guarded(panel.clone(), PERM_DATABASE, db_backup));
+    controller = controller.post("dbRestore", guarded(panel.clone(), PERM_DATABASE, db_restore));
+    controller = controller.get(
+        "dbListBackups",
+        guarded(panel.clone(), PERM_DATABASE, db_list_backups),
+    );
+    controller = controller.post(
+        "dbCreateBackup",
+        guarded(panel.clone(), PERM_DATABASE, db_create_backup),
+    );
+    controller = controller.get(
+        "dbDownloadBackup",
+        guarded(panel.clone(), PERM_DATABASE, db_download_backup),
+    );
+    controller = controller.post(
+        "dbRestoreBackup",
+        guarded(panel.clone(), PERM_DATABASE, db_restore_backup),
+    );
+    controller = controller.post(
+        "dbDeleteBackup",
+        guarded(panel.clone(), PERM_DATABASE, db_delete_backup),
+    );
+
+    // 文件管理（「文件管理」页）
+    controller = controller.get(
+        "fileList",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_list),
+    );
+    controller = controller.get(
+        "fileRead",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_read),
+    );
+    controller = controller.post(
+        "fileWrite",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_write),
+    );
+    controller = controller.post(
+        "fileMkdir",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_mkdir),
+    );
+    controller = controller.post(
+        "fileNewFile",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_new_file),
+    );
+    controller = controller.post(
+        "fileDelete",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_delete),
+    );
+    controller = controller.post(
+        "fileRename",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_rename),
+    );
+    controller = controller.post(
+        "fileMove",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_move),
+    );
+    controller = controller.post(
+        "fileCopy",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_copy),
+    );
+    controller = controller.post(
+        "fileUpload",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload),
+    );
+    controller = controller.get(
+        "fileDownload",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_download),
+    );
+    controller = controller.post(
+        "fileCompress",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_compress),
+    );
+    controller = controller.post(
+        "fileExtract",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_extract),
+    );
+    controller = controller.post(
+        "fileChmod",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_chmod),
+    );
+    controller = controller.get(
+        "fileSearch",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_search),
+    );
+
+    // 日志清理（「日志清理」页）
+    controller = controller.get(
+        "logCleanScan",
+        guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_scan),
+    );
+    controller = controller.post(
+        "logCleanRun",
+        guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_run),
+    );
+
+    // 用户管理（仅内置管理员）与操作日志
+    controller = controller.get("userList", guarded(panel.clone(), PERM_USERS, user_list));
+    controller = controller.post("userSave", guarded(panel.clone(), PERM_USERS, user_save));
+    controller = controller.post(
+        "userDelete",
+        guarded(panel.clone(), PERM_USERS, user_delete),
+    );
+    controller = controller.get("auditLogs", guarded(panel.clone(), PERM_AUDIT, audit_logs));
+
+    controller.get(
+        "getProcessList",
+        guarded(panel, PERM_DASHBOARD, get_process_list),
+    )
 }
 
 // ————— /api 动作 —————
 
-/// 登录：签发令牌。
+/// 登录：签发令牌（成功/失败均写入操作审计）。
 fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let ip = client_ip(ctx);
 
@@ -227,23 +720,79 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let user = arg(ctx, "user").unwrap_or_default();
     let password = arg(ctx, "password").unwrap_or_default();
 
-    match panel.issue_token(&user, &password) {
-        Some(token) => {
+    match panel.authenticate(&user, &password) {
+        Some(principal) => {
+            let token = panel.tokens.issue();
+            panel
+                .sessions
+                .lock()
+                .unwrap()
+                .insert(token.clone(), principal.clone());
             panel.logins.record_success(&ip);
-            util::log_format("Web 面板登录成功：{}（{}）", &[&user, &ip]);
+            util::log_format("Web 面板登录成功：{}（{}）", &[&principal.name, &ip]);
+            audit::record(
+                &panel.base,
+                &audit::AuditEntry {
+                    user: principal.name.clone(),
+                    ip: ip.clone(),
+                    action: "login".to_string(),
+                    title: action_title("login"),
+                    method: ctx.req.method.clone(),
+                    path: ctx.req.path.clone(),
+                    detail: String::new(),
+                    success: true,
+                    code: 0,
+                    message: "登录成功".to_string(),
+                    elapsed_ms: 0,
+                },
+            );
             json_result(0, "", Some(json!({ "token": token })))
         }
         None => {
             panel.logins.record_failure(&ip);
             util::log_format("Web 面板登录失败：{}（{}）", &[&user, &ip]);
+            audit::record(
+                &panel.base,
+                &audit::AuditEntry {
+                    user: truncate_text(user.trim(), 50),
+                    ip: ip.clone(),
+                    action: "login".to_string(),
+                    title: action_title("login"),
+                    method: ctx.req.method.clone(),
+                    path: ctx.req.path.clone(),
+                    detail: String::new(),
+                    success: false,
+                    code: 401,
+                    message: "用户名或密码错误".to_string(),
+                    elapsed_ms: 0,
+                },
+            );
             json_error(401, "Invalid credentials")
         }
     }
 }
 
-/// 注销：吊销当前令牌。
+/// 注销：吊销当前令牌（写入操作审计）。
 fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if let Some(token) = bearer_token(ctx) {
+        if let Some(principal) = panel.principal(ctx) {
+            audit::record(
+                &panel.base,
+                &audit::AuditEntry {
+                    user: principal.name,
+                    ip: client_ip(ctx),
+                    action: "logout".to_string(),
+                    title: action_title("logout"),
+                    method: ctx.req.method.clone(),
+                    path: ctx.req.path.clone(),
+                    detail: String::new(),
+                    success: true,
+                    code: 0,
+                    message: "已退出登录".to_string(),
+                    elapsed_ms: 0,
+                },
+            );
+        }
         panel.revoke_token(&token);
     }
     json_result(0, "ok", None)
@@ -689,6 +1238,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
         config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
+        config_item("LogCleanupPaths", "日志清理自定义路径（分号分隔）", "String", cfg.log_cleanup_paths.clone(), "“日志清理”页额外扫描的路径（绝对路径，分号分隔多选）；目录=清空内容、文件=截断清空。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -733,11 +1283,14 @@ fn update_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "配置已更新，部分配置需重启服务后生效", None)
 }
 
-/// 修改密码（校验旧密码，立即生效）。
+/// 修改密码：内置管理员改配置凭据；数据库用户改本人（均校验旧密码，立即生效）。
 fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
+    let Some(principal) = panel.principal(ctx) else {
+        return json_error(401, "Unauthorized");
+    };
 
     let old_password = arg(ctx, "oldPassword").unwrap_or_default();
     let new_password = arg(ctx, "newPassword").unwrap_or_default();
@@ -749,16 +1302,35 @@ fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(400, "Missing newPassword");
     }
 
-    if old_password != panel.manager.config().web_user_password {
-        return json_error(403, "Old password is incorrect");
+    if principal.is_admin {
+        if old_password != panel.manager.config().web_user_password {
+            return json_error(403, "Old password is incorrect");
+        }
+        panel
+            .manager
+            .update_config(|cfg| cfg.web_user_password = new_password);
+        util::log_info("Web 面板密码已修改");
+        return json_result(0, "密码已修改，下次登录请使用新密码", None);
     }
 
-    panel
-        .manager
-        .update_config(|cfg| cfg.web_user_password = new_password);
-    util::log_info("Web 面板密码已修改");
-
-    json_result(0, "密码已修改，下次登录请使用新密码", None)
+    match audit::change_user_password(
+        panel.base(),
+        &principal.name,
+        &old_password,
+        &new_password,
+    ) {
+        Ok(()) => {
+            util::log_format("面板用户修改密码：{}", &[&principal.name]);
+            json_result(0, "密码已修改，下次登录请使用新密码", None)
+        }
+        Err(e) => {
+            if e.contains("旧密码") {
+                json_error(403, &e)
+            } else {
+                json_error(500, &e)
+            }
+        }
+    }
 }
 
 /// 读取日志（尾部若干行）。
@@ -1415,6 +1987,143 @@ fn get_process_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(json!({ "processes": processes, "total": total })))
 }
 
+// ————— 主体信息 / 用户管理 / 操作日志 —————
+
+/// 当前登录主体（前端据此渲染菜单与权限；登录后即取）。
+fn me(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(principal) = panel.principal(ctx) else {
+        return json_error(401, "Unauthorized");
+    };
+    let perms: Vec<&str> = if principal.is_admin {
+        audit::ALL_PERMISSIONS.iter().map(|(k, _)| *k).collect()
+    } else {
+        principal.perms.iter().map(|s| s.as_str()).collect()
+    };
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "user": principal.name,
+            "isAdmin": principal.is_admin,
+            "perms": perms,
+            "permissions": audit::ALL_PERMISSIONS
+                .iter()
+                .map(|(k, n)| json!({ "key": k, "name": n }))
+                .collect::<Vec<_>>(),
+        })),
+    )
+}
+
+/// 面板用户列表（含可选权限清单；仅内置管理员）。
+fn user_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match audit::list_users_json(panel.base()) {
+        Ok(data) => json_result(0, "", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 保存面板用户（新增须密码；编辑密码留空 = 不变；仅内置管理员）。
+fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let name = body
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let password = body
+        .get("password")
+        .and_then(|v| v.as_str())
+        .map(String::from);
+    let enabled = body
+        .get("enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let remark = body
+        .get("remark")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let permissions: Vec<String> = body
+        .get("permissions")
+        .and_then(|v| v.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let cfg = panel.manager.config();
+    if name.eq_ignore_ascii_case(cfg.web_user_name.trim()) {
+        return json_error(400, "用户名与内置管理员冲突，请另选名称");
+    }
+    match audit::save_user(
+        panel.base(),
+        &name,
+        password.as_deref(),
+        &permissions,
+        enabled,
+        &remark,
+    ) {
+        Ok(()) => {
+            util::log_format("面板用户已保存：{}", &[&name]);
+            json_result(0, "已保存", None)
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 删除面板用户（仅内置管理员）。
+fn user_delete(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let name = arg(ctx, "name").unwrap_or_default();
+    if name.trim().is_empty() {
+        return json_error(400, "缺少用户名");
+    }
+    match audit::delete_user(panel.base(), &name) {
+        Ok(()) => {
+            util::log_format("面板用户已删除：{}", &[&name]);
+            json_result(0, "已删除", None)
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 操作日志分页查询（审计页；`page/size/user/q/success` 筛选）。
+fn audit_logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let page: usize = arg(ctx, "page")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(1);
+    let size: usize = arg(ctx, "size")
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(50);
+    let user = arg(ctx, "user").unwrap_or_default();
+    let q = arg(ctx, "q").unwrap_or_default();
+    let success = match arg(ctx, "success").unwrap_or_default().trim() {
+        "true" => Some(true),
+        "false" => Some(false),
+        _ => None,
+    };
+    match audit::query_logs(panel.base(), page, size, &user, &q, success) {
+        Ok(data) => json_result(0, "", Some(data)),
+        Err(e) => json_error(500, &e),
+    }
+}
+
 // ————— 辅助 —————
 
 /// 运行时长格式化（`d.hh:mm:ss`，与 C# 面板一致）。
@@ -1595,6 +2304,7 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
             }
             _ => false,
         },
+        "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -2210,14 +2920,14 @@ mod tests {
         assert_eq!(j["data"]["columns"][0], "a");
         assert_eq!(j["data"]["rows"][0][0], 1);
 
-        // 概况
+        // 概况（流量 2 张 + 面板用户 + 操作审计）
         let j = body_json(db_info(
             &panel,
             &context("GET", "/star/dbInfo", "", Some(&token)),
         ));
         assert_eq!(j["code"], 0);
         assert_eq!(j["data"]["provider"], "SQLite");
-        assert_eq!(j["data"]["tables"].as_array().map(|a| a.len()), Some(2));
+        assert_eq!(j["data"]["tables"].as_array().map(|a| a.len()), Some(4));
 
         // 备份下载
         let r = db_backup(&panel, &context("GET", "/star/dbBackup", "", Some(&token)));
@@ -2438,5 +3148,140 @@ mod tests {
         assert_eq!(format_bytes(1536), "1.5 KB");
         assert_eq!(format_bytes(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(format_bytes(3 * 1024 * 1024 * 1024), "3.00 GB");
+    }
+
+    #[test]
+    fn login_writes_audit_and_me_reports_permissions() {
+        let (panel, dir) = panel_with_default_password();
+        audit::save_user(
+            &dir,
+            "viewer",
+            Some("vw123"),
+            &["traffic".into(), "dashboard".into()],
+            true,
+            "只读用户",
+        )
+        .unwrap();
+
+        // 表用户登录成功
+        let r = body_json(login(
+            &panel,
+            &context(
+                "POST",
+                "/api/login",
+                r#"{"user":"viewer","password":"vw123"}"#,
+                None,
+            ),
+        ));
+        assert_eq!(r["code"], 0);
+        let token = r["data"]["token"].as_str().unwrap().to_string();
+
+        // /api/me 返回其权限（顺序按权限清单归一化）
+        let m = body_json(me(&panel, &context("GET", "/api/me", "", Some(&token))));
+        assert_eq!(m["code"], 0);
+        assert_eq!(m["data"]["user"], "viewer");
+        assert_eq!(m["data"]["isAdmin"], false);
+        assert_eq!(m["data"]["perms"], json!(["dashboard", "traffic"]));
+
+        // 成功登录已写审计
+        let logs = audit::query_logs(&dir, 1, 50, "viewer", "", None).unwrap();
+        assert_eq!(logs["total"], 1);
+        assert_eq!(logs["items"][0]["action"], "login");
+        assert_eq!(logs["items"][0]["success"], true);
+
+        // 失败登录同样写审计
+        let _ = login(
+            &panel,
+            &context(
+                "POST",
+                "/api/login",
+                r#"{"user":"viewer","password":"bad"}"#,
+                None,
+            ),
+        );
+        let logs = audit::query_logs(&dir, 1, 50, "viewer", "", None).unwrap();
+        assert_eq!(logs["total"], 2);
+
+        crate::history::drop_storage_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn guarded_enforces_permissions_and_audits_changes() {
+        let (panel, dir) = panel_with_default_password();
+        audit::save_user(&dir, "op1", Some("pw1"), &["fileman".into()], true, "").unwrap();
+        let token = panel.issue_token("op1", "pw1").unwrap();
+
+        // 有权限的动作：放行且写入审计
+        let file_act = guarded(panel.clone(), PERM_FILEMAN, |_, _| json_result(0, "ok", None));
+        let r = body_json(file_act(&context(
+            "POST",
+            "/star/fileDelete",
+            r#"{"paths":["x"]}"#,
+            Some(&token),
+        )));
+        assert_eq!(r["code"], 0);
+        let logs = audit::query_logs(&dir, 1, 50, "op1", "", None).unwrap();
+        assert_eq!(logs["total"], 1);
+        assert_eq!(logs["items"][0]["action"], "fileDelete");
+        assert_eq!(logs["items"][0]["success"], true);
+
+        // 无权限的动作：403 且记为失败
+        let db_act = guarded(panel.clone(), PERM_DATABASE, |_, _| json_result(0, "ok", None));
+        let r = body_json(db_act(&context("POST", "/star/dbQuery", "", Some(&token))));
+        assert_eq!(r["code"], 403);
+        let denied = audit::query_logs(&dir, 1, 50, "op1", "dbQuery", Some(false)).unwrap();
+        assert_eq!(denied["total"], 1);
+
+        // 内置管理员全放行
+        let admin_token = panel.issue_token("admin", "admin").unwrap();
+        let r = body_json(db_act(&context("POST", "/star/dbQuery", "", Some(&admin_token))));
+        assert_eq!(r["code"], 0);
+
+        // 远程未认证：401（不写审计）
+        let before = audit::query_logs(&dir, 1, 50, "", "", None).unwrap()["total"]
+            .as_u64()
+            .unwrap();
+        let r = body_json(db_act(&context("POST", "/star/dbQuery", "", None)));
+        assert_eq!(r["code"], 401);
+        let after = audit::query_logs(&dir, 1, 50, "", "", None).unwrap()["total"]
+            .as_u64()
+            .unwrap();
+        assert_eq!(before, after, "未认证请求不写审计");
+
+        crate::history::drop_storage_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn summarize_request_redacts_passwords_and_tokens() {
+        // JSON 体：password 字段脱敏
+        let ctx = Ctx::build(HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/changePassword".to_string(),
+            query: String::new(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: br#"{"oldPassword":"secretA","newPassword":"secretB"}"#
+                .to_vec()
+                .into(),
+            remote_addr: Some("127.0.0.1:1".to_string()),
+        });
+        let text = summarize_request(&ctx);
+        assert!(text.contains("\"oldPassword\":\"***\""), "{text}");
+        assert!(text.contains("\"newPassword\":\"***\""), "{text}");
+        assert!(!text.contains("secretA"), "{text}");
+
+        // 查询串：token 参数脱敏
+        let ctx = Ctx::build(HttpRequest {
+            method: "GET".to_string(),
+            path: "/star/dbDownloadBackup".to_string(),
+            query: "name=a.zip&token=abcdef".to_string(),
+            headers: Vec::new(),
+            body: Vec::new().into(),
+            remote_addr: Some("127.0.0.1:1".to_string()),
+        });
+        let text = summarize_request(&ctx);
+        assert!(text.contains("token=***"), "{text}");
+        assert!(!text.contains("abcdef"), "{text}");
     }
 }

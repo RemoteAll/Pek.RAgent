@@ -49,6 +49,34 @@
         <Column Name="CreateTime" DataType="DateTime" Description="创建时间（首次落库）" />
         <Column Name="UpdateTime" DataType="DateTime" Description="更新时间（最后采集刷新）" />
       </Columns>
+    </Table>    <Table Name="PanelUser" TableName="Agent_PanelUser" Description="面板用户（多用户与菜单权限；admin 为配置文件内置换算，不落本表）">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="UserName" DataType="String" Length="50" Master="True" Nullable="False" Description="用户名（唯一）" />
+        <Column Name="PasswordHash" DataType="String" Length="128" Nullable="False" Description="密码哈希（SHA-256(salt:password) 的 hex）" />
+        <Column Name="Salt" DataType="String" Length="64" Nullable="False" Description="随机盐（hex）" />
+        <Column Name="Permissions" DataType="String" Length="500" Nullable="False" Description="菜单权限（逗号分隔的 key：dashboard,services,traffic,control,config,starconfig,logs,watchdog,database,fileman,cleanup,audit）" />
+        <Column Name="Enabled" DataType="Boolean" Nullable="False" Description="是否启用（禁用后无法登录）" />
+        <Column Name="Remark" DataType="String" Length="200" Description="备注" />
+        <Column Name="CreateTime" DataType="DateTime" Description="创建时间" />
+        <Column Name="UpdateTime" DataType="DateTime" Description="更新时间" />
+      </Columns>
     </Table>
-  </Tables>
+    <Table Name="OperationLog" TableName="Agent_OperationLog" Description="操作审计日志（登录与所有变更类操作；敏感字段已脱敏）">
+      <Columns>
+        <Column Name="Id" DataType="Int32" Identity="True" PrimaryKey="True" Description="编号" />
+        <Column Name="LogTime" DataType="DateTime" Nullable="False" Description="操作时间" />
+        <Column Name="UserName" DataType="String" Length="50" Nullable="False" Description="操作者（本机免登录记为 admin；无鉴权模式远程记为 anon）" />
+        <Column Name="Ip" DataType="String" Length="64" Nullable="False" Description="来源 IP" />
+        <Column Name="Action" DataType="String" Length="60" Nullable="False" Description="动作（接口名，如 fileDelete）" />
+        <Column Name="Title" DataType="String" Length="100" Nullable="False" Description="动作中文名" />
+        <Column Name="Method" DataType="String" Length="10" Nullable="False" Description="HTTP 方法" />
+        <Column Name="Path" DataType="String" Length="200" Nullable="False" Description="请求路径（含查询串）" />
+        <Column Name="Detail" DataType="String" Length="500" Description="参数摘要（密码等敏感字段脱敏，截断）" />
+        <Column Name="Success" DataType="Boolean" Nullable="False" Description="是否成功（结果码为 0）" />
+        <Column Name="Code" DataType="Int32" Nullable="False" Description="结果码（0 成功）" />
+        <Column Name="Message" DataType="String" Length="300" Description="结果消息" />
+        <Column Name="ElapsedMs" DataType="Int32" Nullable="False" Description="耗时（毫秒）" />
+      </Columns>
+    </Table>  </Tables>
 </EntityModel>

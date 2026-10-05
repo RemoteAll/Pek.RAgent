@@ -227,6 +227,43 @@ html.light .info-table td{border-bottom-color:rgba(0,0,0,0.06)}
 .info-table td:first-child{font-size:13px;font-weight:600;color:var(--text-secondary);white-space:nowrap;width:200px;padding-right:20px}
 .info-table td:last-child{font-size:13px;color:var(--text-primary);word-break:break-all}
 .info-table tr:last-child td{border-bottom:none}
+/* ── 文件管理 ── */
+.fm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+.fm-path{font-size:12px;color:var(--text-secondary);background:var(--surface-2);border:1px solid var(--border-subtle);padding:5px 10px;border-radius:var(--radius-sm);max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono)}
+.fm-name{cursor:pointer;color:var(--text-primary);text-decoration:none;word-break:break-all}
+.fm-name:hover{text-decoration:underline;color:var(--brand-300)}
+html.light .fm-name:hover{color:var(--brand-600)}
+.fm-icon-btn{border:none;background:transparent;cursor:pointer;font-size:13px;padding:2px 6px;border-radius:6px;color:var(--text-secondary);line-height:1.4}
+.fm-icon-btn:hover{background:var(--surface-3);color:var(--text-primary)}
+.fm-row-actions{white-space:nowrap;text-align:right}
+.fm-empty{padding:32px;text-align:center;color:var(--text-muted)}
+.fm-search-list{max-height:320px;overflow:auto;border:1px solid var(--border-subtle);border-radius:var(--radius-sm);margin-bottom:8px}
+.fm-search-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid var(--border-subtle);font-size:12px}
+.fm-search-item:last-child{border-bottom:none}
+.fm-search-item .p{flex:1;word-break:break-all;color:var(--text-secondary)}
+.fm-editor{width:100%;height:320px;font-family:var(--font-mono);font-size:12px;line-height:1.5;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px;resize:vertical;outline:none;white-space:pre;overflow:auto}
+/* ── 日志清理 ── */
+.clean-summary{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 20px;border-radius:var(--radius-md);background:var(--gradient-brand-soft);border:1px solid var(--border-subtle);margin-bottom:16px;flex-wrap:wrap}
+.clean-summary-text{display:flex;align-items:center;gap:12px;font-size:14px;color:var(--text-secondary)}
+.clean-summary-text b{font-size:18px;color:var(--text-primary);font-family:var(--font-mono)}
+.clean-list{border:1px solid var(--border-subtle);border-radius:var(--radius-md);overflow:hidden}
+.clean-row{display:flex;align-items:center;gap:10px;padding:12px 16px;border-bottom:1px solid var(--border-subtle);flex-wrap:wrap}
+.clean-row:last-child{border-bottom:none}
+.clean-row.on{background:var(--gradient-brand-soft)}
+.clean-head{font-size:13px;padding:10px 16px}
+.clean-main{display:flex;align-items:center;gap:12px;flex:1;cursor:pointer;flex-wrap:wrap;min-width:0}
+.clean-main input{width:15px;height:15px;accent-color:var(--brand-500)}
+.clean-name{font-weight:600;font-size:14px}
+.clean-meta{font-size:13px;color:var(--text-secondary);font-family:var(--font-mono)}
+.clean-desc{font-size:12px;color:var(--orange)}
+.clean-detail{width:100%;margin:8px 0 0 27px;border-left:2px solid var(--border-default);padding-left:12px}
+.clean-target{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text-muted);padding:3px 0;font-family:var(--font-mono)}
+.clean-target .p{word-break:break-all}
+/* ── 用户 / 操作日志 ── */
+.perm-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px 10px;margin:4px 0 8px;font-size:13px}
+.perm-item{display:flex;align-items:center;gap:6px;cursor:pointer}
+.perm-item input{width:14px;height:14px;accent-color:var(--brand-500)}
+#panel-audit select{padding:8px 10px;border:1px solid var(--border-default);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text-primary);font-size:13px;outline:none}
 </style>
 </head>
 <body>
@@ -273,6 +310,10 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="logs">📋 日志</a>
 <a data-panel="watchdog">🐕 看门狗</a>
 <a data-panel="database">🗄 数据库</a>
+<a data-panel="fileman">🗂 文件管理</a>
+<a data-panel="cleanup">🧹 日志清理</a>
+<a data-panel="audit">📜 操作日志</a>
+<a data-panel="users">👥 用户</a>
 </nav>
 
 <div id="sec-banner" class="sec-banner hidden"></div>
@@ -287,6 +328,10 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-logs" class="panel"></div>
 <div id="panel-watchdog" class="panel"></div>
 <div id="panel-database" class="panel"></div>
+<div id="panel-fileman" class="panel"></div>
+<div id="panel-cleanup" class="panel"></div>
+<div id="panel-audit" class="panel"></div>
+<div id="panel-users" class="panel"></div>
 </main>
 </div>
 
@@ -340,10 +385,32 @@ async function logout(){
 
 function showApp(){
  $('login').style.display='none';$('app').style.display='block';
- loadDashboard();timer=setInterval(loadDashboard,3000);
- loadServices();svcTimer=setInterval(loadServices,3000);
- // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法时保持默认“状态”页）
- restorePanelFromHash();
+ loadMe().then(()=>{
+  // 按权限启动轮询（无权限的页签不发起请求）：仪表盘 / 子服务
+  if(canView('dashboard')){loadDashboard();timer=setInterval(loadDashboard,3000);}
+  if(canView('services')){loadServices();svcTimer=setInterval(loadServices,3000);}
+  // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法/无权限时回退到首个可用页）
+  restorePanelFromHash();
+ });
+}
+
+// 当前登录主体（/api/me：用户名/是否内置管理员/菜单权限）；加载失败时降级为不限制
+let me=null;
+async function loadMe(){
+ try{const j=await api('/api/me');me=(j&&j.code===0)?j.data:null;}catch(e){me=null}
+ renderNav();
+}
+function renderNav(){
+ document.querySelectorAll('#nav-bar a[data-panel]').forEach(a=>{
+  const k=a.dataset.panel;
+  let show=true;
+  if(k==='users')show=!!(me&&me.isAdmin);
+  else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
+  a.style.display=show?'':'none';
+ });
+}
+function canView(key){
+ return !me||me.isAdmin||(me.perms||[]).includes(key);
 }
 
 async function api(url,opt={}){
@@ -388,7 +455,11 @@ function switchPanel(name){
   starconfig:loadStarConfig,
   logs:loadLogs,
   watchdog:loadWatchDog,
-  database:loadDatabase
+  database:loadDatabase,
+  fileman:loadFileman,
+  cleanup:loadCleanup,
+  audit:loadAudit,
+  users:loadUsers
  };
  if(loaders[name])loaders[name]();
  if(name==='traffic'){applyTrafficSub(trafficSubFromHash());trafficTimer=setInterval(loadTraffic,3000);}
@@ -398,25 +469,31 @@ function switchPanel(name){
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
-// 从 URL hash 解析页签名（非法/缺省返回空串；与导航实际页签比对，避免选择器注入）
+// 从 URL hash 解析页签名（非法/缺省/无权限返回空串；与导航实际可见页签比对，避免选择器注入）
 // 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports
 function panelFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
  if(!h)return '';
  if(h==='ports')return 'traffic';
  const name=h.split('.')[0];
- return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name)?name:'';
+ return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
 }
 // 流量页子页签（site 网站流量 / ports 端口流量）
 function trafficSubFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
  return (h==='traffic.ports'||h==='ports')?'ports':'site';
 }
-// 恢复上次所在页签；缺省/状态页时不切换（仅规范化 hash）
+// 恢复上次所在页签；缺省/状态页时规范化 hash；无权限的页签回退到首个可用页
 function restorePanelFromHash(){
  const h=panelFromHash();
- if(h&&h!=='dashboard'){switchPanel(h);}
- else if(location.hash!=='#dashboard'){history.replaceState(null,'','#dashboard');}
+ if(h&&h!=='dashboard'){switchPanel(h);return;}
+ if(canView('dashboard')){
+  if(location.hash!=='#dashboard'){history.replaceState(null,'','#dashboard');}
+  return;
+ }
+ // 无“状态”权限：切到第一个可见页签
+ const first=[...document.querySelectorAll('#nav-bar a[data-panel]')].find(a=>a.style.display!=='none');
+ if(first)switchPanel(first.dataset.panel);
 }
 
 document.querySelector('#nav-bar').addEventListener('click',e=>{
@@ -1760,6 +1837,483 @@ async function fetchLogContent(){
  }catch(e){el.innerHTML=`<div class="log-empty">❌ 加载失败</div>`}
 }
 
+/* ── 文件管理 ── */
+let fmData=null,fmPath='',fmSelected=new Set();
+
+function fmJoin(name){
+ const p=(fmData&&fmData.path)?fmData.path:'';
+ if(!p)return /^[A-Za-z]:$/.test(name)?name+'\\':'/'+name;
+ if(p.endsWith('/')||p.endsWith('\\'))return p+name;
+ const sep=(p.includes('\\')&&!p.includes('/'))?'\\':'/';
+ return p+sep+name;
+}
+function fmParentText(){
+ const p=(fmData&&fmData.path)?fmData.path:'';
+ if(!p)return '';
+ return fmData.parent||'';
+}
+function fmReady(){if(fmData&&fmData.path)return true;showToast('请先进入具体目录','error');return false}
+function fmNavigate(path){fmPath=path;loadFileman()}
+
+async function loadFileman(){
+ try{
+  const j=await api('/star/fileList?path='+encodeURIComponent(fmPath||''));
+  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  fmData=j.data;fmSelected=new Set();
+  renderFileman();
+ }catch(e){}
+}
+
+function renderFileman(){
+ const d=fmData||{items:[]};
+ const isRoot=!d.path;
+ let rows='';
+ if(!(d.items||[]).length){rows=`<tr><td colspan="6" class="fm-empty">${isRoot?'':'此目录为空'}</td></tr>`}
+ else{(d.items||[]).forEach(it=>{
+  const name=it.name;
+  const checked=fmSelected.has(name)?'checked':'';
+  const icon=it.isDir?(it.isLink?'🔗':'📁'):'📄';
+  rows+=`<tr>
+   <td style="width:34px"><input type="checkbox" ${checked} onchange="fmToggle('${escAttr(name)}',this.checked)"></td>
+   <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
+   <td style="width:92px" class="text-secondary">${it.isDir?'—':fmtBytes(it.size)}</td>
+   <td style="width:152px" class="text-muted">${esc(it.mtime||'')}</td>
+   <td style="width:72px" class="text-muted">${esc(it.perm||'—')}</td>
+   <td class="fm-row-actions" style="width:118px">${isRoot?'':`
+    ${it.isDir?'':`<button class="fm-icon-btn" title="下载" onclick="fmDownload(fmJoin('${escAttr(name)}'))">⬇</button>`}
+    <button class="fm-icon-btn" title="重命名" onclick="fmRename('${escAttr(name)}')">✏️</button>
+    <button class="fm-icon-btn" title="删除" onclick="fmDelete(['${escAttr(name)}'])">🗑️</button>`}
+   </td>
+  </tr>`;
+ });}
+ const sel=fmSelected.size;
+ const canUp=!!(fmParentText()||d.path);
+ let html=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🗂 文件管理</h2>
+   <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-secondary btn-sm" onclick="$('fm-upload-input').click()">⬆ 上传</button>
+    <input type="file" id="fm-upload-input" multiple style="display:none" onchange="fmUpload(this)">
+    <button class="btn btn-secondary btn-sm" onclick="fmMkdir()">📁 新建文件夹</button>
+    <button class="btn btn-secondary btn-sm" onclick="fmNewFile()">📄 新建文件</button>
+    <button class="btn btn-secondary btn-sm" onclick="fmSearchPrompt()">🔍 搜索</button>
+    <button class="btn btn-secondary btn-sm" onclick="loadFileman()">⟳ 刷新</button>
+   </div>
+  </div>
+  <div class="fm-toolbar">
+   <button class="btn btn-ghost btn-sm" onclick="fmNavigate('')">🖥 根目录</button>
+   <button class="btn btn-ghost btn-sm" ${canUp?'':'disabled'} onclick="fmNavigate(fmParentText())">⬆ 上一级</button>
+   <span class="fm-path" title="${escAttr(d.path||'计算机')}">${esc(d.path||'计算机')}</span>
+   <span style="flex:1"></span>
+   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmCompress()">🗜 压缩</button>
+   <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmExtract()">📤 解压</button>
+   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmTransfer(false)">📋 复制</button>
+   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmTransfer(true)">✂ 移动</button>
+   <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmChmod()">🔒 权限</button>
+   <button class="btn btn-danger btn-sm" ${sel?'':'disabled'} onclick="fmDelete([...fmSelected])">🗑 删除</button>
+  </div>
+  <div style="overflow-x:auto"><table class="svc-table">
+   <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
+   <tbody>${rows}</tbody>
+  </table></div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 上传/编辑上限 64MB/2MB</div>
+ </div>`;
+ $('panel-fileman').innerHTML=html;
+}
+
+function fmToggle(name,checked){checked?fmSelected.add(name):fmSelected.delete(name);renderFileman()}
+function fmOpen(name,isDir){
+ if(isDir){fmNavigate(fmJoin(name));return}
+ fmEdit(fmJoin(name));
+}
+
+function fmPrompt(title,labelHtml,value,okText,cb){
+ showModal(title,`${labelHtml}<input type="text" id="fm-prompt-input" value="${escAttr(value||'')}" style="width:100%;margin-top:10px">`,okText,()=>{
+  const el=$('fm-prompt-input');
+  cb(el?el.value:'');
+ });
+ setTimeout(()=>{const el=$('fm-prompt-input');if(el){el.focus();el.select()}},50);
+}
+
+function fmUpload(input){
+ const files=[...input.files];input.value='';
+ if(!files.length)return;
+ if(!fmReady())return;
+ const dir=fmData.path;let i=0,ok=0,fail=0;
+ const next=()=>{
+  if(i>=files.length){
+   showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个`:''}`,fail?'error':'success');
+   loadFileman();return;
+  }
+  const f=files[i++];
+  showToast(`正在上传 ${i}/${files.length}：${f.name}`,'info');
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name));
+  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${i}/${files.length}：${f.name} ${Math.round(e.loaded/e.total*100)}%`,'info')};
+  xhr.onload=()=>{
+   let msg='';
+   try{const j=JSON.parse(xhr.responseText);if(j.code===0)ok++;else{fail++;msg=j.message||''}}catch(e){fail++}
+   if(msg)console.warn('上传失败 '+f.name+'：'+msg);
+   next();
+  };
+  xhr.onerror=()=>{fail++;next()};
+  xhr.send(f);
+ };
+ next();
+}
+
+async function fmDownload(path){
+ try{
+  const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:token?{'Authorization':'Bearer '+token}:{}});
+  const ct=r.headers.get('content-type')||'';
+  if(!r.ok||ct.includes('application/json')){
+   let msg='下载失败';
+   try{const j=await r.json();msg=j.message||msg}catch(e){}
+   showToast(msg,'error');return;
+  }
+  const blob=await r.blob();
+  const name=path.split(/[\\/]/).pop()||'download';
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+  document.body.appendChild(a);a.click();
+  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
+ }catch(e){showToast('下载失败','error')}
+}
+
+function fmDelete(names){
+ if(!(names&&names.length))return;
+ showModal('删除确认',`确定删除选中的 <b>${names.length}</b> 项？<br><span class="text-muted">文件夹将连同内容递归删除，此操作不可恢复</span>`,'删除',async()=>{
+  const paths=names.map(n=>fmJoin(n));
+  const j=await api('/star/fileDelete',{method:'POST',body:JSON.stringify({paths})});
+  if(j.code!==0){showToast(j.message||'删除失败','error');return}
+  showToast(`已删除 ${j.data.deleted} 项（释放 ${fmtBytes(j.data.freedBytes)}）`,'success');
+  loadFileman();
+ });
+}
+
+function fmRename(name){
+ fmPrompt('重命名','新名称',name,'重命名',async v=>{
+  v=v.trim();if(!v||v===name)return;
+  const j=await api('/star/fileRename',{method:'POST',body:JSON.stringify({path:fmJoin(name),newName:v})});
+  if(j.code!==0){showToast(j.message||'重命名失败','error');return}
+  showToast('已重命名','success');loadFileman();
+ });
+}
+
+function fmMkdir(){
+ if(!fmReady())return;
+ fmPrompt('新建文件夹','文件夹名称','','创建',async v=>{
+  v=v.trim();if(!v)return;
+  const j=await api('/star/fileMkdir',{method:'POST',body:JSON.stringify({path:fmData.path,name:v})});
+  if(j.code!==0){showToast(j.message||'创建失败','error');return}
+  showToast('已创建','success');loadFileman();
+ });
+}
+
+function fmNewFile(){
+ if(!fmReady())return;
+ fmPrompt('新建文件','文件名称（含扩展名，如 config.json）','','创建',async v=>{
+  v=v.trim();if(!v)return;
+  const j=await api('/star/fileNewFile',{method:'POST',body:JSON.stringify({path:fmData.path,name:v})});
+  if(j.code!==0){showToast(j.message||'创建失败','error');return}
+  showToast('已创建','success');loadFileman();
+ });
+}
+
+function fmCompress(){
+ const names=[...fmSelected];if(!names.length||!fmReady())return;
+ const def=((names.length===1?names[0]:'archive').replace(/[\\/]+$/,''))+'.zip';
+ fmPrompt('压缩为 ZIP',`将选中的 <b>${names.length}</b> 项压缩到当前目录：`,def,'压缩',async v=>{
+  v=v.trim();if(!v)return;
+  const paths=names.map(n=>fmJoin(n));
+  const j=await api('/star/fileCompress',{method:'POST',body:JSON.stringify({paths,target:fmData.path,name:v})});
+  if(j.code!==0){showToast(j.message||'压缩失败','error');return}
+  showToast(`压缩完成（${j.data.fileCount} 个文件，${fmtBytes(j.data.size)}）`,'success');loadFileman();
+ });
+}
+
+function fmExtract(){
+ const names=[...fmSelected];if(names.length!==1||!fmReady())return;
+ const name=names[0];
+ showModal('解压 ZIP',`将 <b>${esc(name)}</b> 解压到所在目录（保留内部目录结构）？`,'解压',async()=>{
+  const j=await api('/star/fileExtract',{method:'POST',body:JSON.stringify({path:fmJoin(name)})});
+  if(j.code!==0){showToast(j.message||'解压失败','error');return}
+  showToast(`解压完成：${j.data.fileCount} 个文件`,'success');loadFileman();
+ });
+}
+
+function fmTransfer(isMove){
+ const names=[...fmSelected];if(!names.length||!fmReady())return;
+ fmPrompt(isMove?'移动到…':'复制到…','目标目录（绝对路径）：',fmData.path,isMove?'移动':'复制',async v=>{
+  v=v.trim();if(!v)return;
+  const paths=names.map(n=>fmJoin(n));
+  const j=await api(isMove?'/star/fileMove':'/star/fileCopy',{method:'POST',body:JSON.stringify({paths,target:v})});
+  if(j.code!==0){showToast(j.message||'操作失败','error');return}
+  showToast(isMove?'已移动':'已复制','success');loadFileman();
+ });
+}
+
+function fmChmod(){
+ const names=[...fmSelected];if(names.length!==1)return;
+ fmPrompt('修改权限','八进制权限（如 755、644；仅 Linux/macOS）：','755','应用',async v=>{
+  v=v.trim();if(!v)return;
+  const j=await api('/star/fileChmod',{method:'POST',body:JSON.stringify({path:fmJoin(names[0]),mode:v})});
+  if(j.code!==0){showToast(j.message||'修改失败','error');return}
+  showToast('权限已修改','success');loadFileman();
+ });
+}
+
+function fmSearchPrompt(){
+ if(!fmReady())return;
+ fmPrompt('搜索文件','名称关键词（不区分大小写，递归当前目录）：','','搜索',async v=>{
+  v=v.trim();if(!v)return;
+  const j=await api('/star/fileSearch?path='+encodeURIComponent(fmData.path)+'&q='+encodeURIComponent(v));
+  if(j.code!==0){showToast(j.message||'搜索失败','error');return}
+  const items=j.data.items||[];
+  let body;
+  if(!items.length){body='<div class="text-muted">无匹配结果</div>'}
+  else{
+   body=`<div class="fm-search-list">`+items.map(it=>
+    `<div class="fm-search-item"><span>${it.isDir?(it.isLink?'🔗':'📁'):'📄'}</span><span class="p" title="${escAttr(it.path)}">${esc(it.path)}</span>${it.isDir?`<button class="fm-icon-btn" title="打开目录" onclick="fmReveal('${escAttr(it.path)}')">打开</button>`:''}</div>`).join('')+`</div>`;
+   if(j.data.truncated)body+=`<div class="text-muted" style="font-size:11px;margin-top:6px">结果已截断（最多 200 条结果 / 扫描 20000 项）</div>`;
+  }
+  showModal(`搜索结果（${items.length}）`,body,'关闭',null);
+ });
+}
+
+function fmReveal(path){closeModal();fmNavigate(path)}
+
+async function fmEdit(path){
+ try{
+  const j=await api('/star/fileRead?path='+encodeURIComponent(path));
+  if(j.code!==0){showToast(j.message||'读取失败','error');return}
+  const shortName=path.split(/[\\/]/).pop()||path;
+  showModal('编辑：'+shortName,
+   `<div class="text-muted" style="margin-bottom:8px">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</div><textarea id="fm-editor" class="fm-editor" spellcheck="false"></textarea>`,
+   '保存',async()=>{
+    const content=$('fm-editor')?$('fm-editor').value:'';
+    const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path,content})});
+    if(r.code!==0){showToast(r.message||'保存失败','error');return}
+    showToast('已保存','success');loadFileman();
+   });
+  const el=$('fm-editor');if(el)el.value=j.data.content;
+ }catch(e){}
+}
+
+/* ── 日志清理 ── */
+let cleanData=null,cleanChecked=new Set(),cleanExpanded=new Set();
+
+async function loadCleanup(){
+ try{
+  const j=await api('/star/logCleanScan');
+  if(j.code!==0){showToast(j.message||'扫描失败','error');return}
+  cleanData=j.data;cleanChecked=new Set();
+  renderCleanup();
+ }catch(e){}
+}
+
+function renderCleanup(){
+ const d=cleanData||{categories:[],totalSize:0};
+ let total=0,sel=0,allOn=(d.categories||[]).length>0;
+ let rows='';
+ (d.categories||[]).forEach(c=>{
+  const checked=cleanChecked.has(c.key);
+  total+=c.size;if(checked)sel+=c.size;else allOn=false;
+  const exp=cleanExpanded.has(c.key);
+  let detail='';
+  if(exp){
+   detail=`<div class="clean-detail">`+(c.targets||[]).map(t=>
+    `<div class="clean-target"><span class="p">${esc(t.path)}</span><span>${t.kind==='journal'?'journald':fmtBytes(t.size)}</span></div>`).join('')+`</div>`;
+  }
+  rows+=`<div class="clean-row ${checked?'on':''}">
+   <label class="clean-main">
+    <input type="checkbox" ${checked?'checked':''} onchange="cleanToggle('${c.key}',this.checked)">
+    <span class="clean-name">${esc(c.name)}</span>
+    <span class="clean-meta">共 ${c.count} 条数据，大小为 ${fmtBytes(c.size)}${c.truncated?'以上':''}</span>
+    <span class="clean-desc">（${esc(c.description)}）</span>
+   </label>
+   <button class="fm-icon-btn" onclick="cleanExpand('${c.key}')" title="展开明细">${exp?'▲':'▼'}</button>
+   ${detail}
+  </div>`;
+ });
+ let html=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🧹 日志清理</h2>
+   <button class="btn btn-secondary btn-sm" onclick="loadCleanup()">⟳ 重新扫描</button>
+  </div>
+  <div class="clean-summary">
+   <div class="clean-summary-text"><span style="font-size:22px">🧹</span><span>共 <b>${fmtBytes(total)}</b> 可清理，已选中 <b>${fmtBytes(sel)}</b></span></div>
+   <button class="btn btn-primary" ${sel?'':'disabled'} onclick="doClean()">立即清理</button>
+  </div>
+  <div class="clean-list">
+   <label class="clean-row clean-head"><input type="checkbox" ${allOn?'checked':''} onchange="cleanToggleAll(this.checked)"> <b>全选</b><span style="flex:1"></span><span class="text-muted" style="font-size:12px">共 ${(d.categories||[]).length} 个分类</span></label>
+   ${rows||'<div class="fm-empty">未发现可清理的日志</div>'}
+  </div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。自定义清理路径可在“配置”页 LogCleanupPaths 设置（分号分隔）。</div>
+ </div>`;
+ $('panel-cleanup').innerHTML=html;
+}
+
+function cleanToggle(key,checked){checked?cleanChecked.add(key):cleanChecked.delete(key);renderCleanup()}
+function cleanToggleAll(checked){cleanChecked=checked?new Set((cleanData&&cleanData.categories||[]).map(c=>c.key)):new Set();renderCleanup()}
+function cleanExpand(key){cleanExpanded.has(key)?cleanExpanded.delete(key):cleanExpanded.add(key);renderCleanup()}
+
+function doClean(){
+ const keys=[...cleanChecked];if(!keys.length)return;
+ showModal('清理确认',`确定清理所选 <b>${keys.length}</b> 个分类？<br><span class="text-muted">日志文件将被清空、缓存目录内容将被删除，此操作不可恢复</span>`,'立即清理',async()=>{
+  const j=await api('/star/logCleanRun',{method:'POST',body:JSON.stringify({keys})});
+  if(j.code!==0){showToast(j.message||'清理失败','error');return}
+  const errs=(j.data.details||[]).reduce((a,x)=>a+((x.errors||[]).length),0);
+  showToast(`清理完成，共释放 ${fmtBytes(j.data.freedBytes)}${errs?`（${errs} 个错误，详见日志）`:''}`,errs?'error':'success');
+  loadCleanup();
+ });
+}
+
+/* ── 操作日志（审计） ── */
+let auditData=null,auditPage=1,auditFilters={q:'',user:'',success:''};
+
+async function loadAudit(){
+ try{
+  const params=new URLSearchParams({page:String(auditPage),size:'50'});
+  if(auditFilters.q)params.set('q',auditFilters.q);
+  if(auditFilters.user)params.set('user',auditFilters.user);
+  if(auditFilters.success)params.set('success',auditFilters.success);
+  const j=await api('/star/auditLogs?'+params.toString());
+  if(j.code!==0){$('panel-audit').innerHTML=`<div class="glass-card card"><h2>📜 操作日志</h2><p class="text-muted">${esc(j.message||'加载失败')}</p></div>`;return}
+  auditData=j.data;renderAudit();
+ }catch(e){}
+}
+
+function renderAudit(){
+ const d=auditData||{items:[],total:0,page:1,size:50};
+ let rows='';
+ (d.items||[]).forEach(it=>{
+  rows+=`<tr>
+   <td class="text-muted" style="white-space:nowrap">${esc(it.time)}</td>
+   <td style="white-space:nowrap">${esc(it.userName)}<div class="text-muted" style="font-size:11px">${esc(it.ip)}</div></td>
+   <td style="white-space:nowrap">${esc(it.title)}<div class="text-muted" style="font-size:11px">${esc(it.action)} ${esc(it.method)}</div></td>
+   <td class="text-secondary" style="font-size:12px;word-break:break-all;max-width:380px">${esc(it.detail||'')}</td>
+   <td style="white-space:nowrap">${it.success?'<span class="text-green">✓ 成功</span>':'<span class="text-red">✗ 失败</span>'}<div class="text-muted" style="font-size:11px">${esc(it.success?'':(it.message||('code '+it.code)))}</div></td>
+   <td class="text-muted" style="white-space:nowrap">${it.elapsedMs}ms</td>
+  </tr>`;
+ });
+ const totalPages=Math.max(1,Math.ceil(d.total/(d.size||50)));
+ let html=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>📜 操作日志</h2>
+   <button class="btn btn-secondary btn-sm" onclick="loadAudit()">⟳ 刷新</button>
+  </div>
+  <div class="fm-toolbar">
+   <input type="text" id="audit-q" placeholder="关键词（动作/路径/详情）" value="${escAttr(auditFilters.q)}" style="max-width:240px" onkeydown="if(event.key==='Enter')auditFilter()">
+   <input type="text" id="audit-user" placeholder="操作者" value="${escAttr(auditFilters.user)}" style="max-width:140px" onkeydown="if(event.key==='Enter')auditFilter()">
+   <select id="audit-success" style="max-width:120px">
+    <option value="">全部结果</option>
+    <option value="true" ${auditFilters.success==='true'?'selected':''}>仅成功</option>
+    <option value="false" ${auditFilters.success==='false'?'selected':''}>仅失败</option>
+   </select>
+   <button class="btn btn-primary btn-sm" onclick="auditFilter()">🔍 筛选</button>
+  </div>
+  <div style="overflow-x:auto"><table class="svc-table">
+   <thead><tr><th>时间</th><th>操作者</th><th>动作</th><th>详情</th><th>结果</th><th>耗时</th></tr></thead>
+   <tbody>${rows||'<tr><td colspan="6" class="fm-empty">暂无操作记录</td></tr>'}</tbody>
+  </table></div>
+  <div class="fm-toolbar" style="justify-content:flex-end;margin-top:10px;margin-bottom:0">
+   <span class="text-muted" style="font-size:12px">共 ${d.total} 条${d.truncated?'（仅扫描最近 2 万条）':''}</span>
+   <button class="btn btn-secondary btn-sm" ${d.page<=1?'disabled':''} onclick="auditGo(${d.page-1})">上一页</button>
+   <span class="text-secondary" style="font-size:12px">第 ${d.page} / ${totalPages} 页</span>
+   <button class="btn btn-secondary btn-sm" ${d.page>=totalPages?'disabled':''} onclick="auditGo(${d.page+1})">下一页</button>
+  </div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">登录、配置修改、服务控制、文件管理、日志清理等全部变更类操作自动落库（密码等敏感字段已脱敏）；本页查询本身受“操作日志”菜单权限控制。</div>
+ </div>`;
+ $('panel-audit').innerHTML=html;
+}
+
+function auditFilter(){
+ auditFilters.q=$('audit-q')?$('audit-q').value.trim():'';
+ auditFilters.user=$('audit-user')?$('audit-user').value.trim():'';
+ auditFilters.success=$('audit-success')?$('audit-success').value:'';
+ auditPage=1;loadAudit();
+}
+function auditGo(p){auditPage=Math.max(1,p);loadAudit()}
+
+/* ── 用户管理（仅内置管理员） ── */
+let usersData=null;
+
+async function loadUsers(){
+ try{
+  const j=await api('/star/userList');
+  if(j.code!==0){$('panel-users').innerHTML=`<div class="glass-card card"><h2>👥 用户管理</h2><p class="text-muted">${esc(j.message||'加载失败')}</p></div>`;return}
+  usersData=j.data;renderUsers();
+ }catch(e){}
+}
+
+function renderUsers(){
+ const d=usersData||{users:[],permissions:[]};
+ let rows='';
+ (d.users||[]).forEach(u=>{
+  rows+=`<tr>
+   <td>👤 ${esc(u.userName)}${u.remark?` <span class="text-muted" style="font-size:12px">（${esc(u.remark)}）</span>`:''}</td>
+   <td class="text-secondary" style="font-size:12px">${u.permissionNames&&u.permissionNames.length?esc(u.permissionNames.join('、')):'<span class="text-muted">无</span>'}</td>
+   <td>${u.enabled?'<span class="text-green">✅ 启用</span>':'<span class="text-red">⛔ 禁用</span>'}</td>
+   <td class="fm-row-actions">
+    <button class="btn btn-secondary btn-sm" onclick="userEdit('${escAttr(u.userName)}')">编辑</button>
+    <button class="btn btn-danger btn-sm" onclick="userDelete('${escAttr(u.userName)}')">删除</button>
+   </td>
+  </tr>`;
+ });
+ let html=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>👥 用户管理</h2>
+   <button class="btn btn-primary btn-sm" onclick="userEdit('')">➕ 新增用户</button>
+  </div>
+  <div style="overflow-x:auto"><table class="svc-table">
+   <thead><tr><th>用户名</th><th>菜单权限</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+   <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无用户（仅内置管理员）</td></tr>'}</tbody>
+  </table></div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">内置管理员（配置文件凭据）拥有全部权限；此处用户登录后仅能看到被勾选的菜单，越权请求会被服务端拒绝并记入操作日志。</div>
+ </div>`;
+ $('panel-users').innerHTML=html;
+}
+
+function userEdit(name){
+ const d=usersData||{users:[],permissions:[]};
+ const u=(d.users||[]).find(x=>x.userName===name);
+ const perms=new Set(u?(u.permissions||[]):[]);
+ const boxes=(d.permissions||[]).map(p=>`<label class="perm-item"><input type="checkbox" value="${escAttr(p.key)}" ${perms.has(p.key)?'checked':''}> ${esc(p.name)}</label>`).join('');
+ const body=`
+  <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">用户名</span>
+   <input type="text" id="user-name" value="${escAttr(name)}" ${u?'disabled':''} style="width:100%;margin-top:4px" placeholder="登录用户名"></div>
+  <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">密码${u?'（留空则不修改）':'（必填）'}</span>
+   <input type="password" id="user-pass" style="width:100%;margin-top:4px" placeholder="${u?'••••••':'设置初始密码'}" autocomplete="new-password"></div>
+  <div style="margin-bottom:6px"><span class="text-secondary" style="font-size:12px">菜单权限</span></div>
+  <div class="perm-grid">${boxes}</div>
+  <div style="margin:8px 0 10px"><label class="perm-item" style="font-size:13px"><input type="checkbox" id="user-enabled" ${!u||u.enabled?'checked':''}> 启用该用户</label></div>
+  <div><span class="text-secondary" style="font-size:12px">备注</span>
+   <input type="text" id="user-remark" value="${escAttr(u?u.remark:'')}" style="width:100%;margin-top:4px" placeholder="可选"></div>`;
+ showModal(u?'编辑用户：'+u.userName:'新增用户',body,'保存',async()=>{
+  const nmEl=$('user-name');
+  const nameVal=nmEl?nmEl.value.trim():name;
+  const pass=$('user-pass')?$('user-pass').value:'';
+  const enabled=$('user-enabled')?$('user-enabled').checked:true;
+  const remark=$('user-remark')?$('user-remark').value.trim():'';
+  const permissions=[...document.querySelectorAll('.perm-grid input:checked')].map(c=>c.value);
+  if(!nameVal){showToast('用户名不能为空','error');return}
+  const payload={name:nameVal,enabled,remark,permissions};
+  if(pass)payload.password=pass;
+  const j=await api('/star/userSave',{method:'POST',body:JSON.stringify(payload)});
+  if(j.code!==0){showToast(j.message||'保存失败','error');return}
+  showToast('已保存','success');loadUsers();
+ });
+}
+
+function userDelete(name){
+ showModal('删除用户',`确定删除用户 <b>${esc(name)}</b>？<br><span class="text-muted">该用户将立即无法登录</span>`,'删除',async()=>{
+  const j=await api('/star/userDelete',{method:'POST',body:JSON.stringify({name})});
+  if(j.code!==0){showToast(j.message||'删除失败','error');return}
+  showToast('已删除','success');loadUsers();
+ });
+}
+
 /* ── Watchdog ── */
 async function loadWatchDog(){
  try{
@@ -1780,7 +2334,7 @@ async function loadWatchDog(){
 }
 
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-function escAttr(s){return String(s??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
+function escAttr(s){return String(s??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;')}
 
 /* ── Theme ── */
 function getTheme(){return localStorage.getItem('agent_theme')||'auto'}

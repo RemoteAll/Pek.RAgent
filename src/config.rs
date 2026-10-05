@@ -82,6 +82,9 @@ pub struct AgentConfig {
     pub port_traffic_ports: String,
     /// 流量历史保留天数（SQLite 每日归档 `Data/traffic.db`，模型见 `Entity/Model.xml`）。默认 90；0 = 永久保留
     pub traffic_history_days: u32,
+    /// 日志清理自定义路径（分号分隔；目录=清空内容、文件=截断清空）。
+    /// 供 Web 面板「日志清理」页在平台内置分类之外额外扫描/清理
+    pub log_cleanup_paths: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -118,6 +121,7 @@ impl Default for AgentConfig {
             port_traffic_ports: String::new(),
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
+            log_cleanup_paths: String::new(),
             apps: sample_apps(),
         }
     }
@@ -336,6 +340,7 @@ impl AgentConfig {
         }
         self.web_logs = self.web_logs.trim().to_string();
         self.port_traffic_ports = self.port_traffic_ports.trim().to_string();
+        self.log_cleanup_paths = self.log_cleanup_paths.trim().to_string();
         // 流量历史保留天数：0 = 永久；非 0 时限定 7~3650 天（防误配清空全部历史）
         if self.traffic_history_days != 0 {
             self.traffic_history_days = self.traffic_history_days.clamp(
@@ -548,6 +553,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = parse_of::<u32>(obj, "TrafficHistoryDays") {
         cfg.traffic_history_days = v;
     }
+    if let Some(v) = text_of(obj, "LogCleanupPaths") {
+        cfg.log_cleanup_paths = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -661,6 +669,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("PortTraffic", bool_text(cfg.port_traffic));
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
         push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
+        push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -959,6 +968,30 @@ mod tests {
             text.contains("<TrafficHistoryDays>0</TrafficHistoryDays>"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn log_cleanup_paths_reads_renders_and_normalizes() {
+        // XML 读取路径（XML 值在 JSON 形态下是字符串）
+        let json: Json =
+            serde_json::from_str(r#"{ "LogCleanupPaths": " /var/log/x;/tmp/y " }"#).unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert_eq!(cfg.log_cleanup_paths, "/var/log/x;/tmp/y");
+
+        // 默认：空（不显示“自定义路径”分类）
+        assert!(AgentConfig::default().log_cleanup_paths.is_empty());
+
+        // 渲染：模板骨架带上新字段（注释由模板保障；空值也应写出空元素）
+        let mut cfg = AgentConfig::default();
+        cfg.log_cleanup_paths = "/www/wwwlogs;/tmp/cache".to_string();
+        let text = render_xml(&cfg, None).unwrap();
+        assert!(
+            text.contains("<LogCleanupPaths>/www/wwwlogs;/tmp/cache</LogCleanupPaths>"),
+            "{text}"
+        );
+        let empty = render_xml(&AgentConfig::default(), None).unwrap();
+        assert!(empty.contains("<LogCleanupPaths"), "{empty}");
     }
 
     #[test]
