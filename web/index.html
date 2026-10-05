@@ -2252,15 +2252,44 @@ function renderPlugins(){
   </div>`;
   return;
  }
+// 合并展示：在线插件源条目 + 本地安装（不在源中）的插件 —— 每个插件仅一行
+ const storeReady=!!(pluginStore&&pluginStore.configured&&!pluginStore.error);
+ const entries=storeReady?(pluginStore.plugins||[]):[];
+ const storeIds=new Set(entries.map(e=>e.id));
  let rows='';
+ entries.forEach(e=>{
+  const svc=e.app?pluginSvc[e.app]:null;
+  const appTxt=e.app?`<span class="text-muted" style="font-size:11px"> · 关联 ${esc(e.app)}${svc?(svc.running?' 🟢':' 🔴'):''}</span>`:'';
+  const svcBtns=(e.app&&canView('services'))?`<button class="btn btn-secondary btn-sm" onclick="doSvcAction('start','${escAttr(e.app)}')">启动</button><button class="btn btn-secondary btn-sm" onclick="doSvcAction('stop','${escAttr(e.app)}')">停止</button>`:'';
+  let ops='';
+  if(e.installed){
+   ops+=svcBtns+`<button class="btn btn-secondary btn-sm" onclick="pluginOpen('${escAttr(e.id)}')">打开</button>`;
+   ops+=e.upToDate
+    ?'<button class="btn btn-secondary btn-sm" disabled>已是最新</button>'
+    :`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">更新到 v${esc(e.version)}</button>`;
+   ops+=`<button class="btn btn-danger btn-sm" onclick="pluginDelete('${escAttr(e.id)}')">删除</button>`;
+  }else{
+   ops+=`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">安装</button>`;
+  }
+  const status=e.installed?('已安装'+(e.installedVersion?` v${esc(e.installedVersion)}`:'')+(e.upToDate?'':' · <span class="text-red">可更新</span>')):'未安装';
+  rows+=`<tr>
+   <td><b>${esc(e.icon||'🧩')} ${esc(e.name)}</b> <span class="text-muted" style="font-size:11px">v${esc(e.version)}</span>${appTxt}</td>
+   <td style="font-size:12px">${e.author?esc(e.author):'<span class="text-muted">—</span>'}</td>
+   <td class="text-muted" style="font-size:12px">${e.description?esc(e.description):'—'}</td>
+   <td style="font-size:12px">${status}</td>
+   <td class="fm-row-actions">${ops}</td>
+  </tr>`;
+ });
  (d.plugins||[]).forEach(p=>{
+  if(storeIds.has(p.id)) return;
   const svc=p.app?pluginSvc[p.app]:null;
-  const appCell=p.app?`${esc(p.app)} ${svc?(svc.running?'🟢':'🔴'):''}`:'<span class="text-muted">—</span>';
+  const appTxt=p.app?`<span class="text-muted" style="font-size:11px"> · 关联 ${esc(p.app)}${svc?(svc.running?' 🟢':' 🔴'):''}</span>`:'';
   const svcBtns=(p.app&&canView('services'))?`<button class="btn btn-secondary btn-sm" onclick="doSvcAction('start','${escAttr(p.app)}')">启动</button><button class="btn btn-secondary btn-sm" onclick="doSvcAction('stop','${escAttr(p.app)}')">停止</button>`:'';
   rows+=`<tr>
-   <td><b>${esc(p.icon||'🧩')} ${esc(p.name)}</b>${p.version?` <span class="text-muted" style="font-size:11px">v${esc(p.version)}</span>`:''}${p.description?`<div class="text-muted" style="font-size:12px">${esc(p.description)}</div>`:''}</td>
-   <td style="font-size:12px"><code>${esc(p.id)}</code></td>
-   <td style="font-size:12px">${appCell}</td>
+   <td><b>${esc(p.icon||'🧩')} ${esc(p.name)}</b>${p.version?` <span class="text-muted" style="font-size:11px">v${esc(p.version)}</span>`:''} <span class="text-muted" style="font-size:11px">· ${esc(p.id)}</span>${appTxt}</td>
+   <td style="font-size:12px"><span class="text-muted">—</span></td>
+   <td class="text-muted" style="font-size:12px">${p.description?esc(p.description):'—'}</td>
+   <td style="font-size:12px">已安装（本地）</td>
    <td class="fm-row-actions">${svcBtns}<button class="btn btn-secondary btn-sm" onclick="pluginOpen('${escAttr(p.id)}')">打开</button><button class="btn btn-danger btn-sm" onclick="pluginDelete('${escAttr(p.id)}')">删除</button></td>
   </tr>`;
  });
@@ -2281,8 +2310,10 @@ function renderPlugins(){
     ?(e.upToDate?'<button class="btn btn-secondary btn-sm" disabled>已是最新</button>':`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">更新到 v${esc(e.version)}</button>`)
     :`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">安装</button>`;
    srows+=`<tr>
-    <td><b>${esc(e.icon||'🧩')} ${esc(e.name)}</b> <span class="text-muted" style="font-size:11px">v${esc(e.version)}</span>${e.description?`<div class="text-muted" style="font-size:12px">${esc(e.description)}</div>`:''}</td>
-    <td style="font-size:12px">${e.installed?('已安装'+(e.installedVersion?` v${esc(e.installedVersion)}`:'')):'未安装'}</td>
+    <td><b>${esc(e.icon||'🧩')} ${esc(e.name)}</b> <span class="text-muted" style="font-size:11px">v${esc(e.version)}</span></td>
+    <td style="font-size:12px">${e.author?esc(e.author):'<span class="text-muted">—</span>'}</td>
+    <td class="text-muted" style="font-size:12px">${e.description?esc(e.description):'—'}</td>
+    <td style="font-size:12px">${e.installed?('已安装'+(e.installedVersion?` v${esc(e.installedVersion)}`:'')+(e.upToDate?'':' · <span class="text-red">可更新</span>')):'未安装'}</td>
     <td style="text-align:right">${btn}</td>
    </tr>`;
   });
@@ -2291,8 +2322,8 @@ function renderPlugins(){
    <span class="text-muted" style="font-size:12px">${pluginStore.signature?'🔏 强制验签已启用 · ':''}HTTPS + SHA-256 校验</span>
   </div>
   <div style="overflow-x:auto"><table class="svc-table">
-   <thead><tr><th>插件</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-   <tbody>${srows||'<tr><td colspan="3" class="fm-empty">插件源中暂无插件</td></tr>'}</tbody>
+   <thead><tr><th>插件</th><th>开发商</th><th>说明</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+   <tbody>${srows||'<tr><td colspan="5" class="fm-empty">插件源中暂无插件</td></tr>'}</tbody>
   </table></div></div>`;
  }
  const html=`<div class="glass-card card">
