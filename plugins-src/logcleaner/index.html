@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>日志清理</title>
+<style>
+ :root{--card:#fff;--text:#1f2937;--muted:#6b7280;--brand:#4f46e5;--border:#e5e7eb;--red:#dc2626;--ok:#059669;--amber:#d97706}
+ *{box-sizing:border-box}
+ body{margin:0;background:transparent;font:13px/1.7 system-ui,"Segoe UI","Microsoft YaHei",sans-serif;color:var(--text)}
+ .card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:16px;margin-bottom:14px;box-shadow:0 2px 10px rgba(15,23,42,.05)}
+ .flex-between{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+ h2{margin:0;font-size:16px}
+ button{padding:7px 14px;background:var(--brand);color:#fff;border:0;border-radius:8px;font-size:13px;cursor:pointer}
+ button:hover{filter:brightness(1.06)}
+ button.gray{background:#6b7280}
+ button.red{background:var(--red)}
+ button.sm{padding:3px 10px;font-size:12px}
+ button:disabled{opacity:.5;cursor:not-allowed}
+ input[type=text]{padding:7px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;outline:none}
+ input[type=text]:focus{border-color:var(--brand)}
+ .muted{color:var(--muted);font-size:12px}
+ .summary{display:flex;justify-content:space-between;align-items:center;background:#f8fafc;border:1px solid var(--border);border-radius:10px;padding:10px 14px;margin:12px 0}
+ .row{display:flex;align-items:center;gap:10px;padding:9px 10px;border:1px solid var(--border);border-radius:10px;margin-bottom:8px}
+ .row.on{border-color:var(--brand);background:#eef2ff}
+ .row .name{font-weight:600}
+ .row .meta{color:var(--muted);font-size:12px}
+ .row .desc{color:var(--muted);font-size:12px}
+ .row input[type=checkbox]{width:16px;height:16px}
+ .detail{margin:2px 0 8px 30px;font-size:12px;color:var(--muted)}
+ .detail .p{display:block;font-family:ui-monospace,Consolas,monospace;word-break:break-all;padding:2px 0}
+ .tag{display:inline-block;border-radius:999px;padding:0 8px;font-size:11px;background:#f3f4f6;color:#6b7280}
+ .tag.dir{background:#eef2ff;color:var(--brand)}
+ .tag.file{background:#ecfdf5;color:var(--ok)}
+ .custom-item{display:flex;align-items:center;gap:10px;padding:7px 10px;border:1px dashed var(--border);border-radius:8px;margin-bottom:6px}
+ .custom-item .p{flex:1;font-family:ui-monospace,Consolas,monospace;font-size:12px;word-break:break-all}
+ #toast{position:fixed;left:50%;top:14px;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
+ #toast.show{opacity:.95}
+ .err{color:var(--red);font-size:12px;min-height:16px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="card">
+ <div class="flex-between">
+  <h2>🧹 日志清理</h2>
+  <button class="gray sm" onclick="scan()">⟳ 重新扫描</button>
+ </div>
+ <div class="summary">
+  <div><span style="font-size:20px">🧹</span> 共 <b id="sum-total">—</b> 可清理，已选中 <b id="sum-sel">—</b></div>
+  <button id="run-btn" disabled onclick="runClean()">立即清理</button>
+ </div>
+ <div id="cats"><div class="muted">扫描中…</div></div>
+ <div class="muted" style="margin-top:8px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。</div>
+</div>
+
+<div class="card">
+ <div class="flex-between">
+  <h2>⚙ 自定义配置</h2>
+  <span class="muted">目录=清空内容（*.log 截断）；文件=截断清空</span>
+ </div>
+ <div id="custom-list" style="margin-top:10px"></div>
+ <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap">
+  <input type="text" id="new-path" placeholder="绝对路径，如 D:\logs 或 /var/log/myapp.log" style="flex:1;min-width:260px">
+  <button onclick="addCustom()">添加</button>
+ </div>
+ <div class="err" id="custom-err"></div>
+</div>
+
+<div id="toast"></div>
+<script>
+const $=id=>document.getElementById(id);
+const token=sessionStorage.getItem('agent_token')||'';
+let cleanData=null,cleanChecked=new Set(),cleanExpanded=new Set(),customPaths=[];
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+function fmtBytes(n){if(!n||n<0)return '0 B';n=Number(n);const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i===0?n:n.toFixed(2))+' '+u[i]}
+function toast(msg,type){const t=$('toast');t.textContent=msg;t.style.background=type==='error'?'#b91c1c':(type==='success'?'#065f46':'#111827');t.classList.add('show');clearTimeout(t._tid);t._tid=setTimeout(()=>t.classList.remove('show'),3200)}
+async function api(path,opt={}){
+ const r=await fetch(path,{...opt,headers:Object.assign({'Content-Type':'application/json'},opt.headers||{},token?{'Authorization':'Bearer '+token}:{})});
+ return r.json();
+}
+
+// ————— 扫描与清理 —————
+async function scan(){
+ $('cats').innerHTML='<div class="muted">扫描中…</div>';
+ try{
+  const j=await api('/star/logCleanScan');
+  if(j.code===401){$('cats').innerHTML='<div class="muted" style="color:#dc2626">未登录或会话已过期：请从主面板登录后重试</div>';return}
+  if(j.code!==0){$('cats').innerHTML='<div class="muted">扫描失败：'+esc(j.message||'')+'</div>';return}
+  cleanData=j.data;cleanChecked=new Set();
+  renderCats();
+ }catch(e){$('cats').innerHTML='<div class="muted">扫描失败（网络错误）</div>'}
+}
+function renderCats(){
+ const d=cleanData||{categories:[]};
+ let total=0,sel=0,allOn=(d.categories||[]).length>0,rows='';
+ (d.categories||[]).forEach(c=>{
+  const checked=cleanChecked.has(c.key);
+  total+=c.size;if(checked)sel+=c.size;else allOn=false;
+  const exp=cleanExpanded.has(c.key);
+  let detail='';
+  if(exp){detail='<div class="detail">'+(c.targets||[]).map(t=>'<span class="p">'+esc(t.path)+' <span class="tag '+(t.kind==='dir'?'dir':'file')+'">'+(t.kind==='dir'?'目录':'文件')+'</span> '+fmtBytes(t.size)+'</span>').join('')+'</div>'}
+  rows+='<div><div class="row '+(checked?'on':'')+'">'+
+   '<input type="checkbox" '+(checked?'checked':'')+' onchange="toggle(\''+c.key+'\',this.checked)">'+
+   '<span class="name">'+esc(c.name)+'</span>'+
+   '<span class="meta">共 '+c.count+' 条，大小 '+fmtBytes(c.size)+(c.truncated?'以上':'')+'</span>'+
+   '<span class="desc">（'+esc(c.description)+'）</span>'+
+   '<span style="flex:1"></span>'+
+   '<button class="gray sm" onclick="expand(\''+c.key+'\')">'+(exp?'▲':'▼')+'</button>'+
+  '</div>'+detail+'</div>';
+ });
+ $('cats').innerHTML='<label class="row" style="border-style:dashed"><input type="checkbox" '+(allOn?'checked':'')+' onchange="toggleAll(this.checked)"> <b>全选</b><span style="flex:1"></span><span class="muted">共 '+(d.categories||[]).length+' 个分类</span></label>'+(rows||'<div class="muted">未发现可清理的日志</div>');
+ $('sum-total').textContent=fmtBytes(total);
+ $('sum-sel').textContent=fmtBytes(sel);
+ $('run-btn').disabled=!sel;
+}
+function toggle(key,checked){checked?cleanChecked.add(key):cleanChecked.delete(key);renderCats()}
+function toggleAll(checked){cleanChecked=checked?new Set((cleanData&&cleanData.categories||[]).map(c=>c.key)):new Set();renderCats()}
+function expand(key){cleanExpanded.has(key)?cleanExpanded.delete(key):cleanExpanded.add(key);renderCats()}
+async function runClean(){
+ const keys=[...cleanChecked];if(!keys.length)return;
+ if(!confirm('确定清理所选 '+keys.length+' 个分类？\n日志文件将被清空、缓存目录内容将被删除，此操作不可恢复。'))return;
+ try{
+  const j=await api('/star/logCleanRun',{method:'POST',body:JSON.stringify({keys})});
+  if(j.code!==0){toast('清理失败：'+(j.message||''),'error');return}
+  const errs=(j.data.details||[]).reduce((a,x)=>a+((x.errors||[]).length),0);
+  toast('清理完成，共释放 '+fmtBytes(j.data.freedBytes)+(errs?'（'+errs+' 个错误，详见日志）':''),errs?'error':'success');
+  scan();
+ }catch(e){toast('清理失败（网络错误）','error')}
+}
+
+// ————— 自定义配置 —————
+async function loadCustom(){
+ try{
+  const j=await api('/star/logCleanConfig');
+  if(j.code===401){$('custom-err').textContent='未登录或会话已过期：请从主面板登录后重试';return}
+  if(j.code!==0){$('custom-err').textContent=j.message||'';return}
+  customPaths=j.data.custom||[];renderCustom();
+ }catch(e){$('custom-err').textContent='加载失败'}
+}
+function renderCustom(){
+ $('custom-list').innerHTML=customPaths.length
+  ? customPaths.map((p,i)=>'<div class="custom-item"><span class="tag '+(/\.[^\\/]+$/.test(p)?'file':'dir')+'">'+(/\.[^\\/]+$/.test(p)?'文件':'目录')+'</span><span class="p">'+esc(p)+'</span><button class="red sm" onclick="delCustom('+i+')">删除</button></div>').join('')
+  : '<div class="muted">（暂无自定义路径；添加后扫描结果会出现“自定义路径”分类）</div>';
+}
+async function saveCustom(){
+ try{
+  const j=await api('/star/logCleanConfigSave',{method:'POST',body:JSON.stringify({custom:customPaths})});
+  if(j.code!==0){$('custom-err').textContent=j.message||'保存失败';return false}
+  $('custom-err').textContent='';
+  toast('已保存','success');scan();
+  return true;
+ }catch(e){$('custom-err').textContent='保存失败（网络错误）';return false}
+}
+async function addCustom(){
+ const p=$('new-path').value.trim();
+ if(!p){$('custom-err').textContent='请输入绝对路径';return}
+ customPaths.push(p);
+ if(await saveCustom()){$('new-path').value='';renderCustom()}else{customPaths.pop()}
+}
+async function delCustom(i){
+ const p=customPaths[i];
+ if(!confirm('移除自定义清理路径？\n'+p))return;
+ const backup=customPaths.slice();customPaths.splice(i,1);
+ if(await saveCustom())renderCustom();else customPaths=backup;
+}
+
+// 初始化：有会话令牌则自动携带；本机回环免登录模式下无令牌也可直接调用（401 时会提示登录）
+scan();loadCustom();
+</script>
+</body>
+</html>

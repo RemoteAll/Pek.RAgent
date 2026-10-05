@@ -176,6 +176,43 @@ fn dir_stats(path: &Path) -> (u64, u64) {
     (files, bytes)
 }
 
+/// 目录大小统计节点数上限（手动点击“计算”时调用；超出返回部分值，防超大目录拖死请求）。
+const DIR_SIZE_MAX_NODES: usize = 200_000;
+/// 目录大小统计时间上限（毫秒）。
+const DIR_SIZE_MAX_MS: u128 = 10_000;
+
+/// 递归统计目录（字节数, 文件数, 子目录数, 是否截断）；不跟随符号链接（防循环）。
+fn size_recursive(root: &Path) -> (u64, u64, u64, bool) {
+    use std::time::Instant;
+    let started = Instant::now();
+    let mut bytes = 0u64;
+    let mut files = 0u64;
+    let mut dirs = 0u64;
+    let mut nodes = 0usize;
+    let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = fs::read_dir(&dir) else { continue };
+        for entry in rd.flatten() {
+            nodes += 1;
+            if nodes > DIR_SIZE_MAX_NODES || started.elapsed().as_millis() > DIR_SIZE_MAX_MS {
+                return (bytes, files, dirs, true);
+            }
+            let Ok(lm) = fs::symlink_metadata(entry.path()) else { continue };
+            if lm.file_type().is_symlink() {
+                continue;
+            }
+            if lm.is_dir() {
+                dirs += 1;
+                stack.push(entry.path());
+            } else {
+                files += 1;
+                bytes += lm.len();
+            }
+        }
+    }
+    (bytes, files, dirs, false)
+}
+
 /// 目录条目 JSON（列表接口单条）。
 fn entry_json(name: String, path: &Path, md: &fs::Metadata, is_link: bool) -> Json {
     // 符号链接按跟随后的类型展示（可进入指向的目录）
@@ -1118,6 +1155,53 @@ pub fn file_search(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(data))
 }
 
+/// `POST /star/fileSize {"path"}`：按需计算文件夹大小（手动点击“计算”时调用；超限返回部分值）。
+pub fn file_dir_size(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let input = json_body(ctx)
+        .and_then(|v| v.get("path").and_then(|s| s.as_str()).map(String::from))
+        .unwrap_or_default();
+    let path = match resolve_path(panel.base(), &input) {
+        Ok(p) => p,
+        Err(e) => return json_error(400, &e),
+    };
+    // fs::metadata 跟随符号链接（允许计算链接指向的目录）
+    let md = match fs::metadata(&path) {
+        Ok(m) => m,
+        Err(e) => return json_error(404, &format!("路径不存在：{}（{}）", path.display(), e)),
+    };
+    if !md.is_dir() {
+        return json_error(400, "仅支持文件夹");
+    }
+    let (bytes, files, dirs, partial) = size_recursive(&path);
+    util::log_format(
+        "文件管理：计算目录大小 {}（{} 字节，{} 文件，{} 子目录）",
+        &[
+            &path.display().to_string(),
+            &bytes.to_string(),
+            &files.to_string(),
+            &dirs.to_string(),
+        ],
+    );
+    json_result(
+        0,
+        if partial {
+            "已计算（目录过大，结果为部分统计）"
+        } else {
+            "已计算"
+        },
+        Some(json!({
+            "path": path.display().to_string(),
+            "bytes": bytes,
+            "files": files,
+            "dirs": dirs,
+            "partial": partial,
+        })),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1135,6 +1219,21 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn dir_size_recursive_counts() {
+        let dir = temp_dir("size");
+        fs::create_dir_all(dir.join("a/b")).unwrap();
+        fs::write(dir.join("f1.txt"), b"12345").unwrap();
+        fs::write(dir.join("a/f2.txt"), b"123").unwrap();
+        fs::write(dir.join("a/b/f3.txt"), b"1").unwrap();
+        let (bytes, files, dirs, partial) = size_recursive(&dir);
+        assert_eq!(bytes, 9);
+        assert_eq!(files, 3);
+        assert_eq!(dirs, 2);
+        assert!(!partial);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

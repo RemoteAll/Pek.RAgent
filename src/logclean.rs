@@ -663,6 +663,61 @@ pub fn log_clean_run(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
+/// `GET /star/logCleanConfig`：读取自定义清理路径（配置项 `LogCleanupPaths`，分号分隔）。
+pub fn log_clean_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let cfg = panel.config();
+    let custom: Vec<String> = cfg
+        .log_cleanup_paths
+        .split(';')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect();
+    json_result(0, "", Some(json!({ "custom": custom })))
+}
+
+/// `POST /star/logCleanConfig {"custom": ["绝对路径", ...]}`：保存自定义清理路径。
+///
+/// 校验：必须为绝对路径且存在（目录=清空内容、文件=截断）；自动去重；保存后热生效。
+pub fn log_clean_config_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let Some(list) = body.get("custom").and_then(|v| v.as_array()) else {
+        return json_error(400, "缺少 custom 数组");
+    };
+    let mut paths: Vec<String> = Vec::new();
+    for item in list {
+        let p = item.as_str().map(str::trim).unwrap_or("").to_string();
+        if p.is_empty() {
+            continue;
+        }
+        let path = Path::new(&p);
+        if !path.is_absolute() {
+            return json_error(400, &format!("路径必须为绝对路径：{p}"));
+        }
+        if !path.is_dir() && !path.is_file() {
+            return json_error(400, &format!("路径不存在：{p}"));
+        }
+        if !paths.contains(&p) {
+            paths.push(p);
+        }
+    }
+    let joined = paths.join(";");
+    panel.update_config(|cfg| cfg.log_cleanup_paths = joined.clone());
+    util::log_format(
+        "日志清理：自定义路径已更新（{} 项）",
+        &[&paths.len().to_string()],
+    );
+    json_result(0, "已保存", Some(json!({ "custom": paths })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -258,6 +258,13 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .clean-desc{font-size:12px;color:var(--orange)}
 .clean-detail{width:100%;margin:8px 0 0 27px;border-left:2px solid var(--border-default);padding-left:12px}
 .plugin-frame{width:100%;height:calc(100vh - 280px);min-height:420px;border:1px solid var(--border-default);border-radius:var(--radius-md)}
+/* 插件查看弹窗（iframe 在悬浮层中打开，不替换面板内容） */
+.plugin-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:210;display:flex;align-items:center;justify-content:center;animation:fadeIn var(--duration-fast) ease-out}
+.plugin-dialog{background:var(--surface-1);border:1px solid var(--border-subtle);border-radius:var(--radius-xl);box-shadow:var(--shadow-modal);width:min(1100px,94vw);height:min(830px,92vh);display:flex;flex-direction:column;overflow:hidden;animation:scaleIn var(--duration-slow) var(--ease-out-expo)}
+.plugin-dialog-head{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:13px 18px;border-bottom:1px solid var(--border-subtle);flex-wrap:wrap}
+.plugin-dialog-head h3{font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.plugin-dialog-body{flex:1;min-height:0;display:flex}
+.plugin-dialog-body .plugin-frame{height:100%;min-height:0;border:0;border-radius:0}
 .clean-target{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text-muted);padding:3px 0;font-family:var(--font-mono)}
 .clean-target .p{word-break:break-all}
 /* ── 用户 / 操作日志 ── */
@@ -307,12 +314,10 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="traffic">📈 流量</a>
 <a data-panel="control">⚡ 控制</a>
 <a data-panel="config">⚙ 配置</a>
-<a data-panel="starconfig">🌐 星尘设置</a>
 <a data-panel="logs">📋 日志</a>
 <a data-panel="watchdog">🐕 看门狗</a>
 <a data-panel="database">🗄 数据库</a>
 <a data-panel="fileman">🗂 文件管理</a>
-<a data-panel="cleanup">🧹 日志清理</a>
 <a data-panel="plugins">🧩 插件</a>
 <a data-panel="users">👥 用户</a>
 </nav>
@@ -325,12 +330,10 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-traffic" class="panel"></div>
 <div id="panel-control" class="panel"></div>
 <div id="panel-config" class="panel"></div>
-<div id="panel-starconfig" class="panel"></div>
 <div id="panel-logs" class="panel"></div>
 <div id="panel-watchdog" class="panel"></div>
 <div id="panel-database" class="panel"></div>
 <div id="panel-fileman" class="panel"></div>
-<div id="panel-cleanup" class="panel"></div>
 <div id="panel-plugins" class="panel"></div>
 <div id="panel-users" class="panel"></div>
 </main>
@@ -344,6 +347,20 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <button class="btn btn-secondary" onclick="closeModal()">取消</button>
 <button class="btn btn-primary" id="modal-confirm-btn" onclick="confirmModal()">确认</button>
 </div>
+</div>
+</div>
+
+<!-- 插件查看弹窗：iframe 悬浮层，不替换面板内容 -->
+<div id="plugin-overlay" class="plugin-overlay hidden">
+<div class="plugin-dialog">
+<div class="plugin-dialog-head">
+<h3 id="plugin-dialog-title">🧩</h3>
+<div style="display:flex;align-items:center;gap:10px">
+<span id="plugin-dialog-sub" class="text-muted" style="font-size:12px"></span>
+<button class="btn btn-secondary btn-sm" onclick="pluginClose()">✕ 关闭</button>
+</div>
+</div>
+<div id="plugin-dialog-body" class="plugin-dialog-body"></div>
 </div>
 </div>
 
@@ -407,6 +424,7 @@ function renderNav(){
   let show=true;
   if(k==='users')show=!!(me&&me.isAdmin);
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
+  else if(k==='config')show=canView('config')||canView('starconfig'); // 配置页含“星尘设置”子页签（任一权限可见）
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -454,21 +472,20 @@ function switchPanel(name){
   traffic:loadTraffic,
   control:updateControlStatus,
   config:loadConfig,
-  starconfig:loadStarConfig,
   logs:loadLogs,
   watchdog:loadWatchDog,
   database:loadDatabase,
   fileman:loadFileman,
-  cleanup:loadCleanup,
   plugins:loadPlugins,
   users:loadUsers
  };
  if(loaders[name])loaders[name]();
  if(name==='traffic'){applyTrafficSub(trafficSubFromHash());trafficTimer=setInterval(loadTraffic,3000);}
- // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录；流量/日志页含子页后缀）
+ // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录；流量/日志/配置页含子页后缀）
  let want='#'+name;
  if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
  if(name==='logs')want=logsSubFromHash()==='audit'?'#logs.audit':'#logs';
+ if(name==='config')want=configSubFromHash()==='star'?'#config.star':'#config';
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
@@ -479,6 +496,8 @@ function panelFromHash(){
  if(!h)return '';
  if(h==='ports')return 'traffic';
  if(h==='audit')return 'logs';
+ if(h==='starconfig')return 'config'; // 兼容早期独立页签书签
+ if(h==='cleanup')return 'plugins'; // “日志清理”已迁移为插件（🧩 插件 → 日志清理）
  const name=h.split('.')[0];
  return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
 }
@@ -512,6 +531,7 @@ window.addEventListener('hashchange',()=>{
  if(link&&!link.classList.contains('active'))switchPanel(h);
  else if(h==='traffic'&&$('traffic-sub-site'))applyTrafficSub(trafficSubFromHash()); // 流量页内子页签同步
  else if(h==='logs'&&$('logs-sub-tabs'))applyLogsSub(logsSubFromHash()); // 日志页内子页签同步
+ else if(h==='config'&&$('config-sub-tabs'))applyConfigSub(configSubFromHash()); // 配置页内子页签同步
 });
 
 /* ── Dashboard ── */
@@ -1667,8 +1687,44 @@ async function doControl(action){
  });
 }
 
-/* ── Config ── */
-async function loadConfig(){
+/* ── Config（Agent 配置 / 星尘设置 子页签） ── */
+function ensureConfigShell(){
+ if($('config-sub-tabs'))return;
+ $('panel-config').innerHTML=`
+  <div class="chart-tabs" id="config-sub-tabs" style="margin-bottom:14px">
+   <span class="chart-tab active" data-sub="agent" id="config-tab-agent" onclick="configSubSwitch('agent')">⚙ Agent 配置</span>
+   <span class="chart-tab" data-sub="star" id="config-tab-star" onclick="configSubSwitch('star')">🌐 星尘设置</span>
+  </div>
+  <div id="config-sub-agent"></div>
+  <div id="config-sub-star" style="display:none"></div>`;
+}
+// 配置页子页签（agent Agent 配置 / star 星尘设置；兼容旧 #starconfig 独立页书签）
+function configSubFromHash(){
+ const h=(location.hash||'').replace(/^#\/?/,'');
+ return (h==='config.star'||h==='starconfig')?'star':'agent';
+}
+function configSubSwitch(sub){
+ applyConfigSub(sub);
+ const h=sub==='star'?'#config.star':'#config';
+ if(location.hash!==h)history.replaceState(null,'',h);
+}
+// 应用子页签：按权限显隐标签与内容（仅有 starconfig 权限时自动落到星尘设置子页）
+function applyConfigSub(sub){
+ const agent=$('config-sub-agent'),star=$('config-sub-star');if(!agent||!star)return;
+ const canAgent=canView('config'),canStar=canView('starconfig');
+ const tabAgent=$('config-tab-agent'),tabStar=$('config-tab-star');
+ if(tabAgent)tabAgent.style.display=canAgent?'':'none';
+ if(tabStar)tabStar.style.display=canStar?'':'none';
+ if(sub==='star'&&!canStar)sub='agent';
+ if(sub==='agent'&&!canAgent)sub='star';
+ agent.style.display=sub==='star'?'none':'';
+ star.style.display=sub==='star'?'':'none';
+ document.querySelectorAll('#config-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
+ if(sub==='star')loadStarConfig();else loadAgentConfig();
+}
+async function loadConfig(){ensureConfigShell();applyConfigSub(configSubFromHash())}
+
+async function loadAgentConfig(){
  try{
   const j=await api('/api/configMetadata');if(j.code!==0)return;const items=j.data.items||[];
   let html=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><table class="config-table"><tbody>`;
@@ -1698,8 +1754,8 @@ async function loadConfig(){
   html+=`<button class="btn btn-primary" onclick="doUpgrade()">⬆ 上传并升级</button>`;
   html+=`<span id="upgrade-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
 
-  $('panel-config').innerHTML=html;
- }catch(e){$('panel-config').innerHTML=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><p class="text-muted">加载失败</p></div>`}
+  $('config-sub-agent').innerHTML=html;
+ }catch(e){$('config-sub-agent').innerHTML=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><p class="text-muted">加载失败</p></div>`}
 }
 
 function renderConfigInput(item){
@@ -1723,7 +1779,7 @@ async function saveConfig(){
  });
  try{
   const j=await api('/api/updateConfig',{method:'POST',body:JSON.stringify(updates)});
-  if(j.code===0){dirtyFields.clear();showToast(j.message,'success');loadConfig()}
+  if(j.code===0){dirtyFields.clear();showToast(j.message,'success');loadAgentConfig()}
   else showToast(j.message,'error');
  }catch(e){showToast('保存失败','error')}
 }
@@ -1759,7 +1815,7 @@ let _starDirtyFields=new Set();
 async function loadStarConfig(){
  try{
   const j=await api('/star/getStarConfig');
-  if(j.code!==0){$('panel-starconfig').innerHTML=`<div class="glass-card card"><h2>🌐 星尘设置</h2><p class="text-muted">加载失败</p></div>`;return}
+  if(j.code!==0){$('config-sub-star').innerHTML=`<div class="glass-card card"><h2>🌐 星尘设置</h2><p class="text-muted">加载失败</p></div>`;return}
   const groups=j.data.groups||[];
   let html=`<div class="glass-card card"><h2>🌐 星尘设置</h2>`;
   groups.forEach(g=>{
@@ -1771,8 +1827,8 @@ async function loadStarConfig(){
    html+=`</tbody></table>`;
   });
   html+=`<div class="mt-16"><button class="btn btn-primary" onclick="saveStarConfig()">💾 保存星尘配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">修改 StarServer 地址后需重启 StarAgent 生效</span></div></div>`;
-  $('panel-starconfig').innerHTML=html;
- }catch(e){$('panel-starconfig').innerHTML=`<div class="glass-card card"><h2>🌐 星尘设置</h2><p class="text-muted">加载失败</p></div>`}
+  $('config-sub-star').innerHTML=html;
+ }catch(e){$('config-sub-star').innerHTML=`<div class="glass-card card"><h2>🌐 星尘设置</h2><p class="text-muted">加载失败</p></div>`}
 }
 
 function renderStarConfigInput(item){
@@ -1883,6 +1939,7 @@ async function fetchLogContent(){
 
 /* ── 文件管理 ── */
 let fmData=null,fmPath='',fmSelected=new Set();
+let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
 function fmJoin(name){
  const p=(fmData&&fmData.path)?fmData.path:'';
@@ -1920,7 +1977,7 @@ function renderFileman(){
   rows+=`<tr>
    <td style="width:34px"><input type="checkbox" ${checked} onchange="fmToggle('${escAttr(name)}',this.checked)"></td>
    <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
-   <td style="width:92px" class="text-secondary">${it.isDir?'—':fmtBytes(it.size)}</td>
+   <td style="width:92px" class="text-secondary">${it.isDir?fmSizeCell(name):fmtBytes(it.size)}</td>
    <td style="width:152px" class="text-muted">${esc(it.mtime||'')}</td>
    <td style="width:72px" class="text-muted">${esc(it.perm||'—')}</td>
    <td class="fm-row-actions" style="width:118px">${isRoot?'':`
@@ -1960,7 +2017,7 @@ function renderFileman(){
    <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 上传/编辑上限 64MB/2MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传/编辑上限 64MB/2MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
 }
@@ -1969,6 +2026,28 @@ function fmToggle(name,checked){checked?fmSelected.add(name):fmSelected.delete(n
 function fmOpen(name,isDir){
  if(isDir){fmNavigate(fmJoin(name));return}
  fmEdit(fmJoin(name));
+}
+
+// 目录大小单元格：未计算显示“计算”，已计算显示大小（点击可重新计算）
+function fmSizeCell(name){
+ const full=fmJoin(name);
+ if(fmDirSizes.has(full))
+  return `<a class="fm-name" style="cursor:pointer" title="点击重新计算" onclick="fmDirSize('${escAttr(name)}',this)">${fmtBytes(fmDirSizes.get(full))}</a>`;
+ return `<a class="fm-name" style="cursor:pointer" title="计算文件夹大小（递归统计，可手动触发）" onclick="fmDirSize('${escAttr(name)}',this)">计算</a>`;
+}
+async function fmDirSize(name,el){
+ const full=fmJoin(name);
+ if(el)el.textContent='计算中…';
+ try{
+  const j=await api('/star/fileSize',{method:'POST',body:JSON.stringify({path:full})});
+  if(j.code!==0){showToast(j.message||'计算失败','error');if(el)el.textContent='计算';return}
+  fmDirSizes.set(full,j.data.bytes);
+  if(el){
+   el.textContent=fmtBytes(j.data.bytes);
+   el.title=`${j.data.files} 个文件 · ${j.data.dirs} 个子目录${j.data.partial?' · 已截断（目录过大）':''}（点击重新计算）`;
+  }
+  showToast(`文件夹大小：${fmtBytes(j.data.bytes)}（${j.data.files} 文件 / ${j.data.dirs} 目录）`,j.data.partial?'info':'success');
+ }catch(e){if(el)el.textContent='计算'}
 }
 
 function fmPrompt(title,labelHtml,value,okText,cb){
@@ -2144,83 +2223,15 @@ async function fmEdit(path){
  }catch(e){}
 }
 
-/* ── 日志清理 ── */
-let cleanData=null,cleanChecked=new Set(),cleanExpanded=new Set();
-
-async function loadCleanup(){
- try{
-  const j=await api('/star/logCleanScan');
-  if(j.code!==0){showToast(j.message||'扫描失败','error');return}
-  cleanData=j.data;cleanChecked=new Set();
-  renderCleanup();
- }catch(e){}
-}
-
-function renderCleanup(){
- const d=cleanData||{categories:[],totalSize:0};
- let total=0,sel=0,allOn=(d.categories||[]).length>0;
- let rows='';
- (d.categories||[]).forEach(c=>{
-  const checked=cleanChecked.has(c.key);
-  total+=c.size;if(checked)sel+=c.size;else allOn=false;
-  const exp=cleanExpanded.has(c.key);
-  let detail='';
-  if(exp){
-   detail=`<div class="clean-detail">`+(c.targets||[]).map(t=>
-    `<div class="clean-target"><span class="p">${esc(t.path)}</span><span>${t.kind==='journal'?'journald':fmtBytes(t.size)}</span></div>`).join('')+`</div>`;
-  }
-  rows+=`<div class="clean-row ${checked?'on':''}">
-   <label class="clean-main">
-    <input type="checkbox" ${checked?'checked':''} onchange="cleanToggle('${c.key}',this.checked)">
-    <span class="clean-name">${esc(c.name)}</span>
-    <span class="clean-meta">共 ${c.count} 条数据，大小为 ${fmtBytes(c.size)}${c.truncated?'以上':''}</span>
-    <span class="clean-desc">（${esc(c.description)}）</span>
-   </label>
-   <button class="fm-icon-btn" onclick="cleanExpand('${c.key}')" title="展开明细">${exp?'▲':'▼'}</button>
-   ${detail}
-  </div>`;
- });
- let html=`<div class="glass-card card">
-  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
-   <h2>🧹 日志清理</h2>
-   <button class="btn btn-secondary btn-sm" onclick="loadCleanup()">⟳ 重新扫描</button>
-  </div>
-  <div class="clean-summary">
-   <div class="clean-summary-text"><span style="font-size:22px">🧹</span><span>共 <b>${fmtBytes(total)}</b> 可清理，已选中 <b>${fmtBytes(sel)}</b></span></div>
-   <button class="btn btn-primary" ${sel?'':'disabled'} onclick="doClean()">立即清理</button>
-  </div>
-  <div class="clean-list">
-   <label class="clean-row clean-head"><input type="checkbox" ${allOn?'checked':''} onchange="cleanToggleAll(this.checked)"> <b>全选</b><span style="flex:1"></span><span class="text-muted" style="font-size:12px">共 ${(d.categories||[]).length} 个分类</span></label>
-   ${rows||'<div class="fm-empty">未发现可清理的日志</div>'}
-  </div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。以上目录由面板自动探测系统常见位置，展开分类明细可查看具体涉及的目录与文件。</div>
- </div>`;
- $('panel-cleanup').innerHTML=html;
-}
-
-function cleanToggle(key,checked){checked?cleanChecked.add(key):cleanChecked.delete(key);renderCleanup()}
-function cleanToggleAll(checked){cleanChecked=checked?new Set((cleanData&&cleanData.categories||[]).map(c=>c.key)):new Set();renderCleanup()}
-function cleanExpand(key){cleanExpanded.has(key)?cleanExpanded.delete(key):cleanExpanded.add(key);renderCleanup()}
-
-function doClean(){
- const keys=[...cleanChecked];if(!keys.length)return;
- showModal('清理确认',`确定清理所选 <b>${keys.length}</b> 个分类？<br><span class="text-muted">日志文件将被清空、缓存目录内容将被删除，此操作不可恢复</span>`,'立即清理',async()=>{
-  const j=await api('/star/logCleanRun',{method:'POST',body:JSON.stringify({keys})});
-  if(j.code!==0){showToast(j.message||'清理失败','error');return}
-  const errs=(j.data.details||[]).reduce((a,x)=>a+((x.errors||[]).length),0);
-  showToast(`清理完成，共释放 ${fmtBytes(j.data.freedBytes)}${errs?`（${errs} 个错误，详见日志）`:''}`,errs?'error':'success');
-  loadCleanup();
- });
-}
-
-/* ── 插件（本地放置的扩展页面） ── */
-let pluginData=null,pluginStore=null,pluginView=null,pluginSvc={};
+/* ── 日志清理：已迁移为插件（🧩 插件 → 日志清理；后端接口 logCleanScan/logCleanRun/logCleanConfig 保留在核心） ── */
+let pluginData=null,pluginStore=null,pluginSvc={};
+let pluginSearch=''; // 插件搜索关键词
 
 async function loadPlugins(){
  try{
   const j=await api('/star/pluginList');
   if(j.code!==0){showToast(j.message||'加载失败','error');return}
-  pluginData=j.data;pluginView=null;pluginSvc={};
+  pluginData=j.data;pluginSvc={};
   const apps=(pluginData.plugins||[]).map(p=>p.app).filter(a=>a);
   if(apps.length&&canView('services')){
    try{const s=await api('/star/services');if(s.code===0)(s.data.services||[]).forEach(x=>{if(x.name)pluginSvc[x.name]=x});}catch(e){}
@@ -2230,31 +2241,53 @@ async function loadPlugins(){
  }catch(e){}
 }
 
-function pluginOpen(id){pluginView=id;renderPlugins()}
-function pluginBack(){pluginView=null;renderPlugins()}
+// 打开插件：以悬浮弹窗（iframe）呈现，不替换面板内容；关闭后仍停留在插件列表
+function pluginOpen(id){
+ const d=pluginData||{plugins:[]};
+ const p=(d.plugins||[]).find(x=>x.id===id);
+ if(!p)return;
+ const entry=String(p.entry||'index.html').split('/').map(encodeURIComponent).join('/');
+ const src='/plugins/'+encodeURIComponent(p.id)+'/'+entry;
+ const svc=p.app?pluginSvc[p.app]:null;
+ $('plugin-dialog-title').innerHTML=`${esc(p.icon||'🧩')} ${esc(p.name)}${p.version?` <span class="text-muted" style="font-size:12px;font-weight:400">v${esc(p.version)}</span>`:''}`;
+ $('plugin-dialog-sub').textContent=p.app?`关联子服务：${p.app} ${svc?(svc.running?'· 🟢 运行中':'· 🔴 已停止'):''}`:'';
+ $('plugin-dialog-body').innerHTML=`<iframe class="plugin-frame" src="${escAttr(src)}" title="${escAttr(p.name)}"></iframe>`;
+ $('plugin-overlay').classList.remove('hidden');
+}
+function pluginClose(){
+ $('plugin-overlay').classList.add('hidden');
+ $('plugin-dialog-body').innerHTML='';
+}
 
 function renderPlugins(){
  const d=pluginData||{plugins:[],invalid:[],dir:''};
- if(pluginView!==null){
-  const p=(d.plugins||[]).find(x=>x.id===pluginView);
-  if(!p){pluginView=null;renderPlugins();return}
-  const entry=String(p.entry||'index.html').split('/').map(encodeURIComponent).join('/');
-  const src='/plugins/'+encodeURIComponent(p.id)+'/'+entry;
-  const svc=p.app?pluginSvc[p.app]:null;
-  const appLine=p.app?`<div class="text-muted" style="font-size:12px;margin-bottom:8px">关联子服务：${esc(p.app)} ${svc?(svc.running?'· 🟢 运行中':'· 🔴 已停止'):''}</div>`:'';
-  $('panel-plugins').innerHTML=`<div class="glass-card card">
-   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
-    <h2>${esc(p.icon||'🧩')} ${esc(p.name)}${p.version?` <span class="text-muted" style="font-size:12px">v${esc(p.version)}</span>`:''}</h2>
-    <button class="btn btn-secondary btn-sm" onclick="pluginBack()">← 返回列表</button>
+ $('panel-plugins').innerHTML=pluginShellHtml(d);
+}
+
+// 插件页外壳（标题/搜索/上传按钮；表格由 pluginTableHtml 单独渲染，搜索时只重建表格、不重建输入框）
+function pluginShellHtml(d){
+ return `<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🧩 插件</h2>
+   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input id="plugin-search" value="${escAttr(pluginSearch)}" oninput="onPluginSearch()" placeholder="🔍 搜索插件（名称/ID/说明/开发商）" style="font-size:12px">
+    <input type="file" id="plugin-file" accept=".zip" style="font-size:12px">
+    <button class="btn btn-primary btn-sm" onclick="pluginInstall()">⬆ 上传安装</button>
    </div>
-   ${appLine}
-   <iframe class="plugin-frame" src="${escAttr(src)}" title="${escAttr(p.name)}"></iframe>
-  </div>`;
-  return;
- }
-// 合并展示：在线插件源条目 + 本地安装（不在源中）的插件 —— 每个插件仅一行
+  </div>
+  <div id="plugin-table-wrap">${pluginTableHtml()}</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">插件目录：<code>${esc(d.dir||'')}</code>；压缩包内需含 <code>plugin.json</code>（可置于包根或唯一子目录）；插件页面以同源 iframe 运行，可复用当前登录态调用面板接口（受当前用户菜单权限约束并记入操作日志）。在线安装仅走 HTTPS 并强制 SHA-256 校验（配置公钥后另行强制 Ed25519 验签），校验失败一律拒绝，插件包不会执行任何安装脚本。</div>
+ </div>`;
+}
+function onPluginSearch(){ pluginSearch=$('plugin-search').value; $('plugin-table-wrap').innerHTML=pluginTableHtml(); }
+
+// 插件表（合并展示：在线插件源条目 + 本地安装（不在源中）的插件 —— 每个插件仅一行；按搜索词过滤）
+function pluginTableHtml(){
+ const d=pluginData||{plugins:[],invalid:[],dir:''};
+ const q=pluginSearch.trim().toLowerCase();
+ const hit=(...fields)=>!q||fields.some(f=>String(f||'').toLowerCase().includes(q));
  const storeReady=!!(pluginStore&&pluginStore.configured&&!pluginStore.error);
- const entries=storeReady?(pluginStore.plugins||[]):[];
+ const entries=(storeReady?(pluginStore.plugins||[]):[]).filter(e=>hit(e.id,e.name,e.description,e.author));
  const storeIds=new Set(entries.map(e=>e.id));
  let rows='';
  entries.forEach(e=>{
@@ -2281,7 +2314,7 @@ function renderPlugins(){
   </tr>`;
  });
  (d.plugins||[]).forEach(p=>{
-  if(storeIds.has(p.id)) return;
+  if(storeIds.has(p.id)||!hit(p.id,p.name,p.description)) return;
   const svc=p.app?pluginSvc[p.app]:null;
   const appTxt=p.app?`<span class="text-muted" style="font-size:11px"> · 关联 ${esc(p.app)}${svc?(svc.running?' 🟢':' 🔴'):''}</span>`:'';
   const svcBtns=(p.app&&canView('services'))?`<button class="btn btn-secondary btn-sm" onclick="doSvcAction('start','${escAttr(p.app)}')">启动</button><button class="btn btn-secondary btn-sm" onclick="doSvcAction('stop','${escAttr(p.app)}')">停止</button>`:'';
@@ -2298,51 +2331,20 @@ function renderPlugins(){
   invalidHtml=`<div style="margin-top:12px"><div class="text-muted" style="font-size:12px;margin-bottom:6px">⚠ 以下目录不构成有效插件（缺少/损坏 plugin.json）：</div>`+
    (d.invalid||[]).map(x=>`<div class="clean-target"><span class="p">${esc(x.id)}</span><span class="text-muted">${esc(x.error)}</span><button class="btn btn-danger btn-sm" onclick="pluginDelete('${escAttr(x.id)}')">删除</button></div>`).join('')+`</div>`;
  }
- let storeHtml='';
+ let storeNote='';
  if(pluginStore&&pluginStore.configured===false){
-  storeHtml=`<div style="margin-top:16px"><div class="text-muted" style="font-size:12px">🌐 在线插件：未配置插件源（「配置」页 →「插件源地址」填写 catalog.json 的 HTTPS 地址后，可在此一键安装/更新）。</div></div>`;
+  storeNote=`<div class="text-muted" style="font-size:12px;margin-bottom:8px">🌐 在线插件源未配置（「配置」页 →「插件源地址」填写 catalog.json 的 HTTPS 地址后，可在此一键安装/更新）。</div>`;
  }else if(pluginStore&&pluginStore.error){
-  storeHtml=`<div style="margin-top:16px"><div class="text-red" style="font-size:12px">🌐 在线插件：加载失败 —— ${esc(pluginStore.error)}</div></div>`;
- }else if(pluginStore&&pluginStore.configured){
-  let srows='';
-  (pluginStore.plugins||[]).forEach(e=>{
-   const btn=e.installed
-    ?(e.upToDate?'<button class="btn btn-secondary btn-sm" disabled>已是最新</button>':`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">更新到 v${esc(e.version)}</button>`)
-    :`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">安装</button>`;
-   srows+=`<tr>
-    <td><b>${esc(e.icon||'🧩')} ${esc(e.name)}</b> <span class="text-muted" style="font-size:11px">v${esc(e.version)}</span></td>
-    <td style="font-size:12px">${e.author?esc(e.author):'<span class="text-muted">—</span>'}</td>
-    <td class="text-muted" style="font-size:12px">${e.description?esc(e.description):'—'}</td>
-    <td style="font-size:12px">${e.installed?('已安装'+(e.installedVersion?` v${esc(e.installedVersion)}`:'')+(e.upToDate?'':' · <span class="text-red">可更新</span>')):'未安装'}</td>
-    <td style="text-align:right">${btn}</td>
-   </tr>`;
-  });
-  storeHtml=`<div style="margin-top:18px"><div class="flex-between mb-16" style="gap:8px;flex-wrap:wrap">
-   <h2 style="font-size:15px">🌐 在线插件</h2>
-   <span class="text-muted" style="font-size:12px">${pluginStore.signature?'🔏 强制验签已启用 · ':''}HTTPS + SHA-256 校验</span>
-  </div>
+  storeNote=`<div class="text-red" style="font-size:12px;margin-bottom:8px">🌐 在线插件源加载失败 —— ${esc(pluginStore.error)}</div>`;
+ }else if(storeReady){
+  storeNote=`<div class="text-muted" style="font-size:12px;margin-bottom:8px">🌐 在线插件源已连接${pluginStore.signature?' · 🔏 强制验签已启用':''} · HTTPS + SHA-256 校验</div>`;
+ }
+ return `${storeNote}
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr><th>插件</th><th>开发商</th><th>说明</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-   <tbody>${srows||'<tr><td colspan="5" class="fm-empty">插件源中暂无插件</td></tr>'}</tbody>
-  </table></div></div>`;
- }
- const html=`<div class="glass-card card">
-  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
-   <h2>🧩 插件</h2>
-   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-    <input type="file" id="plugin-file" accept=".zip" style="font-size:12px">
-    <button class="btn btn-primary btn-sm" onclick="pluginInstall()">⬆ 上传安装</button>
-   </div>
-  </div>
-  <div style="overflow-x:auto"><table class="svc-table">
-   <thead><tr><th>插件</th><th>目录</th><th>关联子服务</th><th style="text-align:right">操作</th></tr></thead>
-   <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无插件（上传 zip 或把插件目录放入下方目录）</td></tr>'}</tbody>
+   <tbody>${rows||'<tr><td colspan="5" class="fm-empty">'+(q?'未找到匹配“'+esc(pluginSearch.trim())+'”的插件':'暂无插件（上传 zip，或在平台审核上架后从插件源安装）')+'</td></tr>'}</tbody>
   </table></div>
-  ${invalidHtml}
-  ${storeHtml}
-  <div class="text-muted" style="margin-top:10px;font-size:12px">插件目录：<code>${esc(d.dir||'')}</code>；压缩包内需含 <code>plugin.json</code>（可置于包根或唯一子目录）；插件页面以同源 iframe 运行，可复用当前登录态调用面板接口（受当前用户菜单权限约束并记入操作日志）。在线安装仅走 HTTPS 并强制 SHA-256 校验（配置公钥后另行强制 Ed25519 验签），校验失败一律拒绝，插件包不会执行任何安装脚本。</div>
- </div>`;
- $('panel-plugins').innerHTML=html;
+  ${invalidHtml}`;
 }
 
 function pluginDelete(id){

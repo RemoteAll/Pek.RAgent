@@ -110,6 +110,11 @@ impl WebPanel {
         self.manager.config()
     }
 
+    /// 更新配置（保存并触发热生效；插件相关接口复用）。
+    pub(crate) fn update_config(&self, f: impl FnOnce(&mut AgentConfig)) {
+        self.manager.update_config(f);
+    }
+
     /// 进程运行时长。
     fn uptime(&self) -> Duration {
         self.started.elapsed()
@@ -423,7 +428,10 @@ fn action_title(action: &str) -> String {
         "fileExtract" => "解压文件",
         "fileChmod" => "修改文件权限",
         "fileSearch" => "搜索文件",
+        "fileSize" => "计算目录大小",
         "logCleanRun" => "日志清理",
+        "logCleanConfig" => "日志清理配置",
+        "logCleanConfigSave" => "保存日志清理配置",
         "pluginInstall" => "安装插件",
         "pluginDelete" => "卸载插件",
         "pluginStoreInstall" => "安装/更新在线插件",
@@ -694,8 +702,12 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         "fileSearch",
         guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_search),
     );
+    controller = controller.post(
+        "fileSize",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_dir_size),
+    );
 
-    // 日志清理（「日志清理」页）
+    // 日志清理（供「日志清理」插件使用；接口保留在核心）
     controller = controller.get(
         "logCleanScan",
         guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_scan),
@@ -703,6 +715,14 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "logCleanRun",
         guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_run),
+    );
+    controller = controller.get(
+        "logCleanConfig",
+        guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_config),
+    );
+    controller = controller.post(
+        "logCleanConfigSave",
+        guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_config_save),
     );
 
     // 插件（「插件」页；页面本身经 /plugins/* 静态服务）
