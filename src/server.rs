@@ -78,6 +78,11 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
                 let options = HttpServerOptions {
                     // 每连接独立线程：管理操作可能阻塞（停止/启动应用），避免拖慢其他请求
                     thread_per_connection: true,
+                    // WebSocket（在线终端）30 秒服务端 Ping：穿透反向代理的空闲断开
+                    ws: dhrust::net::ws::WsServerOptions {
+                        server_ping: Some(std::time::Duration::from_secs(30)),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
 
@@ -96,7 +101,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板）
     let panel = WebPanel::new(manager.clone(), manager.base(), port);
     build_api_controller(panel.clone()).mount(&mut router);
-    build_star_controller(panel).mount(&mut router);
+    build_star_controller(panel.clone()).mount(&mut router);
+
+    // 在线终端：WebSocket 升级路由（真 PTY 流式；认证在处理器内完成，见 terminal.rs）
+    let term_panel = panel.clone();
+    router.map_get(
+        "/star/termWs",
+        route(move |ctx| {
+            let panel = term_panel.clone();
+            async move { crate::terminal::term_ws(&panel, &ctx) }
+        }),
+    );
 
     // DHDeploy 契约：应用级启停重启
     let m = manager.clone();
@@ -204,6 +219,21 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             "/index.html",
             include_bytes!("../web/index.html"),
             "text/html; charset=utf-8",
+        )
+        .embed(
+            "/assets/xterm.js",
+            include_bytes!("../res/web/xterm.js"),
+            "application/javascript; charset=utf-8",
+        )
+        .embed(
+            "/assets/xterm.css",
+            include_bytes!("../res/web/xterm.css"),
+            "text/css; charset=utf-8",
+        )
+        .embed(
+            "/assets/addon-fit.js",
+            include_bytes!("../res/web/addon-fit.js"),
+            "application/javascript; charset=utf-8",
         )
         .spa_fallback(true)
         .spa_excludes(&["/api", "/star", "/plugins"]);

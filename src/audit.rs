@@ -38,6 +38,7 @@ pub(crate) const ALL_PERMISSIONS: &[(&str, &str)] = &[
     ("cleanup", "日志清理"),
     ("plugins", "插件"),
     ("ai", "AI 助手"),
+    ("terminal", "在线终端"),
     ("audit", "操作日志"),
 ];
 

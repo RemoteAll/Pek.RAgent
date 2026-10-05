@@ -245,6 +245,19 @@ impl WebPanel {
         }
     }
 
+    /// 解析请求主体（WebSocket 场景：浏览器无法设置请求头，支持查询参数 `token=` 回退）。
+    pub(crate) fn principal_with_query_token(&self, ctx: &Ctx) -> Option<Principal> {
+        if let Some(p) = self.principal(ctx) {
+            return Some(p);
+        }
+        let token = arg(ctx, "token")?;
+        let token = token.trim();
+        if token.is_empty() || !self.validate_token(token) {
+            return None;
+        }
+        self.sessions.lock().unwrap().get(token).cloned()
+    }
+
     /// 当前鉴权级别（动态读取配置）。
     fn auth_level(&self) -> AuthLevel {
         AuthLevel::parse(&self.manager.config().web_auth_level)
@@ -268,6 +281,7 @@ pub(crate) const PERM_CLEANUP: &str = "cleanup";
 pub(crate) const PERM_PLUGINS: &str = "plugins";
 pub(crate) const PERM_AUDIT: &str = "audit";
 pub(crate) const PERM_AI: &str = "ai";
+pub(crate) const PERM_TERMINAL: &str = "terminal";
 /// 用户管理：仅内置管理员（不参与授权列表）。
 pub(crate) const PERM_USERS: &str = "users";
 
@@ -437,6 +451,7 @@ fn action_title(action: &str) -> String {
         "pluginDelete" => "卸载插件",
         "pluginStoreInstall" => "安装/更新在线插件",
         "aiChat" => "AI 助手对话",
+        "termReset" => "重置终端会话",
         "userSave" => "保存面板用户",
         "userDelete" => "删除面板用户",
         "userResetPassword" => "重置用户密码",
@@ -770,6 +785,12 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "aiChat",
         guarded(panel.clone(), PERM_AI, crate::ai::ai_chat),
+    );
+
+    // 在线终端（真 PTY + WebSocket，见 crate::terminal；WS 入口注册在 server.rs）
+    controller = controller.post(
+        "termReset",
+        guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_reset),
     );
 
     controller.get(
@@ -1312,6 +1333,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("AiBaseUrl", "AI 接口地址", "String", cfg.ai_base_url.clone(), "OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时修改。修改后自动生效"),
         config_item("AiModel", "AI 模型", "String", cfg.ai_model.clone(), "模型名（如 deepseek-chat 对话 / deepseek-reasoner 推理；接入其他服务时填其模型名）。修改后自动生效"),
         config_item("AiApiKey", "AI API Key", "Password", cfg.ai_api_key.clone(), "模型服务商 API Key（Bearer 令牌）。修改后自动生效"),
+        config_item("TerminalEnabled", "在线终端", "Boolean", cfg.terminal_enabled.to_string(), "启用后可在「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兜底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -2443,6 +2465,7 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         "aibaseurl" => set_string(value, |s| cfg.ai_base_url = s),
         "aimodel" => set_string(value, |s| cfg.ai_model = s),
         "aiapikey" => set_string(value, |s| cfg.ai_api_key = s),
+        "terminalenabled" => set_bool(value, |b| cfg.terminal_enabled = b),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -3293,7 +3316,7 @@ mod tests {
         assert!(!users.is_empty());
         assert_eq!(users[0]["userName"], "admin");
         assert_eq!(users[0]["isBuiltin"], true);
-        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 14);
+        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 15);
 
         // 删除内置管理员被拒
         let j = body_json(user_delete(

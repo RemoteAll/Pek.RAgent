@@ -23,11 +23,12 @@
 | 本地 HTTP 控制接口 | 默认 `0.0.0.0:5501`（`LocalOnly=true` 时仅 `127.0.0.1`；与 C# 版 StarAgent 的 5500 错开可并存），兼容 DHDeploy 的调用契约 |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
-| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/流量/控制/配置/星尘设置/日志（含操作日志子页）/看门狗/数据库/文件管理/日志清理/插件/AI 助手/用户管理/服务器校时；**多用户与菜单权限**（面板用户存 SQLite；登录后仅显示被授权菜单，服务端逐接口强制校验）；默认管理员 `admin`/`admin`（配置文件凭据，超级权限，在用户列表首行显示）；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌）；**操作审计**（登录与全部变更类操作自动落库 `Agent_OperationLog`，密码等敏感字段脱敏）；前端页编译期内嵌 |
+| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/流量/控制/配置/星尘设置/日志（含操作日志子页）/看门狗/数据库/文件管理/日志清理/插件/AI 助手/在线终端/用户管理/服务器校时；**多用户与菜单权限**（面板用户存 SQLite；登录后仅显示被授权菜单，服务端逐接口强制校验）；默认管理员 `admin`/`admin`（配置文件凭据，超级权限，在用户列表首行显示）；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌）；**操作审计**（登录与全部变更类操作自动落库 `Agent_OperationLog`，密码等敏感字段脱敏）；前端页编译期内嵌 |
 | 资源采样器 | 后台线程按 `SampleInterval`（默认 1 秒）采样整机 CPU/网络/磁盘/TCP/线程句柄并缓存；面板请求读快照（多客户端读数一致、请求零采集；CPU 与任务管理器/宝塔同粒度）；`SampleInterval=0` 可关闭改由请求时现采 |
 | 流量统计 | **网站流量**（解析 nginx/Apache/Caddy 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled` 等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 SQLite：`Data/traffic.db`，由 **Pek.RCode** 按 XCode 规范模型 `Entity/Model.xml` 管理；网站按站点、端口按天；旧版 JSON 归档首次运行自动迁移），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 | **AI 助手** | 服务器问题分析助手（面板「🤖 AI 助手」页）：对话式分析，自动附带服务器实况快照（主机/代理/子服务/看门狗/最近日志）；**支持自定义模型**——OpenAI 兼容接口（默认接入 DeepSeek `deepseek-chat`，可改 `deepseek-reasoner` 或任何兼容服务/本地 Ollama），配置项 `AiEnabled`/`AiBaseUrl`/`AiModel`/`AiApiKey`（面板配置页可改）；接口 `/star/aiStatus`、`/star/aiChat`；菜单权限 `ai` 可授予子用户 |
+| **在线终端** | 免 SSH 的真终端（「🖥 在线终端」页，xterm.js + WebSocket + PTY）：单区域流式、光标闪烁、命令回显，**支持 vim/top 等交互式程序与 Ctrl+C 中断、pause 等待等完整键盘交互**；会话内 `cd`/环境变量保持、刷新自动重连并回放最近输出、空闲 30 分钟回收；命令以服务账户权限运行（Linux 通常 root、Windows LocalSystem）；**会话打开/关闭记入操作审计**（有意不采集击键——可能含密码）；配置项 `TerminalEnabled` 可整体关闭；菜单权限 `terminal`；接口 `GET /star/termWs`（WebSocket）、`POST /star/termReset` |
 
 ---
 
@@ -282,6 +283,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `AiBaseUrl` | `https://api.deepseek.com/v1` | AI 接口地址：OpenAI 兼容 Base（自动补 `/chat/completions`），也可直接填完整地址；接入其他厂商/本地模型时修改（如 `http://127.0.0.1:11434/v1`） |
 | `AiModel` | `deepseek-chat` | 模型名（如 `deepseek-chat` / `deepseek-reasoner`） |
 | `AiApiKey` | 空 | API Key（Bearer 令牌）；留空时 AI 页提示先到配置页填写 |
+| `TerminalEnabled` | `true` | 在线终端开关（面板「🖥 在线终端」页）；关闭后接口直接拒绝 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）

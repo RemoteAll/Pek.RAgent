@@ -72,6 +72,8 @@
   <AiModel>deepseek-chat</AiModel>
   <!--AI API Key（Bearer 令牌）。留空 = 未配置，AI 助手页会提示先到配置页填写-->
   <AiApiKey></AiApiKey>
+  <!--在线终端。启用后可在面板「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）-->
+  <TerminalEnabled>true</TerminalEnabled>
 
   <!--应用服务集合-->
   <Services></Services>

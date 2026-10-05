@@ -187,6 +187,7 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
 
     // 5) 清理
     manager.shutdown("宿主退出");
+    crate::terminal::close_all();
     drop(timer);
     drop(reload_timer);
     drop(up_timer);

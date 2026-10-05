@@ -23,6 +23,7 @@ mod sampler;
 mod server;
 mod service;
 mod sys;
+mod terminal;
 mod udp_rpc;
 mod util;
 mod weblog;

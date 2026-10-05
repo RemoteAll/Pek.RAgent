@@ -97,6 +97,8 @@ pub struct AgentConfig {
     pub ai_model: String,
     /// AI API Key（Bearer 令牌）
     pub ai_api_key: String,
+    /// 在线终端。启用后可在面板「在线终端」页执行服务器命令（免 SSH；命令以本程序/服务账户权限运行，全部记入审计）
+    pub terminal_enabled: bool,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -140,6 +142,7 @@ impl Default for AgentConfig {
             ai_base_url: "https://api.deepseek.com/v1".to_string(),
             ai_model: "deepseek-chat".to_string(),
             ai_api_key: String::new(),
+            terminal_enabled: true,
             apps: sample_apps(),
         }
     }
@@ -604,6 +607,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "AiApiKey") {
         cfg.ai_api_key = v;
     }
+    if let Some(v) = bool_of(obj, "TerminalEnabled") {
+        cfg.terminal_enabled = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -724,6 +730,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("AiBaseUrl", cfg.ai_base_url.clone());
         push("AiModel", cfg.ai_model.clone());
         push("AiApiKey", cfg.ai_api_key.clone());
+        push("TerminalEnabled", bool_text(cfg.terminal_enabled));
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -1105,6 +1112,16 @@ mod tests {
         );
         assert!(text.contains("<AiEnabled>true</AiEnabled>"), "{text}");
         assert!(text.contains("<AiApiKey"), "{text}");
+    }
+
+    #[test]
+    fn terminal_enabled_read_render() {
+        let json: Json = serde_json::from_str(r#"{ "TerminalEnabled": "false" }"#).unwrap();
+        let cfg = config_from_json(&json);
+        assert!(!cfg.terminal_enabled);
+        assert!(AgentConfig::default().terminal_enabled);
+        let text = render_xml(&AgentConfig::default(), None).unwrap();
+        assert!(text.contains("<TerminalEnabled>true</TerminalEnabled>"), "{text}");
     }
 
     #[test]

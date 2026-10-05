@@ -30,8 +30,12 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+# 在线终端：真 PTY（openpty；bash -l）——0.9：nix 0.28 支持 loongarch64 等全架构交叉编译
+portable-pty = "0.9"
 
 [target.'cfg(windows)'.dependencies]
+# 在线终端：真 PTY（ConPTY）——0.8.1：实测可用（0.9 的 PSUEDOCONSOLE_INHERIT_CURSOR 标志下 ConPTY 无输出）
+portable-pty = "0.8"
 # 注：Windows 服务运行时（windows-service）已随 service 模块下沉至 dhrust
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

@@ -281,6 +281,12 @@ html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
 .ai-input-row{display:flex;gap:8px;align-items:flex-end}
 .ai-input-row textarea{flex:1;resize:vertical;min-height:56px;background:var(--surface-2);border:1px solid var(--border-default);border-radius:var(--radius-sm);color:var(--text-primary);padding:10px 12px;font-size:13px;outline:none;font-family:inherit}
 .ai-input-row textarea:focus{border-color:var(--brand-500)}
+/* ── 在线终端（真 PTY + xterm.js） ── */
+.term-box{height:460px;background:#0b1220;border:1px solid var(--border-default);border-radius:var(--radius-md);padding:6px 8px;overflow:hidden}
+.term-state{margin-left:8px;font-size:12px;font-weight:400;color:var(--text-muted)}
+.term-state.ok{color:#22c55e}
+.term-state.warn{color:#f59e0b}
+.term-state.err{color:#ef4444}
 .clean-target{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text-muted);padding:3px 0;font-family:var(--font-mono)}
 .clean-target .p{word-break:break-all}
 /* ── 用户 / 操作日志 ── */
@@ -336,6 +342,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="fileman">🗂 文件管理</a>
 <a data-panel="plugins">🧩 插件</a>
 <a data-panel="ai">🤖 AI 助手</a>
+<a data-panel="terminal">🖥 在线终端</a>
 <a data-panel="users">👥 用户</a>
 </nav>
 
@@ -353,6 +360,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-fileman" class="panel"></div>
 <div id="panel-plugins" class="panel"></div>
 <div id="panel-ai" class="panel"></div>
+<div id="panel-terminal" class="panel"></div>
 <div id="panel-users" class="panel"></div>
 </main>
 </div>
@@ -496,6 +504,7 @@ function switchPanel(name){
   fileman:loadFileman,
   plugins:loadPlugins,
   ai:loadAi,
+  terminal:loadTerminal,
   users:loadUsers
  };
  if(loaders[name])loaders[name]();
@@ -2490,6 +2499,73 @@ async function aiSend(){
  aiBusy=false;aiPending=false;
  aiPersist();renderAiMessages();
 }
+
+/* ── 在线终端（真 PTY + xterm.js；WebSocket 流式，单区域、光标闪烁、命令回显） ── */
+let termSid=sessionStorage.getItem('term_sid')||'';
+if(!termSid){termSid=('t'+Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)).slice(0,40);sessionStorage.setItem('term_sid',termSid)}
+let termInst=null,termFit=null,termWs=null,termReconnectTimer=null;
+
+// 资源按需加载（xterm.js 仅在进入终端页时拉取）
+function termEnsureAssets(cb){
+ if(window.Terminal)return cb();
+ if(!document.getElementById('xterm-css')){
+  const css=document.createElement('link');css.id='xterm-css';css.rel='stylesheet';css.href='/assets/xterm.css';document.head.appendChild(css);
+ }
+ const s1=document.createElement('script');
+ s1.src='/assets/xterm.js';
+ s1.onload=()=>{const s2=document.createElement('script');s2.src='/assets/addon-fit.js';s2.onload=cb;s2.onerror=()=>cb();document.head.appendChild(s2)};
+ s1.onerror=()=>{const box=$('term-box');if(box)box.innerHTML='<div style="color:#f87171;padding:10px;font-size:13px">终端组件加载失败（/assets/xterm.js）——请确认面板版本已升级</div>'};
+ document.head.appendChild(s1);
+}
+function loadTerminal(){
+ $('panel-terminal').innerHTML=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🖥 在线终端 <span id="term-state" class="term-state">连接中…</span></h2>
+   <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn btn-secondary btn-sm" onclick="termReset()">⟳ 重置会话</button>
+   </div>
+  </div>
+  <div id="term-box" class="term-box"></div>
+  <div class="text-muted" style="margin-top:8px;font-size:12px">真终端（PTY）：支持 vim/top 等交互式程序与完整键盘操作；命令以服务账户权限运行（Linux 通常 root）；会话在标签页内保持、空闲 30 分钟自动回收；刷新页面自动重连并回放最近输出。</div>
+ </div>`;
+ termEnsureAssets(()=>termInit());
+}
+function termInit(){
+ const box=$('term-box');if(!box)return;
+ if(!termInst){
+  termInst=new Terminal({cursorBlink:true,fontSize:13,fontFamily:'Consolas,"Cascadia Mono",Menlo,"Courier New",monospace',theme:{background:'#0b1220',foreground:'#cbd5e1',cursor:'#60a5fa',selectionBackground:'#334155'},scrollback:5000});
+  if(window.FitAddon){termFit=new FitAddon.FitAddon();termInst.loadAddon(termFit)}
+  termInst.onData(d=>{if(termWs&&termWs.readyState===1)termWs.send(JSON.stringify({t:'i',d}))});
+  termInst.onResize(({cols,rows})=>{if(termWs&&termWs.readyState===1)termWs.send(JSON.stringify({t:'r',c:cols,r:rows}))});
+ }
+ if(termInst.element){box.appendChild(termInst.element)}else{termInst.open(box)}
+ try{termFit&&termFit.fit()}catch(e){}
+ // 已有活连接（面板未离开过）则不重连，避免重复回放；仅同步状态文字
+ if(termWs&&termWs.readyState===1){termSetState('已连接','ok');termInst.focus();return}
+ termConnect();
+ termInst.focus();
+}
+function termConnect(){
+ if(termWs){try{termWs.close()}catch(e){}termWs=null}
+ clearTimeout(termReconnectTimer);
+ termSetState('连接中…','warn');
+ const proto=location.protocol==='https:'?'wss://':'ws://';
+ let url=proto+location.host+'/star/termWs?sid='+encodeURIComponent(termSid)+'&cols='+(termInst?termInst.cols:120)+'&rows='+(termInst?termInst.rows:30);
+ if(token)url+='&token='+encodeURIComponent(token);
+ let ws;try{ws=new WebSocket(url)}catch(e){termSetState('连接失败','err');return}
+ termWs=ws;
+ ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');if(termInst){try{termInst.reset()}catch(e){}}try{termFit&&termFit.fit()}catch(e){}};
+ ws.onmessage=ev=>{if(termInst&&typeof ev.data==='string')termInst.write(ev.data)};
+ ws.onclose=()=>{if(termWs!==ws)return;termWs=null;termSetState('已断开（3 秒后自动重连）','err');termReconnectTimer=setTimeout(()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active'))termConnect()},3000)};
+ ws.onerror=()=>{};
+}
+function termSetState(text,kind){const el=$('term-state');if(el){el.textContent=text;el.className='term-state '+(kind||'')}}
+async function termReset(){
+ try{await api('/star/termReset',{method:'POST',body:JSON.stringify({sid:termSid})})}catch(e){}
+ if(termInst){try{termInst.reset()}catch(e){}}
+ termConnect();
+}
+window.addEventListener('resize',()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active')&&termFit){try{termFit.fit()}catch(e){}}});
 
 /* ── 操作日志（审计） ── */
 let auditData=null,auditPage=1,auditFilters={q:'',user:'',success:''};
