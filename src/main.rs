@@ -16,6 +16,7 @@ mod fileman;
 mod history;
 mod logclean;
 mod manager;
+mod plugins;
 mod portstat;
 mod sampler;
 mod server;

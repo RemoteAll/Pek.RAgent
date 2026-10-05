@@ -85,6 +85,10 @@ pub struct AgentConfig {
     /// 日志清理自定义路径（分号分隔；目录=清空内容、文件=截断清空）。
     /// 供 Web 面板「日志清理」页在平台内置分类之外额外扫描/清理
     pub log_cleanup_paths: String,
+    /// 在线插件源地址（`catalog.json` URL；仅 https，127.0.0.1 例外）。空 = 关闭在线插件
+    pub plugin_store_url: String,
+    /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
+    pub plugin_store_pubkey: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -122,6 +126,8 @@ impl Default for AgentConfig {
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
             log_cleanup_paths: String::new(),
+            plugin_store_url: String::new(),
+            plugin_store_pubkey: String::new(),
             apps: sample_apps(),
         }
     }
@@ -341,6 +347,8 @@ impl AgentConfig {
         self.web_logs = self.web_logs.trim().to_string();
         self.port_traffic_ports = self.port_traffic_ports.trim().to_string();
         self.log_cleanup_paths = self.log_cleanup_paths.trim().to_string();
+        self.plugin_store_url = self.plugin_store_url.trim().to_string();
+        self.plugin_store_pubkey = self.plugin_store_pubkey.trim().to_string();
         // 流量历史保留天数：0 = 永久；非 0 时限定 7~3650 天（防误配清空全部历史）
         if self.traffic_history_days != 0 {
             self.traffic_history_days = self.traffic_history_days.clamp(
@@ -556,6 +564,12 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "LogCleanupPaths") {
         cfg.log_cleanup_paths = v;
     }
+    if let Some(v) = text_of(obj, "PluginStoreUrl") {
+        cfg.plugin_store_url = v;
+    }
+    if let Some(v) = text_of(obj, "PluginStorePubKey") {
+        cfg.plugin_store_pubkey = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -670,6 +684,8 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
         push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
+        push("PluginStoreUrl", cfg.plugin_store_url.clone());
+        push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -992,6 +1008,29 @@ mod tests {
         );
         let empty = render_xml(&AgentConfig::default(), None).unwrap();
         assert!(empty.contains("<LogCleanupPaths"), "{empty}");
+    }
+
+    #[test]
+    fn plugin_store_fields_read_render_and_normalize() {
+        let json: Json = serde_json::from_str(
+            r#"{ "PluginStoreUrl": " https://x.example/catalog.json ", "PluginStorePubKey": " abcd " }"#,
+        )
+        .unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert_eq!(cfg.plugin_store_url, "https://x.example/catalog.json");
+        assert_eq!(cfg.plugin_store_pubkey, "abcd");
+        let default = AgentConfig::default();
+        assert!(default.plugin_store_url.is_empty());
+        assert!(default.plugin_store_pubkey.is_empty());
+        let mut cfg = AgentConfig::default();
+        cfg.plugin_store_url = "https://x.example/catalog.json".to_string();
+        let text = render_xml(&cfg, None).unwrap();
+        assert!(
+            text.contains("<PluginStoreUrl>https://x.example/catalog.json</PluginStoreUrl>"),
+            "{text}"
+        );
+        assert!(text.contains("<PluginStorePubKey"), "{text}");
     }
 
     #[test]

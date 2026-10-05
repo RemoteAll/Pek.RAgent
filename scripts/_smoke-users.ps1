@@ -28,13 +28,46 @@ $r = Req 'POST' '/api/login' '{"user":"admin","password":"admin"}' $null
 Check 'admin login' ($r.code -eq 0)
 $admin = $r.data.token
 $r = Req 'GET' '/api/me' $null $admin
-Check 'admin me isAdmin with all perms' ($r.code -eq 0 -and $r.data.isAdmin -eq $true -and $r.data.perms.Count -eq 12)
+Check 'admin me isAdmin with all perms' ($r.code -eq 0 -and $r.data.isAdmin -eq $true -and $r.data.perms.Count -eq 13)
 
 # 2. create user u1 (dashboard + fileman)
 $r = Req 'POST' '/star/userSave' '{"name":"u1","password":"u1pass","permissions":["dashboard","fileman"],"enabled":true,"remark":"smoke"}' $admin
 Check 'create user u1' ($r.code -eq 0)
-$r = Req 'POST' '/star/userSave' '{"name":"ADMIN","password":"x","permissions":[],"enabled":true}' $admin
-Check 'reject builtin-admin name conflict' ($r.code -eq 400)
+
+# 2b. builtin admin: listed (virtual row) / not deletable / password via userSave
+$r = Req 'GET' '/star/userList' $null $admin
+$builtin = $r.data.users | Where-Object { $_.isBuiltin -eq $true }
+Check 'userList shows builtin admin' ($null -ne $builtin -and $builtin.userName -eq 'admin')
+$r = Req 'POST' '/star/userDelete' '{"name":"admin"}' $admin
+Check 'builtin admin cannot be deleted' ($r.code -eq 400)
+$r = Req 'POST' '/star/userSave' '{"name":"admin","password":"admin2"}' $admin
+Check 'change builtin admin password via userSave' ($r.code -eq 0)
+$r = Req 'POST' '/api/login' '{"user":"admin","password":"admin"}' $null
+Check 'old admin password rejected' ($r.code -eq 401)
+$r = Req 'POST' '/api/login' '{"user":"admin","password":"admin2"}' $null
+Check 'new admin password works' ($r.code -eq 0)
+
+# 2c. builtin admin rename: collision rejected / rename + login / rename back
+$r = Req 'POST' '/star/userSave' '{"name":"admin","newName":"u1"}' $admin
+Check 'rename builtin to existing name rejected' ($r.code -eq 400)
+$r = Req 'POST' '/star/userSave' '{"name":"admin","newName":"boss"}' $admin
+Check 'rename builtin admin (no password change)' ($r.code -eq 0)
+$r = Req 'POST' '/api/login' '{"user":"admin","password":"admin2"}' $null
+Check 'old admin name rejected after rename' ($r.code -eq 401)
+$r = Req 'POST' '/api/login' '{"user":"boss","password":"admin2"}' $null
+Check 'renamed admin login works' ($r.code -eq 0)
+$r = Req 'POST' '/star/userSave' '{"name":"boss","newName":"admin"}' $admin
+Check 'rename back to admin' ($r.code -eq 0)
+
+# 2d. plugins: list / invalid zip rejected / bad id rejected
+$r = Req 'GET' '/star/pluginList' $null $admin
+Check 'pluginList works (empty)' ($r.code -eq 0 -and $r.data.plugins.Count -eq 0)
+$r = Req 'POST' '/star/pluginInstall?name=bad.zip' 'not a zip' $admin
+Check 'pluginInstall rejects invalid zip' ($r.code -eq 400)
+$r = Req 'POST' '/star/pluginDelete' '{"id":".."}' $admin
+Check 'pluginDelete rejects bad id' ($r.code -eq 400)
+$r = Req 'GET' '/star/pluginStore' $null $admin
+Check 'pluginStore unconfigured by default' ($r.code -eq 0 -and $r.data.configured -eq $false)
 
 # 3. u1 login + me
 $r = Req 'POST' '/api/login' '{"user":"u1","password":"u1pass"}' $null

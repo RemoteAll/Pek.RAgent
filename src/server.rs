@@ -206,21 +206,28 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             "text/html; charset=utf-8",
         )
         .spa_fallback(true)
-        .spa_excludes(&["/api", "/star"]);
+        .spa_excludes(&["/api", "/star", "/plugins"]);
 
     // 404（静态未命中时）
+    let plugins_base = manager.base().to_path_buf();
     router.fallback(route(move |ctx| {
         let statics = statics.clone();
+        let plugins_base = plugins_base.clone();
         async move {
-            // GET/HEAD：文件 → SPA 回退；其他方法只允许命中真实文件
+            // GET/HEAD：插件文件 → 面板文件 → SPA 回退；其他方法只允许命中真实文件
             let method_ok = ctx.req.method.eq_ignore_ascii_case("GET")
                 || ctx.req.method.eq_ignore_ascii_case("HEAD");
-            let served = if method_ok {
-                statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
-            } else {
-                statics.try_serve_file(&ctx.req.path)
-            };
-            if let Some(response) = served {
+            if method_ok {
+                // 插件静态资源：/plugins/<id>/...（本地放置的扩展页面，见 plugins.rs）
+                if let Some(response) = crate::plugins::serve(&plugins_base, &ctx.req.path) {
+                    return HttpOutcome::Response(response);
+                }
+                if let Some(response) =
+                    statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
+                {
+                    return HttpOutcome::Response(response);
+                }
+            } else if let Some(response) = statics.try_serve_file(&ctx.req.path) {
                 return HttpOutcome::Response(response);
             }
             HttpOutcome::Response(HttpResponse::json(

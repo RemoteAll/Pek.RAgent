@@ -23,7 +23,7 @@
 | 本地 HTTP 控制接口 | 默认 `0.0.0.0:5501`（`LocalOnly=true` 时仅 `127.0.0.1`；与 C# 版 StarAgent 的 5500 错开可并存），兼容 DHDeploy 的调用契约 |
 | 位置参数 zip 拉起 | `pek-ragent app.zip urls=http://*:8080`（影子目录运行的一次性应用） |
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
-| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/流量/控制/配置/星尘设置/日志/看门狗/数据库/文件管理/日志清理/操作日志/用户管理/服务器校时；**多用户与菜单权限**（面板用户存 SQLite；登录后仅显示被授权菜单，服务端逐接口强制校验）；默认管理员 `admin`/`admin`（配置文件凭据，超级权限）；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌）；**操作审计**（登录与全部变更类操作自动落库 `Agent_OperationLog`，密码等敏感字段脱敏）；前端页编译期内嵌 |
+| Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/流量/控制/配置/星尘设置/日志（含操作日志子页）/看门狗/数据库/文件管理/日志清理/插件/用户管理/服务器校时；**多用户与菜单权限**（面板用户存 SQLite；登录后仅显示被授权菜单，服务端逐接口强制校验）；默认管理员 `admin`/`admin`（配置文件凭据，超级权限，在用户列表首行显示）；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌）；**操作审计**（登录与全部变更类操作自动落库 `Agent_OperationLog`，密码等敏感字段脱敏）；前端页编译期内嵌 |
 | 资源采样器 | 后台线程按 `SampleInterval`（默认 1 秒）采样整机 CPU/网络/磁盘/TCP/线程句柄并缓存；面板请求读快照（多客户端读数一致、请求零采集；CPU 与任务管理器/宝塔同粒度）；`SampleInterval=0` 可关闭改由请求时现采 |
 | 流量统计 | **网站流量**（解析 nginx/Apache/Caddy 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled` 等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 SQLite：`Data/traffic.db`，由 **Pek.RCode** 按 XCode 规范模型 `Entity/Model.xml` 管理；网站按站点、端口按天；旧版 JSON 归档首次运行自动迁移），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
@@ -204,6 +204,10 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | 命令 | 说明 |
 |------|------|
 | `-ShowMachineInfo` | 显示本机信息（系统/主机/用户/CPU 型号/内存使用/运行时长 + 网络接口 + 磁盘列表；信息面对齐 C# StarAgent `ShowMachineInfo`） |
+| `-PluginStoreKeygen [目录]` | 生成在线插件源签名密钥对（Ed25519）：`plugin-store.key`（私钥 hex，离线保管）+ `plugin-store.pub`（公钥 hex，填入面板「配置」→ 插件源公钥） |
+| `-PluginStorePublish <插件源目录> <插件.zip> [--base-url https://…/] [--key 私钥]` | 发布插件（推荐）：校验包 → 计算 SHA-256 → 更新 `catalog.json`（url+sha256）→ 重新签名 `.sig`；首次需 `--base-url`（写入 `store.json` 记忆）；同 id 旧版本包自动清理 |
+| `-PluginStoreRemove <插件源目录> <插件id> [--key 私钥]` | 下线插件：删除目录条目与包文件并重新签名 |
+| `-PluginStoreSign <catalog.json> [私钥文件]` | 仅对目录签名（手动维护目录时使用） |
 | `pek-ragent app.zip 参数…` | 位置参数 zip 一次性拉起（影子目录；支持 `-name`、`-shadow`） |
 | `-selftest` / `-ensure-running` | 升级管线内部命令（影子自检 / 重启助手），由程序自动调用，无需手工执行 |
 | `-help` / `-version` | 帮助 / 版本 |
@@ -262,15 +266,17 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 | `Server` / `Project` | 空 | 预留；`-server` / `-project` 参数会保存于此，暂不对接 |
 | `StartupHook` | `false` | 对未引用星尘 SDK 的 .NET 应用注入 `Stardust.dll` |
 | `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
-| `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（配置页可在线修改密码） |
+| `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（面板「用户」页管理：内置管理员行可改用户名/密码） |
 | `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
 | `SampleInterval` | `1000` | 后台资源采样间隔（毫秒）：面板 CPU/网络/磁盘速率按此窗口差分；`0`=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效 |
 | `WebTraffic` | `true` | 网站流量统计开关：后台解析站点访问日志（自动发现常见目录 + `WebLogs` 手动补充），零侵入只读；关闭后停止读取；统计口径默认响应体字节（`$body_bytes_sent`），日志行尾追加 `$bytes_sent` 时自动改用实际发送字节（响应头+响应体，推荐配置见 8. 面板“流量”节） |
-| `WebLogs` | 空 | 网站日志手动配置：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
+| `WebLogs` | 空 | 网站日志手动补充（高级选项，面板配置页不展示，一般无需填写）：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
 | `PortTraffic` | `true` | 端口流量统计开关（默认开启）：Linux 在独立 nftables 表 `inet pek_stats` 中按端口计数收发字节（需 root 与 `nft` 命令；**只计数不改转发**，关闭/卸载时自动删表）；无 nft 或权限不足、Windows/其它平台自动降级为连接视图（无字节数） |
-| `PortTrafficPorts` | 空 | 端口流量统计端口列表：`22,80,443`（逗号分隔）；留空自动取系统监听端口（上限 64 个） |
+| `PortTrafficPorts` | 空 | 端口流量统计端口列表（高级选项，面板配置页不展示，一般无需填写）：`22,80,443`（逗号分隔）；留空自动取系统监听端口（上限 64 个） |
 | `TrafficHistoryDays` | `90` | 流量历史保留天数：每日归档落 SQLite `Data/traffic.db`（Pek.RCode + XCode 模型 `Entity/Model.xml`；网站按站点、端口按天；跨天自动保存、进程重启续算不重复）；`7~3650`，`0`=永久保留 |
-| `LogCleanupPaths` | 空 | 日志清理自定义路径：分号分隔（绝对路径；目录=清空内容、文件=截断清空），在面板“🧹 日志清理”页以“自定义路径”分类显示与清理 |
+| `LogCleanupPaths` | 空 | 日志清理自定义路径（高级选项，面板配置页不展示，直接编辑配置文件，修改后自动生效）：分号分隔（绝对路径；目录=清空内容、文件=截断清空），在面板“🧹 日志清理”页以“自定义路径”分类显示与清理 |
+| `PluginStoreUrl` | 空 | 在线插件源地址（`catalog.json` 的 URL）：仅允许 https（127.0.0.1 例外便于本地调试）；面板「🧩 插件」页据此展示在线插件并可一键安装/更新；留空 = 关闭在线插件。修改后自动生效 |
+| `PluginStorePubKey` | 空 | 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）：非空时对 `catalog.json` 强制验签（需发布同名 `.sig`），防插件源被篡改；留空 = 仅 HTTPS + SHA-256 校验 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）
@@ -401,18 +407,21 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 
 内置管理面板，浏览器访问 `http://127.0.0.1:5501/`（`LocalOnly=false` 时允许远程）：
 
-- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板“配置”页可在线修改密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
+- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
 - **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
 - **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
 - **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
 - **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
-- **日志**：`Log/` 目录文件列表与尾部内容查看（支持行数/文件/级别过滤）；
+- **日志**：页内两个**子页签**（交互对齐流量页）——**📋 系统日志**（`Log/` 目录文件列表与尾部内容查看，支持行数/文件/级别过滤）与 **📜 操作日志**（审计查询，见下）；子页标签按权限显隐（URL hash `#logs` / `#logs.audit`，兼容旧 `#audit` 书签）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
 - **文件管理**（对齐宝塔）：全盘浏览（根=盘符/`/`，符号链接可进入）、上传（多文件、带进度，≤64MB）/下载（≤256MB）、新建文件与文件夹、批量重命名/复制/移动/删除、ZIP 压缩/解压、在线编辑文本（≤2MB，UTF-8，二进制拒读）、Linux 权限修改（chmod）与递归搜索；删除/改名/移动对根、一级目录（`/etc`、`C:\Windows` 等）与程序目录本身设保护（目录内部照常可操作）；
-- **日志清理**（对齐宝塔）：一键扫描并清理 系统日志（syslog/messages/journald）、网站日志（宝塔/nginx/apache）、Nginx 缓存目录、代理自身日志（`Log/`）、Redis/MySQL 日志与自定义路径（`LogCleanupPaths`）；日志文件**截断清空**（保留文件、持句柄进程不受影响）、缓存目录清空（内含 `*.log` 同样截断保留）、journald 走 `journalctl --vacuum`；逐分类显示条数与大小、可展开文件明细。
-- **操作日志**：登录（含失败）与全部变更类操作（配置/控制/子服务/文件管理/日志清理/数据库/用户管理）自动落库 SQLite `Agent_OperationLog`（参数摘要脱敏——密码/令牌等字段替换为 `***`；含失败与 403 越权记录）；支持关键词/操作者/结果筛选与分页；权限：`audit` 菜单。
-- **用户**（仅内置管理员）：多用户管理（用户名/密码/菜单权限勾选/启用/备注/删除）；面板用户存 `Data/traffic.db` 的 `Agent_PanelUser` 表（密码 `SHA-256(salt:password)` 不可逆存储，随数据库备份/还原迁移）；用户登录后仅显示被授权菜单（前端隐藏 + 服务端逐接口校验，越权返回 403 并记审计）；内置管理员（配置文件凭据）拥有全部权限。
+- **日志清理**（对齐宝塔）：一键扫描并清理 系统日志（syslog/messages/journald）、网站日志（宝塔/nginx/apache）、Nginx 缓存目录、代理自身日志（`Log/`）、Redis/MySQL 日志（额外目录可通过配置文件高级项 `LogCleanupPaths` 追加，面板不提供编辑）；日志文件**截断清空**（保留文件、持句柄进程不受影响）、缓存目录清空（内含 `*.log` 同样截断保留）、journald 走 `journalctl --vacuum`；逐分类显示条数与大小、可展开文件明细。
+- **插件**（权限 `plugins`）：`{base}/Plugins/<id>/` 放置含 `plugin.json` 清单的页面包，或面板「🧩 插件」页上传 zip 安装/删除；页面经 `/plugins/<id>/...` 同源服务并以 iframe 嵌入（复用登录态调用面板接口，受权限约束并记入操作日志）；清单字段 `name/description/version/icon/entry/app`（`app` 关联子服务名，可查看状态并启停）。
+- **在线插件源（宝塔式商店的安全版）**：`PluginStoreUrl` 指向自建 `catalog.json`（HTTPS），面板展示在线插件并可一键**安装/更新**（同 id 版本变化即更新，替换失败自动回滚旧版本）；安全设计：**仅 https + 强制 SHA-256 校验 + 可选 Ed25519 强制验签**（`PluginStorePubKey`；发布端用 `pek-ragent -PluginStoreKeygen` / `-PluginStoreSign` 生成密钥并签名 `catalog.json.sig`）+ 下载大小上限 32MB + **不执行任何安装脚本**；校验不通过一律拒绝（对抗中间人/被篡改的插件源）。
+- **插件发布流程**（发布端两步命令）：① 一次：`-PluginStoreKeygen` 生成密钥 + 面板「配置」填公钥；② 每次发布：`-PluginStorePublish ./store myplugin.zip --base-url https://plugins.example.com/ --key plugin-store.key`（自动校验包、计算 SHA-256、更新 `catalog.json` 并签名 `.sig`；同 id 旧版本包自动清理）→ 把整个 `store` 目录同步到 HTTPS 静态空间即完成发布；下线用 `-PluginStoreRemove`。
+- **操作日志**（日志页子页签，权限 `audit`）：登录（含失败）与全部变更类操作（配置/控制/子服务/文件管理/日志清理/数据库/用户管理）自动落库 SQLite `Agent_OperationLog`（参数摘要脱敏——密码/令牌等字段替换为 `***`；含失败与 403 越权记录）；支持关键词/操作者/结果筛选与分页。
+- **用户**（仅内置管理员）：多用户管理（用户名/密码/菜单权限勾选/启用/备注/删除）；内置管理员以虚拟条目显示在列表首行（全部权限、可编辑用户名/密码、不可删除）；面板用户存 `Data/traffic.db` 的 `Agent_PanelUser` 表（密码 `SHA-256(salt:password)` 不可逆存储，随数据库备份/还原迁移）；用户登录后仅显示被授权菜单（前端隐藏 + 服务端逐接口校验，越权返回 403 并记审计）。
 - **流量**：页签内分为 **📈 网站流量 / 🔌 端口流量** 两个子页面（URL hash 记忆：`#traffic` / `#traffic.ports`）。**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图；**按端口每日数据**：端口汇总表（总接收/发送/日均/活跃天数/占比，支持 7/30/90 天与关键词筛选）→ 点击端口钻取**该端口每日收发**（堆叠柱状图 + 逐日明细表）；另有按日期的端口每日流量总表）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
 
 **网站流量统计口径**：默认取日志中的响应体字节（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）。如需统计 **nginx 实际发送流量（响应头+响应体）**，为站点启用扩展日志格式（行尾追加 `$bytes_sent $request_length`），本代理自动识别并改用 `$bytes_sent`：
@@ -448,6 +457,8 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | `POST /star/fileMkdir`、`POST /star/fileNewFile`、`POST /star/fileRename`、`POST /star/fileDelete`、`POST /star/fileCopy`、`POST /star/fileMove` | 文件管理：新建/重命名/删除/复制/移动（均支持批量） |
 | `GET /star/fileDownload`、`POST /star/fileUpload`、`POST /star/fileCompress`、`POST /star/fileExtract`、`POST /star/fileChmod`、`GET /star/fileSearch` | 文件管理：下载/上传/压缩(ZIP)/解压/权限/搜索 |
 | `GET /star/logCleanScan`、`POST /star/logCleanRun` | 日志清理：扫描分类占用（条数/大小/明细） / 按分类清理（`{"keys":["system",…]}`） |
+| `GET /star/pluginList`、`POST /star/pluginInstall?name=`、`POST /star/pluginDelete` | 插件：列表 / 上传安装（zip 请求体）/ 卸载（`{"id":…}`）；插件页面静态服务 `/plugins/<id>/...` |
+| `GET /star/pluginStore`、`POST /star/pluginStoreInstall` | 在线插件源：列表（含已安装/可更新状态；未配置时 `configured=false`） / 安装或更新（`{"id":…}`；HTTPS 下载 + SHA-256 + 可选强制验签，校验失败拒绝） |
 | `GET /api/me` | 当前登录主体（用户名/是否内置管理员/菜单权限；前端据此渲染菜单） |
 | `GET /star/userList`、`POST /star/userSave`、`POST /star/userDelete` | 面板用户管理（仅内置管理员；新增须密码，编辑密码留空不改） |
 | `GET /star/auditLogs` | 操作日志分页查询（`?page=&size=&user=&q=&success=`；需 `audit` 菜单权限） |
@@ -456,7 +467,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 
 > 鉴权：级别由 `WebAuthLevel` 控制——`None` 全部放行；`LocalOnly`（默认）本机回环地址免登录（视为内置管理员）、远程需 `Authorization: Bearer <token>`；`Full` 全部需令牌。未通过返回 `{code:401}`；本机免登录场景下前端自动跳过登录页。
 >
-> **多用户与菜单权限**：除内置管理员外可创建面板用户并勾选菜单权限（状态/子服务/流量/控制/配置/星尘设置/日志/看门狗/数据库/文件管理/日志清理/操作日志）；用户仅能看到被授权的菜单，服务端对每个接口做权限校验（403 拒绝并写入操作审计）；用户管理仅内置管理员可用。面板用户与审计日志存于与流量历史同一 SQLite（`Data/traffic.db`，模型见 `Entity/Model.xml`），数据库备份/还原自动覆盖；**旧版仅含两张流量表的备份包还原时不会清空用户表**（自适应）。
+> **多用户与菜单权限**：除内置管理员外可创建面板用户并勾选菜单权限（状态/子服务/流量/控制/配置/星尘设置/日志/看门狗/数据库/文件管理/日志清理/插件，以及位于日志页内的“操作日志”子页）；用户仅能看到被授权的菜单，服务端对每个接口做权限校验（403 拒绝并写入操作审计）；用户管理仅内置管理员可用。面板用户与审计日志存于与流量历史同一 SQLite（`Data/traffic.db`，模型见 `Entity/Model.xml`），数据库备份/还原自动覆盖；**旧版仅含两张流量表的备份包还原时不会清空用户表**（自适应）。
 
 ---
 

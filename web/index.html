@@ -257,6 +257,7 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .clean-meta{font-size:13px;color:var(--text-secondary);font-family:var(--font-mono)}
 .clean-desc{font-size:12px;color:var(--orange)}
 .clean-detail{width:100%;margin:8px 0 0 27px;border-left:2px solid var(--border-default);padding-left:12px}
+.plugin-frame{width:100%;height:calc(100vh - 280px);min-height:420px;border:1px solid var(--border-default);border-radius:var(--radius-md)}
 .clean-target{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text-muted);padding:3px 0;font-family:var(--font-mono)}
 .clean-target .p{word-break:break-all}
 /* ── 用户 / 操作日志 ── */
@@ -312,7 +313,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="database">🗄 数据库</a>
 <a data-panel="fileman">🗂 文件管理</a>
 <a data-panel="cleanup">🧹 日志清理</a>
-<a data-panel="audit">📜 操作日志</a>
+<a data-panel="plugins">🧩 插件</a>
 <a data-panel="users">👥 用户</a>
 </nav>
 
@@ -330,7 +331,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-database" class="panel"></div>
 <div id="panel-fileman" class="panel"></div>
 <div id="panel-cleanup" class="panel"></div>
-<div id="panel-audit" class="panel"></div>
+<div id="panel-plugins" class="panel"></div>
 <div id="panel-users" class="panel"></div>
 </main>
 </div>
@@ -405,6 +406,7 @@ function renderNav(){
   const k=a.dataset.panel;
   let show=true;
   if(k==='users')show=!!(me&&me.isAdmin);
+  else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -458,23 +460,25 @@ function switchPanel(name){
   database:loadDatabase,
   fileman:loadFileman,
   cleanup:loadCleanup,
-  audit:loadAudit,
+  plugins:loadPlugins,
   users:loadUsers
  };
  if(loaders[name])loaders[name]();
  if(name==='traffic'){applyTrafficSub(trafficSubFromHash());trafficTimer=setInterval(loadTraffic,3000);}
- // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录；流量页含子页后缀）
+ // 记忆当前页签：刷新后仍停留在本页（replaceState 不产生浏览器历史记录；流量/日志页含子页后缀）
  let want='#'+name;
  if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
+ if(name==='logs')want=logsSubFromHash()==='audit'?'#logs.audit':'#logs';
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
 // 从 URL hash 解析页签名（非法/缺省/无权限返回空串；与导航实际可见页签比对，避免选择器注入）
-// 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports
+// 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports / #audit
 function panelFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
  if(!h)return '';
  if(h==='ports')return 'traffic';
+ if(h==='audit')return 'logs';
  const name=h.split('.')[0];
  return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
 }
@@ -507,6 +511,7 @@ window.addEventListener('hashchange',()=>{
  const link=[...document.querySelectorAll('nav a[data-panel]')].find(a=>a.dataset.panel===h);
  if(link&&!link.classList.contains('active'))switchPanel(h);
  else if(h==='traffic'&&$('traffic-sub-site'))applyTrafficSub(trafficSubFromHash()); // 流量页内子页签同步
+ else if(h==='logs'&&$('logs-sub-tabs'))applyLogsSub(logsSubFromHash()); // 日志页内子页签同步
 });
 
 /* ── Dashboard ── */
@@ -542,10 +547,12 @@ async function loadDashboard(){
 }
 
 // 默认密码安全横幅：仍为 admin/admin 时常显，改密后随 3 秒状态刷新自动消失
+// 改密入口：内置管理员在【用户】页（admin 行·编辑）管理用户名/密码（配置页不再维护该凭据）
 function updateSecBanner(d){
  const el=$('sec-banner');if(!el)return;
  if(d.defaultPassword){
-  el.textContent='⚠️ 安全提示：Web 面板仍在使用默认密码 admin/admin'+(d.remoteAccess?'，且已允许远程访问（LocalOnly=false），存在被自动化扫描利用的风险':'')+'，请尽快在【配置】页修改密码！';
+  const hint=(me&&me.isAdmin)?'请尽快在【用户】页修改密码！':'请提醒管理员尽快修改密码！';
+  el.textContent='⚠️ 安全提示：Web 面板仍在使用默认密码 admin/admin'+(d.remoteAccess?'，且已允许远程访问（LocalOnly=false），存在被自动化扫描利用的风险':'')+'，'+hint;
   el.classList.remove('hidden');
  }else{
   el.classList.add('hidden');
@@ -1670,16 +1677,18 @@ async function loadConfig(){
   });
   html+=`</tbody></table><div class="mt-16"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">部分配置需重启服务后生效</span></div></div>`;
 
-  // 修改密码卡片
-  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🔑 修改密码</h2>`;
-  html+=`<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end">`;
-  html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">旧密码</label><input type="password" id="pwd-old" placeholder="请输入旧密码" autocomplete="off"></div>`;
-  html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">新密码</label><input type="password" id="pwd-new" placeholder="请输入新密码" autocomplete="new-password"></div>`;
-  html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">确认新密码</label><input type="password" id="pwd-confirm" placeholder="再次输入新密码" autocomplete="new-password"></div>`;
-  html+=`</div>`;
-  html+=`<div style="margin-top:14px;display:flex;align-items:center;gap:12px">`;
-  html+=`<button class="btn btn-primary" onclick="changePassword()">修改密码</button>`;
-  html+=`<span id="pwd-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
+  // 修改密码卡片：内置管理员在「用户」页管理凭据（用户名/密码），此处仅为数据库用户保留本人改密
+  if(!(me&&me.isAdmin)){
+   html+=`<div class="glass-card card" style="margin-top:16px"><h2>🔑 修改密码</h2>`;
+   html+=`<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;align-items:end">`;
+   html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">旧密码</label><input type="password" id="pwd-old" placeholder="请输入旧密码" autocomplete="off"></div>`;
+   html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">新密码</label><input type="password" id="pwd-new" placeholder="请输入新密码" autocomplete="new-password"></div>`;
+   html+=`<div><label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">确认新密码</label><input type="password" id="pwd-confirm" placeholder="再次输入新密码" autocomplete="new-password"></div>`;
+   html+=`</div>`;
+   html+=`<div style="margin-top:14px;display:flex;align-items:center;gap:12px">`;
+   html+=`<button class="btn btn-primary" onclick="changePassword()">修改密码</button>`;
+   html+=`<span id="pwd-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
+  }
 
   // 程序升级卡片
   html+=`<div class="glass-card card" style="margin-top:16px"><h2>🚀 程序升级</h2>`;
@@ -1797,8 +1806,43 @@ async function saveStarConfig(){
  }catch(e){showToast('保存失败','error')}
 }
 
-/* ── Logs ── */
-async function loadLogs(){await loadLogFiles();renderLogPanel();if(currentLogFile||logFiles.length>0)await fetchLogContent();else $('log-content').innerHTML=`<div class="log-empty">📂 未找到日志文件<br><span style="font-size:11px;color:var(--text-muted)">请确保 Log 目录中存在 .log 文件</span></div>`}
+/* ── 日志（系统日志 / 操作日志 子页签） ── */
+function ensureLogsShell(){
+ if($('logs-sub-tabs'))return;
+ $('panel-logs').innerHTML=`
+  <div class="chart-tabs" id="logs-sub-tabs" style="margin-bottom:14px">
+   <span class="chart-tab active" data-sub="sys" id="logs-tab-sys" onclick="logsSubSwitch('sys')">📋 系统日志</span>
+   <span class="chart-tab" data-sub="audit" id="logs-tab-audit" onclick="logsSubSwitch('audit')">📜 操作日志</span>
+  </div>
+  <div id="log-sub-sys"></div>
+  <div id="log-sub-audit" style="display:none"></div>`;
+}
+// 日志页子页签（sys 系统日志 / audit 操作日志；兼容旧 #audit 独立页书签）
+function logsSubFromHash(){
+ const h=(location.hash||'').replace(/^#\/?/,'');
+ return (h==='logs.audit'||h==='audit')?'audit':'sys';
+}
+function logsSubSwitch(sub){
+ applyLogsSub(sub);
+ const h=sub==='audit'?'#logs.audit':'#logs';
+ if(location.hash!==h)history.replaceState(null,'',h);
+}
+// 应用子页签：按权限显隐标签与内容（仅有 audit 权限时自动落到操作日志子页）
+function applyLogsSub(sub){
+ const sys=$('log-sub-sys'),audit=$('log-sub-audit');if(!sys||!audit)return;
+ const canSys=canView('logs'),canAudit=canView('audit');
+ const tabSys=$('logs-tab-sys'),tabAudit=$('logs-tab-audit');
+ if(tabSys)tabSys.style.display=canSys?'':'none';
+ if(tabAudit)tabAudit.style.display=canAudit?'':'none';
+ if(sub==='audit'&&!canAudit)sub='sys';
+ if(sub==='sys'&&!canSys)sub='audit';
+ sys.style.display=sub==='audit'?'none':'';
+ audit.style.display=sub==='audit'?'':'none';
+ document.querySelectorAll('#logs-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
+ if(sub==='audit')loadAudit();else loadLogsSys();
+}
+async function loadLogs(){ensureLogsShell();applyLogsSub(logsSubFromHash())}
+async function loadLogsSys(){await loadLogFiles();renderLogPanel();if(currentLogFile||logFiles.length>0)await fetchLogContent();else if($('log-content'))$('log-content').innerHTML=`<div class="log-empty">📂 未找到日志文件<br><span style="font-size:11px;color:var(--text-muted)">请确保 Log 目录中存在 .log 文件</span></div>`}
 async function loadLogFiles(){
  try{const j=await api('/api/logFiles');if(j.code===0)logFiles=j.data.files||[]}catch(e){logFiles=[]}
  if(!currentLogFile&&logFiles.length>0)currentLogFile=logFiles[0].name;
@@ -1814,7 +1858,7 @@ function renderLogPanel(){
  html+=`</div><div><div class="log-toolbar">`;
  html+=`<span style="flex:1"></span><button class="btn btn-ghost btn-sm" onclick="refreshLogs()">🔄 刷新</button></div>`;
  html+=`<div class="log-content" id="log-content"><div class="log-empty">加载中...</div></div></div></div></div>`;
- $('panel-logs').innerHTML=html;
+ $('log-sub-sys').innerHTML=html;
 }
 async function selectLogFile(name){currentLogFile=name;renderLogPanel();await fetchLogContent()}
 async function refreshLogs(){await loadLogFiles();renderLogPanel();await fetchLogContent()}
@@ -2149,7 +2193,7 @@ function renderCleanup(){
    <label class="clean-row clean-head"><input type="checkbox" ${allOn?'checked':''} onchange="cleanToggleAll(this.checked)"> <b>全选</b><span style="flex:1"></span><span class="text-muted" style="font-size:12px">共 ${(d.categories||[]).length} 个分类</span></label>
    ${rows||'<div class="fm-empty">未发现可清理的日志</div>'}
   </div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。自定义清理路径可在“配置”页 LogCleanupPaths 设置（分号分隔）。</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。以上目录由面板自动探测系统常见位置，展开分类明细可查看具体涉及的目录与文件。</div>
  </div>`;
  $('panel-cleanup').innerHTML=html;
 }
@@ -2169,6 +2213,135 @@ function doClean(){
  });
 }
 
+/* ── 插件（本地放置的扩展页面） ── */
+let pluginData=null,pluginStore=null,pluginView=null,pluginSvc={};
+
+async function loadPlugins(){
+ try{
+  const j=await api('/star/pluginList');
+  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  pluginData=j.data;pluginView=null;pluginSvc={};
+  const apps=(pluginData.plugins||[]).map(p=>p.app).filter(a=>a);
+  if(apps.length&&canView('services')){
+   try{const s=await api('/star/services');if(s.code===0)(s.data.services||[]).forEach(x=>{if(x.name)pluginSvc[x.name]=x});}catch(e){}
+  }
+  try{const st=await api('/star/pluginStore');pluginStore=(st.code===0)?st.data:null;}catch(e){pluginStore=null;}
+  renderPlugins();
+ }catch(e){}
+}
+
+function pluginOpen(id){pluginView=id;renderPlugins()}
+function pluginBack(){pluginView=null;renderPlugins()}
+
+function renderPlugins(){
+ const d=pluginData||{plugins:[],invalid:[],dir:''};
+ if(pluginView!==null){
+  const p=(d.plugins||[]).find(x=>x.id===pluginView);
+  if(!p){pluginView=null;renderPlugins();return}
+  const entry=String(p.entry||'index.html').split('/').map(encodeURIComponent).join('/');
+  const src='/plugins/'+encodeURIComponent(p.id)+'/'+entry;
+  const svc=p.app?pluginSvc[p.app]:null;
+  const appLine=p.app?`<div class="text-muted" style="font-size:12px;margin-bottom:8px">关联子服务：${esc(p.app)} ${svc?(svc.running?'· 🟢 运行中':'· 🔴 已停止'):''}</div>`:'';
+  $('panel-plugins').innerHTML=`<div class="glass-card card">
+   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+    <h2>${esc(p.icon||'🧩')} ${esc(p.name)}${p.version?` <span class="text-muted" style="font-size:12px">v${esc(p.version)}</span>`:''}</h2>
+    <button class="btn btn-secondary btn-sm" onclick="pluginBack()">← 返回列表</button>
+   </div>
+   ${appLine}
+   <iframe class="plugin-frame" src="${escAttr(src)}" title="${escAttr(p.name)}"></iframe>
+  </div>`;
+  return;
+ }
+ let rows='';
+ (d.plugins||[]).forEach(p=>{
+  const svc=p.app?pluginSvc[p.app]:null;
+  const appCell=p.app?`${esc(p.app)} ${svc?(svc.running?'🟢':'🔴'):''}`:'<span class="text-muted">—</span>';
+  const svcBtns=(p.app&&canView('services'))?`<button class="btn btn-secondary btn-sm" onclick="doSvcAction('start','${escAttr(p.app)}')">启动</button><button class="btn btn-secondary btn-sm" onclick="doSvcAction('stop','${escAttr(p.app)}')">停止</button>`:'';
+  rows+=`<tr>
+   <td><b>${esc(p.icon||'🧩')} ${esc(p.name)}</b>${p.version?` <span class="text-muted" style="font-size:11px">v${esc(p.version)}</span>`:''}${p.description?`<div class="text-muted" style="font-size:12px">${esc(p.description)}</div>`:''}</td>
+   <td style="font-size:12px"><code>${esc(p.id)}</code></td>
+   <td style="font-size:12px">${appCell}</td>
+   <td class="fm-row-actions">${svcBtns}<button class="btn btn-secondary btn-sm" onclick="pluginOpen('${escAttr(p.id)}')">打开</button><button class="btn btn-danger btn-sm" onclick="pluginDelete('${escAttr(p.id)}')">删除</button></td>
+  </tr>`;
+ });
+ let invalidHtml='';
+ if((d.invalid||[]).length){
+  invalidHtml=`<div style="margin-top:12px"><div class="text-muted" style="font-size:12px;margin-bottom:6px">⚠ 以下目录不构成有效插件（缺少/损坏 plugin.json）：</div>`+
+   (d.invalid||[]).map(x=>`<div class="clean-target"><span class="p">${esc(x.id)}</span><span class="text-muted">${esc(x.error)}</span><button class="btn btn-danger btn-sm" onclick="pluginDelete('${escAttr(x.id)}')">删除</button></div>`).join('')+`</div>`;
+ }
+ let storeHtml='';
+ if(pluginStore&&pluginStore.configured===false){
+  storeHtml=`<div style="margin-top:16px"><div class="text-muted" style="font-size:12px">🌐 在线插件：未配置插件源（「配置」页 →「插件源地址」填写 catalog.json 的 HTTPS 地址后，可在此一键安装/更新）。</div></div>`;
+ }else if(pluginStore&&pluginStore.error){
+  storeHtml=`<div style="margin-top:16px"><div class="text-red" style="font-size:12px">🌐 在线插件：加载失败 —— ${esc(pluginStore.error)}</div></div>`;
+ }else if(pluginStore&&pluginStore.configured){
+  let srows='';
+  (pluginStore.plugins||[]).forEach(e=>{
+   const btn=e.installed
+    ?(e.upToDate?'<button class="btn btn-secondary btn-sm" disabled>已是最新</button>':`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">更新到 v${esc(e.version)}</button>`)
+    :`<button class="btn btn-primary btn-sm" onclick="pluginStoreInstall('${escAttr(e.id)}','${escAttr(e.name)}')">安装</button>`;
+   srows+=`<tr>
+    <td><b>${esc(e.icon||'🧩')} ${esc(e.name)}</b> <span class="text-muted" style="font-size:11px">v${esc(e.version)}</span>${e.description?`<div class="text-muted" style="font-size:12px">${esc(e.description)}</div>`:''}</td>
+    <td style="font-size:12px">${e.installed?('已安装'+(e.installedVersion?` v${esc(e.installedVersion)}`:'')):'未安装'}</td>
+    <td style="text-align:right">${btn}</td>
+   </tr>`;
+  });
+  storeHtml=`<div style="margin-top:18px"><div class="flex-between mb-16" style="gap:8px;flex-wrap:wrap">
+   <h2 style="font-size:15px">🌐 在线插件</h2>
+   <span class="text-muted" style="font-size:12px">${pluginStore.signature?'🔏 强制验签已启用 · ':''}HTTPS + SHA-256 校验</span>
+  </div>
+  <div style="overflow-x:auto"><table class="svc-table">
+   <thead><tr><th>插件</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
+   <tbody>${srows||'<tr><td colspan="3" class="fm-empty">插件源中暂无插件</td></tr>'}</tbody>
+  </table></div></div>`;
+ }
+ const html=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🧩 插件</h2>
+   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <input type="file" id="plugin-file" accept=".zip" style="font-size:12px">
+    <button class="btn btn-primary btn-sm" onclick="pluginInstall()">⬆ 上传安装</button>
+   </div>
+  </div>
+  <div style="overflow-x:auto"><table class="svc-table">
+   <thead><tr><th>插件</th><th>目录</th><th>关联子服务</th><th style="text-align:right">操作</th></tr></thead>
+   <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无插件（上传 zip 或把插件目录放入下方目录）</td></tr>'}</tbody>
+  </table></div>
+  ${invalidHtml}
+  ${storeHtml}
+  <div class="text-muted" style="margin-top:10px;font-size:12px">插件目录：<code>${esc(d.dir||'')}</code>；压缩包内需含 <code>plugin.json</code>（可置于包根或唯一子目录）；插件页面以同源 iframe 运行，可复用当前登录态调用面板接口（受当前用户菜单权限约束并记入操作日志）。在线安装仅走 HTTPS 并强制 SHA-256 校验（配置公钥后另行强制 Ed25519 验签），校验失败一律拒绝，插件包不会执行任何安装脚本。</div>
+ </div>`;
+ $('panel-plugins').innerHTML=html;
+}
+
+function pluginDelete(id){
+ showModal('删除插件',`确定删除插件 <b>${esc(id)}</b>？<br><span class="text-muted">将删除其整个目录，不可恢复</span>`,'删除',async()=>{
+  const j=await api('/star/pluginDelete',{method:'POST',body:JSON.stringify({id})});
+  if(j.code!==0){showToast(j.message||'删除失败','error');return}
+  showToast('已删除','success');loadPlugins();
+ });
+}
+
+async function pluginInstall(){
+ const el=$('plugin-file');const f=el&&el.files?el.files[0]:null;
+ if(!f){showToast('请选择插件压缩包（.zip）','error');return}
+ try{
+  const r=await fetch('/star/pluginInstall?name='+encodeURIComponent(f.name),{method:'POST',headers:Object.assign({'Content-Type':'application/zip'},token?{'Authorization':'Bearer '+token}:{}),body:f});
+  const j=await r.json();
+  if(j.code!==0){showToast(j.message||'安装失败','error');return}
+  showToast(j.message||'安装完成','success');loadPlugins();
+ }catch(e){showToast('安装失败','error')}
+}
+
+function pluginStoreInstall(id,name){
+ showModal('安装/更新插件',`从在线插件源获取 <b>${esc(name||id)}</b> 并安装？<br><span class="text-muted">服务端经 HTTPS 下载并校验 SHA-256（启用公钥时强制验签），校验失败拒绝安装</span>`,'安装',async()=>{
+  showToast('正在下载安装…','info');
+  const j=await api('/star/pluginStoreInstall',{method:'POST',body:JSON.stringify({id})});
+  if(j.code!==0){showToast(j.message||'安装失败','error');return}
+  showToast(j.message||'安装完成','success');loadPlugins();
+ });
+}
+
 /* ── 操作日志（审计） ── */
 let auditData=null,auditPage=1,auditFilters={q:'',user:'',success:''};
 
@@ -2179,7 +2352,7 @@ async function loadAudit(){
   if(auditFilters.user)params.set('user',auditFilters.user);
   if(auditFilters.success)params.set('success',auditFilters.success);
   const j=await api('/star/auditLogs?'+params.toString());
-  if(j.code!==0){$('panel-audit').innerHTML=`<div class="glass-card card"><h2>📜 操作日志</h2><p class="text-muted">${esc(j.message||'加载失败')}</p></div>`;return}
+  if(j.code!==0){$('log-sub-audit').innerHTML=`<div class="glass-card card"><h2>📜 操作日志</h2><p class="text-muted">${esc(j.message||'加载失败')}</p></div>`;return}
   auditData=j.data;renderAudit();
  }catch(e){}
 }
@@ -2225,7 +2398,7 @@ function renderAudit(){
   </div>
   <div class="text-muted" style="margin-top:10px;font-size:12px">登录、配置修改、服务控制、文件管理、日志清理等全部变更类操作自动落库（密码等敏感字段已脱敏）；本页查询本身受“操作日志”菜单权限控制。</div>
  </div>`;
- $('panel-audit').innerHTML=html;
+ $('log-sub-audit').innerHTML=html;
 }
 
 function auditFilter(){
@@ -2251,14 +2424,20 @@ function renderUsers(){
  const d=usersData||{users:[],permissions:[]};
  let rows='';
  (d.users||[]).forEach(u=>{
+  const builtin=!!u.isBuiltin;
+  const head=builtin?`👑 ${esc(u.userName)} <span class="text-muted" style="font-size:11px">(内置管理员)</span>`:`👤 ${esc(u.userName)}`;
+  const permCell=builtin
+   ? '<span class="text-secondary">全部权限</span>'
+   : (u.permissionNames&&u.permissionNames.length?esc(u.permissionNames.join('、')):'<span class="text-muted">无</span>');
+  const actions=builtin
+   ? `<button class="btn btn-secondary btn-sm" onclick="userAdminEdit('${escAttr(u.userName)}')">编辑</button>`
+   : `<button class="btn btn-secondary btn-sm" onclick="userEdit('${escAttr(u.userName)}')">编辑</button>
+      <button class="btn btn-danger btn-sm" onclick="userDelete('${escAttr(u.userName)}')">删除</button>`;
   rows+=`<tr>
-   <td>👤 ${esc(u.userName)}${u.remark?` <span class="text-muted" style="font-size:12px">（${esc(u.remark)}）</span>`:''}</td>
-   <td class="text-secondary" style="font-size:12px">${u.permissionNames&&u.permissionNames.length?esc(u.permissionNames.join('、')):'<span class="text-muted">无</span>'}</td>
+   <td>${head}${u.remark?` <span class="text-muted" style="font-size:12px">（${esc(u.remark)}）</span>`:''}</td>
+   <td style="font-size:12px">${permCell}</td>
    <td>${u.enabled?'<span class="text-green">✅ 启用</span>':'<span class="text-red">⛔ 禁用</span>'}</td>
-   <td class="fm-row-actions">
-    <button class="btn btn-secondary btn-sm" onclick="userEdit('${escAttr(u.userName)}')">编辑</button>
-    <button class="btn btn-danger btn-sm" onclick="userDelete('${escAttr(u.userName)}')">删除</button>
-   </td>
+   <td class="fm-row-actions">${actions}</td>
   </tr>`;
  });
  let html=`<div class="glass-card card">
@@ -2268,11 +2447,32 @@ function renderUsers(){
   </div>
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr><th>用户名</th><th>菜单权限</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
-   <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无用户（仅内置管理员）</td></tr>'}</tbody>
+   <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无用户</td></tr>'}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">内置管理员（配置文件凭据）拥有全部权限；此处用户登录后仅能看到被勾选的菜单，越权请求会被服务端拒绝并记入操作日志。</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">内置管理员（配置文件凭据）拥有全部权限且不可删除（可在此编辑用户名/密码）；其余用户登录后仅能看到被勾选的菜单，越权请求会被服务端拒绝并记入操作日志。</div>
  </div>`;
  $('panel-users').innerHTML=html;
+}
+
+// 编辑内置管理员（用户名/密码，均写入配置文件凭据）
+function userAdminEdit(name){
+ showModal('编辑内置管理员',
+  `<div class="text-muted" style="margin-bottom:8px">内置管理员拥有全部权限（配置文件凭据）</div>
+   <span class="text-secondary" style="font-size:12px">用户名</span>
+   <input type="text" id="admin-name" value="${escAttr(name)}" style="width:100%;margin-top:4px">
+   <span class="text-secondary" style="font-size:12px;display:block;margin-top:10px">新密码（留空则不修改）</span>
+   <input type="password" id="admin-pass" style="width:100%;margin-top:4px" autocomplete="new-password">`,
+  '保存',async()=>{
+   const nm=$('admin-name')?$('admin-name').value.trim():'';
+   const pw=$('admin-pass')?$('admin-pass').value:'';
+   if(!nm){showToast('用户名不能为空','error');return}
+   if(nm.toLowerCase()===name.toLowerCase()&&!pw){showToast('未修改任何内容','error');return}
+   const payload={name,newName:nm};
+   if(pw)payload.password=pw;
+   const j=await api('/star/userSave',{method:'POST',body:JSON.stringify(payload)});
+   if(j.code!==0){showToast(j.message||'保存失败','error');return}
+   showToast('内置管理员已更新','success');loadUsers();
+  });
 }
 
 function userEdit(name){
@@ -2298,6 +2498,8 @@ function userEdit(name){
   const remark=$('user-remark')?$('user-remark').value.trim():'';
   const permissions=[...document.querySelectorAll('.perm-grid input:checked')].map(c=>c.value);
   if(!nameVal){showToast('用户名不能为空','error');return}
+  const builtin=(usersData&&usersData.users||[]).find(x=>x.isBuiltin);
+  if(builtin&&nameVal.toLowerCase()===String(builtin.userName||'').toLowerCase()){showToast('该名称属于内置管理员，请另选名称','error');return}
   const payload={name:nameVal,enabled,remark,permissions};
   if(pass)payload.password=pass;
   const j=await api('/star/userSave',{method:'POST',body:JSON.stringify(payload)});

@@ -277,7 +277,7 @@ fn exe_identity(path: &Path) -> Option<ExeIdentity> {
     }
 }
 
-/// 进程启动时的 exe 身份基线（启动即记录；`check_external_replace` 懒初始化兑底）。
+/// 进程启动时的 exe 身份基线（启动即记录；`check_external_replace` 懒初始化兜底）。
 static EXE_IDENTITY: Mutex<Option<ExeIdentity>> = Mutex::new(None);
 /// 已校验失败的外部替换文件指纹（len, mtime 秒），避免周期性重复处理。
 static EXTERNAL_REJECTED: Mutex<Option<(u64, u64)>> = Mutex::new(None);

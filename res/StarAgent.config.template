@@ -50,16 +50,20 @@
   <SampleInterval>1000</SampleInterval>
   <!--网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + 下方手动补充），默认 true-->
   <WebTraffic>true</WebTraffic>
-  <!--网站日志手动配置。`名称=路径;名称2=路径2`；自动发现不到时补充（如 Caddy 自定义日志、非标准目录）-->
+  <!--网站日志手动补充（高级选项，面板配置页不展示；一般无需填写——自动发现宝塔/标准 nginx/apache 站点）。`名称=路径;名称2=路径2`；自动发现不到时补充（如 Caddy 自定义日志、非标准目录）-->
   <WebLogs></WebLogs>
   <!--端口流量统计。默认 true：Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；无 nft 或权限不足时自动降级为连接视图）-->
   <PortTraffic>true</PortTraffic>
-  <!--端口流量统计端口。形如 `22,80,443,3306`；留空 = 自动取系统监听端口-->
+  <!--端口流量统计端口（高级选项，面板配置页不展示；一般无需填写）。形如 `22,80,443,3306`；留空 = 自动取系统监听端口（上限 64 个）-->
   <PortTrafficPorts></PortTrafficPorts>
   <!--流量历史保留天数。每日归档落 SQLite（Data/traffic.db，Pek.RCode 按 Entity/Model.xml 模型管理）；默认 90（7~3650），0 = 永久保留-->
   <TrafficHistoryDays>90</TrafficHistoryDays>
-  <!--日志清理自定义路径。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
+  <!--日志清理自定义路径（高级选项，面板配置页不展示；仅直接编辑本文件时使用）。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
   <LogCleanupPaths></LogCleanupPaths>
+  <!--在线插件源（catalog.json）地址。仅允许 https（127.0.0.1 例外）；留空 = 关闭在线插件-->
+  <PluginStoreUrl></PluginStoreUrl>
+  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256-->
+  <PluginStorePubKey></PluginStorePubKey>
 
   <!--应用服务集合-->
   <Services></Services>

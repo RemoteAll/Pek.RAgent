@@ -441,7 +441,7 @@ pub(crate) fn snapshot_json() -> Json {
     let message = if !enabled {
         "网站流量统计未启用（配置 WebTraffic=true 开启）"
     } else if sites.is_empty() {
-        "未发现网站日志（自动扫描 nginx/apache 常见目录；可在配置 WebLogs 手动指定：名称=路径;名称2=路径2）"
+        "未发现网站日志（自动扫描 nginx/apache 常见目录；如站点在非标准位置，可在配置文件 WebLogs 项手动指定：名称=路径;名称2=路径2）"
     } else {
         ""
     };

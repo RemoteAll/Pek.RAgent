@@ -95,6 +95,10 @@ pub fn run(args: &[String], base: &Path) -> i32 {
             println!("{}", sys::machine_info());
             0
         }
+        "pluginstorekeygen" | "plugkeygen" => cmd_plugin_keygen(args),
+        "pluginstoresign" | "plugsign" => cmd_plugin_sign(args),
+        "pluginstorepublish" | "plugpublish" => cmd_plugin_publish(args),
+        "pluginstoreremove" | "plugremove" => cmd_plugin_remove(args),
         "help" | "h" | "?" => {
             print_help();
             0
@@ -1065,6 +1069,184 @@ fn is_elevated() -> bool {
         .unwrap_or(false)
 }
 
+/// 生成在线插件源签名密钥对（Ed25519）。
+/// 用法：`pek-ragent -PluginStoreKeygen [输出目录]` → 写出 `plugin-store.key`（私钥 hex，离线保管）
+/// 与 `plugin-store.pub`（公钥 hex，填入面板「配置」→ 插件源公钥）。
+fn cmd_plugin_keygen(args: &[String]) -> i32 {
+    use ed25519_dalek::SigningKey;
+    let dir_arg = args
+        .iter()
+        .skip(1)
+        .map(|s| s.trim())
+        .find(|s| !s.is_empty() && !s.starts_with('-'));
+    let dir = dir_arg
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let seed = dhrust::random::bytes(32);
+    let seed_arr: [u8; 32] = seed.as_slice().try_into().unwrap();
+    let key = SigningKey::from_bytes(&seed_arr);
+    let hex_of = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        println!("创建目录失败：{e}");
+        return 1;
+    }
+    let key_path = dir.join("plugin-store.key");
+    let pub_path = dir.join("plugin-store.pub");
+    if let Err(e) = std::fs::write(&key_path, hex_of(&seed_arr)) {
+        println!("写入私钥失败：{e}");
+        return 1;
+    }
+    if let Err(e) = std::fs::write(&pub_path, hex_of(key.verifying_key().as_bytes())) {
+        println!("写入公钥失败：{e}");
+        return 1;
+    }
+    println!("已生成 Ed25519 密钥对：");
+    println!("  私钥（离线保管，切勿上传）：{}", key_path.display());
+    println!("  公钥（填入面板「配置」→ 插件源公钥）：{}", pub_path.display());
+    println!("发布插件：pek-ragent -PluginStorePublish <插件源目录> <插件.zip> --base-url https://xxx/ [--key 私钥文件]");
+    0
+}
+
+/// 解析发布类命令参数：位置参数 + `--base-url` / `--key`（支持 `=` 形式）。
+fn parse_store_args(args: &[String]) -> Result<(Vec<String>, String, String), String> {
+    let mut positionals: Vec<String> = Vec::new();
+    let mut base_url = String::new();
+    let mut key = String::new();
+    let mut it = args.iter().skip(1).map(|s| s.trim()).filter(|s| !s.is_empty());
+    while let Some(a) = it.next() {
+        if a == "--base-url" {
+            base_url = it.next().ok_or("--base-url 缺少参数值")?.to_string();
+        } else if a == "--key" {
+            key = it.next().ok_or("--key 缺少参数值")?.to_string();
+        } else if let Some(v) = a.strip_prefix("--base-url=") {
+            base_url = v.to_string();
+        } else if let Some(v) = a.strip_prefix("--key=") {
+            key = v.to_string();
+        } else if a.starts_with("--") {
+            return Err(format!("未知参数：{a}"));
+        } else {
+            positionals.push(a.to_string());
+        }
+    }
+    Ok((positionals, base_url, key))
+}
+
+/// 发布插件到插件源目录（一步完成：校验/算哈希/更新目录/签名）。
+/// 用法：`pek-ragent -PluginStorePublish <插件源目录> <插件.zip> [--base-url https://xxx/] [--key 私钥文件]`
+fn cmd_plugin_publish(args: &[String]) -> i32 {
+    let (positionals, base_url, key) = match parse_store_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{e}");
+            return 2;
+        }
+    };
+    let (Some(store), Some(zip)) = (positionals.first(), positionals.get(1)) else {
+        println!("用法：pek-ragent -PluginStorePublish <插件源目录> <插件.zip> [--base-url https://xxx/] [--key 私钥文件（默认 plugin-store.key）]");
+        return 2;
+    };
+    let key = if key.is_empty() { "plugin-store.key".to_string() } else { key };
+    match crate::plugins::publish_to_store(Path::new(store), Path::new(zip), &base_url, Path::new(&key)) {
+        Ok(info) => {
+            let ver = if info.version.is_empty() {
+                "（无版本号）".to_string()
+            } else {
+                format!("v{}", info.version)
+            };
+            println!("发布完成：{} {}", info.id, ver);
+            println!("  包文件：{}（SHA-256 {}）", info.file_name, info.sha256);
+            println!("  下载地址：{}", info.url);
+            println!("  目录与签名已更新：{}", Path::new(store).join("catalog.json").display());
+            println!("把整个插件源目录同步到 HTTPS 静态空间即可发布（catalog.json + .sig + 插件包）。");
+            0
+        }
+        Err(e) => {
+            println!("发布失败：{e}");
+            1
+        }
+    }
+}
+
+/// 从插件源目录移除插件并重新签名。
+/// 用法：`pek-ragent -PluginStoreRemove <插件源目录> <插件id> [--key 私钥文件]`
+fn cmd_plugin_remove(args: &[String]) -> i32 {
+    let (positionals, _base_url, key) = match parse_store_args(args) {
+        Ok(v) => v,
+        Err(e) => {
+            println!("{e}");
+            return 2;
+        }
+    };
+    let (Some(store), Some(id)) = (positionals.first(), positionals.get(1)) else {
+        println!("用法：pek-ragent -PluginStoreRemove <插件源目录> <插件id> [--key 私钥文件（默认 plugin-store.key）]");
+        return 2;
+    };
+    let key = if key.is_empty() { "plugin-store.key".to_string() } else { key };
+    match crate::plugins::remove_from_store(Path::new(store), id, Path::new(&key)) {
+        Ok(()) => {
+            println!("已从插件源移除：{id}（目录与签名已更新，同步到 HTTPS 静态空间后生效）");
+            0
+        }
+        Err(e) => {
+            println!("移除失败：{e}");
+            1
+        }
+    }
+}
+
+/// 对插件源目录（catalog.json）签名，产出 `catalog.json.sig`（base64，与目录文件同目录发布）。
+fn cmd_plugin_sign(args: &[String]) -> i32 {
+    use ed25519_dalek::{Signer, SigningKey};
+    let files: Vec<&str> = args
+        .iter()
+        .skip(1)
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty() && !s.starts_with('-'))
+        .collect();
+    let Some(catalog_arg) = files.first() else {
+        println!("用法：pek-ragent -PluginStoreSign <catalog.json> [私钥文件（默认 plugin-store.key）]");
+        return 2;
+    };
+    let catalog = PathBuf::from(catalog_arg);
+    let key_path = files
+        .get(1)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("plugin-store.key"));
+    let key_hex = match std::fs::read_to_string(&key_path) {
+        Ok(t) => t.trim().to_string(),
+        Err(e) => {
+            println!("读取私钥失败（{}）：{e}", key_path.display());
+            return 1;
+        }
+    };
+    let Some(bytes) = crate::plugins::hex_decode(&key_hex) else {
+        println!("私钥不是有效的 hex 文本");
+        return 1;
+    };
+    let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+        println!("私钥长度应为 32 字节");
+        return 1;
+    };
+    let data = match std::fs::read(&catalog) {
+        Ok(d) => d,
+        Err(e) => {
+            println!("读取 {} 失败：{e}", catalog.display());
+            return 1;
+        }
+    };
+    let key = SigningKey::from_bytes(&seed);
+    let sig = key.sign(&data);
+    let sig_b64 = dhrust::sign::base64_encode(&sig.to_bytes());
+    let sig_path = PathBuf::from(format!("{}.sig", catalog.display()));
+    if let Err(e) = std::fs::write(&sig_path, &sig_b64) {
+        println!("写入签名失败：{e}");
+        return 1;
+    }
+    println!("签名完成：{}", sig_path.display());
+    println!("把 catalog.json 与 catalog.json.sig 一起发布到插件源目录即可（面板配置公钥后强制验签）。");
+    0
+}
+
 /// 帮助文本。
 fn print_help() {
     println!(
@@ -1103,6 +1285,14 @@ fn print_help() {
 
 其它：
   pek-ragent -ShowMachineInfo       显示本机信息
+  pek-ragent -PluginStoreKeygen [目录]
+                                    生成在线插件源签名密钥对（plugin-store.key/.pub）
+  pek-ragent -PluginStorePublish <插件源目录> <插件.zip> [--base-url https://xxx/] [--key 私钥]
+                                    发布插件：校验/算哈希/更新目录/签名一步完成
+  pek-ragent -PluginStoreRemove <插件源目录> <插件id> [--key 私钥]
+                                    从插件源移除插件并重新签名
+  pek-ragent -PluginStoreSign <catalog.json> [私钥文件]
+                                    仅对目录签名（手动维护目录时使用）
   pek-ragent -help                  显示本帮助
 
 配置文件：Config/StarAgent.config（XML，与 C# StarAgent 同格式互通）

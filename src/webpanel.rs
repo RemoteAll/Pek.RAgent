@@ -182,6 +182,15 @@ impl WebPanel {
         self.sessions.lock().unwrap().remove(token);
     }
 
+    /// 重命名当前令牌绑定的会话主体（内置管理员改名后立即生效，无需重新登录）。
+    fn rename_session(&self, ctx: &Ctx, new_name: &str) {
+        if let Some(token) = bearer_token(ctx) {
+            if let Some(p) = self.sessions.lock().unwrap().get_mut(&token) {
+                p.name = new_name.to_string();
+            }
+        }
+    }
+
     // ————— 鉴权辅助 —————
 
     /// 请求鉴权（`/api/login` 与 `/api/logout` 除外）。
@@ -251,6 +260,7 @@ pub(crate) const PERM_WATCHDOG: &str = "watchdog";
 pub(crate) const PERM_DATABASE: &str = "database";
 pub(crate) const PERM_FILEMAN: &str = "fileman";
 pub(crate) const PERM_CLEANUP: &str = "cleanup";
+pub(crate) const PERM_PLUGINS: &str = "plugins";
 pub(crate) const PERM_AUDIT: &str = "audit";
 /// 用户管理：仅内置管理员（不参与授权列表）。
 pub(crate) const PERM_USERS: &str = "users";
@@ -414,6 +424,9 @@ fn action_title(action: &str) -> String {
         "fileChmod" => "修改文件权限",
         "fileSearch" => "搜索文件",
         "logCleanRun" => "日志清理",
+        "pluginInstall" => "安装插件",
+        "pluginDelete" => "卸载插件",
+        "pluginStoreInstall" => "安装/更新在线插件",
         "userSave" => "保存面板用户",
         "userDelete" => "删除面板用户",
         "userResetPassword" => "重置用户密码",
@@ -690,6 +703,32 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "logCleanRun",
         guarded(panel.clone(), PERM_CLEANUP, crate::logclean::log_clean_run),
+    );
+
+    // 插件（「插件」页；页面本身经 /plugins/* 静态服务）
+    controller = controller.get(
+        "pluginList",
+        guarded(panel.clone(), PERM_PLUGINS, crate::plugins::plugin_list),
+    );
+    controller = controller.post(
+        "pluginInstall",
+        guarded(panel.clone(), PERM_PLUGINS, crate::plugins::plugin_install),
+    );
+    controller = controller.post(
+        "pluginDelete",
+        guarded(panel.clone(), PERM_PLUGINS, crate::plugins::plugin_delete),
+    );
+    controller = controller.get(
+        "pluginStore",
+        guarded(panel.clone(), PERM_PLUGINS, crate::plugins::plugin_store),
+    );
+    controller = controller.post(
+        "pluginStoreInstall",
+        guarded(
+            panel.clone(),
+            PERM_PLUGINS,
+            crate::plugins::plugin_store_install,
+        ),
     );
 
     // 用户管理（仅内置管理员）与操作日志
@@ -1222,7 +1261,7 @@ fn sync_time(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// 面板配置元数据（排除密码字段，走 ChangePassword 接口）。
+/// 面板配置元数据（凭据类字段除外：内置管理员用户名/密码在「用户」页管理；数据库用户本人改密走 ChangePassword 接口）。
 fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -1230,17 +1269,15 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     let cfg = panel.manager.config();
     let items = vec![
-        config_item("WebUserName", "面板用户名", "String", cfg.web_user_name.clone(), "Web 管理面板的登录用户名"),
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
-        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点 + WebLogs 手动补充），零侵入只读；修改后自动生效"),
-        config_item("WebLogs", "网站日志（名称=路径;…）", "String", cfg.web_logs.clone(), "手动配置站点日志（绝对路径，分号分隔多条），自动发现不到时补充；修改后自动生效"),
-        config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；修改后自动生效"),
-        config_item("PortTrafficPorts", "端口列表（如 22,80,443）", "String", cfg.port_traffic_ports.clone(), "留空自动取系统监听端口（上限 64 个）；修改后自动生效"),
+        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
+        config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；端口自动取系统监听（个别端口可在配置文件 PortTrafficPorts 项指定）；修改后自动生效"),
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
-        config_item("LogCleanupPaths", "日志清理自定义路径（分号分隔）", "String", cfg.log_cleanup_paths.clone(), "“日志清理”页额外扫描的路径（绝对路径，分号分隔多选）；目录=清空内容、文件=截断清空。修改后自动生效"),
+        config_item("PluginStoreUrl", "插件源地址（HTTPS）", "String", cfg.plugin_store_url.clone(), "在线插件目录（catalog.json）的地址；仅允许 https（127.0.0.1 例外便于本地调试）；留空=关闭在线插件。修改后自动生效"),
+        config_item("PluginStorePubKey", "插件源公钥（Ed25519 hex，可选）", "String", cfg.plugin_store_pubkey.clone(), "填写后强制校验插件源签名（catalog.json.sig），防止插件源被篡改；留空=仅 HTTPS+SHA-256 校验。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
-        config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兑底）。修改需重启服务后生效"),
+        config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兜底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
         config_item("MaxFails", "最大失败次数", "Int32", cfg.max_fails.to_string(), "超过后不再尝试启动，默认20"),
         config_item("GuardPeriod", "守护周期(ms)", "Int32", cfg.guard_period.to_string(), "服务守护检查周期，默认30000；修改需重启服务后生效"),
@@ -2014,13 +2051,31 @@ fn me(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
-/// 面板用户列表（含可选权限清单；仅内置管理员）。
+/// 面板用户列表（含内置管理员虚拟条目与可选权限清单；仅内置管理员）。
 fn user_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
     match audit::list_users_json(panel.base()) {
-        Ok(data) => json_result(0, "", Some(data)),
+        Ok(mut data) => {
+            // 内置管理员（配置文件凭据）以虚拟条目展示在首位：全部权限、不可删除、可改密码
+            let cfg = panel.manager.config();
+            let keys: Vec<&str> = audit::ALL_PERMISSIONS.iter().map(|(k, _)| *k).collect();
+            let names: Vec<&str> = audit::ALL_PERMISSIONS.iter().map(|(_, n)| *n).collect();
+            let admin = json!({
+                "id": 0,
+                "userName": cfg.web_user_name.trim(),
+                "permissions": keys,
+                "permissionNames": names,
+                "enabled": true,
+                "remark": "配置文件凭据",
+                "isBuiltin": true,
+            });
+            if let Some(list) = data.get_mut("users").and_then(|v| v.as_array_mut()) {
+                list.insert(0, admin);
+            }
+            json_result(0, "", Some(data))
+        }
         Err(e) => json_error(500, &e),
     }
 }
@@ -2064,7 +2119,44 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     let cfg = panel.manager.config();
     if name.eq_ignore_ascii_case(cfg.web_user_name.trim()) {
-        return json_error(400, "用户名与内置管理员冲突，请另选名称");
+        // 内置管理员：可改用户名与/或密码（写入配置文件凭据；当前操作者即管理员本人）
+        let new_name = body
+            .get("newName")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| name.clone());
+        let pw = password
+            .as_deref()
+            .map(str::trim)
+            .filter(|p| !p.is_empty())
+            .map(String::from);
+        let renamed = !new_name.eq_ignore_ascii_case(cfg.web_user_name.trim());
+        if !renamed && pw.is_none() {
+            return json_error(400, "未修改任何内容");
+        }
+        if renamed {
+            match audit::find_user(panel.base(), &new_name) {
+                Ok(Some(_)) => return json_error(400, "用户名已存在"),
+                Ok(None) => {}
+                Err(e) => return json_error(500, &e),
+            }
+        }
+        let saved_name = new_name.clone();
+        panel.manager.update_config(|cfg| {
+            if renamed {
+                cfg.web_user_name = saved_name.clone();
+            }
+            if let Some(p) = &pw {
+                cfg.web_user_password = p.clone();
+            }
+        });
+        if renamed {
+            panel.rename_session(ctx, &new_name);
+        }
+        util::log_info("Web 面板内置管理员凭据已更新（用户管理）");
+        return json_result(0, "内置管理员已更新", None);
     }
     match audit::save_user(
         panel.base(),
@@ -2090,6 +2182,10 @@ fn user_delete(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let name = arg(ctx, "name").unwrap_or_default();
     if name.trim().is_empty() {
         return json_error(400, "缺少用户名");
+    }
+    let cfg = panel.manager.config();
+    if name.trim().eq_ignore_ascii_case(cfg.web_user_name.trim()) {
+        return json_error(400, "内置管理员不能删除");
     }
     match audit::delete_user(panel.base(), &name) {
         Ok(()) => {
@@ -2305,6 +2401,8 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
             _ => false,
         },
         "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
+        "pluginstoreurl" => set_string(value, |s| cfg.plugin_store_url = s),
+        "pluginstorepubkey" => set_string(value, |s| cfg.plugin_store_pubkey = s),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -3138,6 +3236,105 @@ mod tests {
         assert_eq!(AuthLevel::parse("localonly"), AuthLevel::LocalOnly);
         assert_eq!(AuthLevel::parse(""), AuthLevel::LocalOnly);
         assert_eq!(AuthLevel::parse("unknown"), AuthLevel::LocalOnly);
+    }
+
+    #[test]
+    fn builtin_admin_listed_and_password_managed_via_user_save() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // 用户列表：内置管理员虚拟条目在首位（全部权限、不可删除）
+        let j = body_json(user_list(
+            &panel,
+            &context("GET", "/star/userList", "", Some(&token)),
+        ));
+        assert_eq!(j["code"], 0);
+        let users = j["data"]["users"].as_array().unwrap();
+        assert!(!users.is_empty());
+        assert_eq!(users[0]["userName"], "admin");
+        assert_eq!(users[0]["isBuiltin"], true);
+        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 13);
+
+        // 删除内置管理员被拒
+        let j = body_json(user_delete(
+            &panel,
+            &context(
+                "POST",
+                "/star/userDelete",
+                r#"{"name":"admin"}"#,
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 400);
+
+        // 通过 userSave 修改内置管理员密码（写入配置文件凭据）
+        let j = body_json(user_save(
+            &panel,
+            &context(
+                "POST",
+                "/star/userSave",
+                r#"{"name":"admin","password":"newpw"}"#,
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 0, "{j}");
+        assert!(panel.issue_token("admin", "newpw").is_some());
+        assert!(panel.issue_token("admin", "admin").is_none());
+
+        // 无密码且未改名 → 400
+        let j = body_json(user_save(
+            &panel,
+            &context("POST", "/star/userSave", r#"{"name":"admin"}"#, Some(&token)),
+        ));
+        assert_eq!(j["code"], 400);
+
+        // 改名冲突（与数据库用户重名）→ 400
+        audit::save_user(&dir, "taken", Some("tk123"), &[], true, "").unwrap();
+        let j = body_json(user_save(
+            &panel,
+            &context(
+                "POST",
+                "/star/userSave",
+                r#"{"name":"admin","newName":"taken"}"#,
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 400);
+
+        // 改名（不动密码）：admin → boss 立即生效；当前会话主体同步更名
+        let j = body_json(user_save(
+            &panel,
+            &context(
+                "POST",
+                "/star/userSave",
+                r#"{"name":"admin","newName":"boss"}"#,
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 0, "{j}");
+        assert!(panel.issue_token("boss", "newpw").is_some());
+        assert!(panel.issue_token("admin", "newpw").is_none());
+        let j = body_json(user_list(
+            &panel,
+            &context("GET", "/star/userList", "", Some(&token)),
+        ));
+        assert_eq!(j["data"]["users"][0]["userName"], "boss");
+        let m = body_json(me(&panel, &context("GET", "/api/me", "", Some(&token))));
+        assert_eq!(m["data"]["user"], "boss");
+        // 改名后删除仍被拒（虚拟条目）
+        let j = body_json(user_delete(
+            &panel,
+            &context(
+                "POST",
+                "/star/userDelete",
+                r#"{"name":"boss"}"#,
+                Some(&token),
+            ),
+        ));
+        assert_eq!(j["code"], 400);
+
+        crate::history::drop_storage_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
