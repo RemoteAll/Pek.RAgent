@@ -2270,8 +2270,9 @@ function pluginShellHtml(d){
   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
    <h2>🧩 插件</h2>
    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-    <input id="plugin-search" value="${escAttr(pluginSearch)}" oninput="onPluginSearch()" placeholder="🔍 搜索插件（名称/ID/说明/开发商）" style="font-size:12px">
-    <input type="file" id="plugin-file" accept=".zip" style="font-size:12px">
+    <input type="text" id="plugin-search" value="${escAttr(pluginSearch)}" oninput="onPluginSearch()" placeholder="🔍 搜索插件（名称/ID/说明/开发商）" style="width:260px">
+    <label class="btn btn-secondary btn-sm" style="cursor:pointer;display:inline-block;margin:0">📦 选择 zip<input type="file" id="plugin-file" accept=".zip" style="display:none" onchange="pluginFilePicked(this)"></label>
+    <span id="plugin-file-name" class="text-muted" style="font-size:12px;max-width:150px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
     <button class="btn btn-primary btn-sm" onclick="pluginInstall()">⬆ 上传安装</button>
    </div>
   </div>
@@ -2364,6 +2365,12 @@ async function pluginInstall(){
   if(j.code!==0){showToast(j.message||'安装失败','error');return}
   showToast(j.message||'安装完成','success');loadPlugins();
  }catch(e){showToast('安装失败','error')}
+}
+
+// 选择 zip 后回显文件名（原生文件控件已隐藏，用按钮式 label 触发）
+function pluginFilePicked(el){
+ const f=el&&el.files?el.files[0]:null;
+ const n=$('plugin-file-name');if(n)n.textContent=f?f.name:'';
 }
 
 function pluginStoreInstall(id,name){
