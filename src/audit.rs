@@ -1,10 +1,10 @@
-//! 面板用户与操作审计（薄壳：核心实现在 `pek_rcode::panel`，2026-10-05 下沉）。
+//! 面板用户与操作审计（薄壳：核心实现在 `pek_radmin::panel`，2026-10-05 下沉）。
 //!
 //! - 数据表：`Agent_PanelUser` / `Agent_OperationLog`（同流量历史库 `Data/traffic.db`，
 //!   模型见 `Entity/Model.xml`）；内置管理员（配置文件 `WebUserName`/`WebPassword`，
 //!   超级权限）不落本表；
 //! - 本文件仅保留：Agent 权限表、数据目录 → 共享存储的桥接与原有函数签名（调用点零改动）；
-//!   用户 / 审计核心逻辑与测试见 `pek_rcode::panel`（多项目共用组装线）。
+//!   用户 / 审计核心逻辑与测试见 `pek_radmin::panel`（多项目共用组装线）。
 //!
 //! 说明：`Agent_OperationLog` 当前**无 `Category` 列**（与产测工具表结构差异），
 //! 审计写入自动省略该列（`AuditEntry.category = None`）；查询的类别过滤参数由薄壳传空。
@@ -16,7 +16,7 @@ use serde_json::Value as Json;
 
 use crate::history;
 
-pub(crate) use pek_rcode::panel::{AuditEntry, TABLE_OPLOG, TABLE_USER};
+pub(crate) use pek_radmin::panel::{AuditEntry, TABLE_OPLOG, TABLE_USER};
 
 /// 面板存储（流量历史库共享；注册表单飞打开）。
 fn store(base: &Path) -> Result<Arc<pek_rcode::store::SharedStore>, String> {
@@ -44,9 +44,9 @@ pub(crate) const ALL_PERMISSIONS: &[(&str, &str)] = &[
 ];
 
 /// 权限与用户存储门面（单例；权限表见 [`ALL_PERMISSIONS`]）。
-fn auth() -> &'static pek_rcode::panel::PanelAuth {
-    static AUTH: OnceLock<pek_rcode::panel::PanelAuth> = OnceLock::new();
-    AUTH.get_or_init(|| pek_rcode::panel::PanelAuth::new(ALL_PERMISSIONS))
+fn auth() -> &'static pek_radmin::panel::PanelAuth {
+    static AUTH: OnceLock<pek_radmin::panel::PanelAuth> = OnceLock::new();
+    AUTH.get_or_init(|| pek_radmin::panel::PanelAuth::new(ALL_PERMISSIONS))
 }
 
 // ————— 用户（保持原签名：调用点零改动） —————
@@ -55,7 +55,7 @@ fn auth() -> &'static pek_rcode::panel::PanelAuth {
 pub(crate) fn find_user(
     base: &Path,
     user_name: &str,
-) -> Result<Option<pek_rcode::panel::PanelUser>, String> {
+) -> Result<Option<pek_radmin::panel::PanelUser>, String> {
     auth().find_user(&*store(base)?, user_name)
 }
 
@@ -69,7 +69,7 @@ pub(crate) fn verify_login(
     base: &Path,
     user_name: &str,
     password: &str,
-) -> Result<Option<pek_rcode::panel::PanelUser>, String> {
+) -> Result<Option<pek_radmin::panel::PanelUser>, String> {
     auth().verify_login(&*store(base)?, user_name, password)
 }
 
@@ -105,7 +105,7 @@ pub(crate) fn delete_user(base: &Path, user_name: &str) -> Result<(), String> {
 /// 写入一条审计记录（失败只记程序日志，不影响业务）。
 pub(crate) fn record(base: &Path, entry: &AuditEntry) {
     match store(base) {
-        Ok(store) => pek_rcode::panel::record(&store, entry),
+        Ok(store) => pek_radmin::panel::record(&store, entry),
         Err(e) => dhrust::logs::log().error(&format!("操作日志写入失败（存储不可用）：{e}")),
     }
 }
@@ -119,14 +119,14 @@ pub(crate) fn query_logs(
     keyword: &str,
     success: Option<bool>,
 ) -> Result<Json, String> {
-    pek_rcode::panel::query_logs(&*store(base)?, page, size, "", user, keyword, success)
+    pek_radmin::panel::query_logs(&*store(base)?, page, size, "", user, keyword, success)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// 薄壳连通性冒烟：经 `history::storage` + `pek_rcode::panel` 完成用户 CRUD 与审计写入
+    /// 薄壳连通性冒烟：经 `history::storage` + `pek_radmin::panel` 完成用户 CRUD 与审计写入
     /// （核心逻辑测试见 `pek-rcode::panel` 模块）。
     #[test]
     fn shell_user_crud_and_audit_smoke() {

@@ -32,7 +32,7 @@ use dhrust::net::login_guard::LoginGuard;
 use dhrust::net::panel_auth::{bearer_token, client_ip, is_loopback, AuthLevel, TokenStore};
 use dhrust::net::router::Ctx;
 use dhrust::web::{format_bytes, format_speed};
-use pek_rcode::panel::{action_name_of, truncate_text};
+use pek_radmin::panel::{action_name_of, truncate_text};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
@@ -400,10 +400,10 @@ fn result_info(result: &ActionResult) -> (i32, String) {
 
 /// 动作中文名（审计展示；未知动作回退为 `操作 {action}`）。
 fn action_title(action: &str) -> String {
-    pek_rcode::panel::action_title(action, ACTION_TITLES)
+    pek_radmin::panel::action_title(action, ACTION_TITLES)
 }
 
-/// 动作 → 中文名映射（审计展示；`action_name_of` 来自 `pek_rcode::panel`）。
+/// 动作 → 中文名映射（审计展示；`action_name_of` 来自 `pek_radmin::panel`）。
 const ACTION_TITLES: &[(&str, &str)] = &[
     ("login", "登录"),
     ("logout", "退出登录"),
@@ -458,9 +458,9 @@ const ACTION_TITLES: &[(&str, &str)] = &[
 
 /// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。
 ///
-/// 实现已下沉 `pek_rcode::panel::summarize_body`（与 HlkProductTool 面板共用）。
+/// 实现已下沉 `pek_radmin::panel::summarize_body`（与 HlkProductTool 面板共用）。
 fn summarize_request(ctx: &Ctx) -> String {
-    pek_rcode::panel::summarize_body(
+    pek_radmin::panel::summarize_body(
         &ctx.req.query,
         ctx.header("content-type").unwrap_or(""),
         ctx.req.body.as_ref(),

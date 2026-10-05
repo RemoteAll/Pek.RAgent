@@ -108,7 +108,7 @@ pub(crate) fn storage(base: &Path) -> Result<Arc<SharedStore>, String> {
 ///
 /// 供同库其它模块（面板用户 `Agent_PanelUser`、操作审计 `Agent_OperationLog`）复用
 /// 同一连接、同一建表单飞逻辑（防并发 `CREATE TABLE` 竞态）与同一读写锁。
-#[allow(dead_code)] // 面板用户/审计已下沉 pek_rcode::panel（消费方经 `storage()` 桥接），保留为同库通用入口
+#[allow(dead_code)] // 面板用户/审计已下沉 pek_radmin::panel（消费方经 `storage()` 桥接），保留为同库通用入口
 pub(crate) fn with_store<F, R>(base: &Path, f: F) -> Result<R, String>
 where
     F: FnOnce(&Dal, &mut dyn SqlSession) -> pek_rcode::Result<R>,

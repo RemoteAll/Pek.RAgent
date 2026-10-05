@@ -19,6 +19,8 @@ dhrust = { path = "../DH.RustBase", features = ["net", "http-tls", "toml", "serv
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
 pek-rcode = { path = "../Pek.RCode", default-features = false, features = ["database"] }
+# 管理组件（Pek.RAdmin）：面板用户与操作审计数据层（audit.rs 薄壳消费；仅管理界面项目需要）
+pek-radmin = { path = "../Pek.RAdmin" }
 # 配置与状态序列化（AgentConfig / data/state.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
