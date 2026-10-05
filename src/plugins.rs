@@ -172,19 +172,17 @@ pub trait StoreFetcher {
 /// 生产下载器：`dhrust::net::http_client`（支持 https；跟随至多 4 次重定向）。
 pub struct HttpFetcher;
 
-/// 在独立线程执行阻塞下载：服务端处理器运行在 tokio 运行时线程上，
-/// 直接调用 `blocking_get` 会因“运行时内 block_on”而 panic（实测会杀死 HTTP 服务线程）。
+/// 阻塞下载（**运行时内安全**：库内独立线程 + join，见 `blocking_request_offthread`）。
 fn fetch_blocking(url: &str) -> Result<dhrust::net::http_client::HttpResponse, String> {
-    let u = url.to_string();
-    let handle = std::thread::Builder::new()
-        .name("plugin-store-fetch".to_string())
-        .spawn(move || dhrust::net::http_client::blocking_get(&u, std::time::Duration::from_secs(30)))
-        .map_err(|e| format!("创建下载线程失败：{e}"))?;
-    match handle.join() {
-        Ok(Ok(resp)) => Ok(resp),
-        Ok(Err(e)) => Err(format!("下载失败：{}", e.0)),
-        Err(_) => Err("下载线程异常退出".to_string()),
-    }
+    dhrust::net::http_client::blocking_request_offthread(
+        "GET",
+        url,
+        &[],
+        None,
+        Vec::new(),
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|e| format!("下载失败：{}", e.0))
 }
 
 impl StoreFetcher for HttpFetcher {

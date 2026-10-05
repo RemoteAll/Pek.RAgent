@@ -1617,27 +1617,17 @@ fn dhdeploy_service_text(service: &str) -> &'static str {
 
 /// 本机探测 DHDeploy Agent 面板/服务访问范围（返回 `(panel_mode, service_access)`）。
 ///
-/// 处理器运行在 tokio 运行时线程上，直接在内部 `block_on` 会 panic（历史踩坑），
-/// 因此阻塞 HTTP 一律在独立线程执行后 join。
+/// 阻塞 HTTP 经库内包装（独立线程 + join）——运行时线程内直接 `block_on` 会 panic（历史踩坑）。
 fn dhdeploy_probe() -> Result<(String, String), String> {
-    let handle = std::thread::Builder::new()
-        .name("dhdeploy-panel-probe".to_string())
-        .spawn(|| {
-            dhrust::net::http_client::blocking_request(
-                "GET",
-                DHDEPLOY_PANEL_API,
-                &[],
-                None,
-                Vec::new(),
-                std::time::Duration::from_millis(2000),
-            )
-        })
-        .map_err(|e| format!("创建探测线程失败：{e}"))?;
-    let resp = match handle.join() {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("未检测到 DHDeploy Agent 面板（{}）", e.0)),
-        Err(_) => return Err("探测线程异常退出".to_string()),
-    };
+    let resp = dhrust::net::http_client::blocking_request_offthread(
+        "GET",
+        DHDEPLOY_PANEL_API,
+        &[],
+        None,
+        Vec::new(),
+        std::time::Duration::from_millis(2000),
+    )
+    .map_err(|e| format!("未检测到 DHDeploy Agent 面板（{}）", e.0))?;
     if resp.status != 200 {
         return Err(format!("本机 8282 响应异常（HTTP {}）", resp.status));
     }
@@ -1667,27 +1657,18 @@ fn dhdeploy_probe() -> Result<(String, String), String> {
     Ok((mode, service))
 }
 
-/// 调用 DHDeploy 控制接口（POST JSON；独立线程执行阻塞 HTTP）。
+/// 调用 DHDeploy 控制接口（POST JSON；阻塞 HTTP 经库内包装，运行时内安全）。
 fn dhdeploy_post(payload: &Json) -> Result<String, String> {
     let body = payload.to_string().into_bytes();
-    let handle = std::thread::Builder::new()
-        .name("dhdeploy-panel-set".to_string())
-        .spawn(move || {
-            dhrust::net::http_client::blocking_request(
-                "POST",
-                DHDEPLOY_PANEL_API,
-                &[],
-                Some("application/json"),
-                body,
-                std::time::Duration::from_millis(3000),
-            )
-        })
-        .map_err(|e| format!("创建切换线程失败：{e}"))?;
-    let resp = match handle.join() {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("调用失败（{}）", e.0)),
-        Err(_) => return Err("切换线程异常退出".to_string()),
-    };
+    let resp = dhrust::net::http_client::blocking_request_offthread(
+        "POST",
+        DHDEPLOY_PANEL_API,
+        &[],
+        Some("application/json"),
+        body,
+        std::time::Duration::from_millis(3000),
+    )
+    .map_err(|e| format!("调用失败（{}）", e.0))?;
     let v: Json = serde_json::from_slice(&resp.body).unwrap_or_default();
     let code = v
         .get("code")
