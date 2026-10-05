@@ -276,6 +276,7 @@ version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "chrono",
+ "ed25519-dalek",
  "fastwebsockets",
  "hmac",
  "http-body-util",
@@ -283,6 +284,8 @@ dependencies = [
  "hyper-util",
  "libc",
  "md-5",
+ "portable-pty 0.8.1",
+ "portable-pty 0.9.0",
  "quick-xml",
  "rand 0.8.8",
  "rustls",
@@ -795,11 +798,8 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dhrust",
- "ed25519-dalek",
  "libc",
  "pek-rcode",
- "portable-pty 0.8.1",
- "portable-pty 0.9.0",
  "serde",
  "serde_json",
  "tokio",

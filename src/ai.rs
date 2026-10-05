@@ -11,13 +11,11 @@
 //! 注意：外部调用在独立线程内阻塞执行——面板处理器运行于 tokio 运行时线程，
 //! 直接调用 `blocking_request` 会因“运行时内 block_on”而 panic（历史踩坑）。
 
-use std::time::Duration;
-
 use dhrust::net::controller::{json_error, json_result, ActionResult};
+use dhrust::net::openai::{self, OpenAiOptions};
 use dhrust::net::router::Ctx;
 use serde_json::{json, Value as Json};
 
-use crate::config::AgentConfig;
 use crate::util;
 use crate::webpanel::WebPanel;
 
@@ -25,8 +23,6 @@ use crate::webpanel::WebPanel;
 const MAX_CONTENT_CHARS: usize = 12_000;
 /// 对话消息条数上限（含历史；仅保留最近 N 条）。
 const MAX_MESSAGES: usize = 30;
-/// 调用模型接口的整体超时（推理模型可能较慢）。
-const TIMEOUT: Duration = Duration::from_secs(300);
 /// 快照中随附的代理日志行数。
 const LOG_TAIL_LINES: usize = 40;
 /// 快照中单行日志截断长度。
@@ -83,7 +79,12 @@ pub fn ai_chat(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     full.extend(messages);
 
     let started = std::time::Instant::now();
-    match call_model(&cfg, &full) {
+    let opts = OpenAiOptions::new(
+        cfg.ai_base_url.as_str(),
+        cfg.ai_api_key.as_str(),
+        cfg.ai_model.as_str(),
+    );
+    match openai::chat_blocking(&opts, &full) {
         Ok(reply) => {
             util::log_format(
                 "AI 助手对话完成（用时 {:.1}s，模型 {}，答复 {} 字）",
@@ -160,118 +161,8 @@ fn parse_request(body: &[u8]) -> Result<(Vec<Json>, bool), String> {
 }
 
 // ————— 外部模型调用 —————
-
-/// 模型答复。
-#[derive(Debug)]
-struct AiReply {
-    content: String,
-    reasoning: String,
-    usage: Json,
-    model: String,
-}
-
-/// 拼接 chat/completions 地址：Base 地址补 `/chat/completions`；已是完整地址则原样使用。
-fn chat_completions_url(base: &str) -> String {
-    let b = base.trim().trim_end_matches('/');
-    if b.ends_with("chat/completions") {
-        b.to_string()
-    } else {
-        format!("{b}/chat/completions")
-    }
-}
-
-/// 调用模型接口（OpenAI 兼容）。在独立线程内阻塞执行，避免 tokio 运行时内 block_on panic。
-fn call_model(cfg: &AgentConfig, messages: &[Json]) -> Result<AiReply, String> {
-    let url = chat_completions_url(&cfg.ai_base_url);
-    if !(url.starts_with("https://") || url.starts_with("http://")) {
-        return Err(format!("AI 接口地址无效（需 http/https）：{url}"));
-    }
-    let payload = json!({
-        "model": cfg.ai_model,
-        "messages": messages,
-        "stream": false,
-        "temperature": 0.3,
-    });
-    let body = serde_json::to_vec(&payload).map_err(|e| format!("请求序列化失败：{e}"))?;
-    let auth = format!("Bearer {}", cfg.ai_api_key.trim());
-
-    let handle = std::thread::Builder::new()
-        .name("ai-chat".to_string())
-        .spawn(move || {
-            dhrust::net::http_client::blocking_request(
-                "POST",
-                &url,
-                &[("Authorization", auth.as_str())],
-                Some("application/json"),
-                body,
-                TIMEOUT,
-            )
-        })
-        .map_err(|e| format!("创建请求线程失败：{e}"))?;
-    let resp = match handle.join() {
-        Ok(Ok(r)) => r,
-        Ok(Err(e)) => return Err(format!("调用 AI 接口失败：{}", e.0)),
-        Err(_) => return Err("AI 请求线程异常退出".to_string()),
-    };
-
-    let text = resp.body_text();
-    if !resp.is_success() {
-        let msg = parse_error_message(&text).unwrap_or_else(|| truncate_chars(&text, 300));
-        return Err(format!("AI 接口返回 HTTP {}：{msg}", resp.status));
-    }
-    parse_reply(&text)
-}
-
-/// 解析模型响应（纯函数，供测试）。
-fn parse_reply(body: &str) -> Result<AiReply, String> {
-    let v: Json = serde_json::from_str(body).map_err(|e| format!("AI 响应不是有效 JSON：{e}"))?;
-    let msg = match v.pointer("/choices/0/message") {
-        Some(m) => m,
-        None => {
-            let detail = parse_error_message(body)
-                .unwrap_or_else(|| truncate_chars(body, 300));
-            return Err(format!("AI 响应缺少 choices：{detail}"));
-        }
-    };
-    let content = msg
-        .get("content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    let reasoning = msg
-        .get("reasoning_content")
-        .and_then(|c| c.as_str())
-        .unwrap_or("")
-        .trim()
-        .to_string();
-    if content.is_empty() {
-        if !reasoning.is_empty() {
-            return Err("模型仅返回了推理过程、未给出最终答复，请重试".to_string());
-        }
-        return Err("AI 返回了空答复".to_string());
-    }
-    Ok(AiReply {
-        content,
-        reasoning,
-        usage: v.get("usage").cloned().unwrap_or(Json::Null),
-        model: v
-            .get("model")
-            .and_then(|m| m.as_str())
-            .unwrap_or("")
-            .to_string(),
-    })
-}
-
-/// 从错误响应体提取消息（`{"error":{"message":...}}` 或 `{"message":...}`）。
-fn parse_error_message(body: &str) -> Option<String> {
-    let v: Json = serde_json::from_str(body).ok()?;
-    v.pointer("/error/message")
-        .and_then(|m| m.as_str())
-        .or_else(|| v.get("message").and_then(|m| m.as_str()))
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
+// OpenAI 兼容客户端（/chat/completions 调用、响应解析、错误提取、独立线程防 block_on）
+// 已下沉至 dhrust::net::openai；本模块只负责：请求校验、快照组装、审计日志。
 
 // ————— 服务器实况快照 —————
 
@@ -484,56 +375,6 @@ mod tests {
         let body = serde_json::to_vec(&json!({ "messages": [{"role":"user","content": long}] })).unwrap();
         let (out, _) = parse_request(&body).unwrap();
         assert_eq!(out[0]["content"].as_str().unwrap().chars().count(), MAX_CONTENT_CHARS + 1);
-    }
-
-    #[test]
-    fn parse_reply_normal_and_reasoning() {
-        let body = r#"{"model":"deepseek-chat","choices":[{"message":{"role":"assistant","content":"磁盘 C 盘剩余不足 10%。"},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":5}}"#;
-        let reply = parse_reply(body).unwrap();
-        assert!(reply.content.contains("磁盘"));
-        assert_eq!(reply.model, "deepseek-chat");
-        assert_eq!(reply.usage["completion_tokens"], 5);
-
-        // 推理模型：content 为空但有 reasoning_content → 明确报错
-        let body = r#"{"choices":[{"message":{"content":"","reasoning_content":"让我想想"}}]}"#;
-        let err = parse_reply(body).unwrap_err();
-        assert!(err.contains("推理过程"), "{err}");
-
-        // 错误结构体
-        let err = parse_reply(r#"{"error":{"message":"Insufficient Balance"}}"#).unwrap_err();
-        assert!(err.contains("Insufficient Balance"), "{err}");
-
-        // 非 JSON
-        assert!(parse_reply("<html>oops</html>").is_err());
-    }
-
-    #[test]
-    fn parse_error_message_extracts() {
-        assert_eq!(
-            parse_error_message(r#"{"error":{"message":" Invalid API key "}}"#).unwrap(),
-            "Invalid API key"
-        );
-        assert_eq!(
-            parse_error_message(r#"{"message":"missing"}"#).unwrap(),
-            "missing"
-        );
-        assert!(parse_error_message("plain").is_none());
-    }
-
-    #[test]
-    fn chat_url_join() {
-        assert_eq!(
-            chat_completions_url("https://api.deepseek.com/v1"),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("https://api.deepseek.com/v1/"),
-            "https://api.deepseek.com/v1/chat/completions"
-        );
-        assert_eq!(
-            chat_completions_url("http://127.0.0.1:11434/v1/chat/completions"),
-            "http://127.0.0.1:11434/v1/chat/completions"
-        );
     }
 
     #[test]

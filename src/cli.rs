@@ -1073,7 +1073,6 @@ fn is_elevated() -> bool {
 /// 用法：`pek-ragent -PluginStoreKeygen [输出目录]` → 写出 `plugin-store.key`（私钥 hex，离线保管）
 /// 与 `plugin-store.pub`（公钥 hex，填入面板「配置」→ 插件源公钥）。
 fn cmd_plugin_keygen(args: &[String]) -> i32 {
-    use ed25519_dalek::SigningKey;
     let dir_arg = args
         .iter()
         .skip(1)
@@ -1082,21 +1081,25 @@ fn cmd_plugin_keygen(args: &[String]) -> i32 {
     let dir = dir_arg
         .map(PathBuf::from)
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let seed = dhrust::random::bytes(32);
-    let seed_arr: [u8; 32] = seed.as_slice().try_into().unwrap();
-    let key = SigningKey::from_bytes(&seed_arr);
-    let hex_of = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+    let seed_hex = dhrust::plugin::generate_signing_key();
+    let key = match dhrust::plugin::signing_key_from_hex(&seed_hex) {
+        Ok(k) => k,
+        Err(e) => {
+            println!("生成密钥失败：{e}");
+            return 1;
+        }
+    };
     if let Err(e) = std::fs::create_dir_all(&dir) {
         println!("创建目录失败：{e}");
         return 1;
     }
     let key_path = dir.join("plugin-store.key");
     let pub_path = dir.join("plugin-store.pub");
-    if let Err(e) = std::fs::write(&key_path, hex_of(&seed_arr)) {
+    if let Err(e) = std::fs::write(&key_path, &seed_hex) {
         println!("写入私钥失败：{e}");
         return 1;
     }
-    if let Err(e) = std::fs::write(&pub_path, hex_of(key.verifying_key().as_bytes())) {
+    if let Err(e) = std::fs::write(&pub_path, dhrust::plugin::pubkey_hex(&key)) {
         println!("写入公钥失败：{e}");
         return 1;
     }
@@ -1196,7 +1199,6 @@ fn cmd_plugin_remove(args: &[String]) -> i32 {
 
 /// 对插件源目录（catalog.json）签名，产出 `catalog.json.sig`（base64，与目录文件同目录发布）。
 fn cmd_plugin_sign(args: &[String]) -> i32 {
-    use ed25519_dalek::{Signer, SigningKey};
     let files: Vec<&str> = args
         .iter()
         .skip(1)
@@ -1212,39 +1214,17 @@ fn cmd_plugin_sign(args: &[String]) -> i32 {
         .get(1)
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("plugin-store.key"));
-    let key_hex = match std::fs::read_to_string(&key_path) {
-        Ok(t) => t.trim().to_string(),
-        Err(e) => {
-            println!("读取私钥失败（{}）：{e}", key_path.display());
-            return 1;
+    match crate::plugins::sign_catalog_file(&catalog, &key_path) {
+        Ok(()) => {
+            println!("签名完成：{}.sig", catalog.display());
+            println!("把 catalog.json 与 catalog.json.sig 一起发布到插件源目录即可（面板配置公钥后强制验签）。");
+            0
         }
-    };
-    let Some(bytes) = crate::plugins::hex_decode(&key_hex) else {
-        println!("私钥不是有效的 hex 文本");
-        return 1;
-    };
-    let Ok(seed) = <[u8; 32]>::try_from(bytes.as_slice()) else {
-        println!("私钥长度应为 32 字节");
-        return 1;
-    };
-    let data = match std::fs::read(&catalog) {
-        Ok(d) => d,
         Err(e) => {
-            println!("读取 {} 失败：{e}", catalog.display());
-            return 1;
+            println!("{e}");
+            1
         }
-    };
-    let key = SigningKey::from_bytes(&seed);
-    let sig = key.sign(&data);
-    let sig_b64 = dhrust::sign::base64_encode(&sig.to_bytes());
-    let sig_path = PathBuf::from(format!("{}.sig", catalog.display()));
-    if let Err(e) = std::fs::write(&sig_path, &sig_b64) {
-        println!("写入签名失败：{e}");
-        return 1;
     }
-    println!("签名完成：{}", sig_path.display());
-    println!("把 catalog.json 与 catalog.json.sig 一起发布到插件源目录即可（面板配置公钥后强制验签）。");
-    0
 }
 
 /// 帮助文本。

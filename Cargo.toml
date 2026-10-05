@@ -10,8 +10,11 @@ license = "MIT"
 # DH 基础库（DH.RustBase）：日志（XTrace 等价）、线程定时调度（Timer/TimerScheduler）、
 # 网络内核（http 服务端/路由，对齐 DH.NCore HttpServer/HttpRouter）、
 # HTTPS 客户端（http-tls：rustls+ring，AI 助手/在线插件源/健康检查等 https 调用必需；可 zig 交叉编 musl）、
-# 配置兼容（XML 主配置 Config/StarAgent.config + 旧版 TOML 迁移）
-dhrust = { path = "../DH.RustBase", features = ["net", "http-tls", "toml", "service", "zip-extract"] }
+# 配置兼容（XML 主配置 Config/StarAgent.config + 旧版 TOML 迁移）、
+# 在线终端（term：真 PTY 会话引擎，Windows ConPTY / Unix openpty）、
+# 插件协议（plugin：插件包格式 + 插件源目录 Ed25519 签名，与 Pek.RPanlServer 共用）、
+# AI 客户端（net::openai：OpenAI 兼容 /chat/completions）
+dhrust = { path = "../DH.RustBase", features = ["net", "http-tls", "toml", "service", "zip-extract", "term", "plugin"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
@@ -23,20 +26,16 @@ chrono = "0.4"
 
 # 部署包解压（与 Pek.RCode 同版本同特性；纯 Rust deflate）
 zip = { version = "2", default-features = false, features = ["deflate"] }
-# 在线插件源签名（Ed25519；运行时验签 + 发布端 keygen/sign 子命令）
-ed25519-dalek = "2"
+# 注：在线插件源签名（Ed25519）已随插件协议下沉至 dhrust::plugin（feature "plugin"）
 # HTTP 服务端宿主运行时（dhrust::net::http 基于 hyper/tokio）
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
-# 在线终端：真 PTY（openpty；bash -l）——0.9：nix 0.28 支持 loongarch64 等全架构交叉编译
-portable-pty = "0.9"
 
 [target.'cfg(windows)'.dependencies]
-# 在线终端：真 PTY（ConPTY）——0.8.1：实测可用（0.9 的 PSUEDOCONSOLE_INHERIT_CURSOR 标志下 ConPTY 无输出）
-portable-pty = "0.8"
 # 注：Windows 服务运行时（windows-service）已随 service 模块下沉至 dhrust
+# 注：在线终端 portable-pty 已随 term 模块下沉至 dhrust（Windows 0.8 / Unix 0.9）
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
