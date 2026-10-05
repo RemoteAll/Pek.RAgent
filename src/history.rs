@@ -680,13 +680,17 @@ fn backup_tables() -> [&'static str; 4] {
 
 /// 构建数据库管理服务（固定 RAgent 的表范围与档案约定）。
 fn db_admin_for(base: &Path, store: Arc<SharedStore>) -> pek_rcode::db_admin::DbAdmin {
+    // SQLite 数据文件从实际连接推导（Database.toml 自定义路径时面板显示才准确）
+    let sqlite_file = resolve_connection(base)
+        .ok()
+        .and_then(|(conn, _)| pek_rcode::database::sqlite_file_of(base, &conn));
     pek_rcode::db_admin::DbAdmin::new(
         store,
         backup_tables().iter().map(|t| t.to_string()).collect(),
         backup_dir(base),
         "traffic",
     )
-    .with_sqlite_file(Some(base.join("Data").join(DB_FILE)))
+    .with_sqlite_file(sqlite_file)
 }
 
 /// 构建备份档案存储（不依赖数据库，库不可用时仍可列出/下载/删除）。
@@ -1045,6 +1049,30 @@ mod tests {
         assert!(
             !base.join("Data").join(DB_FILE).is_file(),
             "不应再建内置 traffic.db"
+        );
+        cleanup(&base);
+    }
+
+    #[test]
+    fn db_admin_reports_database_toml_path() {
+        let base = temp_dir("dbadminpath");
+        std::fs::create_dir_all(base.join("Config")).unwrap();
+        let custom = base.join("Data").join("custom.db");
+        std::fs::write(
+            pek_rcode::database::file_path(&base),
+            format!(
+                "[Connections.main]\nConnectionString = 'Data Source={};Provider=SQLite'\n",
+                custom.display()
+            ),
+        )
+        .unwrap();
+        let store = storage(&base).unwrap();
+        let admin = db_admin_for(&base, store);
+        let info = admin.database_info();
+        assert_eq!(
+            info["path"].as_str().unwrap_or_default(),
+            custom.display().to_string(),
+            "{info}"
         );
         cleanup(&base);
     }
