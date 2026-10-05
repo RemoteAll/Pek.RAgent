@@ -32,6 +32,7 @@ use dhrust::net::login_guard::LoginGuard;
 use dhrust::net::panel_auth::{bearer_token, client_ip, is_loopback, AuthLevel, TokenStore};
 use dhrust::net::router::Ctx;
 use dhrust::web::{format_bytes, format_speed};
+use pek_rcode::panel::{action_name_of, truncate_text};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
@@ -349,6 +350,7 @@ fn record_audit(
     audit::record(
         &panel.base,
         &audit::AuditEntry {
+            category: None,
             user: principal.name.clone(),
             ip: client_ip(ctx),
             action: action.to_string(),
@@ -396,146 +398,73 @@ fn result_info(result: &ActionResult) -> (i32, String) {
     }
 }
 
-/// 路径最后一段（动作名，如 `/star/fileDelete` → `fileDelete`）。
-fn action_name_of(path: &str) -> String {
-    path.trim_end_matches('/')
-        .rsplit('/')
-        .next()
-        .unwrap_or("")
-        .to_string()
-}
-
-/// 动作中文名（审计展示；未知动作回退为原名）。
+/// 动作中文名（审计展示；未知动作回退为 `操作 {action}`）。
 fn action_title(action: &str) -> String {
-    let title = match action {
-        "login" => "登录",
-        "logout" => "退出登录",
-        "control" => "服务控制",
-        "dhdeployPanel" => "DHDeploy 面板访问",
-        "freeMemory" => "释放内存",
-        "updateConfig" => "更新配置",
-        "changePassword" => "修改密码",
-        "upgrade" => "程序升级",
-        "syncTime" => "同步系统时间",
-        "startService" => "启动子服务",
-        "stopService" => "停止子服务",
-        "restartService" => "重启子服务",
-        "addService" => "添加/更新子服务",
-        "removeService" => "删除子服务",
-        "updateStarConfig" => "更新星尘设置",
-        "dbQuery" => "数据库查询",
-        "dbBackup" => "数据库备份下载",
-        "dbRestore" => "数据库还原",
-        "dbCreateBackup" => "创建数据库备份",
-        "dbDownloadBackup" => "下载数据库备份",
-        "dbRestoreBackup" => "从备份还原数据库",
-        "dbDeleteBackup" => "删除数据库备份",
-        "fileRead" => "读取文件",
-        "fileWrite" => "保存文件",
-        "fileMkdir" => "新建文件夹",
-        "fileNewFile" => "新建文件",
-        "fileDelete" => "删除文件",
-        "fileRename" => "重命名",
-        "fileMove" => "移动文件",
-        "fileCopy" => "复制文件",
-        "fileUpload" => "上传文件",
-        "fileDownload" => "下载文件",
-        "fileCompress" => "压缩文件",
-        "fileExtract" => "解压文件",
-        "fileChmod" => "修改文件权限",
-        "fileSearch" => "搜索文件",
-        "fileSize" => "计算目录大小",
-        "logCleanRun" => "日志清理",
-        "logCleanConfig" => "日志清理配置",
-        "logCleanConfigSave" => "保存日志清理配置",
-        "pluginInstall" => "安装插件",
-        "pluginDelete" => "卸载插件",
-        "pluginStoreInstall" => "安装/更新在线插件",
-        "aiChat" => "AI 助手对话",
-        "termReset" => "重置终端会话",
-        "userSave" => "保存面板用户",
-        "userDelete" => "删除面板用户",
-        "userResetPassword" => "重置用户密码",
-        "auditLogs" => "查看操作日志",
-        _ => return format!("操作 {action}"),
-    };
-    title.to_string()
+    pek_rcode::panel::action_title(action, ACTION_TITLES)
 }
 
-/// 请求参数摘要（查询串 + JSON/表单体；`password`/`secret`/`token` 字段脱敏；截断）。
+/// 动作 → 中文名映射（审计展示；`action_name_of` 来自 `pek_rcode::panel`）。
+const ACTION_TITLES: &[(&str, &str)] = &[
+    ("login", "登录"),
+    ("logout", "退出登录"),
+    ("control", "服务控制"),
+    ("dhdeployPanel", "DHDeploy 面板访问"),
+    ("freeMemory", "释放内存"),
+    ("updateConfig", "更新配置"),
+    ("changePassword", "修改密码"),
+    ("upgrade", "程序升级"),
+    ("syncTime", "同步系统时间"),
+    ("startService", "启动子服务"),
+    ("stopService", "停止子服务"),
+    ("restartService", "重启子服务"),
+    ("addService", "添加/更新子服务"),
+    ("removeService", "删除子服务"),
+    ("updateStarConfig", "更新星尘设置"),
+    ("dbQuery", "数据库查询"),
+    ("dbBackup", "数据库备份下载"),
+    ("dbRestore", "数据库还原"),
+    ("dbCreateBackup", "创建数据库备份"),
+    ("dbDownloadBackup", "下载数据库备份"),
+    ("dbRestoreBackup", "从备份还原数据库"),
+    ("dbDeleteBackup", "删除数据库备份"),
+    ("fileRead", "读取文件"),
+    ("fileWrite", "保存文件"),
+    ("fileMkdir", "新建文件夹"),
+    ("fileNewFile", "新建文件"),
+    ("fileDelete", "删除文件"),
+    ("fileRename", "重命名"),
+    ("fileMove", "移动文件"),
+    ("fileCopy", "复制文件"),
+    ("fileUpload", "上传文件"),
+    ("fileDownload", "下载文件"),
+    ("fileCompress", "压缩文件"),
+    ("fileExtract", "解压文件"),
+    ("fileChmod", "修改文件权限"),
+    ("fileSearch", "搜索文件"),
+    ("fileSize", "计算目录大小"),
+    ("logCleanRun", "日志清理"),
+    ("logCleanConfig", "日志清理配置"),
+    ("logCleanConfigSave", "保存日志清理配置"),
+    ("pluginInstall", "安装插件"),
+    ("pluginDelete", "卸载插件"),
+    ("pluginStoreInstall", "安装/更新在线插件"),
+    ("aiChat", "AI 助手对话"),
+    ("termReset", "重置终端会话"),
+    ("userSave", "保存面板用户"),
+    ("userDelete", "删除面板用户"),
+    ("userResetPassword", "重置用户密码"),
+    ("auditLogs", "查看操作日志"),
+];
+
+/// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。
+///
+/// 实现已下沉 `pek_rcode::panel::summarize_body`（与 HlkProductTool 面板共用）。
 fn summarize_request(ctx: &Ctx) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if !ctx.req.query.is_empty() {
-        parts.push(redact_form(&ctx.req.query));
-    }
-    let body = ctx.req.body.as_ref();
-    if !body.is_empty() {
-        let content_type = ctx
-            .header("content-type")
-            .unwrap_or("")
-            .to_ascii_lowercase();
-        if content_type.contains("application/json") && body.len() <= 64 * 1024 {
-            match serde_json::from_slice::<Json>(body) {
-                Ok(mut v) => {
-                    redact_json(&mut v);
-                    parts.push(v.to_string());
-                }
-                Err(_) => parts.push(format!("body={} 字节", body.len())),
-            }
-        } else if content_type.contains("x-www-form-urlencoded") {
-            parts.push(redact_form(&String::from_utf8_lossy(body)));
-        } else {
-            parts.push(format!("body={} 字节", body.len()));
-        }
-    }
-    truncate_text(&parts.join(" | "), 400)
-}
-
-/// `k=v&k2=v2` 形式摘要素材的脱敏。
-fn redact_form(text: &str) -> String {
-    text.split('&')
-        .map(|pair| match pair.split_once('=') {
-            Some((k, _)) if is_sensitive_key(k) => format!("{k}=***"),
-            _ => pair.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("&")
-}
-
-/// JSON 体递归脱敏（键名含 password/secret/token 的值替换为 `***`）。
-fn redact_json(v: &mut Json) {
-    match v {
-        Json::Object(map) => {
-            for (k, val) in map.iter_mut() {
-                if is_sensitive_key(k) {
-                    *val = json!("***");
-                } else {
-                    redact_json(val);
-                }
-            }
-        }
-        Json::Array(items) => {
-            for item in items {
-                redact_json(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// 是否敏感键（不区分大小写包含匹配；`apikey` 覆盖 AI 接口密钥等）。
-fn is_sensitive_key(key: &str) -> bool {
-    let k = key.to_ascii_lowercase();
-    k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("apikey")
-}
-
-/// 按字符截断（附省略号；不破坏 UTF-8 边界）。
-fn truncate_text(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max).collect();
-    format!("{clipped}…")
+    pek_rcode::panel::summarize_body(
+        &ctx.req.query,
+        ctx.header("content-type").unwrap_or(""),
+        ctx.req.body.as_ref(),
+    )
 }
 
 // ————— 控制器注册 —————
@@ -831,6 +760,7 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             audit::record(
                 &panel.base,
                 &audit::AuditEntry {
+                    category: None,
                     user: principal.name.clone(),
                     ip: ip.clone(),
                     action: "login".to_string(),
@@ -852,6 +782,7 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             audit::record(
                 &panel.base,
                 &audit::AuditEntry {
+                    category: None,
                     user: truncate_text(user.trim(), 50),
                     ip: ip.clone(),
                     action: "login".to_string(),
@@ -877,6 +808,7 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             audit::record(
                 &panel.base,
                 &audit::AuditEntry {
+                    category: None,
                     user: principal.name,
                     ip: client_ip(ctx),
                     action: "logout".to_string(),

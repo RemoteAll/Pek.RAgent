@@ -85,7 +85,7 @@ static OPEN_ERROR: Mutex<Option<String>> = Mutex::new(None);
 /// 多个采样线程（网站流量 / 端口流量）同时首开同一数据库时只能有一个执行建表，
 /// 否则并发 `CREATE TABLE` 会撞 “table already exists”
 /// （2026-10-02 服务器实测：两线程首开竞态，后到者建表失败）。
-fn storage(base: &Path) -> Result<Arc<SharedStore>, String> {
+pub(crate) fn storage(base: &Path) -> Result<Arc<SharedStore>, String> {
     match store::get_or_open(base, || open_dal(base)) {
         Ok((opened, created)) => {
             if created && OPEN_ERROR.lock().unwrap().take().is_some() {
@@ -108,6 +108,7 @@ fn storage(base: &Path) -> Result<Arc<SharedStore>, String> {
 ///
 /// 供同库其它模块（面板用户 `Agent_PanelUser`、操作审计 `Agent_OperationLog`）复用
 /// 同一连接、同一建表单飞逻辑（防并发 `CREATE TABLE` 竞态）与同一读写锁。
+#[allow(dead_code)] // 面板用户/审计已下沉 pek_rcode::panel（消费方经 `storage()` 桥接），保留为同库通用入口
 pub(crate) fn with_store<F, R>(base: &Path, f: F) -> Result<R, String>
 where
     F: FnOnce(&Dal, &mut dyn SqlSession) -> pek_rcode::Result<R>,
@@ -1354,6 +1355,7 @@ mod tests {
         audit::record(
             &base,
             &audit::AuditEntry {
+                category: None,
                 user: "tester".to_string(),
                 ip: "127.0.0.1".to_string(),
                 action: "smoke".to_string(),

@@ -88,6 +88,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
     audit::record(
         panel.base(),
         &audit::AuditEntry {
+            category: None,
             user: principal.name.clone(),
             ip: client_ip(ctx),
             action: "termWs".to_string(),
@@ -165,6 +166,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
         audit::record(
             &base_close,
             &audit::AuditEntry {
+                category: None,
                 user: user_close.clone(),
                 ip: ip_close.clone(),
                 action: "termClose".to_string(),
