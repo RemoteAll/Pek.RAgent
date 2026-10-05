@@ -18,7 +18,7 @@ dhrust = { path = "../DH.RustBase", features = ["net", "http-tls", "toml", "serv
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
-pek-rcode = { path = "../Pek.RCode", default-features = false }
+pek-rcode = { path = "../Pek.RCode", default-features = false, features = ["database"] }
 # 配置与状态序列化（AgentConfig / data/state.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
