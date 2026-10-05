@@ -265,6 +265,22 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .plugin-dialog-head h3{font-size:16px;font-weight:700;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .plugin-dialog-body{flex:1;min-height:0;display:flex}
 .plugin-dialog-body .plugin-frame{height:100%;min-height:0;border:0;border-radius:0}
+/* ── AI 助手（服务器问题分析） ── */
+.ai-msgs{display:flex;flex-direction:column;gap:10px;max-height:460px;min-height:160px;overflow-y:auto;padding:4px 2px;margin-bottom:10px}
+.ai-msg{max-width:86%;padding:10px 14px;border-radius:12px;font-size:13px;line-height:1.65;word-break:break-word;overflow-wrap:anywhere}
+.ai-msg.user{align-self:flex-end;background:var(--gradient-brand-soft);border:1px solid var(--brand-500)}
+.ai-msg.assistant{align-self:flex-start;background:var(--surface-2);border:1px solid var(--border-subtle)}
+.ai-msg code{font-family:var(--font-mono);font-size:12px;background:rgba(127,127,127,0.15);padding:1px 4px;border-radius:4px}
+.ai-msg pre{margin:6px 0;padding:8px 10px;background:rgba(0,0,0,0.25);border:1px solid var(--border-subtle);border-radius:6px;overflow-x:auto;font-size:12px;line-height:1.5;font-family:var(--font-mono);white-space:pre-wrap}
+html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
+.ai-msg .ai-usage{margin-top:6px;font-size:11px;color:var(--text-muted)}
+.ai-thinking{color:var(--text-muted)}
+.ai-quick{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+.ai-chip{cursor:pointer;font-size:12px;padding:4px 12px;border-radius:999px;border:1px solid var(--border-default);color:var(--text-secondary);background:transparent}
+.ai-chip:hover{border-color:var(--brand-500);color:var(--brand-500)}
+.ai-input-row{display:flex;gap:8px;align-items:flex-end}
+.ai-input-row textarea{flex:1;resize:vertical;min-height:56px;background:var(--surface-2);border:1px solid var(--border-default);border-radius:var(--radius-sm);color:var(--text-primary);padding:10px 12px;font-size:13px;outline:none;font-family:inherit}
+.ai-input-row textarea:focus{border-color:var(--brand-500)}
 .clean-target{display:flex;justify-content:space-between;gap:12px;font-size:12px;color:var(--text-muted);padding:3px 0;font-family:var(--font-mono)}
 .clean-target .p{word-break:break-all}
 /* ── 用户 / 操作日志 ── */
@@ -319,6 +335,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="database">🗄 数据库</a>
 <a data-panel="fileman">🗂 文件管理</a>
 <a data-panel="plugins">🧩 插件</a>
+<a data-panel="ai">🤖 AI 助手</a>
 <a data-panel="users">👥 用户</a>
 </nav>
 
@@ -335,6 +352,7 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-database" class="panel"></div>
 <div id="panel-fileman" class="panel"></div>
 <div id="panel-plugins" class="panel"></div>
+<div id="panel-ai" class="panel"></div>
 <div id="panel-users" class="panel"></div>
 </main>
 </div>
@@ -477,6 +495,7 @@ function switchPanel(name){
   database:loadDatabase,
   fileman:loadFileman,
   plugins:loadPlugins,
+  ai:loadAi,
   users:loadUsers
  };
  if(loaders[name])loaders[name]();
@@ -1764,6 +1783,8 @@ function renderConfigInput(item){
   return `<label class="toggle"><input type="checkbox" id="cfg-${n}" ${v?'checked':''} onchange="markDirty('${n}')"><span class="track"><span class="thumb"></span></span></label>`;
  if(item.type==='Int32')
   return `<input type="number" id="cfg-${n}" value="${v??0}" onchange="markDirty('${n}')">`;
+ if(item.type==='Password')
+  return `<input type="password" id="cfg-${n}" value="${esc(v??'')}" autocomplete="off" onchange="markDirty('${n}')">`;
  return `<input type="text" id="cfg-${n}" value="${esc(v??'')}" onchange="markDirty('${n}')">`;
 }
 let dirtyFields=new Set();
@@ -2380,6 +2401,94 @@ function pluginStoreInstall(id,name){
   if(j.code!==0){showToast(j.message||'安装失败','error');return}
   showToast(j.message||'安装完成','success');loadPlugins();
  });
+}
+
+/* ── AI 助手（服务器问题分析；模型接口/Key 可在配置页自定义，默认 DeepSeek） ── */
+let aiMessages=[]; // {role:'user'|'assistant', content, usage?}
+let aiMeta=null,aiBusy=false,aiPending=false,aiUseContext=true;
+const AI_QUICKS=['分析当前服务器状态','检查异常与风险点','分析最近的错误日志','磁盘空间还够用吗？'];
+try{aiMessages=JSON.parse(sessionStorage.getItem('ai_chat')||'[]')||[];aiUseContext=sessionStorage.getItem('ai_chat_ctx')!=='0'}catch(e){aiMessages=[]}
+
+function aiPersist(){
+ try{sessionStorage.setItem('ai_chat',JSON.stringify(aiMessages.slice(-60)));sessionStorage.setItem('ai_chat_ctx',aiUseContext?'1':'0')}catch(e){}
+}
+// 轻量渲染：```代码块→<pre>、`行内代码`→<code>、换行保留；其余转义防注入
+function aiRender(content){
+ const esc2=s=>s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+ const parts=String(content||'').split('```');
+ let html='';
+ parts.forEach((p,i)=>{
+  if(i%2===1){const body=p.replace(/^[a-zA-Z0-9_-]*\r?\n/,'');html+=`<pre>${esc2(body)}</pre>`}
+  else{html+=esc2(p).replace(/`([^`\n]+)`/g,'<code>$1</code>').replace(/\n/g,'<br>')}
+ });
+ return html;
+}
+async function loadAi(){
+ $('panel-ai').innerHTML=`<div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>🤖 AI 助手 <span id="ai-model-tag" class="text-muted" style="font-size:12px;font-weight:400"></span></h2>
+   <div style="display:flex;gap:10px;align-items:center">
+    <label class="perm-item" style="font-size:12px"><input type="checkbox" id="ai-context" ${aiUseContext?'checked':''} onchange="aiCtxToggle(this)"> 附服务器实况快照</label>
+    <button class="btn btn-secondary btn-sm" onclick="aiClear()">🗑 清空</button>
+   </div>
+  </div>
+  <div id="ai-status" class="text-muted" style="font-size:12px;margin-bottom:10px">加载中…</div>
+  <div id="ai-msgs" class="ai-msgs"></div>
+  <div class="ai-quick">${AI_QUICKS.map(q=>`<span class="ai-chip" onclick="aiQuick('${escAttr(q)}')">${esc(q)}</span>`).join('')}</div>
+  <div class="ai-input-row">
+   <textarea id="ai-input" placeholder="描述服务器问题，如：磁盘快满了吗？/ 为什么服务反复重启？（Enter 发送 · Shift+Enter 换行）" onkeydown="aiKey(event)"></textarea>
+   <button class="btn btn-primary" id="ai-send" onclick="aiSend()">发送</button>
+  </div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">对话由服务端转发至配置的模型接口（默认 DeepSeek）；仅发送文字与所选快照（不含密码等敏感配置）；模型答复仅供参考，涉及高风险操作请先备份。</div>
+ </div>`;
+ renderAiMessages();
+ try{const j=await api('/star/aiStatus');aiMeta=(j&&j.code===0)?j.data:null}catch(e){aiMeta=null}
+ updateAiStatusLine();
+}
+function updateAiStatusLine(){
+ const el=$('ai-status');if(!el)return;
+ const tag=$('ai-model-tag');
+ if(!aiMeta){el.textContent='⚠ 无法获取 AI 配置状态';return}
+ if(tag)tag.textContent=aiMeta.model?('· '+aiMeta.model):'';
+ if(!aiMeta.enabled){el.innerHTML='⚠ AI 助手未启用 —— 请到「⚙ 配置」页开启「AI 助手」开关';return}
+ if(!aiMeta.hasKey){el.innerHTML=`⚠ 尚未配置 AI API Key —— 请到「⚙ 配置」页填写「AI API Key」（当前接口：${esc(aiMeta.baseUrl)} · 模型：${esc(aiMeta.model)}）`;return}
+ el.innerHTML=`模型：<b>${esc(aiMeta.model)}</b> · 接口：${esc(aiMeta.baseUrl)} · 附服务器实况快照：${aiUseContext?'开':'关'}`;
+}
+function aiCtxToggle(el){aiUseContext=!!el.checked;aiPersist();updateAiStatusLine()}
+function aiQuick(t){const i=$('ai-input');if(!i)return;i.value=t;aiSend()}
+function aiKey(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();aiSend()}}
+function aiClear(){aiMessages=[];aiPersist();renderAiMessages()}
+function renderAiMessages(){
+ const box=$('ai-msgs');if(!box)return;
+ let html='';
+ if(!aiMessages.length&&!aiPending){
+  html='<div class="text-muted" style="font-size:13px;text-align:center;padding:34px 0">向 AI 描述服务器问题即可开始分析（可点下方快捷问题直接提问）</div>';
+ }else{
+  aiMessages.forEach(m=>{
+   const cls=m.role==='user'?'user':'assistant';
+   const usage=m.usage&&m.usage.total_tokens?`<div class="ai-usage">tokens ${m.usage.prompt_tokens||0}+${m.usage.completion_tokens||0}=${m.usage.total_tokens}</div>`:'';
+   html+=`<div class="ai-msg ${cls}">${aiRender(m.content)}${usage}</div>`;
+  });
+ }
+ if(aiPending)html+='<div class="ai-msg assistant ai-thinking">正在分析，请稍候…</div>';
+ box.innerHTML=html;box.scrollTop=box.scrollHeight;
+ const send=$('ai-send');if(send)send.disabled=aiBusy;
+}
+async function aiSend(){
+ if(aiBusy)return;
+ const input=$('ai-input');if(!input)return;
+ const text=(input.value||'').trim();
+ if(!text)return;
+ input.value='';
+ aiMessages.push({role:'user',content:text});
+ aiPersist();aiBusy=true;aiPending=true;renderAiMessages();
+ try{
+  const j=await api('/star/aiChat',{method:'POST',body:JSON.stringify({messages:aiMessages.slice(-30),useContext:aiUseContext})});
+  if(j.code!==0)aiMessages.push({role:'assistant',content:'⚠ '+(j.message||'AI 对话失败')});
+  else aiMessages.push({role:'assistant',content:j.data.reply,usage:j.data.usage});
+ }catch(e){aiMessages.push({role:'assistant',content:'⚠ 请求失败：'+(e&&e.message||e)})}
+ aiBusy=false;aiPending=false;
+ aiPersist();renderAiMessages();
 }
 
 /* ── 操作日志（审计） ── */

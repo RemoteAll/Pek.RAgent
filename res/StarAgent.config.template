@@ -64,6 +64,14 @@
   <PluginStoreUrl></PluginStoreUrl>
   <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256-->
   <PluginStorePubKey></PluginStorePubKey>
+  <!--AI 助手。启用后可在面板「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）-->
+  <AiEnabled>true</AiEnabled>
+  <!--AI 接口地址。OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时改这里-->
+  <AiBaseUrl>https://api.deepseek.com/v1</AiBaseUrl>
+  <!--AI 模型名。如 deepseek-chat（对话）/ deepseek-reasoner（推理）；接入其他服务时填其模型名-->
+  <AiModel>deepseek-chat</AiModel>
+  <!--AI API Key（Bearer 令牌）。留空 = 未配置，AI 助手页会提示先到配置页填写-->
+  <AiApiKey></AiApiKey>
 
   <!--应用服务集合-->
   <Services></Services>

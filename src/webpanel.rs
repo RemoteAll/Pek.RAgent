@@ -63,7 +63,7 @@ impl Principal {
 /// 面板共享状态。
 pub struct WebPanel {
     /// 应用管理器
-    manager: Arc<AppManager>,
+    pub(crate) manager: Arc<AppManager>,
     /// 程序基础目录
     base: PathBuf,
     /// 面板端口
@@ -116,7 +116,7 @@ impl WebPanel {
     }
 
     /// 进程运行时长。
-    fn uptime(&self) -> Duration {
+    pub(crate) fn uptime(&self) -> Duration {
         self.started.elapsed()
     }
 
@@ -267,6 +267,7 @@ pub(crate) const PERM_FILEMAN: &str = "fileman";
 pub(crate) const PERM_CLEANUP: &str = "cleanup";
 pub(crate) const PERM_PLUGINS: &str = "plugins";
 pub(crate) const PERM_AUDIT: &str = "audit";
+pub(crate) const PERM_AI: &str = "ai";
 /// 用户管理：仅内置管理员（不参与授权列表）。
 pub(crate) const PERM_USERS: &str = "users";
 
@@ -435,6 +436,7 @@ fn action_title(action: &str) -> String {
         "pluginInstall" => "安装插件",
         "pluginDelete" => "卸载插件",
         "pluginStoreInstall" => "安装/更新在线插件",
+        "aiChat" => "AI 助手对话",
         "userSave" => "保存面板用户",
         "userDelete" => "删除面板用户",
         "userResetPassword" => "重置用户密码",
@@ -505,10 +507,10 @@ fn redact_json(v: &mut Json) {
     }
 }
 
-/// 是否敏感键（不区分大小写包含匹配）。
+/// 是否敏感键（不区分大小写包含匹配；`apikey` 覆盖 AI 接口密钥等）。
 fn is_sensitive_key(key: &str) -> bool {
     let k = key.to_ascii_lowercase();
-    k.contains("password") || k.contains("secret") || k.contains("token")
+    k.contains("password") || k.contains("secret") || k.contains("token") || k.contains("apikey")
 }
 
 /// 按字符截断（附省略号；不破坏 UTF-8 边界）。
@@ -759,6 +761,16 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_USERS, user_delete),
     );
     controller = controller.get("auditLogs", guarded(panel.clone(), PERM_AUDIT, audit_logs));
+
+    // AI 助手（服务器问题分析；模型接口/Key 可在配置页自定义）
+    controller = controller.get(
+        "aiStatus",
+        guarded(panel.clone(), PERM_AI, crate::ai::ai_status),
+    );
+    controller = controller.post(
+        "aiChat",
+        guarded(panel.clone(), PERM_AI, crate::ai::ai_chat),
+    );
 
     controller.get(
         "getProcessList",
@@ -1296,6 +1308,10 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
         config_item("PluginStoreUrl", "插件源地址（HTTPS）", "String", cfg.plugin_store_url.clone(), "在线插件目录（catalog.json）的地址；仅允许 https（127.0.0.1 例外便于本地调试）；留空=关闭在线插件。修改后自动生效"),
         config_item("PluginStorePubKey", "插件源公钥（Ed25519 hex，可选）", "String", cfg.plugin_store_pubkey.clone(), "填写后强制校验插件源签名（catalog.json.sig），防止插件源被篡改；留空=仅 HTTPS+SHA-256 校验。修改后自动生效"),
+        config_item("AiEnabled", "AI 助手", "Boolean", cfg.ai_enabled.to_string(), "启用后可在「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）。修改后自动生效"),
+        config_item("AiBaseUrl", "AI 接口地址", "String", cfg.ai_base_url.clone(), "OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时修改。修改后自动生效"),
+        config_item("AiModel", "AI 模型", "String", cfg.ai_model.clone(), "模型名（如 deepseek-chat 对话 / deepseek-reasoner 推理；接入其他服务时填其模型名）。修改后自动生效"),
+        config_item("AiApiKey", "AI API Key", "Password", cfg.ai_api_key.clone(), "模型服务商 API Key（Bearer 令牌）。修改后自动生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兜底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -2243,7 +2259,7 @@ fn audit_logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 // ————— 辅助 —————
 
 /// 运行时长格式化（`d.hh:mm:ss`，与 C# 面板一致）。
-fn format_uptime(duration: Duration) -> String {
+pub(crate) fn format_uptime(duration: Duration) -> String {
     let secs = duration.as_secs();
     format!(
         "{}.{:02}:{:02}:{:02}",
@@ -2423,6 +2439,10 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
         "pluginstoreurl" => set_string(value, |s| cfg.plugin_store_url = s),
         "pluginstorepubkey" => set_string(value, |s| cfg.plugin_store_pubkey = s),
+        "aienabled" => set_bool(value, |b| cfg.ai_enabled = b),
+        "aibaseurl" => set_string(value, |s| cfg.ai_base_url = s),
+        "aimodel" => set_string(value, |s| cfg.ai_model = s),
+        "aiapikey" => set_string(value, |s| cfg.ai_api_key = s),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -3273,7 +3293,7 @@ mod tests {
         assert!(!users.is_empty());
         assert_eq!(users[0]["userName"], "admin");
         assert_eq!(users[0]["isBuiltin"], true);
-        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 13);
+        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 14);
 
         // 删除内置管理员被拒
         let j = body_json(user_delete(
@@ -3500,5 +3520,20 @@ mod tests {
         let text = summarize_request(&ctx);
         assert!(text.contains("token=***"), "{text}");
         assert!(!text.contains("abcdef"), "{text}");
+
+        // AI 密钥：ApiKey 字段脱敏（不落审计明文）
+        let ctx = Ctx::build(HttpRequest {
+            method: "POST".to_string(),
+            path: "/api/updateConfig".to_string(),
+            query: String::new(),
+            headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+            body: br#"{"AiApiKey":"sk-verysecret","AiModel":"deepseek-chat"}"#
+                .to_vec()
+                .into(),
+            remote_addr: Some("127.0.0.1:1".to_string()),
+        });
+        let text = summarize_request(&ctx);
+        assert!(text.contains("\"AiApiKey\":\"***\""), "{text}");
+        assert!(!text.contains("sk-verysecret"), "{text}");
     }
 }

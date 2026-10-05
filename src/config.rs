@@ -89,6 +89,14 @@ pub struct AgentConfig {
     pub plugin_store_url: String,
     /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
     pub plugin_store_pubkey: String,
+    /// AI 助手。启用后可在面板「AI 助手」页对话分析服务器问题（OpenAI 兼容接口）
+    pub ai_enabled: bool,
+    /// AI 接口地址。OpenAI 兼容 Base（如 `https://api.deepseek.com/v1`；也可直接填完整 `.../chat/completions`）
+    pub ai_base_url: String,
+    /// AI 模型名（如 `deepseek-chat` / `deepseek-reasoner`）
+    pub ai_model: String,
+    /// AI API Key（Bearer 令牌）
+    pub ai_api_key: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -128,6 +136,10 @@ impl Default for AgentConfig {
             log_cleanup_paths: String::new(),
             plugin_store_url: String::new(),
             plugin_store_pubkey: String::new(),
+            ai_enabled: true,
+            ai_base_url: "https://api.deepseek.com/v1".to_string(),
+            ai_model: "deepseek-chat".to_string(),
+            ai_api_key: String::new(),
             apps: sample_apps(),
         }
     }
@@ -349,6 +361,16 @@ impl AgentConfig {
         self.log_cleanup_paths = self.log_cleanup_paths.trim().to_string();
         self.plugin_store_url = self.plugin_store_url.trim().to_string();
         self.plugin_store_pubkey = self.plugin_store_pubkey.trim().to_string();
+        self.ai_base_url = self.ai_base_url.trim().to_string();
+        self.ai_model = self.ai_model.trim().to_string();
+        self.ai_api_key = self.ai_api_key.trim().to_string();
+        // AI 默认值：地址/模型为空时落回默认（误清空配置时保持可用）
+        if self.ai_base_url.is_empty() {
+            self.ai_base_url = "https://api.deepseek.com/v1".to_string();
+        }
+        if self.ai_model.is_empty() {
+            self.ai_model = "deepseek-chat".to_string();
+        }
         // 流量历史保留天数：0 = 永久；非 0 时限定 7~3650 天（防误配清空全部历史）
         if self.traffic_history_days != 0 {
             self.traffic_history_days = self.traffic_history_days.clamp(
@@ -570,6 +592,18 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "PluginStorePubKey") {
         cfg.plugin_store_pubkey = v;
     }
+    if let Some(v) = bool_of(obj, "AiEnabled") {
+        cfg.ai_enabled = v;
+    }
+    if let Some(v) = text_of(obj, "AiBaseUrl") {
+        cfg.ai_base_url = v;
+    }
+    if let Some(v) = text_of(obj, "AiModel") {
+        cfg.ai_model = v;
+    }
+    if let Some(v) = text_of(obj, "AiApiKey") {
+        cfg.ai_api_key = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -686,6 +720,10 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
         push("PluginStoreUrl", cfg.plugin_store_url.clone());
         push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
+        push("AiEnabled", bool_text(cfg.ai_enabled));
+        push("AiBaseUrl", cfg.ai_base_url.clone());
+        push("AiModel", cfg.ai_model.clone());
+        push("AiApiKey", cfg.ai_api_key.clone());
     }
     let after_scalars =
         dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
@@ -1031,6 +1069,42 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("<PluginStorePubKey"), "{text}");
+    }
+
+    #[test]
+    fn ai_fields_read_render_and_normalize() {
+        let json: Json = serde_json::from_str(
+            r#"{ "AiEnabled": "false", "AiBaseUrl": " https://api.deepseek.com/v1 ", "AiModel": " deepseek-reasoner ", "AiApiKey": " sk-x " }"#,
+        )
+        .unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert!(!cfg.ai_enabled);
+        assert_eq!(cfg.ai_base_url, "https://api.deepseek.com/v1");
+        assert_eq!(cfg.ai_model, "deepseek-reasoner");
+        assert_eq!(cfg.ai_api_key, "sk-x");
+
+        // 空地址/模型回退默认（误清空配置时保持可用）
+        let json: Json = serde_json::from_str(r#"{ "AiBaseUrl": "", "AiModel": "" }"#).unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert_eq!(cfg.ai_base_url, "https://api.deepseek.com/v1");
+        assert_eq!(cfg.ai_model, "deepseek-chat");
+
+        let default = AgentConfig::default();
+        assert!(default.ai_enabled);
+        assert!(default.ai_api_key.is_empty());
+
+        let mut cfg = AgentConfig::default();
+        cfg.ai_model = "deepseek-reasoner".to_string();
+        let text = render_xml(&cfg, None).unwrap();
+        assert!(text.contains("<AiModel>deepseek-reasoner</AiModel>"), "{text}");
+        assert!(
+            text.contains("<AiBaseUrl>https://api.deepseek.com/v1</AiBaseUrl>"),
+            "{text}"
+        );
+        assert!(text.contains("<AiEnabled>true</AiEnabled>"), "{text}");
+        assert!(text.contains("<AiApiKey"), "{text}");
     }
 
     #[test]

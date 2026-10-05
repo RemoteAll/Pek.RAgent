@@ -7,6 +7,7 @@
 #![recursion_limit = "256"]
 
 mod agent;
+mod ai;
 mod app;
 mod audit;
 mod cli;
