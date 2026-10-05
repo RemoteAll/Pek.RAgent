@@ -18,9 +18,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex};
 
 use chrono::{Days, Local, NaiveDate, NaiveDateTime};
+use pek_rcode::store::{self, SharedStore};
 use pek_rcode::{Dal, DbRow, DbValue, EntityModel, Query, SqlSession, Where};
 use serde::Deserialize;
 use serde_json::{json, Value as Json};
@@ -73,41 +74,23 @@ pub struct PortCounters {
     pub tx: u64,
 }
 
-// ————— 数据访问层（Pek.RCode，按数据目录缓存） —————
+// ————— 数据访问层（Pek.RCode 共享存储：单飞打开 / 串行会话） —————
 
-/// 数据访问层实例（生产环境只有一个；测试按临时目录各建一个）。
-struct Storage {
-    base: PathBuf,
-    dal: Dal,
-}
-
-/// 按基础目录缓存的数据访问层。
-static REGISTRY: Mutex<BTreeMap<PathBuf, Arc<Storage>>> = Mutex::new(BTreeMap::new());
-/// 数据操作串行锁（写路径、清理与快照互斥；简化并发模型，SQLite 单连接即可满足）。
-static LOCK: Mutex<()> = Mutex::new(());
-/// 默认拦截器注册（TimeInterceptor：自动维护 CreateTime/UpdateTime，对齐 C# 实体工厂默认装配）。
-static INTERCEPTORS: Once = Once::new();
 /// 打开失败的日志节流（同一错误只记一次；成功恢复后重置）。
 static OPEN_ERROR: Mutex<Option<String>> = Mutex::new(None);
 
-/// 获取（或首次打开）某数据目录的数据访问层。
+/// 获取（或首次打开）某数据目录的共享存储。
 ///
-/// 打开（含 `sync_schema` 建表）在注册表锁内**串行执行**：多个采样线程
-/// （网站流量 / 端口流量）同时首开同一数据库时只能有一个执行建表，
+/// 打开（含 `sync_schema` 建表）由 `pek_rcode::store` 在注册表锁内**单飞执行**：
+/// 多个采样线程（网站流量 / 端口流量）同时首开同一数据库时只能有一个执行建表，
 /// 否则并发 `CREATE TABLE` 会撞 “table already exists”
 /// （2026-10-02 服务器实测：两线程首开竞态，后到者建表失败）。
-fn storage(base: &Path) -> Result<Arc<Storage>, String> {
-    let mut registry = REGISTRY.lock().unwrap();
-    if let Some(existing) = registry.get(base) {
-        return Ok(existing.clone());
-    }
-
-    match open_storage(base) {
-        Ok(opened) => {
-            if OPEN_ERROR.lock().unwrap().take().is_some() {
+fn storage(base: &Path) -> Result<Arc<SharedStore>, String> {
+    match store::get_or_open(base, || open_dal(base)) {
+        Ok((opened, created)) => {
+            if created && OPEN_ERROR.lock().unwrap().take().is_some() {
                 util::log_info("流量历史数据库已恢复可用");
             }
-            registry.insert(base.to_path_buf(), opened.clone());
             Ok(opened)
         }
         Err(e) => {
@@ -121,7 +104,7 @@ fn storage(base: &Path) -> Result<Arc<Storage>, String> {
     }
 }
 
-/// 在共享数据访问层上执行一次会话操作（写路径统一经 `LOCK` 串行）。
+/// 在共享数据访问层上执行一次会话操作（写路径统一串行）。
 ///
 /// 供同库其它模块（面板用户 `Agent_PanelUser`、操作审计 `Agent_OperationLog`）复用
 /// 同一连接、同一建表单飞逻辑（防并发 `CREATE TABLE` 竞态）与同一读写锁。
@@ -129,19 +112,11 @@ pub(crate) fn with_store<F, R>(base: &Path, f: F) -> Result<R, String>
 where
     F: FnOnce(&Dal, &mut dyn SqlSession) -> pek_rcode::Result<R>,
 {
-    let store = storage(base)?;
-    let _guard = LOCK.lock().unwrap();
-    let mut session = store
-        .dal
-        .open_session()
-        .map_err(|e| format!("数据会话创建失败：{e}"))?;
-    f(&store.dal, session.as_mut()).map_err(|e| e.to_string())
+    storage(base)?.with_session(f)
 }
 
-/// 打开数据库：解析内嵌模型 → SQLite → 增量同步表结构 → 首轮旧版 JSON 迁移。
-fn open_storage(base: &Path) -> Result<Arc<Storage>, String> {
-    INTERCEPTORS.call_once(|| pek_rcode::interceptor::enable_defaults());
-
+/// 打开数据库（`store::get_or_open` 的单飞闭包）：解析内嵌模型 → SQLite → 增量同步表结构 → 首轮旧版 JSON 迁移。
+fn open_dal(base: &Path) -> Result<Dal, String> {
     let model = EntityModel::parse(MODEL_XML).map_err(|e| format!("Model.xml 解析失败：{e}"))?;
     let db_path = base.join("Data").join(DB_FILE);
     if let Some(dir) = db_path.parent() {
@@ -156,20 +131,14 @@ fn open_storage(base: &Path) -> Result<Arc<Storage>, String> {
         "流量历史数据库已就绪（{}）",
         &[&db_path.display().to_string()],
     );
-
-    let storage = Arc::new(Storage {
-        base: base.to_path_buf(),
-        dal,
-    });
-    import_legacy_json(&storage);
-    Ok(storage)
+    import_legacy_json(&dal, base);
+    Ok(dal)
 }
 
 /// 释放某数据目录的连接（测试用；Windows 下否则无法删除临时目录）。
 #[cfg(test)]
 pub(crate) fn drop_storage_for_test(base: &Path) {
-    let mut registry = REGISTRY.lock().unwrap();
-    registry.remove(base);
+    store::drop_for_test(base);
 }
 
 // ————— 写入 —————
@@ -185,8 +154,8 @@ pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
     let Some(day) = parse_day(date) else {
         return;
     };
-    let _guard = LOCK.lock().unwrap();
-    let mut session = match store.dal.open_session() {
+    let _guard = store.lock();
+    let mut session = match store.dal().open_session() {
         Ok(session) => session,
         Err(e) => {
             util::log_error(&format!("流量历史会话创建失败：{e}"));
@@ -194,7 +163,7 @@ pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
         }
     };
     for (site, stats) in sites {
-        if let Err(e) = upsert_web_row(&store.dal, session.as_mut(), &day, site, stats) {
+        if let Err(e) = upsert_web_row(store.dal(), session.as_mut(), &day, site, stats) {
             util::log_error(&format!("网站流量落库失败（{date} {site}）：{e}"));
         }
     }
@@ -211,8 +180,8 @@ pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounte
     let Some(day) = parse_day(date) else {
         return;
     };
-    let _guard = LOCK.lock().unwrap();
-    let mut session = match store.dal.open_session() {
+    let _guard = store.lock();
+    let mut session = match store.dal().open_session() {
         Ok(session) => session,
         Err(e) => {
             util::log_error(&format!("流量历史会话创建失败：{e}"));
@@ -223,7 +192,7 @@ pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounte
         let Some((proto, port)) = parse_port_key(key) else {
             continue;
         };
-        if let Err(e) = upsert_port_row(&store.dal, session.as_mut(), &day, proto, port, counters) {
+        if let Err(e) = upsert_port_row(store.dal(), session.as_mut(), &day, proto, port, counters) {
             util::log_error(&format!("端口流量落库失败（{date} {key}）：{e}"));
         }
     }
@@ -330,7 +299,7 @@ pub fn maybe_prune(base: &Path, retention_days: u32) {
     let Ok(store) = storage(base) else {
         return;
     };
-    let _lock = LOCK.lock().unwrap();
+    let _lock = store.lock();
     {
         let mut guard = LAST_PRUNE.lock().unwrap();
         if guard.as_deref() == Some(today.as_str()) {
@@ -353,7 +322,7 @@ pub fn maybe_prune(base: &Path, retention_days: u32) {
         return;
     };
 
-    let mut session = match store.dal.open_session() {
+    let mut session = match store.dal().open_session() {
         Ok(session) => session,
         Err(e) => {
             util::log_error(&format!("流量历史清理会话创建失败：{e}"));
@@ -362,7 +331,7 @@ pub fn maybe_prune(base: &Path, retention_days: u32) {
     };
     let mut removed = 0usize;
     for table_name in [TABLE_WEB, TABLE_PORTS] {
-        let Ok(table) = store.dal.table(table_name) else {
+        let Ok(table) = store.dal().table(table_name) else {
             continue;
         };
         let filter = Where::new().lt("StatDate", cutoff);
@@ -411,8 +380,8 @@ pub fn snapshot_json(base: &Path, days: usize, retention_days: u32) -> Json {
     let Ok(store) = storage(base) else {
         return empty();
     };
-    let _guard = LOCK.lock().unwrap();
-    let mut session = match store.dal.open_session() {
+    let _guard = store.lock();
+    let mut session = match store.dal().open_session() {
         Ok(session) => session,
         Err(e) => {
             util::log_error(&format!("流量历史读取会话创建失败：{e}"));
@@ -421,9 +390,9 @@ pub fn snapshot_json(base: &Path, days: usize, retention_days: u32) -> Json {
     };
 
     let web_rows: Arc<Vec<DbRow>> = match store
-        .dal
+        .dal()
         .entity_cache(TABLE_WEB)
-        .and_then(|c| c.entities(&store.dal, session.as_mut()))
+        .and_then(|c| c.entities(store.dal(), session.as_mut()))
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -432,9 +401,9 @@ pub fn snapshot_json(base: &Path, days: usize, retention_days: u32) -> Json {
         }
     };
     let port_rows: Arc<Vec<DbRow>> = match store
-        .dal
+        .dal()
         .entity_cache(TABLE_PORTS)
-        .and_then(|c| c.entities(&store.dal, session.as_mut()))
+        .and_then(|c| c.entities(store.dal(), session.as_mut()))
     {
         Ok(rows) => rows,
         Err(e) => {
@@ -590,11 +559,11 @@ pub(crate) fn day_web_sites(base: &Path, date: &str) -> BTreeMap<String, SiteDay
     let Some(day) = parse_day(date) else {
         return out;
     };
-    let _guard = LOCK.lock().unwrap();
-    let Ok(mut session) = store.dal.open_session() else {
+    let _guard = store.lock();
+    let Ok(mut session) = store.dal().open_session() else {
         return out;
     };
-    let Ok(table) = store.dal.table(TABLE_WEB) else {
+    let Ok(table) = store.dal().table(TABLE_WEB) else {
         return out;
     };
     let Ok(rows) = table.query(
@@ -639,11 +608,11 @@ pub(crate) fn day_ports(base: &Path, date: &str) -> BTreeMap<String, PortCounter
     let Some(day) = parse_day(date) else {
         return out;
     };
-    let _guard = LOCK.lock().unwrap();
-    let Ok(mut session) = store.dal.open_session() else {
+    let _guard = store.lock();
+    let Ok(mut session) = store.dal().open_session() else {
         return out;
     };
-    let Ok(table) = store.dal.table(TABLE_PORTS) else {
+    let Ok(table) = store.dal().table(TABLE_PORTS) else {
         return out;
     };
     let Ok(rows) = table.query(
@@ -751,9 +720,9 @@ pub fn database_info(base: &Path) -> Json {
     match storage(base) {
         Ok(store) => {
             for entity in backup_tables() {
-                let rows = store.dal.open_session().ok().and_then(|mut session| {
+                let rows = store.dal().open_session().ok().and_then(|mut session| {
                     store
-                        .dal
+                        .dal()
                         .table(entity)
                         .ok()
                         .and_then(|t| t.count(session.as_mut(), None).ok())
@@ -791,7 +760,7 @@ pub fn query_readonly(base: &Path, sql: &str) -> Result<Json, String> {
     validate_readonly_sql(sql)?;
     let store = storage(base)?;
     let started = std::time::Instant::now();
-    let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+    let mut session = store.dal().open_session().map_err(|e| e.to_string())?;
     let set = session.query(sql, &[]).map_err(|e| e.to_string())?;
     let elapsed_ms = started.elapsed().as_millis() as u64;
 
@@ -821,7 +790,7 @@ pub fn query_readonly(base: &Path, sql: &str) -> Result<Json, String> {
 /// 备份全部业务表（含面板用户与操作审计）为 DbTable zip 包（`backup_schema=true` 带模型 XML；与 C# 生态互通）。
 pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
     let store = storage(base)?;
-    let _guard = LOCK.lock().unwrap();
+    let _guard = store.lock();
     let tmp = base.join("Data").join(format!(
         ".traffic-backup-{}.zip",
         Local::now().format("%Y%m%d%H%M%S%3f")
@@ -829,7 +798,7 @@ pub fn backup_zip(base: &Path) -> Result<Vec<u8>, String> {
     let tables = backup_tables();
     let expected = tables.len();
     let result = store
-        .dal
+        .dal()
         .backup_all(&tables, &tmp, true)
         .map_err(|e| format!("备份失败：{e}"))
         .and_then(|count| {
@@ -887,8 +856,8 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
     // 3) 清空 + 导入（与写路径共用串行锁；完成后失效实体缓存）
     let expected = present.len();
     let outcome = (|| -> Result<(Vec<String>, Json), String> {
-        let _guard = LOCK.lock().unwrap();
-        let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+        let _guard = store.lock();
+        let mut session = store.dal().open_session().map_err(|e| e.to_string())?;
         for entity in &present {
             let physical = physical_table(entity);
             session
@@ -897,7 +866,7 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
         }
         drop(session);
         let done = store
-            .dal
+            .dal()
             .restore_all(&tmp, Some(&present), false)
             .map_err(|e| format!("导入失败：{e}"))?;
         if done.len() < expected {
@@ -908,9 +877,9 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
         }
         let mut rows = serde_json::Map::new();
         for entity in &present {
-            let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+            let mut session = store.dal().open_session().map_err(|e| e.to_string())?;
             let n = store
-                .dal
+                .dal()
                 .table(entity)
                 .map_err(|e| e.to_string())?
                 .count(session.as_mut(), None)
@@ -918,7 +887,7 @@ pub fn restore_zip(base: &Path, bytes: &[u8]) -> Result<Json, String> {
             rows.insert(physical_table(entity).to_string(), json!(n));
         }
         for entity in &present {
-            store.dal.invalidate_cache(entity);
+            store.dal().invalidate_cache(entity);
         }
         Ok((done, Json::Object(rows)))
     })();
@@ -1121,14 +1090,12 @@ struct LegacyCounters {
 }
 
 /// 首轮迁移：库为空时导入 `Data/traffic/*.json`，成功导入的文件删除（迁移后以库为唯一来源）。
-fn import_legacy_json(store: &Storage) {
+fn import_legacy_json(dal: &Dal, base: &Path) {
     // 仅在库为空（首次迁移）时执行
     let empty = (|| -> Result<bool, String> {
-        let mut session = store.dal.open_session().map_err(|e| e.to_string())?;
+        let mut session = dal.open_session().map_err(|e| e.to_string())?;
         let mut count_all = |name: &str| -> Result<i64, String> {
-            store
-                .dal
-                .table(name)
+            dal.table(name)
                 .map_err(|e| e.to_string())?
                 .count(session.as_mut(), None)
                 .map_err(|e| e.to_string())
@@ -1140,7 +1107,7 @@ fn import_legacy_json(store: &Storage) {
         return;
     }
 
-    let Ok(entries) = std::fs::read_dir(dir(&store.base)) else {
+    let Ok(entries) = std::fs::read_dir(dir(base)) else {
         return;
     };
     let mut files: Vec<PathBuf> = Vec::new();
@@ -1181,7 +1148,7 @@ fn import_legacy_json(store: &Storage) {
         };
 
         let mut ok = true;
-        match store.dal.open_session() {
+        match dal.open_session() {
             Ok(mut session) => {
                 for (site, s) in &day_file.web.sites {
                     let stats = SiteDay {
@@ -1194,7 +1161,7 @@ fn import_legacy_json(store: &Storage) {
                         s5xx: s.s5xx,
                     };
                     if let Err(e) =
-                        upsert_web_row(&store.dal, session.as_mut(), &day, site, &stats)
+                        upsert_web_row(dal, session.as_mut(), &day, site, &stats)
                     {
                         util::log_error(&format!("流量历史迁移失败（{date} {site}）：{e}"));
                         ok = false;
@@ -1206,7 +1173,7 @@ fn import_legacy_json(store: &Storage) {
                     };
                     let counters = PortCounters { rx: c.rx, tx: c.tx };
                     if let Err(e) = upsert_port_row(
-                        &store.dal,
+                        dal,
                         session.as_mut(),
                         &day,
                         proto,
@@ -1561,9 +1528,9 @@ mod tests {
         let store = storage(&base).unwrap();
         let tmp = base.join("Data").join(".old-format.zip");
         {
-            let _guard = LOCK.lock().unwrap();
+            let _guard = store.lock();
             store
-                .dal
+                .dal()
                 .backup_all(&[TABLE_WEB, TABLE_PORTS], &tmp, true)
                 .unwrap();
         }

@@ -58,9 +58,9 @@ fn new_salt() -> String {
     dhrust::random::hex(16)
 }
 
-/// 计算密码哈希：`SHA-256(salt:password)` hex。
+/// 计算密码哈希：`SHA-256(salt:password)` hex（口径统一在 `dhrust::sign::salted_sha256_hex`）。
 fn hash_password(salt: &str, password: &str) -> String {
-    dhrust::sign::sha256_hex(format!("{salt}:{password}").as_bytes())
+    dhrust::sign::salted_sha256_hex(salt, password)
 }
 
 // ————— 用户读取 —————
