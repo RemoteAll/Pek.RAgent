@@ -1688,26 +1688,33 @@ async function changePassword(){
   html+=`<div class="cmd-item"><span class="cmd-time">${esc(h.time)}</span><span class="cmd-action">${esc(h.action)}</span><span class="cmd-result">${esc(h.result)}</span></div>`;
  });
  html+=`</div></div>`;
- html+=`<div class="glass-card card" style="margin-top:16px"><h2>🛡 DHDeploy Agent 面板访问</h2><div id="dhdeploy-panel-box"><div class="text-muted" style="font-size:12px">检测中...</div></div></div>`;
+ html+=`<div class="glass-card card" style="margin-top:16px"><h2>🛡 DHDeploy 访问控制</h2><div id="dhdeploy-panel-box"><div class="text-muted" style="font-size:12px">检测中...</div></div></div>`;
  $('panel-control').innerHTML=html;
  // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
  setInterval(updateControlStatus,3000);updateControlStatus();
 })();
 
-// DHDeploy Agent（Rust）面板访问范围：本机 8282 控制接口（仅回环）；节流探测，切换后立即刷新
+// DHDeploy Agent（Rust）访问控制：本机 8282 控制接口（仅回环）；节流探测，切换后延时刷新
+// 两个独立开关：服务访问（整个监听 0.0.0.0 ⇄ 127.0.0.1，热重绑）/ 管理面板访问（off/local/always）
 let _dhdeployLast=0;
 function renderDHDeployBox(st){
  const box=$('dhdeploy-panel-box');if(!box)return;
  if(!st){box.innerHTML='<div class="text-muted" style="font-size:12px">检测中...</div>';return}
  if(!st.detected){
-  box.innerHTML=`<div class="text-muted" style="font-size:12px">未检测到 DHDeploy Agent（Rust）管理面板：${esc(st.reason||'')}</div>`;
+  box.innerHTML=`<div class="text-muted" style="font-size:12px">未检测到 DHDeploy Agent（Rust）：${esc(st.reason||'')}</div>`;
   return;
  }
+ const svc=(st.service||'').toLowerCase();
+ const svcBtns=[['remote','允许远程（默认）'],['local','仅本机']].map(m=>`<button class="btn btn-sm ${svc===m[0]?'btn-primary':'btn-ghost'}" onclick="setDHDeploy('service','${m[0]}')">${m[1]}</button>`).join(' ');
  const modes=[['local','仅本机（推荐）'],['always','允许远程'],['off','关闭面板']];
- const btns=modes.map(m=>`<button class="btn btn-sm ${st.mode===m[0]?'btn-primary':'btn-ghost'}" onclick="setDHDeployMode('${m[0]}')">${m[1]}</button>`).join(' ');
- box.innerHTML=`<div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">当前：<b>${esc(st.text||'')}</b> · <span class="font-mono" style="font-size:12px">http://127.0.0.1:8282/panel</span></div>
-  <div style="display:flex;gap:8px;flex-wrap:wrap">${btns}</div>
-  <div style="font-size:12px;color:var(--text-muted);margin-top:8px">建议保持「仅本机」：远程请求一律 403，避免默认账号被扫描登录；需要远程查看时再临时开启。</div>`;
+ const pnlBtns=modes.map(m=>`<button class="btn btn-sm ${st.mode===m[0]?'btn-primary':'btn-ghost'}" onclick="setDHDeploy('mode','${m[0]}')">${m[1]}</button>`).join(' ');
+ box.innerHTML=`<div class="font-mono" style="font-size:12px;color:var(--text-muted);margin-bottom:12px">http://127.0.0.1:8282/panel</div>
+  <div style="font-size:13px;margin-bottom:6px">服务远程访问（业务接口 8282/8283）· 当前：<b>${esc(st.serviceText||'未知')}</b></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">${svcBtns}</div>
+  <div style="font-size:12px;color:var(--text-muted);margin:6px 0 14px">仅本机 = 监听只绑 127.0.0.1，外部完全无法连接（适合平台走 WS 中继的节点）；直连部署/传输将不可用。</div>
+  <div style="font-size:13px;margin-bottom:6px">管理面板访问 · 当前：<b>${esc(st.modeText||'未知')}</b></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">${pnlBtns}</div>
+  <div style="font-size:12px;color:var(--text-muted);margin-top:8px">面板与业务接口独立：面板默认「仅本机」（远程请求 403），避免默认账号被扫描登录。</div>`;
 }
 async function loadDHDeployPanelStatus(force){
  if(!$('dhdeploy-panel-box'))return;
@@ -1715,11 +1722,13 @@ async function loadDHDeployPanelStatus(force){
  _dhdeployLast=Date.now();
  try{const j=await api('/api/dhdeployPanel');renderDHDeployBox(j.data||null)}catch(e){}
 }
-async function setDHDeployMode(mode){
+async function setDHDeploy(kind,value){
  try{
-  const j=await api('/api/dhdeployPanel',{method:'POST',body:JSON.stringify({mode})});
+  const body={};body[kind]=value;
+  const j=await api('/api/dhdeployPanel',{method:'POST',body:JSON.stringify(body)});
   if(j.code===0){showToast('✅ '+(j.message||'已切换'),'success')}else{showToast('❌ '+(j.message||'切换失败'),'error')}
-  _dhdeployLast=0;loadDHDeployPanelStatus(true);
+  _dhdeployLast=0;renderDHDeployBox(j.data&&j.data.detected?j.data:null);
+  setTimeout(()=>loadDHDeployPanelStatus(true),1300); // 监听重绑约 1 秒，延时再刷新一次
  }catch(e){showToast('❌ 切换失败','error')}
 }
 

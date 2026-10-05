@@ -1591,20 +1591,35 @@ fn dhdeploy_valid_mode(mode: &str) -> bool {
     matches!(mode, "off" | "local" | "always")
 }
 
-/// 模式中文描述。
+/// 服务访问范围白名单（与 DHDeploy `service_access` 一致）。
+fn dhdeploy_valid_service(service: &str) -> bool {
+    matches!(service, "remote" | "local")
+}
+
+/// 面板模式中文描述。
 fn dhdeploy_mode_text(mode: &str) -> &'static str {
     match mode {
         "always" => "允许远程访问",
         "off" => "面板已关闭",
-        _ => "仅本机访问",
+        "local" => "仅本机访问",
+        _ => "未知（旧版 Agent）",
     }
 }
 
-/// 本机探测 DHDeploy Agent 面板访问模式。
+/// 服务访问范围中文描述。
+fn dhdeploy_service_text(service: &str) -> &'static str {
+    match service {
+        "remote" => "允许远程访问",
+        "local" => "仅本机（已关闭远程）",
+        _ => "未知（旧版 Agent）",
+    }
+}
+
+/// 本机探测 DHDeploy Agent 面板/服务访问范围（返回 `(panel_mode, service_access)`）。
 ///
 /// 处理器运行在 tokio 运行时线程上，直接在内部 `block_on` 会 panic（历史踩坑），
 /// 因此阻塞 HTTP 一律在独立线程执行后 join。
-fn dhdeploy_probe() -> Result<String, String> {
+fn dhdeploy_probe() -> Result<(String, String), String> {
     let handle = std::thread::Builder::new()
         .name("dhdeploy-panel-probe".to_string())
         .spawn(|| {
@@ -1631,24 +1646,30 @@ fn dhdeploy_probe() -> Result<String, String> {
     if v.get("code").and_then(|c| c.as_i64()) != Some(0) {
         return Err("控制接口返回异常".to_string());
     }
-    let mode = v
-        .get("data")
-        .and_then(|d| d.get("mode"))
+    let data = v.get("data").cloned().unwrap_or_default();
+    let mode = data
+        .get("mode")
         .and_then(|m| m.as_str())
         .unwrap_or("")
         .to_ascii_lowercase();
     if !dhdeploy_valid_mode(&mode) {
         return Err("未识别的面板访问模式".to_string());
     }
-    Ok(mode)
+    let service = data
+        .get("service")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // 旧版 Agent 无 service 字段：返回空串（前端显示“未知（旧版 Agent）”）
+    if !service.is_empty() && !dhdeploy_valid_service(&service) {
+        return Err("未识别的服务访问范围".to_string());
+    }
+    Ok((mode, service))
 }
 
-/// 切换 DHDeploy Agent 面板访问模式（独立线程执行阻塞 HTTP）。
-fn dhdeploy_set_mode(mode: &str) -> Result<String, String> {
-    if !dhdeploy_valid_mode(mode) {
-        return Err(format!("无效的访问模式：{mode}"));
-    }
-    let body = json!({ "mode": mode }).to_string().into_bytes();
+/// 调用 DHDeploy 控制接口（POST JSON；独立线程执行阻塞 HTTP）。
+fn dhdeploy_post(payload: &Json) -> Result<String, String> {
+    let body = payload.to_string().into_bytes();
     let handle = std::thread::Builder::new()
         .name("dhdeploy-panel-set".to_string())
         .spawn(move || {
@@ -1684,15 +1705,12 @@ fn dhdeploy_set_mode(mode: &str) -> Result<String, String> {
             message
         });
     }
-    Ok(if message.is_empty() {
-        format!("面板访问范围已设为：{}", dhdeploy_mode_text(mode))
-    } else {
-        message
-    })
+    Ok(message)
 }
 
-/// `GET /api/dhdeployPanel`：探测本机 DHDeploy Agent（Rust）管理面板的访问范围；
-/// `POST /api/dhdeployPanel {"mode":"off|local|always"}`：切换访问范围。
+/// `GET /api/dhdeployPanel`：探测本机 DHDeploy Agent（Rust）访问范围；
+/// `POST /api/dhdeployPanel`：切换——`{"mode":"off|local|always"}` 面板访问；
+/// `{"service":"remote|local"}` 服务访问（热重绑监听，外部可达性）。
 ///
 /// 注：控制器动作表按名称去重（同名后注册覆盖先注册），故 GET/POST 合并为一个动作按方法分支。
 fn dhdeploy_panel(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
@@ -1700,28 +1718,58 @@ fn dhdeploy_panel(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(401, "Unauthorized");
     }
     if ctx.req.method.eq_ignore_ascii_case("POST") {
-        let mode = arg(ctx, "mode").unwrap_or_default().to_ascii_lowercase();
-        if !dhdeploy_valid_mode(&mode) {
-            return json_error(400, &format!("无效的访问模式：{mode}（可选 off / local / always）"));
+        let mut payload = serde_json::Map::new();
+        if let Some(mode) = arg(ctx, "mode") {
+            let mode = mode.trim().to_ascii_lowercase();
+            if !dhdeploy_valid_mode(&mode) {
+                return json_error(
+                    400,
+                    &format!("无效的面板访问模式：{mode}（可选 off / local / always）"),
+                );
+            }
+            payload.insert("mode".to_string(), json!(mode));
         }
-        match dhdeploy_set_mode(&mode) {
-            Ok(message) => json_result(
-                0,
-                &message,
-                Some(json!({ "mode": mode, "text": dhdeploy_mode_text(&mode) })),
-            ),
-            Err(e) => json_error(500, &e),
+        if let Some(service) = arg(ctx, "service") {
+            let service = service.trim().to_ascii_lowercase();
+            if !dhdeploy_valid_service(&service) {
+                return json_error(
+                    400,
+                    &format!("无效的服务访问范围：{service}（可选 remote / local）"),
+                );
+            }
+            payload.insert("service".to_string(), json!(service));
         }
-    } else {
-        match dhdeploy_probe() {
-            Ok(mode) => json_result(
-                0,
-                "",
-                Some(json!({ "detected": true, "mode": mode, "text": dhdeploy_mode_text(&mode) })),
-            ),
-            Err(e) => json_result(0, "", Some(json!({ "detected": false, "reason": e }))),
+        if payload.is_empty() {
+            return json_error(
+                400,
+                "缺少参数（mode = off|local|always；service = remote|local）",
+            );
         }
+        let message = match dhdeploy_post(&Json::Object(payload)) {
+            Ok(message) => message,
+            Err(e) => return json_error(500, &e),
+        };
+        // 切换后重探测（失败则仅回传消息）
+        return match dhdeploy_probe() {
+            Ok((mode, service)) => json_result(0, &message, Some(dhdeploy_state_json(&mode, &service))),
+            Err(_) => json_result(0, &message, Some(json!({ "detected": true }))),
+        };
     }
+    match dhdeploy_probe() {
+        Ok((mode, service)) => json_result(0, "", Some(dhdeploy_state_json(&mode, &service))),
+        Err(e) => json_result(0, "", Some(json!({ "detected": false, "reason": e }))),
+    }
+}
+
+/// 探测结果 JSON（双开关统一结构）。
+fn dhdeploy_state_json(mode: &str, service: &str) -> Json {
+    json!({
+        "detected": true,
+        "mode": mode,
+        "modeText": dhdeploy_mode_text(mode),
+        "service": service,
+        "serviceText": dhdeploy_service_text(service),
+    })
 }
 
 // ————— /star 动作 —————
@@ -2671,6 +2719,13 @@ mod tests {
         assert_eq!(dhdeploy_mode_text("local"), "仅本机访问");
         assert_eq!(dhdeploy_mode_text("always"), "允许远程访问");
         assert_eq!(dhdeploy_mode_text("off"), "面板已关闭");
+        assert!(dhdeploy_valid_service("remote"));
+        assert!(dhdeploy_valid_service("local"));
+        assert!(!dhdeploy_valid_service("off"));
+        assert!(!dhdeploy_valid_service("everyone"));
+        assert_eq!(dhdeploy_service_text("remote"), "允许远程访问");
+        assert_eq!(dhdeploy_service_text("local"), "仅本机（已关闭远程）");
+        assert_eq!(dhdeploy_service_text(""), "未知（旧版 Agent）");
     }
 
     /// 构造来自远程地址的测试上下文（默认配置下需令牌的场景）。
