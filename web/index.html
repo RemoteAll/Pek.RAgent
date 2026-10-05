@@ -1687,10 +1687,41 @@ async function changePassword(){
  else cmdHistory.slice(-8).reverse().forEach(h=>{
   html+=`<div class="cmd-item"><span class="cmd-time">${esc(h.time)}</span><span class="cmd-action">${esc(h.action)}</span><span class="cmd-result">${esc(h.result)}</span></div>`;
  });
- html+=`</div></div>`;$('panel-control').innerHTML=html;
+ html+=`</div></div>`;
+ html+=`<div class="glass-card card" style="margin-top:16px"><h2>🛡 DHDeploy Agent 面板访问</h2><div id="dhdeploy-panel-box"><div class="text-muted" style="font-size:12px">检测中...</div></div></div>`;
+ $('panel-control').innerHTML=html;
  // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
  setInterval(updateControlStatus,3000);updateControlStatus();
 })();
+
+// DHDeploy Agent（Rust）面板访问范围：本机 8282 控制接口（仅回环）；节流探测，切换后立即刷新
+let _dhdeployLast=0;
+function renderDHDeployBox(st){
+ const box=$('dhdeploy-panel-box');if(!box)return;
+ if(!st){box.innerHTML='<div class="text-muted" style="font-size:12px">检测中...</div>';return}
+ if(!st.detected){
+  box.innerHTML=`<div class="text-muted" style="font-size:12px">未检测到 DHDeploy Agent（Rust）管理面板：${esc(st.reason||'')}</div>`;
+  return;
+ }
+ const modes=[['local','仅本机（推荐）'],['always','允许远程'],['off','关闭面板']];
+ const btns=modes.map(m=>`<button class="btn btn-sm ${st.mode===m[0]?'btn-primary':'btn-ghost'}" onclick="setDHDeployMode('${m[0]}')">${m[1]}</button>`).join(' ');
+ box.innerHTML=`<div style="font-size:13px;color:var(--text-secondary);margin-bottom:10px">当前：<b>${esc(st.text||'')}</b> · <span class="font-mono" style="font-size:12px">http://127.0.0.1:8282/panel</span></div>
+  <div style="display:flex;gap:8px;flex-wrap:wrap">${btns}</div>
+  <div style="font-size:12px;color:var(--text-muted);margin-top:8px">建议保持「仅本机」：远程请求一律 403，避免默认账号被扫描登录；需要远程查看时再临时开启。</div>`;
+}
+async function loadDHDeployPanelStatus(force){
+ if(!$('dhdeploy-panel-box'))return;
+ if(!force&&Date.now()-_dhdeployLast<10000)return;
+ _dhdeployLast=Date.now();
+ try{const j=await api('/api/dhdeployPanel');renderDHDeployBox(j.data||null)}catch(e){}
+}
+async function setDHDeployMode(mode){
+ try{
+  const j=await api('/api/dhdeployPanel',{method:'POST',body:JSON.stringify({mode})});
+  if(j.code===0){showToast('✅ '+(j.message||'已切换'),'success')}else{showToast('❌ '+(j.message||'切换失败'),'error')}
+  _dhdeployLast=0;loadDHDeployPanelStatus(true);
+ }catch(e){showToast('❌ 切换失败','error')}
+}
 
 async function updateControlStatus(){
  if(!document.querySelector('#panel-control.active'))return;
@@ -1699,6 +1730,7 @@ async function updateControlStatus(){
   const el=$('ctrl-status');if(!el)return;
   el.innerHTML=`当前状态：<span class="status-indicator ${d.running?'running':'stopped'}"><span class="status-dot ${d.running?'on':'off'}"></span>${d.running?'运行中':'已停止'}</span> &nbsp; 运行时长：${esc(d.uptime)}`;
   $('btn-start').disabled=d.running;$('btn-stop').disabled=!d.running;$('btn-restart').disabled=!d.running;
+  loadDHDeployPanelStatus(false);
  }catch(e){}
 }
 
