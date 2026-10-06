@@ -603,10 +603,20 @@ fn health_check(spec: &str) -> Result<(), String> {
     let spec = spec.trim();
 
     if spec.starts_with("http://") || spec.starts_with("https://") {
-        // 支持 https（dhrust::net::http_client 含 TLS）；非 2xx 亦视为"有响应=存活"（与旧行为一致）
-        return dhrust::net::http_client::blocking_get_text(spec, Duration::from_millis(5_000))
-            .map(|_| ())
-            .map_err(|e| e.to_string());
+        // 支持 https（dhrust::net::http_client 含 TLS）；非 2xx 亦视为"有响应=存活"（与旧行为一致）。
+        // 必须用 offthread 版本：本函数也会在 tokio 连接线程内被调用（HTTP 控制接口
+        // /StartService 的启动尾段健康检查），直接 blocking_get_text 会因"运行时内
+        // block_on"panic → 连接无响应关闭（客户端只见 Empty reply）。
+        return dhrust::net::http_client::blocking_request_offthread(
+            "GET",
+            spec,
+            &[],
+            None,
+            Vec::new(),
+            Duration::from_millis(5_000),
+        )
+        .map(|_| ())
+        .map_err(|e| e.to_string());
     }
 
     let host_port = spec.strip_prefix("tcp://").unwrap_or(spec);
