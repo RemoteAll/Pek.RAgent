@@ -885,7 +885,7 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "displayName": cfg.display_name,
         "description": cfg.description,
         "running": true,
-        "uptime": format_uptime(uptime),
+        "uptime": dhrust::sys::process::format_uptime(uptime),
         "uptimeSeconds": uptime.as_secs(),
         "processId": pid,
         "memoryMB": memory_mb,
@@ -930,7 +930,7 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "load1": load.map(|l| l.0),
         "load5": load.map(|l| l.1),
         "load15": load.map(|l| l.2),
-        "hostUptime": format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
+        "hostUptime": dhrust::sys::process::format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
         // 服务器本地时间（含时区偏移；顶部机器概览以 3 秒粒度刷新，用于时间/时区核对）
         "localTime": chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string(),
         "port": panel.port(),
@@ -1752,7 +1752,7 @@ fn app_cpu_rate(pid: u32) -> Option<f64> {
     // 清理长时间未刷新的基线（应用已退出/不再上报）
     map.retain(|_, (t, _)| now.duration_since(*t) < Duration::from_secs(600));
     let pct = map.get(&pid).map(|(t0, c0)| {
-        sampler::process_cpu_percent(
+        dhrust::sys::monitor::process_cpu_percent(
             (total - c0).max(0.0),
             now.duration_since(*t0).as_secs_f64(),
             cores,
@@ -2125,7 +2125,7 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "userName": sys::user_name(),
         "processorCount": cpu_count,
         "tickCount": sys::host_uptime_seconds(),
-        "hostUptime": format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
+        "hostUptime": dhrust::sys::process::format_uptime(Duration::from_secs(sys::host_uptime_seconds())),
         "runtime": format!("Pek.RAgent v{}（Rust）", env!("CARGO_PKG_VERSION")),
         "processArch": arch_name(),
         "systemArch": arch_name(),
@@ -2389,18 +2389,6 @@ fn audit_logs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 }
 
 // ————— 辅助 —————
-
-/// 运行时长格式化（`d.hh:mm:ss`，与 C# 面板一致）。
-pub(crate) fn format_uptime(duration: Duration) -> String {
-    let secs = duration.as_secs();
-    format!(
-        "{}.{:02}:{:02}:{:02}",
-        secs / 86400,
-        (secs % 86400) / 3600,
-        (secs % 3600) / 60,
-        secs % 60
-    )
-}
 
 /// 平台名（与 C# `Runtime.Windows/Linux/OSX` 输出一致）。
 fn platform_name() -> &'static str {

@@ -248,7 +248,7 @@ fn build_snapshot(panel: &WebPanel) -> String {
         "  版本 v{} · 面板端口 {} · 运行时长 {}\n",
         env!("CARGO_PKG_VERSION"),
         panel.port(),
-        crate::webpanel::format_uptime(panel.uptime())
+        dhrust::sys::process::format_uptime(panel.uptime())
     ));
     if let Some(mem) = crate::sys::memory_mb(std::process::id()) {
         s.push_str(&format!("  进程内存：{mem} MB\n"));

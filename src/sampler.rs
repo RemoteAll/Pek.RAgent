@@ -66,10 +66,9 @@ static SNAPSHOT: Mutex<Option<Snapshot>> = Mutex::new(None);
 static NET_LAST: Mutex<Option<(Instant, u64, u64)>> = Mutex::new(None);
 /// 磁盘差分基线（时刻, 累计统计）。
 static DISK_LAST: Mutex<Option<(Instant, sys::DiskIo)>> = Mutex::new(None);
-/// 代理自身 CPU 差分基线（时刻, 累计 CPU 秒）。
-static AGENT_CPU_LAST: Mutex<Option<(Instant, f64)>> = Mutex::new(None);
-/// 采样器启动时刻（首帧“自启动以来平均 CPU”的近似窗口）。
-static STARTED_AT: Mutex<Option<Instant>> = Mutex::new(None);
+/// 代理自身 CPU 采样器（采样周期间差分；`dhrust::sys::monitor` 统一实现，
+/// 与 Pek.RPanlServer 概览页共用）。
+static AGENT_CPU: dhrust::sys::monitor::ProcessCpuMeter = dhrust::sys::monitor::ProcessCpuMeter::new();
 
 /// 采样间隔（毫秒；配置 `SampleInterval`，启动时写入）。
 static INTERVAL_MS: AtomicU64 = AtomicU64::new(1000);
@@ -121,48 +120,18 @@ pub(crate) fn current() -> Snapshot {
     fresh.unwrap_or_else(|| tick(true, true, None))
 }
 
-/// 进程 CPU 占用百分比（占整机口径：CPU 时间 / 经过时间 / 逻辑核数 × 100，钳制 0~100）。
-pub(crate) fn process_cpu_percent(cpu_seconds: f64, elapsed_secs: f64, cores: usize) -> f64 {
-    if elapsed_secs <= 0.0 || cores == 0 {
-        return 0.0;
-    }
-    ((cpu_seconds / elapsed_secs) / cores as f64 * 100.0).clamp(0.0, 100.0)
-}
-
 /// 采样一次：差分各项速率并汇总快照。
 ///
 /// `with_tcp` / `with_stats` 控制“重项”是否本次执行——Windows 下单次
 /// `GetExtendedTcpTable` ≈ 4ms、Toolhelp 全进程快照 ≈ 14ms（实测），对面板展示
 /// 所需的时效无必要每秒执行；为 false 时沿用 `prev` 中对应的旧值。
 fn tick(with_tcp: bool, with_stats: bool, prev: Option<&Snapshot>) -> Snapshot {
-    let cores = std::thread::available_parallelism()
-        .map(|v| v.get())
-        .unwrap_or(1);
-
     // 整机 CPU：`system_cpu_rate` 自带差分基线（调用间隔 = 采样周期 → 1 秒窗口）
     let cpu_rate = sys::system_cpu_rate();
 
-    // 代理自身 CPU 占用（首帧为“自启动以来平均”，之后按 1 秒窗口差分）
-    let agent_cpu_rate = {
-        let (cpu_total, _, _) = sys::process_cpu_seconds();
-        let now = Instant::now();
-        let started = *STARTED_AT.lock().unwrap().get_or_insert(now);
-        let mut slot = AGENT_CPU_LAST.lock().unwrap();
-        let rate = match *slot {
-            Some((t0, c0)) => process_cpu_percent(
-                (cpu_total - c0).max(0.0),
-                now.duration_since(t0).as_secs_f64(),
-                cores,
-            ),
-            None => process_cpu_percent(
-                cpu_total,
-                now.duration_since(started).as_secs_f64().max(0.5),
-                cores,
-            ),
-        };
-        *slot = Some((now, cpu_total));
-        rate
-    };
+    // 代理自身 CPU 占用（首帧为“采样起点以来平均”，之后按采样周期窗口差分；
+    // 差分内核在 `dhrust::sys::monitor::ProcessCpuMeter`，与 Pek.RPanlServer 共用）
+    let agent_cpu_rate = AGENT_CPU.sample_since(Instant::now());
 
     // 网络速率与累计字节
     let (mut net_up_bps, mut net_down_bps) = (0u64, 0u64);
@@ -249,22 +218,6 @@ fn tick(with_tcp: bool, with_stats: bool, prev: Option<&Snapshot>) -> Snapshot {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn process_cpu_percent_clamps_to_range() {
-        // 1 秒间隔消耗 0.5 秒 CPU、单核 → 50%
-        assert!((process_cpu_percent(0.5, 1.0, 1) - 50.0).abs() < 0.01);
-        // 8 核下 0.4 秒 CPU / 1 秒 → 5%（占整机口径）
-        assert!((process_cpu_percent(0.4, 1.0, 8) - 5.0).abs() < 0.01);
-        // 异常输入：零间隔 / 零核
-        assert_eq!(process_cpu_percent(1.0, 0.0, 8), 0.0);
-        assert_eq!(process_cpu_percent(1.0, 1.0, 0), 0.0);
-        // 负数增量（时钟噪声）钳制为 0，超界钳制为 100
-        assert_eq!(process_cpu_percent(-1.0, 1.0, 8), 0.0);
-        assert_eq!(process_cpu_percent(16.0, 1.0, 8), 100.0);
-        let v = process_cpu_percent(7.5, 10.0, 32);
-        assert!((v - 2.34).abs() < 0.01, "占整机口径换算：{v}");
-    }
 
     #[test]
     fn current_samples_with_cpu_rate() {
