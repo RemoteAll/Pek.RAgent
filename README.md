@@ -79,11 +79,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 ### 3.1 Linux 部署（静态单文件）
 
-发布包（`dist/`）按架构选择：`uname -m` 输出 `x86_64` → `pek-ragent-v0.1.0-x86_64-unknown-linux-musl.tar.gz`；`aarch64`（ARM64）→ `...-aarch64-unknown-linux-musl.tar.gz`；另提供 `riscv64gc` / `loongarch64` 包。均为 **静态 musl 单文件**（约 3MB，零运行库依赖），压缩包内即一个 `pek-ragent`。
+发布包（`dist/`）按架构选择：`uname -m` 输出 `x86_64` → `pek-ragent-v0.1.1-x86_64-unknown-linux-musl.tar.gz`；`aarch64`（ARM64）→ `...-aarch64-unknown-linux-musl.tar.gz`；另提供 `riscv64gc` / `loongarch64` 包。均为 **静态 musl 单文件**（约 3MB，零运行库依赖），压缩包内即一个 `pek-ragent`。
 
 ```bash
 # 本机（Windows PowerShell）上传；dist 下同名 .tar.gz 解压后即 pek-ragent + install.sh
-scp dist/pek-ragent-v0.1.0-x86_64-unknown-linux-musl.tar.gz root@server:/tmp/
+scp dist/pek-ragent-v0.1.1-x86_64-unknown-linux-musl.tar.gz root@server:/tmp/
 
 # 服务器上解压安装（systemd：Restart=always / KillMode=process / OOMScoreAdjust=-1000 随单元自动生成）
 sudo mkdir -p /opt/staragent
@@ -182,7 +182,7 @@ $ pek-ragent -status
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
 
-Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
+Pek.RAgent	版本：0.1.1	发布：2026-10-01 12:16:14
 
 配置：/www/Agent/Config/StarAgent.config
 本地端口：5501（仅本机：是）
@@ -224,7 +224,7 @@ Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
 
-Pek.RAgent	版本：0.1.0	发布：2026-10-01 12:16:14
+Pek.RAgent	版本：0.1.1	发布：2026-10-01 12:16:14
 
  序号 功能名称            命令行参数
  1、 显示状态            -status
@@ -552,6 +552,14 @@ src/
 
 - 单元测试：`cargo test`（71 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
+
+### 11.1 版本号规范（发布约定）
+
+- 版本号格式为 `主.次.修订`（当前处于 `0.x` 阶段，尚未发布正式稳定版）；
+- **每次对外打包必须使用新版本号，绝不重号**：打包前先更新 `Cargo.toml` 的 `version`（打包脚本自动带入包名；程序内 `-status`、Web 面板、`/star/info` 等处同步生效），并顺带更新 README 中的包名示例；
+- **修订位 +1（默认）**：每次打包/发版（`0.1.1 → 0.1.2 → …`）；
+- **次位 +1（里程碑）**：阶段性大功能定型、或存在不兼容变更（配置格式/协议变化等）时，确认后跳（`0.2.0`、`0.3.0`…）；
+- **主位 `1.0.0`**：正式版本（另行约定）。
 
 ---
 
