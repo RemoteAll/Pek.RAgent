@@ -528,8 +528,17 @@ impl AppManager {
 
         let cfg = self.config();
         let apps = self.inner.lock().unwrap().apps.clone();
+        let mut changed = false;
         for rt in apps {
-            rt.monitor_reload(&cfg);
+            if rt.monitor_reload(&cfg) {
+                changed = true;
+            }
+        }
+        if changed {
+            // 文件变动重启会改变运行 PID：当次立即持久化。否则代理在此后短时间内退出
+            // （升级/重启）时状态文件缺失条目，新实例无法接管 → 重复拉起端口冲突
+            // （2026-10-09 实测：文件变动重启后 14 秒代理自升级，平台被重复拉起）
+            self.persist_state();
         }
     }
 

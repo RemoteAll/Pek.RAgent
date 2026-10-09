@@ -55,6 +55,7 @@ impl Agent {
             "星尘代理启动（前台运行模式），当前版本 {}（构建 {}）",
             &[env!("CARGO_PKG_VERSION"), &dhrust::build_time_text!("PEK_RAGENT_BUILD_UNIX")],
         );
+        report_takeover_marker();
         self.install_signal_handlers();
 
         // 回车退出（菜单“模拟运行”的体验）
@@ -87,6 +88,7 @@ impl Agent {
             "星尘代理启动（系统服务模式），当前版本 {}（构建 {}）",
             &[env!("CARGO_PKG_VERSION"), &dhrust::build_time_text!("PEK_RAGENT_BUILD_UNIX")],
         );
+        report_takeover_marker();
         crate::sys::raise_priority();
         self.install_signal_handlers();
 
@@ -170,9 +172,10 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     reload_timer.set_async(true);
 
     // 3.2) 自升级监视（Web 上传 / `-update` / update 升级目录 / 外部直接替换
-    //      → 热检测 + 影子冒烟 + 原子替换 + 退出重拉；Linux 禁止覆盖写运行中 ELF）
+    //      → 热检测 + 影子冒烟 + 原子替换 + 移交新版本；Linux 禁止覆盖写运行中 ELF）
     record_exe_identity_baseline();
-    let up_timer = Timer::new(5_000, 10_000, move |_| check_self_upgrade());
+    let up_mgr = manager.clone();
+    let up_timer = Timer::new(5_000, 10_000, move |_| check_self_upgrade(&up_mgr));
     up_timer.set_async(true);
 
     // 3.3) 心跳日志（每 5 分钟一条）：周期任务正常时也定期可见，便于运维确认代理存活；
@@ -214,19 +217,21 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     util::log_info("星尘代理已退出");
 }
 
-/// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并退出，由服务管理器拉起新版本。
+/// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并移交新版本——Unix 由旧进程
+/// `execv` 原地接管（进程号不变、无服务空窗），Windows 服务交由 SCM 失败恢复自动拉起
+/// （不再启动重启助手），前台/极端场景由重启助手兜底。
 ///
 /// 背景：Linux 内核禁止写入"正在执行的 ELF"（ETXTBSY），无法像 dotnet dll 那样直接覆盖上传；
-/// 本实现采用"上传 + 热检测 + 影子冒烟 + 原子替换 + 退出重拉"完成运行时升级——上传后约
-/// 10 秒内自动完成（服务模式）；前台 `-run` 模式退出后需手动重启（日志有提示）。
+/// 本实现采用"上传 + 热检测 + 影子冒烟 + 原子替换 + 移交新版本"完成运行时升级——上传后约
+/// 10 秒内自动完成；Windows 前台 `-run` 模式退出后需手动重启（日志有提示）。
 ///
 /// 候选来源（按优先级）：
 /// 0. 程序文件被"直接替换"（先删后传 / mv / 手工改名替换等"能成功落盘"的替换方式）：
-///    检测文件身份变化，校验 + 影子冒烟通过后退出重启（磁盘上已是新版本，无需再替换）；
+///    检测文件身份变化，校验 + 影子冒烟通过后移交新版本（磁盘上已是新版本，无需再替换）；
 /// 1. `{exe}.new`：Web 面板上传 / `-update` 命令 / 手工放置的兼容路径；
 /// 2. `{exe 目录}/Update/` 升级目录下的任意文件（取最新修改者）：SFTP 手工上传时把
 ///    新版本文件丢进该目录即可，文件名随意（启动时自动创建；兼容早期小写 `update`）。
-pub(crate) fn check_self_upgrade() {
+pub(crate) fn check_self_upgrade(manager: &Arc<AppManager>) {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -239,12 +244,12 @@ pub(crate) fn check_self_upgrade() {
     UPGRADE_CHECKS.fetch_add(1, Ordering::Relaxed);
 
     // 候选零：程序文件被外部直接替换（文件身份变化）
-    check_external_replace(&exe);
+    check_external_replace(&exe, manager);
 
     // 候选一：`{exe}.new`（Web 上传 / CLI / 兼容约定）
     let dot_new = PathBuf::from(format!("{}.new", exe.display()));
     if dot_new.is_file() {
-        try_auto_upgrade(&dot_new, &exe, &[]);
+        try_auto_upgrade(&dot_new, &exe, &[], manager);
         return;
     }
 
@@ -253,7 +258,7 @@ pub(crate) fn check_self_upgrade() {
     let mut candidates = collect_update_files(&exe_dir);
     if !candidates.is_empty() {
         let best = candidates.remove(0);
-        try_auto_upgrade(&best, &exe, &candidates);
+        try_auto_upgrade(&best, &exe, &candidates, manager);
     }
 }
 
@@ -336,7 +341,7 @@ fn record_exe_identity_baseline() {
 /// 说明：Linux 内核禁止"覆盖写"运行中的 ELF（ETXTBSY），但允许删除/改名（unlink/rename）；
 /// 部分 FTP/SFTP/同步工具采用"临时文件 + 重命名"实现上传，或用户手动先删再传——
 /// 本检测在这些场景下补齐"替换后自动生效重启"的最后一环。
-fn check_external_replace(exe: &Path) {
+fn check_external_replace(exe: &Path, manager: &Arc<AppManager>) {
     let Some(identity) = exe_identity(exe) else {
         return;
     };
@@ -380,13 +385,9 @@ fn check_external_replace(exe: &Path) {
         return;
     }
 
-    // 通过：磁盘上已是可用的新版本，退出重启生效（服务管理器/重启助手拉起）
-    util::log_info(
-        "检测到程序文件被直接替换（外部升级）：影子自检通过，正在退出以便服务管理器拉起新版本……",
-    );
-    schedule_service_restart(exe);
-    dhrust::logs::flush();
-    std::process::exit(0);
+    // 通过：磁盘上已是可用的新版本，移交新版本生效（Unix 原地接管 / Windows SCM 拉起）
+    util::log_info("检测到程序文件被直接替换（外部升级）：影子自检通过，程序文件已是新版本");
+    handoff_to_new_version(exe, manager);
 }
 
 /// 文件修改时间（UNIX 秒；不可用时返回 0）。
@@ -403,19 +404,14 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 ///
 /// `skip_list`：同一批次未被采用的其他候选（升级目录里的其余文件）——处置后统一
 /// 标记 `.skipped`，保证无论目录里有多少文件都只发生一轮升级（一次重启）。
-fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf]) {
+fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager: &Arc<AppManager>) {
     match apply_upgrade(new_path, exe, 10) {
         Ok(()) => {
-            util::log_info(
-                "检测到新版本：影子自检通过，程序文件已替换，正在退出以便服务管理器拉起新版本……",
-            );
+            util::log_info("检测到新版本：影子自检通过，程序文件已替换");
             // 其余候选跳过（避免重启后逐个升级造成多轮重启）
             skip_candidates(skip_list);
-            // 不依赖服务管理器的失败恢复策略：由新版本进程显式确保服务运行
-            schedule_service_restart(exe);
-            // 异步文件日志同步落盘后再退出（否则最后一条日志可能在队列中丢失）
-            dhrust::logs::flush();
-            std::process::exit(0);
+            // 移交新版本（Unix 原地接管 / Windows 服务由 SCM 拉起 / 其余助手兜底）
+            handoff_to_new_version(exe, manager);
         }
         Err(e) => {
             // 正常中间态（静默，下个周期重试）：
@@ -450,11 +446,160 @@ fn skip_candidates(paths: &[PathBuf]) {
     }
 }
 
+/// 升级收尾（各升级路径共用）：把运行权交给新版本——启动次数最少、停顿最短、日志完整。
+///
+/// - Unix：`execv` 原地接管（同一进程号直接变为新版本，无服务空窗，不依赖服务管理器）；
+/// - Windows 服务（已安装且指向本程序）：交由 SCM 失败恢复自动拉起（升级前静默刷新
+///   恢复策略；非零退出码确保被判定为"失败"并触发恢复动作），不再启动重启助手；
+/// - 其余场景（Windows 前台 / Unix 极端失败）：重启助手兜底（助手负责等待或显式拉起）。
+///
+/// 本函数不返回：接管成功时进程映像被替换，其余路径以退出结束。
+pub(crate) fn handoff_to_new_version(exe: &Path, manager: &Arc<AppManager>) -> ! {
+    // 退出前快照运行状态：子进程随宿主退出继续存活，新实例据此“接管”而非重复拉起
+    // （安全网：与 monitor_files 的即时持久化双保险）
+    manager.persist_state();
+
+    #[cfg(unix)]
+    {
+        let err = exec_takeover(exe);
+        util::log_error(&format!("原地接管失败，回退重启助手流程：{err}"));
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(name) = own_service_name(manager, exe) {
+            // 刷新失败恢复策略（幂等；防被外部清空导致"退出后无人拉起"）
+            reassert_failure_actions(&name);
+            util::log_format(
+                "程序文件已替换：由服务管理器失败恢复自动拉起新版本（{}，无需重启助手）……",
+                &[&name],
+            );
+            dhrust::logs::flush();
+            // 非零退出码：确保服务管理器把本次退出识别为"失败"并触发恢复动作
+            std::process::exit(UPGRADE_RESTART_EXIT_CODE);
+        }
+    }
+
+    // 兜底：重启助手（等待服务管理器拉起，超时显式启动）+ 退出
+    schedule_service_restart(exe);
+    dhrust::logs::flush();
+    std::process::exit(0);
+}
+
+/// `execv` 原地接管：用已替换到位的程序文件重建当前进程映像（成功不返回；失败返回原因）。
+///
+/// 同进程号、无服务空窗：不依赖服务管理器与重启助手；日志连续完整（新版本在同一
+/// 日志文件中续写启动记录）。仅 Unix 具备该能力（Windows 无 exec 语义）。
+#[cfg(unix)]
+fn exec_takeover(exe: &Path) -> String {
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = match std::ffi::CString::new(exe.as_os_str().as_bytes()) {
+        Ok(p) => p,
+        Err(_) => return "程序路径含 NUL 字符".to_string(),
+    };
+    let argv = match takeover_argv(exe, std::env::args_os()) {
+        Ok(a) => a,
+        Err(e) => return e,
+    };
+    let mut argv_ptrs: Vec<*const libc::c_char> = argv.iter().map(|a| a.as_ptr()).collect();
+    argv_ptrs.push(std::ptr::null());
+
+    // 交接标记：新版本启动时记录"由旧版原地接管"（启动早期移除，避免被子进程继承）。
+    // edition 2024 下环境变量写操作为 unsafe；此处位于升级尾段、即将 exec，竞态无实际影响
+    unsafe {
+        std::env::set_var("PEK_RAGENT_TAKEOVER_FROM", env!("CARGO_PKG_VERSION"));
+    }
+
+    util::log_info("程序文件已替换：正在原地接管新版本（execv 原地重启，进程号不变、服务不中断）……");
+    dhrust::logs::flush();
+
+    // 成功：当前进程映像被新版本替换，execv 不返回；返回即失败（errno 见 last_os_error）
+    let rc = unsafe { libc::execv(path.as_ptr(), argv_ptrs.as_ptr()) };
+    format!("execv 失败（错误码 {rc}）：{}", std::io::Error::last_os_error())
+}
+
+/// 构建 execv 的 argv（argv[0] 保留现有命令行；空命令行回退程序路径）。
+#[cfg(unix)]
+fn takeover_argv<I>(exe: &Path, args: I) -> Result<Vec<std::ffi::CString>, String>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut argv: Vec<CString> = Vec::new();
+    for arg in args {
+        argv.push(CString::new(arg.as_bytes()).map_err(|_| "命令行参数含 NUL 字符".to_string())?);
+    }
+    if argv.is_empty() {
+        argv.push(
+            CString::new(exe.as_os_str().as_bytes())
+                .map_err(|_| "程序路径含 NUL 字符".to_string())?,
+        );
+    }
+    Ok(argv)
+}
+
+/// 升级移交的退出码（非零：确保服务管理器把本次退出识别为"失败"并触发恢复动作；值本身无其他含义）。
+#[cfg(windows)]
+const UPGRADE_RESTART_EXIT_CODE: i32 = 101;
+
+/// 当前部署的 Windows 服务名（服务已安装且注册程序指向本程序时返回——即"可交由 SCM 恢复拉起"）。
+#[cfg(windows)]
+fn own_service_name(manager: &Arc<AppManager>, exe: &Path) -> Option<String> {
+    let svc = crate::service::manager(manager.base(), &manager.config());
+    if svc.query() == crate::service::ServiceState::NotInstalled {
+        return None;
+    }
+    match svc.installed_exe() {
+        Some(path) if paths_same(&path, exe) => Some(svc.name.clone()),
+        _ => None,
+    }
+}
+
+/// 路径是否指向同一程序（Windows 大小写不敏感）。
+#[cfg(windows)]
+fn paths_same(a: &Path, b: &Path) -> bool {
+    a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+}
+
+/// 升级前刷新 Windows 服务失败恢复策略（与安装时一致；尽力而为、静默）。
+#[cfg(windows)]
+fn reassert_failure_actions(name: &str) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let _ = std::process::Command::new("sc.exe")
+        .args([
+            "failure",
+            name,
+            "reset=",
+            "86400",
+            "actions=",
+            "restart/5000/restart/10000/restart/30000",
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output();
+}
+
+/// 升级标记检查（原地接管由旧版本设置环境变量传递）：启动早期记录并移除，避免被子进程继承。
+fn report_takeover_marker() {
+    if let Some(from) = std::env::var_os("PEK_RAGENT_TAKEOVER_FROM") {
+        // edition 2024 下环境变量写操作为 unsafe；此处为启动最早期，无并发读者
+        unsafe {
+            std::env::remove_var("PEK_RAGENT_TAKEOVER_FROM");
+        }
+        let from = from.to_string_lossy().to_string();
+        util::log_format("已由 v{} 原地接管升级启动（进程号不变，服务无中断）", &[&from]);
+    }
+}
+
 /// 安排服务重启助手：从新程序文件启动 `-ensure-running -upgrade` 子进程，
 /// 由新版本进程在旧进程退出后确保服务运行。
 ///
-/// 不依赖服务管理器的失败恢复策略（SCM 恢复动作次数有限，耗尽后或延迟较久时
-/// 服务可能长时间停止；systemd 受 StartLimit 约束）；前台模式由助手自行判断跳过。
+/// 作为**兜底路径**使用（Unix 原地接管与 Windows 服务失败恢复均不经过本助手）：
+/// 服务管理器的失败恢复可能延迟较久或次数有限（systemd 受 StartLimit 约束）；
+/// 前台模式由助手自行判断跳过。
 pub(crate) fn schedule_service_restart(exe: &Path) {
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("-ensure-running").arg("-upgrade");
@@ -825,5 +970,28 @@ mod tests {
         assert_ne!(first, exe_identity(&exe).unwrap(), "替换后身份应变化");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn takeover_argv_preserves_command_line() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let exe = PathBuf::from("/opt/agent/pek-ragent");
+        // 正常：argv[0] 与参数原样保留（原地接管后新进程续用同一命令行）
+        let args: Vec<OsString> = vec!["/opt/agent/pek-ragent".into(), "-s".into()];
+        let argv = takeover_argv(&exe, args.into_iter()).unwrap();
+        let values: Vec<String> = argv.iter().map(|c| c.to_string_lossy().into_owned()).collect();
+        assert_eq!(values, vec!["/opt/agent/pek-ragent", "-s"]);
+
+        // 空命令行：回退为程序路径（保证 argv[0] 存在）
+        let argv = takeover_argv(&exe, std::iter::empty::<OsString>()).unwrap();
+        assert_eq!(argv.len(), 1);
+        assert_eq!(argv[0].to_str().unwrap(), "/opt/agent/pek-ragent");
+
+        // NUL 字符：拒绝（execv 会截断参数）
+        let bad = OsString::from_vec(b"a\0b".to_vec());
+        assert!(takeover_argv(&exe, vec![bad].into_iter()).is_err());
     }
 }

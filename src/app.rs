@@ -489,7 +489,9 @@ impl AppRuntime {
     ///
     /// 注意：`stop()` 会清空 `reload_ready`/`next_start`，因此停止动作完成后必须重新写入，
     /// 否则会停留在“已停止且永不重启”的状态（冒烟测试曾实测到该问题）。
-    pub fn monitor_reload(&self, global: &AgentConfig) {
+    ///
+    /// 返回本次是否发生了停止/重启动作（供管理器立即持久化运行状态，见 `monitor_files`）。
+    pub fn monitor_reload(&self, global: &AgentConfig) -> bool {
         let reload_action = {
             let mut st = self.state.lock().unwrap();
             let mut action = 0u8; // 0 无，1 停止，2 重启
@@ -545,6 +547,8 @@ impl AppRuntime {
             }
             _ => {}
         }
+
+        reload_action != 0
     }
 }
 

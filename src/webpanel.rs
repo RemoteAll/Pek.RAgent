@@ -2004,21 +2004,18 @@ fn upgrade(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     match agent::apply_upgrade(&staged, &exe, 0) {
         Ok(()) => {
-            util::log_info(
-                "Web 面板上传升级：影子自检通过，程序文件已替换，即将退出等待服务管理器拉起新版本……",
-            );
-            // 不依赖服务管理器的失败恢复策略：由新版本进程显式确保服务运行
-            agent::schedule_service_restart(&exe);
-            // 异步文件日志同步落盘后再退出（否则最后一条日志可能在队列中丢失）
-            dhrust::logs::flush();
-            // 延迟退出：确保本次 HTTP 响应先送达浏览器，再由服务管理器拉起新版本
-            std::thread::spawn(|| {
+            util::log_info("Web 面板上传升级：影子自检通过，程序文件已替换");
+            // 延迟 1 秒再移交新版本：确保本次 HTTP 响应先送达浏览器
+            // （Unix 原地接管 / Windows 服务由 SCM 失败恢复拉起 / 其余助手兜底）
+            let mgr = panel.manager.clone();
+            let target = exe.clone();
+            std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_millis(1000));
-                std::process::exit(0);
+                agent::handoff_to_new_version(&target, &mgr);
             });
             json_result(
                 0,
-                "升级完成：影子自检通过，程序文件已替换，服务即将自动重启",
+                "升级完成：影子自检通过，程序文件已替换，服务即将自动切换新版本",
                 None,
             )
         }
