@@ -37,7 +37,10 @@ param(
     [ValidateSet('all', 'windows', 'linux', 'linux-arm64', 'linux-riscv64', 'linux-loongarch64')]
     [string[]]$Targets = @('all'),
     [switch]$Clean,
-    [switch]$CleanAll
+    [switch]$CleanAll,
+    [switch]$Force,      # 跳过「同版本内容变化」打包拦截（逃生门）
+    [switch]$Bump,       # 打包前自动递升补丁版本号（写 Cargo.toml + 更新 Cargo.lock）
+    [switch]$BumpMinor   # 打包前自动递升次版本号（minor，补丁归零）
 )
 
 # 是否选中某目标（-Targets 支持多选，如 -Targets linux,linux-arm64）
@@ -48,6 +51,16 @@ try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch { }
 
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
+
+# ———— 版本升号守卫（实现下沉 dhrust/tools/version-guard.ps1：防「同版本号打包出不同内容」）————
+# 拦截规则：同版本 + 内容指纹已变化 → 拒绝打包；-Bump/-BumpMinor 自动递升；-Force 强制放行。
+$depPath = (Select-String -Path (Join-Path $root 'Cargo.toml') `
+            -Pattern 'dhrust\s*=\s*\{\s*path\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+if (-not $depPath) { throw '无法在 Cargo.toml 中解析 dhrust 依赖路径（version-guard 需要）' }
+$guardScript = Join-Path (Resolve-Path (Join-Path $root $depPath)).Path 'tools\version-guard.ps1'
+if (-not (Test-Path $guardScript)) { throw "未找到版本守卫脚本：$guardScript（请先更新 DH.RustBase 仓库）" }
+. $guardScript
+Assert-VersionGuard -RepoRoot $root -Name 'pek-ragent' -Force:$Force -Bump:$Bump -BumpMinor:$BumpMinor
 
 # 显式启用增量编译（与 Cargo.toml 中的 profile 设置一致）
 $env:CARGO_INCREMENTAL = '1'
