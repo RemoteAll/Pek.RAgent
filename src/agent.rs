@@ -316,6 +316,8 @@ fn heartbeat(manager: &AppManager) {
             &UPGRADE_CHECKS.load(Ordering::Relaxed).to_string(),
         ],
     );
+    // 操作日志保留期清理（每天最多一次；机制下沉 pek_radmin::panel）
+    crate::audit::maybe_cleanup(manager.base());
 }
 
 /// 记录进程启动时的 exe 身份基线（幂等；供外部替换检测对比）。

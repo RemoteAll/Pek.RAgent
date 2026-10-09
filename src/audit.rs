@@ -10,7 +10,7 @@
 //! 审计写入自动省略该列（`AuditEntry.category = None`）；查询的类别过滤参数由薄壳传空。
 
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use serde_json::Value as Json;
 
@@ -120,6 +120,45 @@ pub(crate) fn query_logs(
     success: Option<bool>,
 ) -> Result<Json, String> {
     pek_radmin::panel::query_logs(&*store(base)?, page, size, "", user, keyword, success)
+}
+
+// ————— 清理 —————
+
+/// 操作日志保留天数（超期记录每日清理一次；0 = 不清理）。
+pub(crate) const AUDIT_RETENTION_DAYS: u32 = 90;
+
+/// 最近一次清理的日期（每天最多清理一次；与流量历史 `maybe_prune` 同模式）。
+static LAST_CLEAN: Mutex<Option<String>> = Mutex::new(None);
+
+/// 清理过期操作日志（每天最多一次；机制下沉 `pek_radmin::panel::cleanup_logs`）。
+pub(crate) fn maybe_cleanup(base: &Path) {
+    let today = chrono::Local::now().format("%Y-%m-%d").to_string();
+    {
+        let guard = LAST_CLEAN.lock().unwrap();
+        if guard.as_deref() == Some(today.as_str()) {
+            return;
+        }
+    }
+    let Ok(store) = store(base) else {
+        return;
+    };
+    {
+        let mut guard = LAST_CLEAN.lock().unwrap();
+        if guard.as_deref() == Some(today.as_str()) {
+            return;
+        }
+        *guard = Some(today);
+    }
+    if AUDIT_RETENTION_DAYS == 0 {
+        return;
+    }
+    match pek_radmin::panel::cleanup_logs(&store, AUDIT_RETENTION_DAYS) {
+        Ok(n) if n > 0 => dhrust::logs::log().info(&format!(
+            "操作日志清理：移除 {n} 条过期记录（保留 {AUDIT_RETENTION_DAYS} 天）"
+        )),
+        Ok(_) => {}
+        Err(e) => dhrust::logs::log().error(&format!("操作日志清理失败：{e}")),
+    }
 }
 
 #[cfg(test)]

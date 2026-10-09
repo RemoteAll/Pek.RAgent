@@ -216,7 +216,7 @@ pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounte
     }
 }
 
-/// 插入或更新一行网站流量（自然键：日期 + 站点）。
+/// 插入或更新一行网站流量（自然键：日期 + 站点；机制下沉 `pek_rcode::dal::TableRef::upsert_by_key`）。
 fn upsert_web_row(
     dal: &Dal,
     session: &mut dyn SqlSession,
@@ -225,12 +225,7 @@ fn upsert_web_row(
     stats: &SiteDay,
 ) -> pek_rcode::Result<()> {
     let table = dal.table(TABLE_WEB)?;
-    let filter = Where::new().eq("StatDate", *day).eq("Site", site);
-    let found = table.query(
-        session,
-        &Query::new().column("Id").filter(filter).take(1),
-    )?;
-
+    let keys: [(&str, DbValue); 2] = [("StatDate", (*day).into()), ("Site", site.into())];
     let values: [(&str, DbValue); 7] = [
         ("Hits", to_i64(stats.hits).into()),
         ("Bytes", to_i64(stats.bytes).into()),
@@ -240,24 +235,11 @@ fn upsert_web_row(
         ("S4xx", to_i64(stats.s4xx).into()),
         ("S5xx", to_i64(stats.s5xx).into()),
     ];
-
-    if let Some(row) = found.first() {
-        let id = row
-            .get_by_name("Id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_default();
-        table.update_by_pk(session, &values, &[id.into()])?;
-    } else {
-        let mut fields: Vec<(&str, DbValue)> = Vec::with_capacity(values.len() + 2);
-        fields.push(("StatDate", (*day).into()));
-        fields.push(("Site", site.into()));
-        fields.extend_from_slice(&values);
-        table.insert(session, &fields)?;
-    }
+    table.upsert_by_key(session, &keys, &values, &[])?;
     Ok(())
 }
 
-/// 插入或更新一行端口流量（自然键：日期 + 协议 + 端口）。
+/// 插入或更新一行端口流量（自然键：日期 + 协议 + 端口；机制同 `upsert_web_row`）。
 fn upsert_port_row(
     dal: &Dal,
     session: &mut dyn SqlSession,
@@ -267,36 +249,16 @@ fn upsert_port_row(
     counters: &PortCounters,
 ) -> pek_rcode::Result<()> {
     let table = dal.table(TABLE_PORTS)?;
-    let filter = Where::new()
-        .eq("StatDate", *day)
-        .eq("Proto", proto)
-        .eq("Port", i32::from(port));
-    let found = table.query(
-        session,
-        &Query::new().column("Id").filter(filter).take(1),
-    )?;
-
+    let keys: [(&str, DbValue); 3] = [
+        ("StatDate", (*day).into()),
+        ("Proto", proto.into()),
+        ("Port", i32::from(port).into()),
+    ];
     let values: [(&str, DbValue); 2] = [
         ("Rx", to_i64(counters.rx).into()),
         ("Tx", to_i64(counters.tx).into()),
     ];
-
-    if let Some(row) = found.first() {
-        let id = row
-            .get_by_name("Id")
-            .and_then(|v| v.as_i64())
-            .unwrap_or_default();
-        table.update_by_pk(session, &values, &[id.into()])?;
-    } else {
-        let fields: [(&str, DbValue); 5] = [
-            ("StatDate", (*day).into()),
-            ("Proto", proto.into()),
-            ("Port", i32::from(port).into()),
-            ("Rx", to_i64(counters.rx).into()),
-            ("Tx", to_i64(counters.tx).into()),
-        ];
-        table.insert(session, &fields)?;
-    }
+    table.upsert_by_key(session, &keys, &values, &[])?;
     Ok(())
 }
 
