@@ -286,6 +286,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "fastwebsockets",
+ "flate2",
  "hmac",
  "http-body-util",
  "hyper",

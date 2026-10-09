@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use dhrust::net::controller::{arg, json_body, json_error, json_result, ActionResult};
-use dhrust::net::http::HttpResponse;
+use dhrust::net::http::{HttpRequest, HttpResponse};
 use dhrust::net::router::Ctx;
 use dhrust::net::static_files::StaticFiles;
 use dhrust::plugin::InspectOptions;
@@ -145,8 +145,10 @@ pub fn uninstall(base: &Path, id: &str) -> Result<(), String> {
 
 /// 静态服务 `/plugins/<id>/<相对路径>`（目录/空路径命中 `index.html`；
 /// 未命中或路径穿越返回 `None`）。
-pub fn serve(base: &Path, path: &str) -> Option<HttpResponse> {
-    let plain = path.split(['?', '#']).next().unwrap_or("");
+///
+/// 按请求服务：承接 `If-None-Match` 条件头（插件页面/资源重复打开 → `304` 零正文）。
+pub fn serve(base: &Path, req: &HttpRequest) -> Option<HttpResponse> {
+    let plain = req.path.split(['?', '#']).next().unwrap_or("");
     let rest = plain.strip_prefix("/plugins/")?;
     let (id, rel) = match rest.split_once('/') {
         Some((id, rel)) => (id, rel),
@@ -157,7 +159,10 @@ pub fn serve(base: &Path, path: &str) -> Option<HttpResponse> {
     if !dir.is_dir() {
         return None;
     }
-    StaticFiles::new(dir).try_serve_file(&format!("/{rel}"))
+    // 视图路径改写为该插件目录下的相对路径（沿用请求的 Accept/If-None-Match）
+    let mut scoped = req.clone();
+    scoped.path = format!("/{rel}");
+    StaticFiles::new(dir).try_serve_request(&scoped)
 }
 
 // ————— 在线插件源（catalog.json） —————
@@ -736,14 +741,22 @@ mod tests {
         fs::create_dir_all(dir.join("assets")).unwrap();
         fs::write(dir.join("index.html"), "<html>p1</html>").unwrap();
         fs::write(dir.join("assets/app.js"), "console.log(1)").unwrap();
-        assert!(serve(&base, "/plugins/p1/").is_some());
-        assert!(serve(&base, "/plugins/p1/index.html").is_some());
-        assert!(serve(&base, "/plugins/p1/assets/app.js").is_some());
-        assert!(serve(&base, "/plugins/p1/nope.txt").is_none());
-        assert!(serve(&base, "/plugins/missing/").is_none());
-        assert!(serve(&base, "/plugins/../secret").is_none());
-        assert!(serve(&base, "/plugins/p1/../plugin.json").is_none());
-        assert!(serve(&base, "/other/p1/").is_none());
+        let get = |path: &str| HttpRequest {
+            method: "GET".to_string(),
+            path: path.to_string(),
+            query: String::new(),
+            headers: Vec::new(),
+            body: Default::default(),
+            remote_addr: None,
+        };
+        assert!(serve(&base, &get("/plugins/p1/")).is_some());
+        assert!(serve(&base, &get("/plugins/p1/index.html")).is_some());
+        assert!(serve(&base, &get("/plugins/p1/assets/app.js")).is_some());
+        assert!(serve(&base, &get("/plugins/p1/nope.txt")).is_none());
+        assert!(serve(&base, &get("/plugins/missing/")).is_none());
+        assert!(serve(&base, &get("/plugins/../secret")).is_none());
+        assert!(serve(&base, &get("/plugins/p1/../plugin.json")).is_none());
+        assert!(serve(&base, &get("/other/p1/")).is_none());
         let _ = fs::remove_dir_all(&base);
     }
 

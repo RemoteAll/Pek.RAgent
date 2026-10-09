@@ -439,6 +439,15 @@ function showApp(){
  });
 }
 
+// 页面重新可见时立即补刷当前数据（浏览器后台标签各轮询已暂停——恢复即刷新，稳态流量不增加）
+document.addEventListener('visibilitychange',()=>{
+ if(document.hidden||$('login').style.display!=='none')return;
+ if(canView('dashboard'))loadDashboard();
+ if(canView('services')||canView('watchdog'))loadServices();
+ updateControlStatus();
+ if(trafficTimer)loadTraffic();
+});
+
 // 当前登录主体（/api/me：用户名/是否内置管理员/菜单权限）；加载失败时降级为不限制
 let me=null;
 async function loadMe(){
@@ -570,6 +579,7 @@ let _diskSig=''; // 磁盘列表签名：磁盘增减时重建仪表盘
 let _machineInfoBuilt=false;
 
 async function loadDashboard(){
+ if(document.hidden)return; // 后台标签暂停轮询（恢复可见时由 visibilitychange 立即补刷）
  try{
   // 单请求：health 指标已合并进 /api/status（后端复用同一批系统采集，省去第二次请求与重复采样）
   const s=await api('/api/status');
@@ -725,6 +735,7 @@ function updateDashboard(d,health){
 }
 
 async function loadMachineDetail(){
+ if(document.hidden)return;
  const el=$('machine-detail');if(!el)return;
  try{
   const j=await api('/star/machine');
@@ -874,6 +885,7 @@ function applyTrafficSub(sub){
  document.querySelectorAll('#traffic-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
 }
 async function loadTraffic(){
+ if(document.hidden)return;
  ensureTrafficShell();
  try{
   const [w,p]=await Promise.all([api('/star/webTraffic'),api('/star/portTraffic')]);
@@ -1481,7 +1493,8 @@ let _servicesData=null;
 let _watchdogData=null; // 看门狗服务列表；null=未加载/无权限/失败
 
 async function loadServices(){
- if(!document.querySelector('#panel-services.active'))return;
+ // 非当前页签 / 浏览器后台标签不轮询（带宽治理；进入页签与恢复可见时立即刷新）
+ if(document.hidden||!document.querySelector('#panel-services.active'))return;
  try{
   // 子服务与看门狗并行拉取（仅请求有权限的数据）
   const [sj,wj]=await Promise.all([
@@ -1760,7 +1773,7 @@ async function setDHDeploy(kind,value){
 }
 
 async function updateControlStatus(){
- if(!document.querySelector('#panel-control.active'))return;
+ if(document.hidden||!document.querySelector('#panel-control.active'))return;
  try{
   const j=await api('/api/status');if(j.code!==0)return;const d=j.data;
   const el=$('ctrl-status');if(!el)return;

@@ -249,12 +249,11 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
                 || ctx.req.method.eq_ignore_ascii_case("HEAD");
             if method_ok {
                 // 插件静态资源：/plugins/<id>/...（本地放置的扩展页面，见 plugins.rs）
-                if let Some(response) = crate::plugins::serve(&plugins_base, &ctx.req.path) {
+                if let Some(response) = crate::plugins::serve(&plugins_base, &ctx.req) {
                     return HttpOutcome::Response(response);
                 }
-                if let Some(response) =
-                    statics.try_serve_with_accept(&ctx.req.path, ctx.req.header("accept"))
-                {
+                // 面板静态资源：条件请求（ETag/304）+ SPA 回退
+                if let Some(response) = statics.try_serve_request(&ctx.req) {
                     return HttpOutcome::Response(response);
                 }
             } else if let Some(response) = statics.try_serve_file(&ctx.req.path) {
