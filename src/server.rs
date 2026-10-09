@@ -220,6 +220,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             include_bytes!("../web/index.html"),
             "text/html; charset=utf-8",
         )
+        // 面板样式/脚本独立文件（拆分自单文件页面：编辑友好；ETag/304 条件复用）
+        .embed(
+            "/assets/app.css",
+            include_bytes!("../web/app.css"),
+            "text/css; charset=utf-8",
+        )
+        .embed(
+            "/assets/app.js",
+            include_bytes!("../web/app.js"),
+            "application/javascript; charset=utf-8",
+        )
         .embed(
             "/assets/xterm.js",
             include_bytes!("../res/web/xterm.js"),
