@@ -53,12 +53,9 @@ pub fn ws_url(cfg: &AgentConfig) -> Option<String> {
     Some(format!("{scheme}{host}/store/agents/ws"))
 }
 
-/// 节点标识（机器唯一标识；缺失时回退主机名）。
-pub fn agent_id() -> String {
-    dhrust::sys::machine::machine_guid()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(dhrust::sys::machine::hostname)
-}
+// 节点标识（平台「服务器节点」身份）存放于配置 `AgentId`：首次运行由
+// `AgentConfig::normalize` 生成随机值并随配置持久化（不用 /etc/machine-id——
+// 克隆镜像会重复，会导致多台服务器被平台当成同一个节点；对齐 DHDeploy 的独立标识模型）。
 
 /// 启动后台通道（幂等；专用线程 + current_thread 运行时保持会话存活）。
 pub fn start(manager: Arc<AppManager>) {
@@ -162,10 +159,10 @@ fn build_hooks(manager: Arc<AppManager>) -> WsHooks {
 }
 
 /// `register` 报文（连接建立后发送）。
-fn build_register(_manager: &AppManager) -> String {
+fn build_register(manager: &AppManager) -> String {
     json!({
         "type": "register",
-        "agentId": agent_id(),
+        "agentId": manager.config().agent_id,
         "name": dhrust::sys::machine::hostname(),
         "version": env!("CARGO_PKG_VERSION"),
         "platform": crate::self_upgrade::current_platform(),
@@ -196,7 +193,7 @@ fn build_heartbeat(manager: &AppManager) -> String {
     let pid = std::process::id();
     json!({
         "type": "heartbeat",
-        "agentId": agent_id(),
+        "agentId": manager.config().agent_id,
         "version": env!("CARGO_PKG_VERSION"),
         "cpuRate": snap.cpu_rate.unwrap_or(0.0),
         "memoryUsedMB": mem_used_mb,

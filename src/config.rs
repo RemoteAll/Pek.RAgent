@@ -2,8 +2,9 @@
 //!
 //! - 字段名与 C# `StarAgentSetting`/`ServiceInfo` 对齐（PascalCase）；C# 特有字段
 //!   （Code/Secret/Channel/SyncTime/UseAutorun 等）读写时原样保留不丢失；
-//! - 注释由内置模板（`res/StarAgent.config.template`）保障：首次生成即带完整字段说明，
-//!   程序修改配置值（含 Web 面板）时按元素就地更新、注释与排版保留（dhrust::config XML 管线）；
+//! - 注释与顺序由内置模板（`res/StarAgent.config.template`）保障：保存时以模板为骨架
+//!   **按固定顺序重建**（对齐 C# `Config.Save()`——任何时候各参数位置一致；新增参数出现在
+//!   模板位置而非文件尾部），C# 特有字段/未知属性值原样带入不丢失（dhrust::config XML 管线）；
 //! - 兼容迁移：旧 `Config/Agent.toml`（TOML 版）与 `Config/Agent.json` 自动转换（原文件改名 `.bak`）。
 
 use std::collections::HashMap;
@@ -98,6 +99,9 @@ pub struct AgentConfig {
     /// 平台接入令牌（Pek.RPanlServer「服务器节点」页生成；配置后启用 WebSocket 实时通道：
     /// 上报机器数据到平台并接收「立即检查升级」指令。空 = 不接入）
     pub auto_upgrade_token: String,
+    /// 节点标识（平台「服务器节点」识别本机的唯一 ID）。首次运行自动生成随机值并写入本文件，
+    /// 此后保持不变；克隆镜像/整机复制的多台服务器也不会撞号。一般无需修改
+    pub agent_id: String,
     /// AI 助手。启用后可在面板「AI 助手」页对话分析服务器问题（OpenAI 兼容接口）
     pub ai_enabled: bool,
     /// AI 接口地址。OpenAI 兼容 Base（如 `https://api.deepseek.com/v1`；也可直接填完整 `.../chat/completions`）
@@ -150,6 +154,7 @@ impl Default for AgentConfig {
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
             auto_upgrade_interval_minutes: 60,
             auto_upgrade_token: String::new(),
+            agent_id: String::new(),
             ai_enabled: true,
             ai_base_url: "https://api.deepseek.com/v1".to_string(),
             ai_model: "deepseek-chat".to_string(),
@@ -417,6 +422,14 @@ impl AgentConfig {
                 crate::history::MAX_RETENTION_DAYS,
             );
         }
+        // 节点标识（平台实时通道身份）：空 = 首次运行/被清空 → 生成随机值并随配置持久化
+        // （保存方 save_if_changed 会写盘）。不用机器标识——Linux /etc/machine-id 在克隆镜像
+        // 上会重复，此前导致多台服务器被平台当成同一个节点（列表行在服务器间跳变）
+        if self.agent_id.trim().is_empty() {
+            self.agent_id = dhrust::random::hex(16);
+            util::log_format("已生成节点标识：{}（写入配置 AgentId）", &[&self.agent_id]);
+        }
+        self.agent_id = self.agent_id.trim().to_string();
 
         for app in &mut self.apps {
             let name = app.name.trim().to_string();
@@ -640,6 +653,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = parse_of::<u32>(obj, "AutoUpgradeIntervalMinutes") {
         cfg.auto_upgrade_interval_minutes = v;
     }
+    if let Some(v) = text_of(obj, "AgentId") {
+        cfg.agent_id = v;
+    }
     if let Some(v) = bool_of(obj, "AiEnabled") {
         cfg.ai_enabled = v;
     }
@@ -734,10 +750,24 @@ fn app_from_json(item: &Json) -> Option<AppConfig> {
 
 /// 渲染配置为 XML 文本：以现有文件（或内置模板）为骨架——
 /// 标量键 upsert（保留注释与排版），`Services` 节整段重建（保留旧条目的未知属性）。
+/// 渲染配置：**以内置模板为骨架按固定顺序重建**（对齐 C# `Config.Save()`）。
+///
+/// - 模板键：值取自配置项 `cfg`（模板注释/排版原样保留）——保证任何时刻（新建与历次更新后）
+///   各参数位置/顺序完全一致；新版本新增参数出现在模板位置，而不是追加到文件尾部；
+/// - 文件承载的 C# 标量（Code/Secret/Channel/UseAutorun/SyncTime/UserName/Dpi/Resolution）：
+///   值从当前文件带入（缺省则保持模板默认值），保证重建不丢 C# 数据；
+/// - 当前文件里其余标量键（未来 C# 新字段等）：值保留、追加在根结束标签前；
+/// - `Services` 节：整段重建（`render_services`），Rust 不认识的属性（C# 的 Priority 等）
+///   从当前文件原样保留。
 fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String> {
-    let base = current.unwrap_or(TEMPLATE);
+    // 当前文件根对象（承载 C# 特有字段值；无文件或解析失败时按空处理）
+    let cur_root: serde_json::Map<String, Json> = current
+        .and_then(|text| dhrust::config::read_xml_to_json(text).ok())
+        .and_then(|json| json.as_object().and_then(|o| o.values().next()).cloned())
+        .and_then(|root| root.as_object().cloned())
+        .unwrap_or_default();
 
-    // 标量键（含扩展）；缺失时插入并带模板注释
+    // 标量键（按模板顺序输出；缺失键由 dhrust 管线插入并带模板注释）
     let comments = template_comments();
     let mut items: Vec<(String, String, String)> = Vec::new();
     {
@@ -777,20 +807,52 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
             "AutoUpgradeIntervalMinutes",
             cfg.auto_upgrade_interval_minutes.to_string(),
         );
+        push("AgentId", cfg.agent_id.clone());
         push("AiEnabled", bool_text(cfg.ai_enabled));
         push("AiBaseUrl", cfg.ai_base_url.clone());
         push("AiModel", cfg.ai_model.clone());
         push("AiApiKey", cfg.ai_api_key.clone());
         push("TerminalEnabled", bool_text(cfg.terminal_enabled));
+        // 文件承载键（C# 特有标量）：当前文件有值则原样带入（缺省保持模板默认，防重建丢 C# 数据）
+        for key in [
+            "Code",
+            "Secret",
+            "Channel",
+            "UseAutorun",
+            "SyncTime",
+            "UserName",
+            "Dpi",
+            "Resolution",
+        ] {
+            if let Some(text) = cur_root.get(key).and_then(json_scalar_text) {
+                push(key, text);
+            }
+        }
     }
-    let after_scalars =
-        dhrust::config::upsert_root_values(base, &items).map_err(|e| e.to_string())?;
+    // 当前文件里其余标量键（既不在模板也不在以上列表，如未来 C# 新字段）：保留值，
+    // 由插入逻辑追加在根结束标签前（不占已建模字段的位置）
+    {
+        let known: std::collections::HashSet<String> =
+            items.iter().map(|(k, _, _)| k.clone()).collect();
+        let mut extras: Vec<(String, String, String)> = Vec::new();
+        for (key, value) in &cur_root {
+            if key == "Services" || known.contains(key.as_str()) {
+                continue;
+            }
+            if let Some(text) = json_scalar_text(value) {
+                extras.push((key.clone(), text, String::new()));
+            }
+        }
+        items.extend(extras);
+    }
 
-    // Services 节重建（保留旧文件里 Rust 不认识的属性，如 C# 的 AutoStart/Priority）
-    let previous = service_attrs(&after_scalars);
+    let rebuilt =
+        dhrust::config::upsert_root_values(TEMPLATE, &items).map_err(|e| e.to_string())?;
+
+    // Services 节重建（属性来源 = 当前文件，保留 Rust 不认识的 C# 属性如 Priority/AutoStart）
+    let previous = service_attrs(current.unwrap_or(""));
     let inner = render_services(&previous, &cfg.apps);
-    dhrust::config::replace_root_section(&after_scalars, "Services", &inner)
-        .map_err(|e| e.to_string())
+    dhrust::config::replace_root_section(&rebuilt, "Services", &inner).map_err(|e| e.to_string())
 }
 
 /// 从模板提取“键 → 注释”映射（元素前最近的单行注释）。
@@ -923,6 +985,16 @@ fn render_services(previous: &[Json], apps: &[AppConfig]) -> String {
         inner.push_str(" />\n");
     }
     inner
+}
+
+/// JSON 标量 → XML 文本（对象/数组不参与标量重建；`Services` 节单独处理）。
+fn json_scalar_text(v: &Json) -> Option<String> {
+    match v {
+        Json::String(s) => Some(s.clone()),
+        Json::Bool(b) => Some(bool_text(*b)),
+        Json::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
 }
 
 /// 布尔 → XML 文本。
@@ -1412,6 +1484,9 @@ mod tests {
   <Debug>true</Debug>
   <Code>abc123</Code>
   <Channel>Release</Channel>
+  <UserName>root</UserName>
+  <Dpi>96</Dpi>
+  <Resolution>1920x1080</Resolution>
   <LocalPort>5700</LocalPort>
   <Project>demo</Project>
   <Delay>5000</Delay>
@@ -1441,6 +1516,12 @@ mod tests {
         assert!(text.contains("<LocalPort>5711</LocalPort>"), "{text}");
         assert!(text.contains("<Code>abc123</Code>"), "C# 字段应保留：\n{text}");
         assert!(text.contains("<Channel>Release</Channel>"), "C# 字段应保留：\n{text}");
+        assert!(text.contains("<UserName>root</UserName>"), "C# 字段应保留：\n{text}");
+        assert!(text.contains("<Dpi>96</Dpi>"), "C# 字段应保留：\n{text}");
+        assert!(
+            text.contains("<Resolution>1920x1080</Resolution>"),
+            "C# 字段应保留：\n{text}"
+        );
         assert!(text.contains("Priority=\"2\""), "未知属性应保留：\n{text}");
         assert!(text.contains("Mode=\"11\""), "Mode 应写 C# 数值：\n{text}");
 
@@ -1450,6 +1531,71 @@ mod tests {
         assert_eq!(back.apps.len(), 2);
         assert_eq!(back.apps[0].max_memory, 128);
 
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn agent_id_generated_once_and_persisted() {
+        // 节点标识：首次加载生成（32 位十六进制）并写入配置；之后保持不变；
+        // 两台全新安装（模拟克隆机）各自独立生成，不会撞号（旧实现用 /etc/machine-id 会撞）
+        let base = temp_base("agent-id");
+        let cfg = AgentConfig::load(&base);
+        assert_eq!(cfg.agent_id.len(), 32, "{}", cfg.agent_id);
+        assert!(cfg.agent_id.chars().all(|c| c.is_ascii_hexdigit()));
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        assert!(
+            text.contains(&format!("<AgentId>{}</AgentId>", cfg.agent_id)),
+            "标识应写入配置：\n{text}"
+        );
+
+        // 再加载：不变（持久化生效）
+        let again = AgentConfig::load(&base);
+        assert_eq!(again.agent_id, cfg.agent_id);
+
+        // 另一套全新安装：不同标识
+        let base2 = temp_base("agent-id2");
+        assert_ne!(AgentConfig::load(&base2).agent_id, cfg.agent_id);
+
+        // 手工指定的值：尊重用户设置（拷贝现成配置到新机时可手工区分）
+        let path = config_path(&base);
+        let text = std::fs::read_to_string(&path).unwrap().replace(
+            &format!("<AgentId>{}</AgentId>", cfg.agent_id),
+            "<AgentId>custom-node-1</AgentId>",
+        );
+        std::fs::write(&path, text).unwrap();
+        assert_eq!(AgentConfig::load(&base).agent_id, "custom-node-1");
+
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&base2);
+    }
+
+    #[test]
+    fn render_normalizes_key_order_to_template() {
+        // 回归（用户反馈）：历史版本会把新增参数追到文件尾部，导致各机器文件顺序不一致；
+        // 现在保存时按模板固定顺序重建，错位/后加的参数都回到模板位置
+        let base = temp_base("order");
+        let path = config_path(&base);
+        std::fs::write(
+            &path,
+            "<StarAgent>\n  <Debug>false</Debug>\n  <LocalPort>5501</LocalPort>\n  <AutoUpgradeIntervalMinutes>60</AutoUpgradeIntervalMinutes>\n  <WatchDog></WatchDog>\n</StarAgent>\n",
+        )
+        .unwrap();
+        let _cfg = AgentConfig::load(&base); // 加载即规范化回写
+        let text = std::fs::read_to_string(&path).unwrap();
+        let pos = |key: &str| text.find(key).unwrap_or_else(|| panic!("缺 {key}：\n{text}"));
+        // AutoUpgradeIntervalMinutes 回到 AiEnabled 之前（模板位置），而不是文件末尾
+        assert!(
+            pos("<AutoUpgradeIntervalMinutes>") < pos("<AiEnabled>"),
+            "{text}"
+        );
+        // LocalPort 在 Channel 之前（C# 段顺序）
+        assert!(pos("<LocalPort>") < pos("<Channel>"), "{text}");
+        // AgentId 已生成且位于模板位置
+        assert!(
+            pos("<AutoUpgradeIntervalMinutes>") < pos("<AgentId>"),
+            "{text}"
+        );
+        assert!(pos("<AgentId>") < pos("<AiEnabled>"), "{text}");
         let _ = std::fs::remove_dir_all(&base);
     }
 }
