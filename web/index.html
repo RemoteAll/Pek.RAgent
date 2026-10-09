@@ -85,6 +85,7 @@ main{padding:20px 24px;max-width:1320px;margin:0 auto;position:relative;z-index:
 .panel.active{display:block}
 .section-title{font-size:13px;font-weight:600;color:var(--text-tertiary);text-transform:uppercase;letter-spacing:0.8px;margin-bottom:14px}
 .card{padding:20px 24px;margin-bottom:16px}
+.card.drop-active{outline:2px dashed var(--brand-500);outline-offset:2px;background:rgba(91,91,255,.06)}
 .card h2{font-size:15px;font-weight:600;margin-bottom:16px;display:flex;align-items:center;gap:8px}
 .stats-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:12px}
 .stat{padding:16px;background:rgba(255,255,255,0.03);border-radius:var(--radius-md);text-align:center;border:1px solid var(--border-subtle)}
@@ -2853,6 +2854,32 @@ function toggleTheme(){
 }
 applyTheme(getTheme());
 window.matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{if(getTheme()==='auto')applyTheme('auto')});
+
+// ————— 拖拽上传（全局委托：任意「含 file input 的 .card/.card2」即拖放目标）—————
+// 拖入卡片高亮 → 松开填充 input.files → 派发 change（复用既有上传流程；每卡片取首个 file input）；
+// document 级委托，动态渲染的卡片自动生效、无需逐处绑定。
+function installDropUpload(){
+ if(document._dropUploadInstalled) return;
+ document._dropUploadInstalled = true;
+ const cardOf = e => (e.target && e.target.closest) ? e.target.closest('.card, .card2') : null;
+ const inputOf = c => c ? c.querySelector('input[type=file]') : null;
+ document.addEventListener('dragenter', e => { const c = cardOf(e); if(c && inputOf(c)) c.classList.add('drop-active'); }, true);
+ document.addEventListener('dragover', e => { const c = cardOf(e); if(c && inputOf(c)){ e.preventDefault(); e.stopPropagation(); if(e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; } }, true);
+ document.addEventListener('dragleave', e => { const c = cardOf(e); if(c && !c.contains(e.relatedTarget)) c.classList.remove('drop-active'); }, true);
+ document.addEventListener('drop', e => {
+  const c = cardOf(e); if(!c) return;
+  const input = inputOf(c); if(!input) return;
+  e.preventDefault(); e.stopPropagation();
+  c.classList.remove('drop-active');
+  const fs = e.dataTransfer && e.dataTransfer.files;
+  if(!fs || !fs.length) return;
+  const dt = new DataTransfer();
+  if(input.multiple){ for(const f of fs) dt.items.add(f); } else { dt.items.add(fs[0]); }
+  input.files = dt.files;
+  input.dispatchEvent(new Event('change', { bubbles: true }));
+ }, true);
+}
+installDropUpload();
 
 token=sessionStorage.getItem('agent_token')||'';
 if(token)showApp();
