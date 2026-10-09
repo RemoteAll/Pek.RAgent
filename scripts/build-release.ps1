@@ -171,8 +171,11 @@ New-Item -ItemType Directory -Force -Path 'dist' | Out-Null
 # ---- Windows ----
 if (Test-Want 'windows') {
     Write-Host '== Windows release 构建（MSVC，增量） =='
-    cargo build --release --locked
-    if ($LASTEXITCODE -ne 0) { throw 'Windows 构建失败' }
+    # 原生命令 stderr 不应在 Stop 下变成终止错误：临时放宽 + 2>&1 捕获回显（外层管道调用同样稳定）
+    $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    cargo build --release --locked 2>&1 | ForEach-Object { Write-Host ([string]$_) }
+    $code = $LASTEXITCODE; $ErrorActionPreference = $prevEap
+    if ($code -ne 0) { throw 'Windows 构建失败' }
 
     $zip = "dist\pek-ragent-v$ver-x86_64-pc-windows-msvc.zip"
     Compress-Archive -Path 'target\release\pek-ragent.exe' -DestinationPath $zip -Force
@@ -239,9 +242,9 @@ with tarfile.open(dst, 'w:gz') as t:
         }
 
         Write-Host "== Linux 交叉构建：$t（cargo-zigbuild，增量） =="
-        # 原生命令 stderr（zig 链接器提示等）不应在 Stop 下变成终止错误：临时放宽、以退出码判定
+        # 原生命令 stderr（zig 链接器提示等）不应在 Stop 下变成终止错误：临时放宽 + 2>&1 捕获回显
         $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
-        cargo zigbuild --release --locked --target $t
+        cargo zigbuild --release --locked --target $t 2>&1 | ForEach-Object { Write-Host ([string]$_) }
         $code = $LASTEXITCODE; $ErrorActionPreference = $prevEap
         if ($code -ne 0) { throw "交叉构建失败：$t" }
 
