@@ -625,27 +625,15 @@ fn smoke_test(new_path: &Path, official_exe: &Path) -> Result<(), String> {
 pub(crate) fn upgrade_from(new_path: &Path, exe: &Path, min_age_secs: u64) -> Result<(), String> {
     validate_upgrade_file(new_path, min_age_secs)?;
 
-    // 直接 rename 替换：Unix 下运行中的旧文件 inode 保留给当前进程，此调用必成功
-    if std::fs::rename(new_path, exe).is_ok() {
-        return Ok(());
-    }
-
-    // 兜底（Windows：运行中的 exe 无法被覆盖）——"改名让位"：
-    // 旧 exe 改名为 .old（允许），再把新文件改名到正式名；失败则回滚
+    // 替换（统一原语 `dhrust::io::replace_file`）：Unix 下运行中的旧文件 inode 保留给
+    // 当前进程、原地改名必成功；Windows 运行中被占用时自动"改名让位"到 `.old` 再就位，
+    // 失败自动回滚
     let old = PathBuf::from(format!("{}.old", exe.display()));
+    dhrust::io::replace_file(new_path, exe, &old).map_err(|e| format!("替换失败：{e}"))?;
+
+    // 旧文件尽力清理（运行中删除失败则留待后续清理）
     let _ = std::fs::remove_file(&old);
-    std::fs::rename(exe, &old).map_err(|e| format!("旧程序改名失败：{e}"))?;
-    match std::fs::rename(new_path, exe) {
-        Ok(()) => {
-            // 旧文件尽力清理（运行中删除失败则留待后续清理）
-            let _ = std::fs::remove_file(&old);
-            Ok(())
-        }
-        Err(e) => {
-            let _ = std::fs::rename(&old, exe);
-            Err(format!("替换失败：{e}"))
-        }
-    }
+    Ok(())
 }
 
 #[cfg(unix)]

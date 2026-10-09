@@ -73,12 +73,10 @@ pub struct WebPanel {
     started: Instant,
     /// 进程启动墙钟
     started_at: DateTime<Local>,
-    /// 令牌表（实现下沉 `dhrust::net::panel_auth::TokenStore`，默认 24 小时）
-    tokens: TokenStore,
+    /// 令牌表（令牌 → 会话主体；实现下沉 `dhrust::net::panel_auth::TokenStore`，默认 24 小时）
+    tokens: TokenStore<Principal>,
     /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
     logins: LoginGuard,
-    /// 会话主体（令牌 → 登录用户与权限；随令牌吊销/过期失效）
-    sessions: Mutex<HashMap<String, Principal>>,
 }
 
 impl WebPanel {
@@ -92,7 +90,6 @@ impl WebPanel {
             started_at: Local::now(),
             tokens: TokenStore::new(),
             logins: LoginGuard::new(),
-            sessions: Mutex::new(HashMap::new()),
         })
     }
 
@@ -169,12 +166,7 @@ impl WebPanel {
     #[cfg(test)]
     fn issue_token(&self, user: &str, password: &str) -> Option<String> {
         let principal = self.authenticate(user, password)?;
-        let token = self.tokens.issue();
-        self.sessions
-            .lock()
-            .unwrap()
-            .insert(token.clone(), principal);
-        Some(token)
+        Some(self.tokens.issue_with(principal))
     }
 
     /// 校验令牌。
@@ -182,18 +174,15 @@ impl WebPanel {
         self.tokens.validate(token)
     }
 
-    /// 吊销令牌（同时移除会话主体）。
+    /// 吊销令牌（绑定主体随令牌一并失效）。
     fn revoke_token(&self, token: &str) {
         self.tokens.revoke(token);
-        self.sessions.lock().unwrap().remove(token);
     }
 
     /// 重命名当前令牌绑定的会话主体（内置管理员改名后立即生效，无需重新登录）。
     fn rename_session(&self, ctx: &Ctx, new_name: &str) {
         if let Some(token) = bearer_token(ctx) {
-            if let Some(p) = self.sessions.lock().unwrap().get_mut(&token) {
-                p.name = new_name.to_string();
-            }
+            self.tokens.update(&token, |p| p.name = new_name.to_string());
         }
     }
 
@@ -215,8 +204,8 @@ impl WebPanel {
     /// （详见 [`WebPanel::check_auth`]）。
     pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
         if let Some(token) = bearer_token(ctx) {
-            if self.validate_token(&token) {
-                return self.sessions.lock().unwrap().get(&token).cloned();
+            if let Some(p) = self.tokens.get(&token) {
+                return Some(p);
             }
         }
         let cfg = self.manager.config();
@@ -252,11 +241,7 @@ impl WebPanel {
             return Some(p);
         }
         let token = arg(ctx, "token")?;
-        let token = token.trim();
-        if token.is_empty() || !self.validate_token(token) {
-            return None;
-        }
-        self.sessions.lock().unwrap().get(token).cloned()
+        self.tokens.get(token.trim())
     }
 
     /// 当前鉴权级别（动态读取配置）。
@@ -754,12 +739,7 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     match panel.authenticate(&user, &password) {
         Some(principal) => {
-            let token = panel.tokens.issue();
-            panel
-                .sessions
-                .lock()
-                .unwrap()
-                .insert(token.clone(), principal.clone());
+            let token = panel.tokens.issue_with(principal.clone());
             panel.logins.record_success(&ip);
             util::log_format("Web 面板登录成功：{}（{}）", &[&principal.name, &ip]);
             audit::record(

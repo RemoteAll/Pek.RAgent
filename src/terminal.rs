@@ -158,7 +158,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
     let user_close = principal.name.clone();
     let ip_close = client_ip(ctx);
     let on_close = Arc::new(move |_conn: WsServerConn, reason: String| {
-        let reason = truncate_chars(&reason, 120);
+        let reason = dhrust::text::truncate_chars(&reason, 120);
         util::log_format(
             "在线终端已断开（{}）：{}",
             &[&user_close, &reason],
@@ -239,15 +239,6 @@ fn json_err(status: u16, message: &str) -> HttpResponse {
             json_escape(message)
         ),
     )
-}
-
-/// 按字符截断（不破坏 UTF-8 边界）。
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max).collect();
-    format!("{clipped}…")
 }
 
 #[cfg(test)]

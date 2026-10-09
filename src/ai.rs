@@ -148,7 +148,7 @@ fn parse_request(body: &[u8]) -> Result<(Vec<Json>, bool), String> {
         }
         out.push(json!({
             "role": role,
-            "content": truncate_chars(content, MAX_CONTENT_CHARS),
+            "content": dhrust::text::truncate_chars(content, MAX_CONTENT_CHARS),
         }));
     }
     if out.is_empty() {
@@ -313,7 +313,7 @@ fn build_snapshot(panel: &WebPanel) -> String {
                 .unwrap_or_default();
             s.push_str(&format!("■ 最近代理日志（{name}，末 {} 行）\n", lines.len()));
             for line in &lines {
-                s.push_str(&truncate_chars(line, LOG_LINE_CHARS));
+                s.push_str(&dhrust::text::truncate_chars(line, LOG_LINE_CHARS));
                 s.push('\n');
             }
         }
@@ -323,15 +323,6 @@ fn build_snapshot(panel: &WebPanel) -> String {
 }
 
 // ————— 工具 —————
-
-/// 按字符截断（附省略号；不破坏 UTF-8 边界）。
-fn truncate_chars(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let clipped: String = text.chars().take(max).collect();
-    format!("{clipped}…")
-}
 
 #[cfg(test)]
 mod tests {
