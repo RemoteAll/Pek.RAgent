@@ -175,6 +175,18 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     let hb_timer = Timer::new(60_000, 300_000, move |_| heartbeat(&hb));
     hb_timer.set_async(true);
 
+    // 3.4) 自动升级检查（Pek.RPanlServer 发行源；tick 粒度 60s，实际频率由
+    //      AutoUpgradeIntervalMinutes 决定；未配置发行源时静默跳过）
+    let ua = manager.clone();
+    let au_timer = Timer::new(45_000, 60_000, move |_| {
+        crate::self_upgrade::trigger(ua.config(), false);
+    });
+    au_timer.set_async(true);
+
+    // 3.5) 平台实时通道（Pek.RPanlServer「服务器节点」；配置接入令牌后启用：
+    //      上报机器数据 + 接收「立即检查升级」指令；线程自管理重连，无需定时器）
+    crate::panel_ws::start(manager.clone());
+
     util::log_format(
         "守护周期 {} 秒；按 Ctrl+C（前台模式可回车）退出",
         &[&(guard_period / 1000).to_string()],
@@ -192,6 +204,7 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     drop(reload_timer);
     drop(up_timer);
     drop(hb_timer);
+    drop(au_timer);
     util::log_info("星尘代理已退出");
 }
 

@@ -1,0 +1,212 @@
+//! 平台实时通道（Pek.RAgent → Pek.RPanlServer WebSocket）。
+//!
+//! 配置「平台接入令牌」（`AutoUpgradeToken`）后启用：
+//! - 上行：`register`（节点信息）/ `heartbeat`（机器数据，60 秒）——平台「服务器节点」页可见；
+//! - 下行：`checkUpgrade`（平台下发"立即检查升级"→ 触发一次强制自升级检查）。
+//!
+//! 连接地址从自动升级源（`AutoUpgradeUrl`）推导：`scheme://host[:port]` + `/store/agents/ws`
+//! （http → ws、https → wss）；断线由 dhrust `WsClient` 会话层自动重连（指数退避），
+//! 配置变更（地址/令牌）在 30 秒内自动换连。
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant};
+
+use serde_json::{json, Value as Json};
+
+use dhrust::net::ws::{WsClient, WsClientOptions, WsHooks, WsMessage};
+
+use crate::config::AgentConfig;
+use crate::manager::AppManager;
+use crate::util;
+
+/// 进程内启动时刻（心跳上报运行时长）。
+static STARTED: OnceLock<Instant> = OnceLock::new();
+/// 当前连接状态（会话钩子维护；面板状态展示用）。
+static CONNECTED: AtomicBool = AtomicBool::new(false);
+
+/// 当前是否已连接平台（令牌未配置/连接中均返回 false）。
+pub fn connected() -> bool {
+    CONNECTED.load(Ordering::Relaxed)
+}
+
+/// 是否启用（升级源地址与接入令牌都非空）。
+pub fn enabled(cfg: &AgentConfig) -> bool {
+    !cfg.auto_upgrade_url.trim().is_empty() && !cfg.auto_upgrade_token.trim().is_empty()
+}
+
+/// 从升级源地址推导 WS 地址（origin + `/store/agents/ws`；仅 http/https）。
+pub fn ws_url(cfg: &AgentConfig) -> Option<String> {
+    let raw = cfg.auto_upgrade_url.trim();
+    let scheme = if raw.starts_with("https://") {
+        "wss://"
+    } else if raw.starts_with("http://") {
+        "ws://"
+    } else {
+        return None;
+    };
+    let rest = raw.split_once("://")?.1;
+    let host = rest.split('/').next().unwrap_or("");
+    if host.is_empty() {
+        return None;
+    }
+    Some(format!("{scheme}{host}/store/agents/ws"))
+}
+
+/// 节点标识（机器唯一标识；缺失时回退主机名）。
+pub fn agent_id() -> String {
+    dhrust::sys::machine::machine_guid()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(dhrust::sys::machine::hostname)
+}
+
+/// 启动后台通道（幂等；专用线程 + current_thread 运行时保持会话存活）。
+pub fn start(manager: Arc<AppManager>) {
+    let _ = STARTED.set(Instant::now());
+    let _ = std::thread::Builder::new()
+        .name("ragent-panel-ws".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    util::log_error(&format!("平台实时通道运行时创建失败：{e}"));
+                    return;
+                }
+            };
+            rt.block_on(run(manager));
+        });
+}
+
+/// 主循环：未配置时周期探测；已配置时建连并在会话内维持心跳（配置变更自动换连）。
+async fn run(manager: Arc<AppManager>) {
+    loop {
+        let cfg = manager.config();
+        if !enabled(&cfg) {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        }
+        let Some(url) = ws_url(&cfg) else {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            continue;
+        };
+        let token = cfg.auto_upgrade_token.trim().to_string();
+        let full = format!("{url}?token={}", dhrust::web::url_encode(&token));
+        util::log_format("平台实时通道连接中：{}", &[&url]);
+        let client = WsClient::connect(full, build_hooks(manager.clone()), WsClientOptions::default());
+
+        // 会话内循环：60 秒心跳 + 30 秒配置检查（配置变更即断开重连）
+        let mut hb = tokio::time::interval(Duration::from_secs(60));
+        hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut chk = tokio::time::interval(Duration::from_secs(30));
+        chk.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 消费首 tick（避免建连即发心跳；配置检查首 tick 保留）
+        hb.tick().await;
+        loop {
+            tokio::select! {
+                _ = hb.tick() => {
+                    if client.is_connected() {
+                        let _ = client.send_text(build_heartbeat(&manager));
+                    }
+                }
+                _ = chk.tick() => {
+                    let now = manager.config();
+                    let same = enabled(&now)
+                        && ws_url(&now).as_deref() == Some(url.as_str())
+                        && now.auto_upgrade_token.trim() == token;
+                    if !same {
+                        client.close();
+                        util::log_info("平台实时通道配置已变更，重新连接");
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+}
+
+/// 会话钩子（注册/指令/断开日志）。
+fn build_hooks(manager: Arc<AppManager>) -> WsHooks {
+    let reg_mgr = manager.clone();
+    let on_connected = Arc::new(move |client: WsClient| {
+        CONNECTED.store(true, Ordering::Relaxed);
+        let _ = client.send_text(build_register(&reg_mgr));
+    });
+    let msg_mgr = manager.clone();
+    let on_message = Arc::new(move |msg: WsMessage| {
+        let Ok(v) = serde_json::from_str::<Json>(&msg.text) else {
+            return;
+        };
+        match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
+            "hello" => util::log_info("平台实时通道已建立（节点已接入）"),
+            "checkUpgrade" => {
+                util::log_info("平台下发「立即检查升级」指令，开始检查");
+                crate::self_upgrade::trigger(msg_mgr.config(), true);
+            }
+            _ => {}
+        }
+    });
+    let on_disconnected = Arc::new(move |reason: String| {
+        CONNECTED.store(false, Ordering::Relaxed);
+        util::log_format("平台实时通道已断开：{}（自动重连中）", &[&reason]);
+    });
+    WsHooks {
+        on_message: Some(on_message),
+        on_connected: Some(on_connected),
+        on_disconnected: Some(on_disconnected),
+        on_ping_tick: None,
+    }
+}
+
+/// `register` 报文（连接建立后发送）。
+fn build_register(_manager: &AppManager) -> String {
+    json!({
+        "type": "register",
+        "agentId": agent_id(),
+        "name": dhrust::sys::machine::hostname(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "platform": crate::self_upgrade::current_platform(),
+        "os": dhrust::sys::machine::os_description(),
+        "hostname": dhrust::sys::machine::hostname(),
+    })
+    .to_string()
+}
+
+/// `heartbeat` 报文（60 秒周期；机器数据 + 子服务状态）。
+fn build_heartbeat(manager: &AppManager) -> String {
+    let snap = crate::sampler::current();
+    // sys::memory_info 返回字节（与 webpanel 同口径；面板侧换算 MB）
+    let (mem_total, mem_avail) = crate::sys::memory_info().unwrap_or((0, 0));
+    let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
+    let mem_total_mb = mem_total / 1024 / 1024;
+    let mut disk_total = 0u64;
+    let mut disk_used = 0u64;
+    for d in crate::sys::disks() {
+        if d.ready && d.total > 0 {
+            disk_total += d.total;
+            disk_used += d.total.saturating_sub(d.free);
+        }
+    }
+    let services = manager.list();
+    let running = services.iter().filter(|(_, s)| s.running).count();
+    let uptime = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
+    let pid = std::process::id();
+    json!({
+        "type": "heartbeat",
+        "agentId": agent_id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "cpuRate": snap.cpu_rate.unwrap_or(0.0),
+        "memoryUsedMB": mem_used_mb,
+        "memoryTotalMB": mem_total_mb,
+        "diskUsedMB": disk_used / 1_048_576,
+        "diskTotalMB": disk_total / 1_048_576,
+        "uptimeSecs": uptime,
+        "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
+        "servicesRunning": running,
+        "servicesTotal": services.len(),
+    })
+    .to_string()
+}

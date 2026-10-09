@@ -1689,6 +1689,7 @@ async function changePassword(){
  });
  html+=`</div></div>`;
  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🛡 DHDeploy 访问控制</h2><div id="dhdeploy-panel-box"><div class="text-muted" style="font-size:12px">检测中...</div></div></div>`;
+ html+=`<div class="glass-card card" style="margin-top:16px"><h2>⬆️ 自动升级 / 平台通道</h2><div id="upgrade-box"><div class="text-muted" style="font-size:12px">加载中...</div></div></div>`;
  $('panel-control').innerHTML=html;
  // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
  setInterval(updateControlStatus,3000);updateControlStatus();
@@ -1739,8 +1740,35 @@ async function updateControlStatus(){
   const el=$('ctrl-status');if(!el)return;
   el.innerHTML=`当前状态：<span class="status-indicator ${d.running?'running':'stopped'}"><span class="status-dot ${d.running?'on':'off'}"></span>${d.running?'运行中':'已停止'}</span> &nbsp; 运行时长：${esc(d.uptime)}`;
   $('btn-start').disabled=d.running;$('btn-stop').disabled=!d.running;$('btn-restart').disabled=!d.running;
+  renderUpgradeBox(d);
   loadDHDeployPanelStatus(false);
  }catch(e){}
+}
+
+// 自动升级 / 平台实时通道卡片（数据来自 /api/status 的 selfUpgrade + panelWs）
+function renderUpgradeBox(d){
+ const box=$('upgrade-box');if(!box||!d)return;
+ const su=d.selfUpgrade||{};
+ const pw=d.panelWs||{};
+ const chk=su.checkedAt?('最近检查：'+esc(su.checkedAt)):'';
+ const info=su.message?esc(su.message):(su.latest?('最新版本 v'+esc(su.latest)):'');
+ const pwText=pw.connected?'<span style="color:var(--green)">已连接</span>':(pw.enabled?'<span style="color:var(--yellow,#eab308)">连接中/离线</span>':'未配置');
+ box.innerHTML=`
+  <div style="display:flex;gap:28px;flex-wrap:wrap;margin-bottom:10px">
+   <div><div style="font-size:12px;color:var(--text-muted)">当前版本</div><div style="font-size:16px;font-weight:600">v${esc(su.current||'')}</div></div>
+   <div><div style="font-size:12px;color:var(--text-muted)">自动升级</div><div style="font-size:16px;font-weight:600">${su.enabled?'<span style="color:var(--green)">已启用</span>':'未配置'}</div></div>
+   <div><div style="font-size:12px;color:var(--text-muted)">平台实时通道</div><div style="font-size:16px;font-weight:600">${pwText}</div></div>
+  </div>
+  <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">${chk}${info?' · '+info:''}<br>升级源：${esc(su.url||'（未配置）')}${su.intervalMinutes?(' · 检查间隔 '+su.intervalMinutes+' 分钟'):''}</div>
+  <button class="btn btn-sm btn-primary" onclick="checkUpgradeNow()">⬆️ 立即检查升级</button>
+  <span style="font-size:12px;color:var(--text-muted);margin-left:8px">发现新版本将自动下载（优先增量补丁）并替换重启，无需手工操作</span>`;
+}
+async function checkUpgradeNow(){
+ try{
+  const j=await api('/api/selfUpgradeCheck',{method:'POST',body:'{}'});
+  showToast(j.code===0?('✅ '+(j.message||'已开始检查')):('❌ '+(j.message||'检查失败')),j.code===0?'success':'error');
+  setTimeout(updateControlStatus,1500);
+ }catch(e){showToast('❌ 检查失败','error')}
 }
 
 async function doControl(action){

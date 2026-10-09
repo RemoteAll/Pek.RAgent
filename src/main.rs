@@ -17,9 +17,11 @@ mod fileman;
 mod history;
 mod logclean;
 mod manager;
+mod panel_ws;
 mod plugins;
 mod portstat;
 mod sampler;
+mod self_upgrade;
 mod server;
 mod service;
 mod sys;
@@ -31,7 +33,27 @@ mod webpanel;
 
 use std::path::{Path, PathBuf};
 
+/// 版本标记字符串源（结尾 NUL 便于平台字节扫描精确截断）。
+const VERSION_TAG_STR: &str = concat!("Pek.RAgent/", env!("CARGO_PKG_VERSION"), "\0");
+
+/// 版本标记（编译期嵌入二进制的字节常量，供 Pek.RPanlServer「代理发行」上传时自动识别版本号）。
+/// 格式：`Pek.RAgent/<版本>`；请勿删除或改名。
+#[used]
+#[unsafe(no_mangle)]
+pub static PEK_RAGENT_VERSION_TAG: [u8; VERSION_TAG_STR.len()] = {
+    let src = VERSION_TAG_STR.as_bytes();
+    let mut buf = [0u8; VERSION_TAG_STR.len()];
+    let mut i = 0;
+    while i < src.len() {
+        buf[i] = src[i];
+        i += 1;
+    }
+    buf
+};
+
 fn main() {
+    // 引用防 fat LTO 裁剪（版本标记供平台识别上传包版本）
+    let _ = std::hint::black_box(&PEK_RAGENT_VERSION_TAG);
     let raw: Vec<String> = std::env::args().skip(1).collect();
     let base = util::base_dir();
     let original = std::env::current_dir().unwrap_or_else(|_| base.clone());

@@ -62,8 +62,14 @@
   <LogCleanupPaths></LogCleanupPaths>
   <!--在线插件源（catalog.json）地址。仅允许 https（127.0.0.1 例外）；留空 = 关闭在线插件-->
   <PluginStoreUrl></PluginStoreUrl>
-  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256-->
+  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256。自动升级发行源验签复用本公钥-->
   <PluginStorePubKey></PluginStorePubKey>
+  <!--代理自动升级源（星尘代理发行源 catalog.json）地址，默认官方平台。仅允许 https（127.0.0.1 例外）；留空 = 关闭自动升级（仍可用「上传即升级」手工通道）-->
+  <AutoUpgradeUrl>https://p.sc8.fun/store/agents/catalog.json</AutoUpgradeUrl>
+  <!--平台接入令牌（Pek.RPanlServer「服务器节点」页生成）。配置后启用 WebSocket 实时通道：向平台实时上报机器数据（CPU/内存/磁盘/子服务），并接收平台下发的「立即检查升级」指令；留空 = 不接入平台-->
+  <AutoUpgradeToken></AutoUpgradeToken>
+  <!--自动升级检查间隔（分钟），默认 60（5~1440）-->
+  <AutoUpgradeIntervalMinutes>60</AutoUpgradeIntervalMinutes>
   <!--AI 助手。启用后可在面板「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）-->
   <AiEnabled>true</AiEnabled>
   <!--AI 接口地址。OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时改这里-->

@@ -413,6 +413,7 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("updateConfig", "更新配置"),
     ("changePassword", "修改密码"),
     ("upgrade", "程序升级"),
+    ("selfUpgradeCheck", "检查升级"),
     ("syncTime", "同步系统时间"),
     ("startService", "启动子服务"),
     ("stopService", "停止子服务"),
@@ -509,6 +510,10 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_DASHBOARD, sync_time),
     );
     controller = controller.post("control", guarded(panel.clone(), PERM_CONTROL, control));
+    controller = controller.post(
+        "selfUpgradeCheck",
+        guarded(panel.clone(), PERM_CONTROL, self_upgrade_check),
+    );
     controller.map(
         "*",
         "dhdeployPanel",
@@ -879,6 +884,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         .unwrap_or(0);
     // 代理自身 CPU 占用（占整机百分比；采样器 1 秒窗口差分）
     let proc_cpu = sample.agent_cpu_rate;
+    // 自动升级检查状态快照（面板自升级卡片）
+    let self_upgrade = crate::self_upgrade::status();
 
     let data = json!({
         "serviceName": cfg.service_name,
@@ -937,6 +944,21 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         // 默认凭据提示：面板顶部横幅数据（remoteAccess=允许远程访问时风险更高）
         "defaultPassword": uses_default_credentials(&cfg),
         "remoteAccess": !cfg.local_only,
+        // 自动升级（Pek.RPanlServer 发行源）：当前版本 / 检查状态（面板「控制」页展示）
+        "selfUpgrade": {
+            "enabled": crate::self_upgrade::enabled(&cfg),
+            "current": env!("CARGO_PKG_VERSION"),
+            "url": cfg.auto_upgrade_url.clone(),
+            "intervalMinutes": cfg.auto_upgrade_interval_minutes,
+            "checkedAt": self_upgrade.as_ref().map(|s| s.checked_at.clone()).unwrap_or_default(),
+            "latest": self_upgrade.as_ref().map(|s| s.latest.clone()).unwrap_or_default(),
+            "message": self_upgrade.as_ref().map(|s| s.message.clone()).unwrap_or_default(),
+        },
+        // 平台实时通道（Pek.RPanlServer「服务器节点」）：令牌已配置 / 当前连接状态
+        "panelWs": {
+            "enabled": crate::panel_ws::enabled(&cfg),
+            "connected": crate::panel_ws::connected(),
+        },
         // 进程健康指标（原 /api/health 合并至此：面板每 3 秒刷新只需一次请求，
         // 且复用上面已采集的进程统计，省一次全进程快照与进程内存查询）
         "health": json!({
@@ -1267,6 +1289,9 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
         config_item("PluginStoreUrl", "插件源地址（HTTPS）", "String", cfg.plugin_store_url.clone(), "在线插件目录（catalog.json）的地址；仅允许 https（127.0.0.1 例外便于本地调试）；留空=关闭在线插件。修改后自动生效"),
         config_item("PluginStorePubKey", "插件源公钥（Ed25519 hex，可选）", "String", cfg.plugin_store_pubkey.clone(), "填写后强制校验插件源签名（catalog.json.sig），防止插件源被篡改；留空=仅 HTTPS+SHA-256 校验。修改后自动生效"),
+        config_item("AutoUpgradeUrl", "自动升级源地址（HTTPS）", "String", cfg.auto_upgrade_url.clone(), "星尘代理发行源（catalog.json）地址；默认已指向官方平台（p.sc8.fun）。仅允许 https（127.0.0.1 例外）；留空=关闭自动升级。配置「插件源公钥」后强制验签（留空=仅 HTTPS+SHA-256 校验）。修改后自动生效"),
+        config_item("AutoUpgradeIntervalMinutes", "自动升级检查间隔(分钟)", "Int32", cfg.auto_upgrade_interval_minutes.to_string(), "定期检查发行源新版本的间隔，默认 60（5~1440）。修改后自动生效"),
+    config_item("AutoUpgradeToken", "平台接入令牌", "Password", cfg.auto_upgrade_token.clone(), "Pek.RPanlServer「服务器节点」页生成的接入令牌；填写后启用实时通道：向平台上报机器数据（CPU/内存/磁盘/子服务），并接收「立即检查升级」指令。留空 = 不接入。修改后自动生效"),
         config_item("AiEnabled", "AI 助手", "Boolean", cfg.ai_enabled.to_string(), "启用后可在「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）。修改后自动生效"),
         config_item("AiBaseUrl", "AI 接口地址", "String", cfg.ai_base_url.clone(), "OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时修改。修改后自动生效"),
         config_item("AiModel", "AI 模型", "String", cfg.ai_model.clone(), "模型名（如 deepseek-chat 对话 / deepseek-reasoner 推理；接入其他服务时填其模型名）。修改后自动生效"),
@@ -1619,6 +1644,29 @@ fn dhdeploy_post(payload: &Json) -> Result<String, String> {
         });
     }
     Ok(message)
+}
+
+/// `POST /api/selfUpgradeCheck`：立即执行一次自动升级检查（等同平台下发的「立即检查升级」指令；
+/// 检查在后台线程执行，结果见「控制」页自动升级卡片与日志）。
+fn self_upgrade_check(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let cfg = panel.manager.config();
+    if !crate::self_upgrade::enabled(&cfg) {
+        return json_error(400, "未配置自动升级源（AutoUpgradeUrl），无法检查");
+    }
+    // 注意：先 read 到本地再 move（trigger 接收 AgentConfig 所有权；检查在线程内完成）
+    let started = crate::self_upgrade::trigger(cfg, true);
+    if started {
+        json_result(
+            0,
+            "已开始检查升级：结果见自动升级卡片（发现新版本将自动完成替换重启）",
+            None,
+        )
+    } else {
+        json_error(429, "已有检查正在进行，请稍候")
+    }
 }
 
 /// `GET /api/dhdeployPanel`：探测本机 DHDeploy Agent（Rust）访问范围；
@@ -2559,6 +2607,15 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
         "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
         "pluginstoreurl" => set_string(value, |s| cfg.plugin_store_url = s),
         "pluginstorepubkey" => set_string(value, |s| cfg.plugin_store_pubkey = s),
+        "autoupgradeurl" => set_string(value, |s| cfg.auto_upgrade_url = s),
+        "autoupgradetoken" => set_string(value, |s| cfg.auto_upgrade_token = s),
+        "autoupgradeintervalminutes" => match value_u64(value) {
+            Some(v) if (5..=1440).contains(&v) => {
+                cfg.auto_upgrade_interval_minutes = v as u32;
+                true
+            }
+            _ => false,
+        },
         "aienabled" => set_bool(value, |b| cfg.ai_enabled = b),
         "aibaseurl" => set_string(value, |s| cfg.ai_base_url = s),
         "aimodel" => set_string(value, |s| cfg.ai_model = s),

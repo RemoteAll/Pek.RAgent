@@ -89,6 +89,15 @@ pub struct AgentConfig {
     pub plugin_store_url: String,
     /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
     pub plugin_store_pubkey: String,
+    /// 代理自动升级源地址（发行源 `catalog.json` URL；仅 https，127.0.0.1 例外）。默认官方平台；留空 = 关闭自动升级
+    ///
+    /// 验签公钥复用 `PluginStorePubKey`（平台同一把签名密钥）：配置后强制验签，留空仅 HTTPS+SHA-256。
+    pub auto_upgrade_url: String,
+    /// 自动升级检查间隔（分钟，默认 60；5~1440）
+    pub auto_upgrade_interval_minutes: u32,
+    /// 平台接入令牌（Pek.RPanlServer「服务器节点」页生成；配置后启用 WebSocket 实时通道：
+    /// 上报机器数据到平台并接收「立即检查升级」指令。空 = 不接入）
+    pub auto_upgrade_token: String,
     /// AI 助手。启用后可在面板「AI 助手」页对话分析服务器问题（OpenAI 兼容接口）
     pub ai_enabled: bool,
     /// AI 接口地址。OpenAI 兼容 Base（如 `https://api.deepseek.com/v1`；也可直接填完整 `.../chat/completions`）
@@ -138,6 +147,9 @@ impl Default for AgentConfig {
             log_cleanup_paths: String::new(),
             plugin_store_url: String::new(),
             plugin_store_pubkey: String::new(),
+            auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
+            auto_upgrade_interval_minutes: 60,
+            auto_upgrade_token: String::new(),
             ai_enabled: true,
             ai_base_url: "https://api.deepseek.com/v1".to_string(),
             ai_model: "deepseek-chat".to_string(),
@@ -364,6 +376,13 @@ impl AgentConfig {
         self.log_cleanup_paths = self.log_cleanup_paths.trim().to_string();
         self.plugin_store_url = self.plugin_store_url.trim().to_string();
         self.plugin_store_pubkey = self.plugin_store_pubkey.trim().to_string();
+        self.auto_upgrade_url = self.auto_upgrade_url.trim().to_string();
+        self.auto_upgrade_token = self.auto_upgrade_token.trim().to_string();
+        if self.auto_upgrade_interval_minutes == 0 {
+            self.auto_upgrade_interval_minutes = 60;
+        } else {
+            self.auto_upgrade_interval_minutes = self.auto_upgrade_interval_minutes.clamp(5, 1440);
+        }
         self.ai_base_url = self.ai_base_url.trim().to_string();
         self.ai_model = self.ai_model.trim().to_string();
         self.ai_api_key = self.ai_api_key.trim().to_string();
@@ -595,6 +614,15 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "PluginStorePubKey") {
         cfg.plugin_store_pubkey = v;
     }
+    if let Some(v) = text_of(obj, "AutoUpgradeUrl") {
+        cfg.auto_upgrade_url = v;
+    }
+    if let Some(v) = text_of(obj, "AutoUpgradeToken") {
+        cfg.auto_upgrade_token = v;
+    }
+    if let Some(v) = parse_of::<u32>(obj, "AutoUpgradeIntervalMinutes") {
+        cfg.auto_upgrade_interval_minutes = v;
+    }
     if let Some(v) = bool_of(obj, "AiEnabled") {
         cfg.ai_enabled = v;
     }
@@ -726,6 +754,12 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
         push("PluginStoreUrl", cfg.plugin_store_url.clone());
         push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
+        push("AutoUpgradeUrl", cfg.auto_upgrade_url.clone());
+        push("AutoUpgradeToken", cfg.auto_upgrade_token.clone());
+        push(
+            "AutoUpgradeIntervalMinutes",
+            cfg.auto_upgrade_interval_minutes.to_string(),
+        );
         push("AiEnabled", bool_text(cfg.ai_enabled));
         push("AiBaseUrl", cfg.ai_base_url.clone());
         push("AiModel", cfg.ai_model.clone());
