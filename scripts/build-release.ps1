@@ -239,8 +239,11 @@ with tarfile.open(dst, 'w:gz') as t:
         }
 
         Write-Host "== Linux 交叉构建：$t（cargo-zigbuild，增量） =="
+        # 原生命令 stderr（zig 链接器提示等）不应在 Stop 下变成终止错误：临时放宽、以退出码判定
+        $prevEap = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
         cargo zigbuild --release --locked --target $t
-        if ($LASTEXITCODE -ne 0) { throw "交叉构建失败：$t" }
+        $code = $LASTEXITCODE; $ErrorActionPreference = $prevEap
+        if ($code -ne 0) { throw "交叉构建失败：$t" }
 
         $bin = "target\$t\release\pek-ragent"
         $tgz = "dist\pek-ragent-v$ver-$t.tar.gz"
