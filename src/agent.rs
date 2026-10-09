@@ -140,7 +140,7 @@ impl Agent {
 
 /// 核心运行：拉起应用、启动控制接口、守护循环、等待退出。
 fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period: u64) {
-    // 1) 拉起已启用应用
+    // 1) 拉起已启用应用（配置“加载即补齐”由 AgentConfig::load 内部自动完成）
     manager.start_all();
 
     // 2) 本地控制接口（线程持有；进程退出即结束）

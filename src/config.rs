@@ -272,6 +272,7 @@ impl AgentConfig {
     /// 加载配置。
     ///
     /// - `StarAgent.config`（XML，与 C# 同格式）存在：直接读取（损坏时备份 `.bad` 并用默认配置重建）；
+    ///   读取成功后按当前版本模板核对补齐缺失项（**加载即补齐**，无变化不写盘；对齐 C# 运行期多点保存）；
     /// - 否则 `Agent.toml`（旧版）存在：自动迁移为 XML（原文件改名 `.toml.bak`）；
     /// - 否则 `Agent.json`（旧版）存在：自动迁移为 XML（原文件改名 `.json.bak`）；
     /// - 都没有：从内置模板生成带注释的默认配置。
@@ -320,6 +321,15 @@ impl AgentConfig {
             } else {
                 util::log_info(&format!("已生成默认配置 {}", path.display()));
             }
+        } else {
+            // 加载即补齐（自动执行）：文件缺少当前版本配置项（含新版本新增项）时按模板回写；
+            // 无变化不写盘。对齐 C# 运行期多点 Save() 的“缺了自动补齐”行为
+            // （机制在 dhrust::config::save_if_changed，文本管线各项目可复用）。
+            match cfg.save_if_changed(base) {
+                Ok(true) => util::log_info("配置文件已按当前版本模板补齐缺失项"),
+                Ok(false) => {}
+                Err(e) => util::log_error(&format!("配置补齐写回失败：{}", e)),
+            }
         }
         cfg
     }
@@ -332,6 +342,15 @@ impl AgentConfig {
         let text = render_xml(self, current.as_deref())
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         dhrust::io::write_all_text_atomic(&path, &text)
+    }
+
+    /// 保存配置；仅当渲染结果与磁盘内容不同才写入，返回是否发生写入。
+    /// 机制已下沉 `dhrust::config::save_if_changed`（读现有文本 → 渲染 → 比对 → 原子写回）；
+    /// `load` 及所有调用方自动获得“缺了自动补齐”行为（对齐 C# 运行期多点保存）。
+    pub fn save_if_changed(&self, base: &Path) -> std::io::Result<bool> {
+        let path = config_path(base);
+        dhrust::config::save_if_changed(&path, |cur| render_xml(self, cur))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))
     }
 
     /// 归一化：补默认值，修正应用的缺省文件名与工作目录（与 C# `ServiceManager.Fix` 一致）。
@@ -1285,6 +1304,41 @@ mod tests {
         let back = AgentConfig::load(&base);
         assert!(back.web_logs.is_empty());
         assert!(back.port_traffic_ports.is_empty());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn load_backfills_missing_items_and_is_idempotent() {
+        // 回归：旧版本配置文件缺少新版本新增项（如平台接入令牌）时，
+        // 加载（启动路径）应自动按模板补齐；已完整时不再写盘
+        // （机制：dhrust::config::save_if_changed——渲染与磁盘比对，无变化不写）。
+        let base = temp_base("backfill");
+        let path = config_path(&base);
+        std::fs::write(
+            &path,
+            "<StarAgent>\n  <ServiceName>StarAgentRust</ServiceName>\n</StarAgent>\n",
+        )
+        .unwrap();
+
+        let cfg = AgentConfig::load(&base);
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("<AutoUpgradeToken>"), "加载应自动补齐缺失项：\n{text}");
+        assert!(text.contains("<!--"), "应带模板注释：\n{text}");
+        assert!(
+            text.contains("<ServiceName>StarAgentRust</ServiceName>"),
+            "既有值应保留：\n{text}"
+        );
+
+        // 再次加载与显式检查：渲染结果与磁盘一致 → 不写盘、内容不变
+        let cfg2 = AgentConfig::load(&base);
+        assert!(!cfg2.save_if_changed(&base).unwrap(), "无变化不应写盘");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "重复加载不应改变文件"
+        );
+        assert_eq!(cfg2.service_name, cfg.service_name);
 
         let _ = std::fs::remove_dir_all(&base);
     }
