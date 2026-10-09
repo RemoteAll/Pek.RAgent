@@ -337,7 +337,6 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <a data-panel="control">⚡ 控制</a>
 <a data-panel="config">⚙ 配置</a>
 <a data-panel="logs">📋 日志</a>
-<a data-panel="watchdog">🐕 看门狗</a>
 <a data-panel="database">🗄 数据库</a>
 <a data-panel="fileman">🗂 文件管理</a>
 <a data-panel="plugins">🧩 插件</a>
@@ -355,7 +354,6 @@ document.getElementById('lpass').addEventListener('keydown', e => {
 <div id="panel-control" class="panel"></div>
 <div id="panel-config" class="panel"></div>
 <div id="panel-logs" class="panel"></div>
-<div id="panel-watchdog" class="panel"></div>
 <div id="panel-database" class="panel"></div>
 <div id="panel-fileman" class="panel"></div>
 <div id="panel-plugins" class="panel"></div>
@@ -432,7 +430,7 @@ function showApp(){
  loadMe().then(()=>{
   // 按权限启动轮询（无权限的页签不发起请求）：仪表盘 / 子服务
   if(canView('dashboard')){loadDashboard();timer=setInterval(loadDashboard,3000);}
-  if(canView('services')){loadServices();svcTimer=setInterval(loadServices,3000);}
+  if(canView('services')||canView('watchdog')){loadServices();svcTimer=setInterval(loadServices,3000);}
   // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法/无权限时回退到首个可用页）
   restorePanelFromHash();
  });
@@ -451,6 +449,7 @@ function renderNav(){
   if(k==='users')show=!!(me&&me.isAdmin);
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
   else if(k==='config')show=canView('config')||canView('starconfig'); // 配置页含“星尘设置”子页签（任一权限可见）
+  else if(k==='services')show=canView('services')||canView('watchdog'); // 子服务页含“看门狗”卡片（任一权限可见）
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -499,7 +498,6 @@ function switchPanel(name){
   control:updateControlStatus,
   config:loadConfig,
   logs:loadLogs,
-  watchdog:loadWatchDog,
   database:loadDatabase,
   fileman:loadFileman,
   plugins:loadPlugins,
@@ -518,7 +516,7 @@ function switchPanel(name){
 }
 
 // 从 URL hash 解析页签名（非法/缺省/无权限返回空串；与导航实际可见页签比对，避免选择器注入）
-// 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports / #audit
+// 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports / #audit / #starconfig / #cleanup / #watchdog
 function panelFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
  if(!h)return '';
@@ -526,6 +524,7 @@ function panelFromHash(){
  if(h==='audit')return 'logs';
  if(h==='starconfig')return 'config'; // 兼容早期独立页签书签
  if(h==='cleanup')return 'plugins'; // “日志清理”已迁移为插件（🧩 插件 → 日志清理）
+ if(h==='watchdog')return 'services'; // “看门狗”已并入“子服务”页
  const name=h.split('.')[0];
  return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
 }
@@ -1474,23 +1473,30 @@ function drawTrend(){
  svg.innerHTML=parts.join('');
 }
 
-/* ── 子服务管理 ── */
+/* ── 子服务管理（含“看门狗”卡片：原独立页签已并入本页） ── */
 let _servicesData=null;
+let _watchdogData=null; // 看门狗服务列表；null=未加载/无权限/失败
 
 async function loadServices(){
  if(!document.querySelector('#panel-services.active'))return;
  try{
-  const j=await api('/star/services');
-  if(j.code!==0)return;
-  _servicesData=j.data;
+  // 子服务与看门狗并行拉取（仅请求有权限的数据）
+  const [sj,wj]=await Promise.all([
+   canView('services')?api('/star/services'):Promise.resolve(null),
+   canView('watchdog')?api('/api/watchdog'):Promise.resolve(null),
+  ]);
+  if(sj&&sj.code===0)_servicesData=sj.data;
+  if(wj&&wj.code===0)_watchdogData=(wj.data&&wj.data.services)||[];
   renderServices();
  }catch(e){}
 }
 
 function renderServices(){
- const d=_servicesData;if(!d)return;
+ let html='';
+ const d=_servicesData;
+ if(canView('services')&&d){
  const svcs=d.services||[];
- let html=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📦 子服务管理</h2><span style="font-size:12px;color:var(--text-tertiary)">运行 ${d.running||0} / 总计 ${d.total||0}</span></div>`;
+ html+=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📦 子服务管理</h2><span style="font-size:12px;color:var(--text-tertiary)">运行 ${d.running||0} / 总计 ${d.total||0}</span></div>`;
  html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button></div>`;
  if(svcs.length===0){
   html+=`<div class="empty-state"><div class="empty-icon">📦</div><p>暂无子服务</p><p style="font-size:11px;margin-top:4px">点击"添加服务"按钮创建第一个子服务</p></div>`;
@@ -1515,6 +1521,23 @@ function renderServices(){
   html+=`</tbody></table>`;
  }
  html+=`</div>`;
+ }
+ if(canView('watchdog')&&_watchdogData!==null){
+  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🐕 看门狗</h2>`;
+  if(_watchdogData.length===0){
+   html+=`<div class="empty-state"><div class="empty-icon">🐕</div><p>未配置看门狗服务</p><p style="font-size:11px;margin-top:4px">在配置中设置 WatchDog 字段，多个服务名用逗号分隔</p></div>`;
+  }else{
+   html+=`<div class="stats-grid">`;
+   _watchdogData.forEach(s=>{
+    const cls=s.running===true?'text-green':s.running===false?'text-red':'text-yellow';
+    const txt=s.running===true?'运行中':s.running===false?'已停止':'状态未知';
+    html+=`<div class="stat"><div class="stat-val ${cls}">${txt}</div><div class="stat-lbl">${esc(s.name)}</div></div>`;
+   });
+   html+=`</div>`;
+  }
+  html+=`</div>`;
+ }
+ if(!html)return;
  $('panel-services').innerHTML=html;
 }
 
@@ -2810,24 +2833,7 @@ function userDelete(name){
  });
 }
 
-/* ── Watchdog ── */
-async function loadWatchDog(){
- try{
-  const j=await api('/api/watchdog');if(j.code!==0)return;const svcs=j.data.services||[];
-  let html=`<div class="glass-card card"><h2>🐕 看门狗</h2>`;
-  if(svcs.length===0){html+=`<div class="empty-state"><div class="empty-icon">🐕</div><p>未配置看门狗服务</p><p style="font-size:11px;margin-top:4px">在配置中设置 WatchDog 字段，多个服务名用逗号分隔</p></div>`}
-  else{
-   html+=`<div class="stats-grid">`;
-   svcs.forEach(s=>{
-    const cls=s.running===true?'text-green':s.running===false?'text-red':'text-yellow';
-    const txt=s.running===true?'运行中':s.running===false?'已停止':'状态未知';
-    html+=`<div class="stat"><div class="stat-val ${cls}">${txt}</div><div class="stat-lbl">${esc(s.name)}</div></div>`;
-   });
-   html+=`</div>`;
-  }
-  html+=`</div>`;$('panel-watchdog').innerHTML=html;
- }catch(e){}
-}
+
 
 function esc(s){return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
 function escAttr(s){return String(s??'').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/'/g,'&#39;')}
