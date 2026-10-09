@@ -1,6 +1,6 @@
 [package]
 name = "pek-ragent"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "Pek.RAgent：星尘代理（StarAgent 的 Rust 实现）——多应用守护、影子目录部署、跨平台服务管理与本地 HTTP 控制接口"
 authors = ["PeiKeSmart"]

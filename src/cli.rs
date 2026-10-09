@@ -217,7 +217,7 @@ fn print_status_core(cfg: &AgentConfig, svc: &ServiceManager, state: ServiceStat
     println!(
         "Pek.RAgent\t版本：{}\t发布：{}",
         env!("CARGO_PKG_VERSION"),
-        build_time_text()
+        dhrust::build_time_text!("PEK_RAGENT_BUILD_UNIX")
     );
 }
 
@@ -242,19 +242,6 @@ fn print_recent_logs(base: &Path, count: usize) {
     for line in lines {
         println!("{line}");
     }
-}
-
-/// 构建时间文本（`build.rs` 注入的 Unix 秒，本地时区格式化）。
-fn build_time_text() -> String {
-    std::option_env!("PEK_RAGENT_BUILD_UNIX")
-        .and_then(|s| s.parse::<i64>().ok())
-        .and_then(|secs| chrono::DateTime::from_timestamp(secs, 0))
-        .map(|utc| {
-            utc.with_timezone(&chrono::Local)
-                .format("%Y-%m-%d %H:%M:%S")
-                .to_string()
-        })
-        .unwrap_or_default()
 }
 
 /// 安装服务。

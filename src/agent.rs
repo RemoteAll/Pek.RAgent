@@ -51,7 +51,10 @@ impl Agent {
 
     /// 前台运行（`-run`，等价 C# 的模拟运行）：回车或 Ctrl+C 退出。
     pub fn run_foreground(&self) -> i32 {
-        util::log_info("星尘代理启动（前台运行模式）");
+        util::log_format(
+            "星尘代理启动（前台运行模式），当前版本 {}（构建 {}）",
+            &[env!("CARGO_PKG_VERSION"), &dhrust::build_time_text!("PEK_RAGENT_BUILD_UNIX")],
+        );
         self.install_signal_handlers();
 
         // 回车退出（菜单“模拟运行”的体验）
@@ -80,7 +83,10 @@ impl Agent {
 
     /// 服务方式运行（`-s`）。
     pub fn run_service(&self) -> i32 {
-        util::log_info("星尘代理启动（系统服务模式）");
+        util::log_format(
+            "星尘代理启动（系统服务模式），当前版本 {}（构建 {}）",
+            &[env!("CARGO_PKG_VERSION"), &dhrust::build_time_text!("PEK_RAGENT_BUILD_UNIX")],
+        );
         crate::sys::raise_priority();
         self.install_signal_handlers();
 
