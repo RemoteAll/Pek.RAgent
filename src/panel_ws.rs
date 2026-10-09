@@ -24,6 +24,8 @@ use crate::util;
 static STARTED: OnceLock<Instant> = OnceLock::new();
 /// 当前连接状态（会话钩子维护；面板状态展示用）。
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+/// 当前会话的客户端句柄（平台判定标识重复时用于立即断开触发重连）。
+static CURRENT: OnceLock<std::sync::Mutex<Option<WsClient>>> = OnceLock::new();
 
 /// 当前是否已连接平台（令牌未配置/连接中均返回 false）。
 pub fn connected() -> bool {
@@ -92,7 +94,14 @@ async fn run(manager: Arc<AppManager>) {
         let token = cfg.auto_upgrade_token.trim().to_string();
         let full = format!("{url}?token={}", dhrust::web::url_encode(&token));
         util::log_format("平台实时通道连接中：{}", &[&url]);
-        let client = WsClient::connect(full, build_hooks(manager.clone()), WsClientOptions::default());
+        // 会话当前标识（每次连接成功时由 on_connected 刷新）：配置中的标识变更（含平台判定
+        // 重复后自动重建）即断开重连，重连时携带新标识重新注册
+        let session_id = Arc::new(std::sync::Mutex::new(cfg.agent_id.clone()));
+        let client = WsClient::connect(
+            full,
+            build_hooks(manager.clone(), session_id.clone()),
+            WsClientOptions::default(),
+        );
 
         // 会话内循环：60 秒心跳 + 30 秒配置检查（配置变更即断开重连）
         let mut hb = tokio::time::interval(Duration::from_secs(60));
@@ -110,9 +119,14 @@ async fn run(manager: Arc<AppManager>) {
                 }
                 _ = chk.tick() => {
                     let now = manager.config();
+                    let sid = session_id
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
                     let same = enabled(&now)
                         && ws_url(&now).as_deref() == Some(url.as_str())
-                        && now.auto_upgrade_token.trim() == token;
+                        && now.auto_upgrade_token.trim() == token
+                        && now.agent_id == sid;
                     if !same {
                         client.close();
                         util::log_info("平台实时通道配置已变更，重新连接");
@@ -126,10 +140,23 @@ async fn run(manager: Arc<AppManager>) {
 }
 
 /// 会话钩子（注册/指令/断开日志）。
-fn build_hooks(manager: Arc<AppManager>) -> WsHooks {
+fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String>>) -> WsHooks {
     let reg_mgr = manager.clone();
+    let conn_id = session_id.clone();
     let on_connected = Arc::new(move |client: WsClient| {
         CONNECTED.store(true, Ordering::Relaxed);
+        // 记录本会话实际使用的标识（重连时若配置已变更——如平台判定重复后重建——取新值）
+        {
+            let mut sid = conn_id.lock().unwrap_or_else(|e| e.into_inner());
+            *sid = reg_mgr.config().agent_id;
+        }
+        {
+            let mut cur = CURRENT
+                .get_or_init(|| std::sync::Mutex::new(None))
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            *cur = Some(client.clone());
+        }
         let _ = client.send_text(build_register(&reg_mgr));
     });
     let msg_mgr = manager.clone();
@@ -139,6 +166,10 @@ fn build_hooks(manager: Arc<AppManager>) -> WsHooks {
         };
         match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "hello" => util::log_info("平台实时通道已建立（节点已接入）"),
+            "idConflict" => {
+                util::log_info("平台检测到节点标识与其他服务器重复，重新生成标识");
+                regenerate_agent_id(&msg_mgr);
+            }
             "checkUpgrade" => {
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
@@ -155,6 +186,39 @@ fn build_hooks(manager: Arc<AppManager>) -> WsHooks {
         on_connected: Some(on_connected),
         on_disconnected: Some(on_disconnected),
         on_ping_tick: None,
+    }
+}
+
+/// 平台判定标识重复时调用：重新生成 `AgentId` 并写盘，然后断开当前会话——
+/// 配置检查周期（30 秒）最迟在下一拍以新标识重连注册（60 秒冷却防异常场景下标识抖动）。
+fn regenerate_agent_id(manager: &AppManager) {
+    static LAST: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *last
+        && t.elapsed() < Duration::from_secs(60)
+    {
+        util::log_info("节点标识重复提示过快，已忽略（60 秒冷却）");
+        return;
+    }
+    *last = Some(Instant::now());
+    drop(last);
+
+    manager.update_config(|cfg| cfg.agent_id = dhrust::random::hex(16));
+    util::log_format(
+        "已重新生成节点标识：{}（配置已写盘，重连后以新标识上线）",
+        &[&manager.config().agent_id],
+    );
+    // 断开当前会话触发重连：配置检查周期（30 秒）最迟在下一拍以新标识重新注册
+    if let Some(client) = CURRENT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        client.close();
     }
 }
 
