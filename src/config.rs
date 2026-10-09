@@ -336,12 +336,10 @@ impl AgentConfig {
 
     /// 保存配置（按元素就地更新：保留现有文件中的注释、排版与 C# 特有字段；
     /// 缺失字段按模板格式插入；`Services` 节整段重建）。
+    /// **内容与磁盘一致时不写盘**（对齐 C# `Config.Save()` 的“相同跳过”；避免无谓改写与
+    /// 文件监视抖动）——内部等同 [`Self::save_if_changed`]，仅不返回是否写入。
     pub fn save(&self, base: &Path) -> std::io::Result<()> {
-        let path = config_path(base);
-        let current = std::fs::read_to_string(&path).ok();
-        let text = render_xml(self, current.as_deref())
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        dhrust::io::write_all_text_atomic(&path, &text)
+        self.save_if_changed(base).map(|_| ())
     }
 
     /// 保存配置；仅当渲染结果与磁盘内容不同才写入，返回是否发生写入。
@@ -1339,6 +1337,13 @@ mod tests {
             "重复加载不应改变文件"
         );
         assert_eq!(cfg2.service_name, cfg.service_name);
+
+        // 主动调用保存（save）同样“相同跳过”：内容一致时不触发真实重写
+        // （对齐 C# `Config.Save()` 语义；mtime 不变 = 未写盘）
+        let m1 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        cfg2.save(&base).unwrap();
+        let m2 = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(m1, m2, "无变化时 save 不应重写文件");
 
         let _ = std::fs::remove_dir_all(&base);
     }
