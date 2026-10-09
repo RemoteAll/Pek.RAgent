@@ -1,6 +1,6 @@
 [package]
 name = "pek-ragent"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2024"
 description = "Pek.RAgent：星尘代理（StarAgent 的 Rust 实现）——多应用守护、影子目录部署、跨平台服务管理与本地 HTTP 控制接口"
 authors = ["PeiKeSmart"]
@@ -14,7 +14,8 @@ license = "MIT"
 # 在线终端（term：真 PTY 会话引擎，Windows ConPTY / Unix openpty）、
 # 插件协议（plugin：插件包格式 + 插件源目录 Ed25519 签名，与 Pek.RPanlServer 共用）、
 # AI 客户端（net::openai：OpenAI 兼容 /chat/completions）
-dhrust = { path = "../DH.RustBase", features = ["net", "http-tls", "toml", "service", "zip-extract", "term", "plugin", "patch"] }
+# 网络与 TLS：服务器节点 wss 通道依赖 net-tls（含 http-tls，覆盖 AI 助手/插件源等 HTTPS 调用）
+dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
