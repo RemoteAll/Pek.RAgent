@@ -295,6 +295,8 @@ html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
 .perm-item{display:flex;align-items:center;gap:6px;cursor:pointer}
 .perm-item input{width:14px;height:14px;accent-color:var(--brand-500)}
 #panel-audit select{padding:8px 10px;border:1px solid var(--border-default);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text-primary);font-size:13px;outline:none}
+.card.drop-candidate,.card2.drop-candidate{outline:2px dashed rgba(91,91,255,.28);outline-offset:2px}
+.drop-hint{font-size:11px;color:#8b93a7;margin-top:8px}
 </style>
 </head>
 <body>
@@ -2856,17 +2858,37 @@ applyTheme(getTheme());
 window.matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{if(getTheme()==='auto')applyTheme('auto')});
 
 // ————— 拖拽上传（全局委托：任意「含 file input 的 .card/.card2」即拖放目标）—————
-// 拖入卡片高亮 → 松开填充 input.files → 派发 change（复用既有上传流程；每卡片取首个 file input）；
-// document 级委托，动态渲染的卡片自动生效、无需逐处绑定。
+// 拖动开始即高亮全部候选卡（解决“不知道能拖到哪”）；拖入卡片强化高亮 → 松开填充
+// input.files → 派发 change（复用既有上传流程；每卡片取首个 file input）。
+// 常驻小提示自动注入（.drop-hint）。document 级委托，动态渲染的卡片自动生效。
 function installDropUpload(){
  if(document._dropUploadInstalled) return;
  document._dropUploadInstalled = true;
+ const cards = () => Array.from(document.querySelectorAll('.card, .card2')).filter(c => c.querySelector('input[type=file]'));
  const cardOf = e => (e.target && e.target.closest) ? e.target.closest('.card, .card2') : null;
  const inputOf = c => c ? c.querySelector('input[type=file]') : null;
- document.addEventListener('dragenter', e => { const c = cardOf(e); if(c && inputOf(c)) c.classList.add('drop-active'); }, true);
+ const clearCandidates = () => document.querySelectorAll('.drop-candidate').forEach(c => c.classList.remove('drop-candidate'));
+ const ensureHints = () => cards().forEach(c => {
+  if(!c.querySelector('.drop-hint')){
+   const h = document.createElement('div');
+   h.className = 'drop-hint';
+   h.textContent = '⬆ 支持拖拽上传：把文件拖到本卡片即可';
+   c.appendChild(h);
+  }
+ });
+ ensureHints();
+ document.addEventListener('dragenter', e => {
+  const hasFile = !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'));
+  if(hasFile){ ensureHints(); cards().forEach(c => c.classList.add('drop-candidate')); }
+  const c = cardOf(e); if(c && inputOf(c)) c.classList.add('drop-active');
+ }, true);
  document.addEventListener('dragover', e => { const c = cardOf(e); if(c && inputOf(c)){ e.preventDefault(); e.stopPropagation(); if(e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; } }, true);
- document.addEventListener('dragleave', e => { const c = cardOf(e); if(c && !c.contains(e.relatedTarget)) c.classList.remove('drop-active'); }, true);
+ document.addEventListener('dragleave', e => {
+  if(e.relatedTarget === null){ clearCandidates(); return; }
+  const c = cardOf(e); if(c && !c.contains(e.relatedTarget)) c.classList.remove('drop-active');
+ }, true);
  document.addEventListener('drop', e => {
+  clearCandidates();
   const c = cardOf(e); if(!c) return;
   const input = inputOf(c); if(!input) return;
   e.preventDefault(); e.stopPropagation();
