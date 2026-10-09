@@ -79,11 +79,11 @@ powershell -ExecutionPolicy Bypass -File scripts\build-release.ps1 -Targets linu
 
 ### 3.1 Linux 部署（静态单文件）
 
-发布包（`dist/`）按架构选择：`uname -m` 输出 `x86_64` → `pek-ragent-v0.1.3-x86_64-unknown-linux-musl.tar.gz`；`aarch64`（ARM64）→ `...-aarch64-unknown-linux-musl.tar.gz`；另提供 `riscv64gc` / `loongarch64` 包。均为 **静态 musl 单文件**（约 3MB，零运行库依赖），压缩包内即一个 `pek-ragent`。
+发布包（`dist/`）按架构选择：`uname -m` 输出 `x86_64` → `pek-ragent-v0.1.4-x86_64-unknown-linux-musl.tar.gz`；`aarch64`（ARM64）→ `...-aarch64-unknown-linux-musl.tar.gz`；另提供 `riscv64gc` / `loongarch64` 包。均为 **静态 musl 单文件**（约 3MB，零运行库依赖），压缩包内即一个 `pek-ragent`。
 
 ```bash
 # 本机（Windows PowerShell）上传；dist 下同名 .tar.gz 解压后即 pek-ragent + install.sh
-scp dist/pek-ragent-v0.1.3-x86_64-unknown-linux-musl.tar.gz root@server:/tmp/
+scp dist/pek-ragent-v0.1.4-x86_64-unknown-linux-musl.tar.gz root@server:/tmp/
 
 # 服务器上解压安装（systemd：Restart=always / KillMode=process / OOMScoreAdjust=-1000 随单元自动生成）
 sudo mkdir -p /opt/staragent
@@ -182,7 +182,7 @@ $ pek-ragent -status
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
 
-Pek.RAgent	版本：0.1.3	发布：2026-10-09 10:00:00
+Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 
 配置：/www/Agent/Config/StarAgent.config
 本地端口：5501（仅本机：是）
@@ -224,7 +224,7 @@ Pek.RAgent	版本：0.1.3	发布：2026-10-09 10:00:00
 状态：systemd 运行中
 路径：/www/Agent/pek-ragent
 
-Pek.RAgent	版本：0.1.3	发布：2026-10-09 10:00:00
+Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 
  序号 功能名称            命令行参数
  1、 显示状态            -status
