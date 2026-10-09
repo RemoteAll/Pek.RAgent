@@ -169,7 +169,8 @@ impl WebPanel {
         Some(self.tokens.issue_with(principal))
     }
 
-    /// 校验令牌。
+    /// 校验令牌（测试辅助；生产路径直接用 `tokens.get`）。
+    #[cfg(test)]
     fn validate_token(&self, token: &str) -> bool {
         self.tokens.validate(token)
     }
