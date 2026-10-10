@@ -153,6 +153,19 @@ sudo /www/Agent/pek-ragent -update /tmp/pek-ragent-new    # 升级 + 重启服�
   请使用上述三种上传方式之一；
 - 前台 `-run` 模式：Unix 同样原地接管（无需手动重启）；Windows 需手动重启（日志有提示）。
 
+### 3.3 把应用安装进星尘（通用脚本）
+
+`packaging/install-app.sh`：把任意应用安装到本机星尘（Pek.RAgent / C# StarAgent）中的通用安装脚本——应用打包时随包携带（或部署方直接调用），自动完成文件就位、停止旧实例、注册子服务（`-AddService`，注册即启用并由星尘拉起）与就绪检查：
+
+```bash
+sudo sh install-app.sh --name dhdeploy-agent-rust --bin ./dhdeploy-agent-rust \
+     --dir /www/DeployRust --health http://127.0.0.1:8282/api/panel/status
+
+sudo sh install-app.sh --name dhdeploy-agent-rust --unregister   # 从星尘注销
+```
+
+详见 `packaging/README-应用安装.md`（选项、星尘探测顺序、C# 版兼容说明）。
+
 ---
 
 ## 4. 命令行一览
