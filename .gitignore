@@ -3,7 +3,8 @@
 /data
 *.del
 /dist
-/tools
+/tools/*
+!/tools/continuity/
 # 运行时目录（服务在源码目录直接运行时产生）
 /Data
 /Log
