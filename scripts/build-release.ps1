@@ -14,6 +14,7 @@ Pek.RAgent 一键发布打包（Windows 主机）
               all = windows + linux(x86_64) + linux-arm64(aarch64) + linux-riscv64 + linux-loongarch64
     -Clean                       先清理 dist 旧产物与 zig 缓存，再构建
     -CleanAll                    额外执行 cargo clean（清空全部编译缓存，最省磁盘）
+    -NoBump                      关闭默认的自动递升补丁版本号（保持当前版本打包）
 
 前置条件（仅 Linux 交叉构建需要；缺失时脚本自动补齐，完整清单见 docs/build-env.md）：
   - cargo-zigbuild：cargo install --locked cargo-zigbuild      （缺失时自动安装）
@@ -39,7 +40,8 @@ param(
     [switch]$Clean,
     [switch]$CleanAll,
     [switch]$Force,      # 跳过「同版本内容变化」打包拦截（逃生门）
-    [switch]$Bump,       # 打包前自动递升补丁版本号（写 Cargo.toml + 更新 Cargo.lock）
+    [switch]$NoBump,     # 关闭默认的自动递升补丁版本号
+    [switch]$Bump,       # 兼容保留：显式递升补丁号（现为默认行为）
     [switch]$BumpMinor   # 打包前自动递升次版本号（minor，补丁归零）
 )
 
@@ -53,14 +55,16 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 # ———— 版本升号守卫（实现下沉 dhrust/tools/version-guard.ps1：防「同版本号打包出不同内容」）————
-# 拦截规则：同版本 + 内容指纹已变化 → 拒绝打包；-Bump/-BumpMinor 自动递升；-Force 强制放行。
+# 拦截规则：默认自动递升补丁号（-NoBump 关闭）；同版本 + 内容指纹已变化 → 拒绝打包；-Force 强制放行。
 $depPath = (Select-String -Path (Join-Path $root 'Cargo.toml') `
             -Pattern 'dhrust\s*=\s*\{\s*path\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
 if (-not $depPath) { throw '无法在 Cargo.toml 中解析 dhrust 依赖路径（version-guard 需要）' }
 $guardScript = Join-Path (Resolve-Path (Join-Path $root $depPath)).Path 'tools\version-guard.ps1'
 if (-not (Test-Path $guardScript)) { throw "未找到版本守卫脚本：$guardScript（请先更新 DH.RustBase 仓库）" }
 . $guardScript
-Assert-VersionGuard -RepoRoot $root -Name 'pek-ragent' -Force:$Force -Bump:$Bump -BumpMinor:$BumpMinor
+# 默认自动递升补丁版本号（-NoBump 关闭；-BumpMinor 递升次版本）
+Assert-VersionGuard -RepoRoot $root -Name 'pek-ragent' -Force:$Force `
+    -Bump:((-not $NoBump) -and (-not $BumpMinor)) -BumpMinor:$BumpMinor
 
 # 显式启用增量编译（与 Cargo.toml 中的 profile 设置一致）
 $env:CARGO_INCREMENTAL = '1'
