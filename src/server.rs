@@ -98,6 +98,13 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
 fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let mut router = Router::new();
 
+    // 〇 WAF（管理端预设：拦恶意爬虫与扫描器 + 路径探测/CC；在线 SQL/文件管理/AI 端点跳过攻击检测，由业务护栏负责）
+    let mut waf_cfg = pek_rwaf::WafConfig::admin_api();
+    waf_cfg.skip_attack_prefixes =
+        vec!["/star/db".to_string(), "/star/file".to_string(), "/star/ai".to_string()];
+    let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
+    router.use_middleware(waf.middleware());
+
     // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板）
     let panel = WebPanel::new(manager.clone(), manager.base(), port);
     build_api_controller(panel.clone()).mount(&mut router);

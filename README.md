@@ -587,3 +587,8 @@ src/
 - [ ] Linux 实机验证与发行（systemd 单元模板随包提供）
 - [ ] 进程按名称接管 / 多实例精确匹配
 - [ ] 多平台支持：国产 Linux（麒麟/统信/openEuler）实机验证、嵌入式/路由系统（OpenWrt/Buildroot）服务化适配、macOS 实机（ARM64 交叉产物已打通；规划见 `docs/platform-support.md`）
+---
+
+## 13. Web 应用防火墙（Pek.RWaf）
+
+面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.json` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。

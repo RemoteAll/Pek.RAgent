@@ -22,6 +22,8 @@ dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "servi
 pek-rcode = { path = "../Pek.RCode", default-features = false, features = ["database"] }
 # 管理组件（Pek.RAdmin）：面板用户与操作审计数据层（audit.rs 薄壳消费；仅管理界面项目需要）
 pek-radmin = { path = "../Pek.RAdmin" }
+# Web 应用防火墙（爬虫分级：拦恶意扫描器；路径探测/CC；Config/Waf.json 热重载）
+pek-rwaf = { path = "../Pek.RWaf" }
 # 配置与状态序列化（AgentConfig / data/state.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
