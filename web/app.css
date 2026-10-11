@@ -290,3 +290,10 @@ html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
 #panel-audit select{padding:8px 10px;border:1px solid var(--border-default);border-radius:var(--radius-sm);background:var(--surface-2);color:var(--text-primary);font-size:13px;outline:none}
 .card.drop-candidate,.card2.drop-candidate{outline:2px dashed rgba(91,91,255,.28);outline-offset:2px}
 .drop-hint{font-size:11px;color:#8b93a7;margin-top:8px}
+/* ── 安全页（WAF）与页脚耗时 ── */
+.waf-row{display:flex;flex-wrap:wrap;gap:10px 22px;align-items:center;margin:10px 0;font-size:13px}
+.waf-row label{display:inline-flex;align-items:center;gap:6px;color:var(--text-secondary)}
+.waf-row input[type="text"],.waf-row input:not([type]){background:var(--surface-2);border:1px solid var(--border-default);border-radius:var(--radius-sm);color:var(--text-primary);padding:6px 10px;min-width:220px;outline:none}
+.waf-sel{padding:4px 8px;border-radius:var(--radius-sm);border:1px solid var(--border-default);background:var(--surface-2);color:var(--text-primary);outline:none}
+.waf-json{width:100%;box-sizing:border-box;min-height:280px;font-family:var(--font-mono);font-size:12px;line-height:1.55;border-radius:var(--radius-md);border:1px solid var(--border-default);background:var(--surface-2);color:var(--text-primary);padding:10px;outline:none}
+.srv-foot{text-align:center;font-size:12px;color:var(--text-muted);padding:14px 0 20px}

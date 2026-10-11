@@ -105,8 +105,8 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
     router.use_middleware(waf.middleware());
 
-    // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板）
-    let panel = WebPanel::new(manager.clone(), manager.base(), port);
+    // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板；WAF 用于「安全」页在线管理）
+    let panel = WebPanel::new(manager.clone(), manager.base(), port, waf.clone());
     build_api_controller(panel.clone()).mount(&mut router);
     build_star_controller(panel.clone()).mount(&mut router);
 

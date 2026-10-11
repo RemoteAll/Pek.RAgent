@@ -74,6 +74,7 @@ function renderNav(){
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
   else if(k==='config')show=canView('config')||canView('starconfig'); // 配置页含“星尘设置”子页签（任一权限可见）
   else if(k==='services')show=canView('services')||canView('watchdog'); // 子服务页含“看门狗”卡片（任一权限可见）
+  else if(k==='security')show=canView('control'); // 安全页（WAF 在线管理）随「控制」权限
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -86,6 +87,7 @@ async function api(url,opt={}){
  const h=opt.headers||{};
  if(token)h['Authorization']='Bearer '+token;
  const r=await fetch(url,{...opt,headers:{...h,'Content-Type':'application/json'}});
+ const _el=r.headers.get('X-Elapsed-Ms');if(_el)setSrvElapsed(_el);
  const j=await r.json();
  if(j.code===401||r.status===401){logout();showToast('登录已过期，请重新登录','error');throw new Error('Unauthorized')}
  return j;
@@ -120,6 +122,7 @@ function switchPanel(name){
   services:loadServices,
   traffic:loadTraffic,
   control:updateControlStatus,
+  security:loadSecurity,
   config:loadConfig,
   logs:loadLogs,
   database:loadDatabase,
@@ -184,6 +187,100 @@ window.addEventListener('hashchange',()=>{
  else if(h==='logs'&&$('logs-sub-tabs'))applyLogsSub(logsSubFromHash()); // 日志页内子页签同步
  else if(h==='config'&&$('config-sub-tabs'))applyConfigSub(configSubFromHash()); // 配置页内子页签同步
 });
+
+/* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.json） ── */
+let wafCfg=null;
+const WAF_ACTS=[['off','关闭'],['monitor','仅记录'],['block','拦截']];
+function wafActSel(id,v){return '<select id="'+id+'" class="waf-sel">'+WAF_ACTS.map(a=>'<option value="'+a[0]+'"'+(v===a[0]?' selected':'')+'>'+a[1]+'</option>').join('')+'</select>'}
+function wafList(v){return (v||[]).join(', ')}
+function wafParseList(t){return String(t||'').split(/[,，;；\s]+/).filter(Boolean)}
+async function loadSecurity(){
+ try{
+  const j=await api('/star/waf');
+  if(j.code!==0){$('panel-security').innerHTML='<div class="card"><h3>🛡 WAF</h3><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
+  wafCfg=j.data;renderSecurity();
+ }catch(e){}
+}
+function renderSecurity(){
+ const c=wafCfg||{};
+ $('panel-security').innerHTML=`
+<div class="card">
+ <h3>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h3>
+ <p class="text-muted" style="font-size:12px;margin:2px 0 10px">爬虫分级（放行正常搜索引擎/GEO-AI，拦恶意爬虫与扫描器）+ SQL 注入/路径探测防护 + CC 限速；保存后立即生效，并写入配置文件。</p>
+ <div class="waf-row">
+  <label><input type="checkbox" id="waf-enable" ${c.enable?'checked':''}> <b>启用 WAF</b>（关闭后请求全放行）</label>
+  <label><input type="checkbox" id="waf-block-mal" ${c.blockMaliciousBots?'checked':''}> 拦截恶意爬虫/扫描器</label>
+ </div>
+ <div class="waf-row">
+  <label>模式：<select id="waf-mode"><option value="adminApi" ${c.mode==='adminApi'?'selected':''}>管理端（不放行任何机器人）</option><option value="publicSite" ${c.mode==='publicSite'?'selected':''}>前台站点（放行搜索引擎/GEO-AI）</option></select></label>
+  <label>CC 限速：<input id="waf-rate" type="number" min="0" style="width:90px" value="${Number(c.rateLimitPerMin||0)}"> 次/分钟/IP（0=关闭）</label>
+ </div>
+ <div class="waf-row">
+  <label><input type="checkbox" id="waf-search" ${c.allowSearchBots?'checked':''}> 放行搜索引擎</label>
+  <label><input type="checkbox" id="waf-aibots" ${c.allowAiBots?'checked':''}> 放行 GEO/AI 抓取</label>
+  <label><input type="checkbox" id="waf-social" ${c.allowSocialPreviews?'checked':''}> 放行社交预览</label>
+ </div>
+ <div class="waf-row">攻击防护动作：SQL 注入 ${wafActSel('waf-sqli',c.sqliAction)} 路径穿透 ${wafActSel('waf-path',c.pathAction)} XSS ${wafActSel('waf-xss',c.xssAction)} 命令注入 ${wafActSel('waf-cmd',c.cmdAction)}</div>
+ <div class="waf-row">
+  <label>敏感前缀（禁一切机器人）<input id="waf-sensitive" value="${escAttr(wafList(c.sensitivePrefixes))}"></label>
+  <label>IP 白名单<input id="waf-wl" value="${escAttr(wafList(c.ipWhitelist))}"></label>
+  <label>IP 黑名单<input id="waf-bl" value="${escAttr(wafList(c.ipBlacklist))}"></label>
+ </div>
+ <div class="waf-row">
+  <label><input type="checkbox" id="waf-emptyua" ${c.blockEmptyUa?'checked':''}> 拦截空 UA</label>
+  <label><input type="checkbox" id="waf-loopback" ${c.loopbackBypass?'checked':''}> 回环地址豁免（本地工具）</label>
+  <label><input type="checkbox" id="waf-verbose" ${c.verbose?'checked':''}> 详细日志</label>
+ </div>
+ <div style="margin-top:12px"><button class="btn btn-primary" onclick="wafSave()">💾 保存并立即生效</button></div>
+</div>
+<div class="card">
+ <h3>📖 参考配置（完整 JSON）</h3>
+ <p class="text-muted" style="font-size:12px;margin:2px 0 8px">高级项（如规则集 <code>ruleset</code>、跳过检测前缀 <code>skipAttackPrefixes</code>）可直接编辑 JSON 保存；也可直接编辑服务器配置文件（修改后 10 秒内热生效）。</p>
+ <textarea id="waf-json" class="waf-json" spellcheck="false">${JSON.stringify(c,null,2).replace(/</g,'\\u003c')}</textarea>
+ <div style="margin-top:10px"><button class="btn btn-primary" onclick="wafSaveJson()">💾 保存 JSON</button></div>
+</div>`;
+}
+function wafCollect(){
+ const c=Object.assign({},wafCfg,{
+  enable:$('waf-enable').checked,
+  mode:$('waf-mode').value,
+  rateLimitPerMin:Math.max(0,parseInt($('waf-rate').value||'0',10)||0),
+  allowSearchBots:$('waf-search').checked,
+  allowAiBots:$('waf-aibots').checked,
+  allowSocialPreviews:$('waf-social').checked,
+  blockMaliciousBots:$('waf-block-mal').checked,
+  blockEmptyUa:$('waf-emptyua').checked,
+  loopbackBypass:$('waf-loopback').checked,
+  verbose:$('waf-verbose').checked,
+  sqliAction:$('waf-sqli').value,
+  xssAction:$('waf-xss').value,
+  pathAction:$('waf-path').value,
+  cmdAction:$('waf-cmd').value,
+  sensitivePrefixes:wafParseList($('waf-sensitive').value),
+  ipWhitelist:wafParseList($('waf-wl').value),
+  ipBlacklist:wafParseList($('waf-bl').value),
+ });
+ delete c.configFile;
+ return c;
+}
+async function wafPost(c){
+ try{
+  const j=await api('/star/wafSave',{method:'POST',body:JSON.stringify(c)});
+  if(j.code===0){showToast('WAF 配置已保存并生效','success');wafCfg=null;loadSecurity();}
+  else showToast(j.message||'保存失败','error');
+ }catch(e){}
+}
+function wafSave(){if(!$('waf-enable'))return;wafPost(wafCollect())}
+function wafSaveJson(){
+ try{const c=JSON.parse($('waf-json').value);wafPost(c)}catch(e){showToast('JSON 解析失败：'+e.message,'error')}
+}
+
+/* ── 页脚：服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
+function setSrvElapsed(v){
+ const f=$('srv-foot');if(!f)return;
+ const t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+ f.textContent='服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
+}
 
 /* ── Dashboard ── */
 let _dashboardBuilt=false;

@@ -77,11 +77,18 @@ pub struct WebPanel {
     tokens: TokenStore<Principal>,
     /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
     logins: LoginGuard,
+    /// Web 应用防火墙（「安全」页：在线开关 + 参考配置）
+    pub waf: Arc<pek_rwaf::Waf>,
 }
 
 impl WebPanel {
     /// 创建面板。
-    pub fn new(manager: Arc<AppManager>, base: &Path, port: u16) -> Arc<WebPanel> {
+    pub fn new(
+        manager: Arc<AppManager>,
+        base: &Path,
+        port: u16,
+        waf: Arc<pek_rwaf::Waf>,
+    ) -> Arc<WebPanel> {
         Arc::new(WebPanel {
             manager,
             base: base.to_path_buf(),
@@ -90,6 +97,7 @@ impl WebPanel {
             started_at: Local::now(),
             tokens: TokenStore::new(),
             logins: LoginGuard::new(),
+            waf,
         })
     }
 
@@ -584,6 +592,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_DATABASE, db_delete_backup),
     );
 
+    // WAF（「安全」页：在线开关 + 参考配置）
+    controller = controller.get("waf", guarded(panel.clone(), PERM_CONTROL, waf_info));
+    controller = controller.post("wafSave", guarded(panel.clone(), PERM_CONTROL, waf_save));
+
     // 文件管理（「文件管理」页）
     controller = controller.get(
         "fileList",
@@ -1022,6 +1034,47 @@ fn traffic_history(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             cfg.traffic_history_days,
         )),
     )
+}
+
+// ————— WAF（/star/waf*：在线开关 + 参考配置；配置落盘 Config/Waf.json 并立即生效） —————
+
+/// WAF 状态与完整配置（参考配置页数据源）。
+fn waf_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let cfg = panel.waf.config();
+    let mut v = serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({}));
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "configFile".to_string(),
+            serde_json::json!(
+                panel
+                    .base()
+                    .join("Config")
+                    .join("Waf.json")
+                    .display()
+                    .to_string()
+            ),
+        );
+    }
+    json_result(0, "", Some(v))
+}
+
+/// 保存 WAF 配置（在线启用/关闭与各项策略；写文件并立即生效）。
+fn waf_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let body = String::from_utf8_lossy(&ctx.req.body).to_string();
+    let cfg: pek_rwaf::WafConfig = match serde_json::from_str(&body) {
+        Ok(c) => c,
+        Err(e) => return json_error(400, &format!("配置解析失败：{e}")),
+    };
+    match panel.waf.apply_config(cfg) {
+        Ok(()) => json_result(0, "WAF 配置已保存并生效", None),
+        Err(e) => json_error(500, &e),
+    }
 }
 
 // ————— 数据库管理（/star/db*：只读查询 / 备份 / 还原） —————
@@ -2715,7 +2768,8 @@ mod tests {
 
         let cfg = AgentConfig::default();
         let manager = AppManager::new(&dir, cfg);
-        let panel = WebPanel::new(manager, &dir, 5501);
+        let waf = pek_rwaf::Waf::load_with_default(&dir, pek_rwaf::WafConfig::admin_api());
+        let panel = WebPanel::new(manager, &dir, 5501, waf);
         (panel, dir)
     }
 
