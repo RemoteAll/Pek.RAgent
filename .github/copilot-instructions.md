@@ -12,10 +12,11 @@
 - **停止链**：先温和后强制、覆盖进程树（Windows `taskkill /PID /T` → 3s → `/T /F` → 2s 终检；Unix 组长按进程组）；【接管】仅基于 `data/state.json` 记录的 PID）。
 - **多实例**：配置按名称 upsert（**不能同名**）；多实例用不同子服务名分别注册（各自目录/配置/资源）。停止按 PID 定点，无同名连坐。
 - 自升级管线：热检测 + 影子冒烟 + 原子替换 + 移交（Unix `execv` 原地接管；Windows 服务交 SCM 失败恢复）。
+- **WAF（Pek.RWaf）**：HTTP 控制接口挂 `pek_rwaf` 中间件（`server.rs::build_router` 首行）——管理端预设（拦恶意爬虫/sqlmap/curl 默认 UA；路径探测拦截；CC 300/分钟）；`Config/Waf.json` 首启生成 + 10s 热重载；`/star/db|file|ai` 经 `skipAttackPrefixes` 跳过攻击检测（业务护栏负责）。**网络层 curl 实测须带浏览器 UA**（回环豁免）。
 
 ## 构建与验证
 - `cargo build --release`；`cargo test`；打包 `powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1`（**默认自动递升补丁号**，`-NoBump` 关闭；版本守卫取自 `../DH.RustBase/tools/version-guard.ps1`；`-Targets` 默认 all = windows + 4 个 Linux musl 目标；zig 自动发现 `E:\Soft\zig-*`）。
-- 依赖均为 path：`dhrust=../DH.RustBase`、`pek-rcode=../Pek.RCode`、`pek-radmin=../Pek.RAdmin`——**编译报缺 API/疑似落后时先在本机拉新这三库再复测**（用户级指令「源码依赖自动拉新」）。
+- 依赖均为 path：`dhrust=../DH.RustBase`、`pek-rcode=../Pek.RCode`、`pek-radmin=../Pek.RAdmin`、`pek-rwaf=../Pek.RWaf`——**编译报缺 API/疑似落后时先在本机拉新这几库再复测**（用户级指令「源码依赖自动拉新」）。
 - 中文注释优先；含中文 `.ps1` 必须 UTF-8 with BOM；不搞无关全仓格式化。
 
 ## 流程
