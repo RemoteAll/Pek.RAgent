@@ -37,6 +37,8 @@
  #toast{position:fixed;left:50%;top:14px;transform:translateX(-50%);background:#111827;color:#fff;padding:8px 16px;border-radius:8px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:9}
  #toast.show{opacity:.95}
  .err{color:var(--red);font-size:12px;min-height:16px;margin-top:6px}
+ .warn{background:#fffbeb;border:1px solid #fde68a;color:#92400e;border-radius:8px;padding:8px 12px;font-size:12px;margin-bottom:10px;line-height:1.6}
+ .warn .p{font-family:ui-monospace,Consolas,monospace;word-break:break-all}
 </style>
 </head>
 <body>
@@ -49,6 +51,7 @@
   <div><span style="font-size:20px">🧹</span> 共 <b id="sum-total">—</b> 可清理，已选中 <b id="sum-sel">—</b></div>
   <button id="run-btn" disabled onclick="runClean()">立即清理</button>
  </div>
+ <div id="warn-box"></div>
  <div id="cats"><div class="muted">扫描中…</div></div>
  <div class="muted" style="margin-top:8px">日志文件与目录内的 *.log 将被清空（截断保留文件，正在写入的进程不受影响）；缓存等其余文件将删除、按需自动重建。</div>
 </div>
@@ -116,6 +119,11 @@ function renderCats(){
  $('sum-total').textContent=fmtBytes(total);
  $('sum-sel').textContent=fmtBytes(sel);
  $('run-btn').disabled=!sel;
+ // 被安全守卫拒绝的自定义路径（不会参与清理）
+ const warns=d.warnings||[];
+ $('warn-box').innerHTML=warns.length
+  ? '<div class="warn"><b>⚠ '+warns.length+' 个自定义路径被拒绝</b>（不安全，不会参与清理；请改为具体的日志子目录）：'+warns.map(x=>'<div class="p">'+esc(x.path)+' — '+esc(x.reason)+'</div>').join('')+'</div>'
+  : '';
 }
 function toggle(key,checked){checked?cleanChecked.add(key):cleanChecked.delete(key);renderCats()}
 function toggleAll(checked){cleanChecked=checked?new Set((cleanData&&cleanData.categories||[]).map(c=>c.key)):new Set();renderCats()}
