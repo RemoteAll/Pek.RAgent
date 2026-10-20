@@ -206,6 +206,22 @@ impl AppManager {
         self.persist_state();
     }
 
+    /// 记录应用心跳（`/star/appHeartbeat`）；返回是否找到该应用。
+    pub fn mark_heartbeat(&self, name: &str) -> bool {
+        let inner = self.inner.lock().unwrap();
+        match inner
+            .apps
+            .iter()
+            .find(|a| a.name.eq_ignore_ascii_case(name.trim()))
+        {
+            Some(app) => {
+                app.mark_heartbeat();
+                true
+            }
+            None => false,
+        }
+    }
+
     /// 守护周期检查（代理运行期间周期调用）。
     pub fn check_all(&self) {
         if self.shutting_down() {
@@ -584,6 +600,10 @@ impl AppManager {
                     pid: 0,
                     process_name: String::new(),
                     start_time: String::new(),
+                    health_fails: 0,
+                    health_error: None,
+                    health_ok_at: 0,
+                    last_heartbeat: 0,
                 });
             out.push((app_cfg.clone(), status));
         }

@@ -17,7 +17,7 @@
 | 安全文件替换 | 目标文件被占用时先改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件），应用停止后自动清理 |
 | 内存限制 | `MaxMemory` 超限自动重启应用（Windows 读私有内存、Linux 读 `/proc`） |
 | 文件变动重启 | `ReloadOnChange=true`（默认）时按 5 秒周期监视**配置的程序文件本身**（含无扩展名的 Linux 可执行文件），变更后停止应用，稳定 `Delay` 毫秒后重启 |
-| 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
+| 健康检查 | **假死自愈**（每 `GuardPeriod` 探一次，连续 3 次失败 → 重启）：`HealthCheck` 留空时**自动探测该进程（含子进程）的监听端口**；也可配 `http(s)://`、`tcp://`、`file:<日志/输出文件>`（窗口内无变化即判假死）、`heartbeat`（应用调 `POST /star/appHeartbeat?name=<应用名>`；**从未上报过不判定**，应用不支持看门狗则不探不误杀），`off` 关闭 |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
 | 本地 HTTP 控制接口 | 默认 `0.0.0.0:5501`（`LocalOnly=true` 时仅 `127.0.0.1`；与 C# 版 StarAgent 的 5500 错开可并存），兼容 DHDeploy 的调用契约 |
@@ -318,7 +318,7 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `ReloadOnChange` | `true` | 文件变动自动重启（5 秒周期监视程序文件本身） |
 | `MaxMemory` | `0` | 最大内存（MB），超限重启；0 不限制 |
 | `OomScoreAdjust` | `0` | OOM 分值（仅 Linux） |
-| `HealthCheck` | 空 | 健康检查：`http://…`、`https://…`（含 TLS）或 `tcp://host:port` |
+| `HealthCheck` | 空 | 健康探针：留空 = 自动探测该进程（含子进程）的 TCP 监听端口；`http(s)://…`、`tcp://host:port`、`file:<日志/输出文件>[?within=秒]`（文件活性）、`heartbeat[?within=秒]`（应用调 `POST /star/appHeartbeat?name=<应用名>`，从未上报不判定）、`off`（关闭）。连续 3 次失败判定假死并重启 |
 | `Overwrite` | 空 | 部署包内需拷贝覆盖到工作目录的文件/子目录，`;` 分隔，支持 `*` |
 | `Debug` | `false` | 应用输出重定向到 `Log/app-{Name}.log` |
 

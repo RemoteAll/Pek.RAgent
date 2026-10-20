@@ -10,6 +10,9 @@ use crate::deploy::{self, PrepareContext};
 use crate::sys::{self, Handle, SpawnRequest};
 use crate::util;
 
+/// 连续健康检查失败多少次判定为「假死」并重启。
+const HEALTH_FAIL_LIMIT: u32 = 3;
+
 /// 应用状态快照。
 #[derive(Clone, Debug)]
 pub struct AppStatus {
@@ -21,6 +24,14 @@ pub struct AppStatus {
     pub process_name: String,
     /// 开始时间文本
     pub start_time: String,
+    /// 连续健康检查失败次数（0 = 正常；未配置 HealthCheck 时恒 0）
+    pub health_fails: u32,
+    /// 最近一次健康检查失败原因（成功时清空）
+    pub health_error: Option<String>,
+    /// 最近一次健康检查通过时间（Unix 秒；0 = 未知）
+    pub health_ok_at: i64,
+    /// 最近一次应用心跳（Unix 秒；0 = 从未上报）
+    pub last_heartbeat: i64,
 }
 
 /// 检查结果。
@@ -59,6 +70,16 @@ struct AppState {
     files: HashMap<PathBuf, u64>,
     files_primed: bool,
     reload_ready: Option<Instant>,
+    /// 连续健康检查失败次数（假死判定）
+    health_fails: u32,
+    /// 最近一次健康检查失败原因
+    health_error: Option<String>,
+    /// 最近一次健康检查通过时间（Unix 秒）
+    health_ok_at: i64,
+    /// 文件活性探针：上次观测到的 (修改时间秒, 大小) 与最后变化时刻
+    activity: Option<(u64, u64, i64)>,
+    /// 主动心跳：最后一次上报时间（Unix 秒；0 = 尚未上报）
+    last_heartbeat: i64,
 }
 
 /// 应用运行时。
@@ -91,6 +112,11 @@ impl AppRuntime {
                 files: HashMap::new(),
                 files_primed: false,
                 reload_ready: None,
+                health_fails: 0,
+                health_error: None,
+                health_ok_at: 0,
+                activity: None,
+                last_heartbeat: 0,
             }),
         }
     }
@@ -122,6 +148,10 @@ impl AppRuntime {
                 pid: 0,
                 process_name: String::new(),
                 start_time: String::new(),
+                health_fails: 0,
+                health_error: None,
+                health_ok_at: 0,
+                last_heartbeat: 0,
             };
         }
 
@@ -136,6 +166,10 @@ impl AppRuntime {
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
                 })
                 .unwrap_or_default(),
+            health_fails: st.health_fails,
+            health_error: st.health_error.clone(),
+            health_ok_at: st.health_ok_at,
+            last_heartbeat: st.last_heartbeat,
         }
     }
 
@@ -150,6 +184,11 @@ impl AppRuntime {
         st.hosted = false;
         st.error_count = 0;
         st.next_start = None;
+        st.health_fails = 0;
+        st.health_error = None;
+        st.health_ok_at = 0;
+        st.activity = None;
+        st.last_heartbeat = 0;
         // 接管不经过 start()，需在此补算工作目录（文件变动监视/停止清理等依赖它；缺失会静默跳过）
         let wd = crate::deploy::work_dir(&self.base, &st.cfg);
         st.work_dir = wd;
@@ -265,6 +304,11 @@ impl AppRuntime {
         st.next_start = None;
         st.files.clear();
         st.files_primed = false;
+        st.health_fails = 0;
+        st.health_error = None;
+        st.health_ok_at = 0;
+        st.activity = None;
+        st.last_heartbeat = 0;
 
         // OOM 分值（仅 Linux）
         if cfg.oom_score_adjust != 0 {
@@ -395,6 +439,145 @@ impl AppRuntime {
         ok
     }
 
+    /// 周期性健康检查（假死自愈）。
+    ///
+    /// 进程「活着」不等于「能干活」：死锁、阻塞线程池耗尽、内部锁中毒等情况下进程仍在，
+    /// 但请求一律无响应（面板此前只判 PID 存在，于是显示「运行中」而实际已假死）。
+    ///
+    /// - **显式配置** `HealthCheck` → 按配置探活（`http(s)://` 最准；`tcp://` 只能查端口）；
+    /// - **未配置** → 自动发现该应用（含子进程树）的 TCP 监听口并探活，无需任何配置；
+    /// - `HealthCheck=off|none` → 显式关闭探活；
+    /// - 无监听端口的应用（纯计算/批处理）不做假死判定；
+    /// - 启动后 `max(StartWait, 5s)` 宽限期内不判定（刚拉起可能尚未就绪）；
+    /// - 连续 [`HEALTH_FAIL_LIMIT`] 次失败 → 视为假死：停止并安排重启（走全局 `Delay` 退避）。
+    fn check_health(&self, global: &AgentConfig) {
+        let (cfg, pid, started, running) = {
+            let st = self.state.lock().unwrap();
+            (st.cfg.clone(), st.pid, st.start_time, st.running)
+        };
+        if !running || pid == 0 {
+            return;
+        }
+        let targets = health_targets(&cfg, pid, global.local_port);
+        if targets.is_empty() {
+            return;
+        }
+        // 启动宽限：刚拉起未就绪时不判失败
+        let grace = Duration::from_millis(global.start_wait.max(5_000));
+        if let Some(started) = started {
+            if started.elapsed().map(|d| d < grace).unwrap_or(false) {
+                return;
+            }
+        }
+
+        let mut last_error = String::new();
+        for target in &targets {
+            let result = match target {
+                HealthTarget::Addr(spec) => health_check(spec),
+                HealthTarget::Port(port) => probe_alive(*port),
+                HealthTarget::File(path, within) => self.probe_file_activity(path, *within),
+                HealthTarget::Heartbeat(within) => self.probe_heartbeat(*within),
+            };
+            match result {
+                Ok(()) => {
+                    let mut st = self.state.lock().unwrap();
+                    if st.health_fails != 0 || st.health_error.is_some() {
+                        util::log_format("应用[{}]健康检查已恢复", &[&self.name]);
+                    }
+                    st.health_fails = 0;
+                    st.health_error = None;
+                    st.health_ok_at = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    return;
+                }
+                Err(e) => last_error = e,
+            }
+        }
+
+        {
+            let fails = {
+                let mut st = self.state.lock().unwrap();
+                st.health_fails = st.health_fails.saturating_add(1);
+                st.health_error = Some(last_error.clone());
+                st.health_fails
+            };
+            util::log_format(
+                "应用[{}]健康检查失败（连续 {} 次）：{}",
+                &[&self.name, &fails.to_string(), &last_error],
+            );
+            if fails >= HEALTH_FAIL_LIMIT {
+                util::log_format(
+                    "应用[{}]连续 {} 次健康检查失败，判定假死，准备重启",
+                    &[&self.name, &fails.to_string()],
+                );
+                self.stop("健康检查失败（假死）");
+                let mut st = self.state.lock().unwrap();
+                st.health_fails = 0;
+                if st.cfg.enable {
+                    let delay = global.delay.max(1_000);
+                    st.next_start = Some(Instant::now() + Duration::from_millis(delay));
+                }
+            }
+        }
+    }
+
+    /// 文件活性探针：窗口内文件（日志/输出/数据库）没有任何变化 → 视为假死。
+    ///
+    /// 首次观测只建立基线（不判失败），之后以「窗口内是否出现过变化」为准。
+    /// 适合「不监听端口、由定时任务/队列驱动」的应用。
+    fn probe_file_activity(&self, path: &Path, within: i64) -> Result<(), String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = meta.len();
+        let now = now_unix();
+        let mut st = self.state.lock().unwrap();
+        match st.activity {
+            Some((prev_m, prev_s, changed_at)) if prev_m == mtime && prev_s == size => {
+                if now - changed_at >= within {
+                    return Err(format!(
+                        "{} 已 {} 秒无变化（疑似假死）",
+                        path.display(),
+                        now - changed_at
+                    ));
+                }
+            }
+            _ => st.activity = Some((mtime, size, now)),
+        }
+        Ok(())
+    }
+
+    /// 主动心跳探针（对齐 DH.NAgent / DH.NStar 的看门狗思路）。
+    ///
+    /// 应用在窗口内调用 `POST /star/appHeartbeat?name=<应用名>` 即视为存活。
+    /// **从未上报过时不做任何判定**（应用本身不支持心跳 → 不探、不误杀）；
+    /// 一旦上报过一次，之后超过窗口未上报才判假死并重启。
+    fn probe_heartbeat(&self, within: i64) -> Result<(), String> {
+        let st = self.state.lock().unwrap();
+        let last = st.last_heartbeat;
+        if last <= 0 {
+            return Ok(());
+        }
+        let now = now_unix();
+        if now - last > within {
+            return Err(format!("已 {} 秒未收到心跳", now - last));
+        }
+        Ok(())
+    }
+
+    /// 记录一次应用心跳（`/star/appHeartbeat`）。
+    pub fn mark_heartbeat(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.last_heartbeat = now_unix();
+    }
+
     /// 守护检查（由管理器周期调用）：退出检测、内存限制、文件变动重启。
     pub fn check(&self, global: &AgentConfig) -> CheckOutcome {
         let mut outcome = CheckOutcome::default();
@@ -463,6 +646,9 @@ impl AppRuntime {
                 st.next_start = Some(Instant::now() + Duration::from_millis(delay));
             }
         }
+
+        // 2.5) 周期性健康检查（假死自愈：进程活着但不响应时自动重启）
+        self.check_health(global);
 
         // 3) 计划启动（失败退避 / 文件变动重启）
         let should_start = {
@@ -602,6 +788,119 @@ fn file_changed(path: &Path, files: &mut HashMap<PathBuf, u64>) -> bool {
     }
 }
 
+/// 健康探针目标。
+enum HealthTarget {
+    /// 显式地址（http(s):// / tcp:// / host:port）
+    Addr(String),
+    /// 自动发现的本机监听端口
+    Port(u16),
+    /// 文件活性：路径 + 判定窗口（秒）
+    File(PathBuf, i64),
+    /// 主动心跳：判定窗口（秒）
+    Heartbeat(i64),
+}
+
+/// 默认活性窗口（秒）：文件活性 / 主动心跳多久没动静算异常。
+const ACTIVITY_WINDOW_SECS: i64 = 300;
+
+/// 当前 Unix 秒。
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 解析 `?within=秒` 后缀（缺省用默认窗口）。
+fn split_within(spec: &str) -> (String, i64) {
+    match spec.split_once("?within=") {
+        Some((head, tail)) => (
+            head.trim().to_string(),
+            tail.trim().parse::<i64>().unwrap_or(ACTIVITY_WINDOW_SECS).max(10),
+        ),
+        None => (spec.trim().to_string(), ACTIVITY_WINDOW_SECS),
+    }
+}
+
+/// 健康检查目标解析。
+///
+/// - `off` / `none` → 空（不探活，面板标「未探活」）；
+/// - `http(s)://` / `tcp://` / `host:port` → 按配置探活；
+/// - `file:<路径>[?within=秒]` → **文件活性**（日志/输出/数据库文件在窗口内有变化即存活），
+///   适合「不监听端口、靠定时任务干活」的应用；
+/// - `heartbeat[?within=秒]` → **主动心跳**（应用调 `POST /star/appHeartbeat?name=<应用名>`），
+///   最精确，需应用配合；
+/// - 空 → **自动发现**该进程（含子进程树）的 TCP 监听口（`auto:`，最多 3 个，排除 RAgent 端口）；
+/// - 都没有 → 不做假死判定（避免误杀纯计算/常驻型应用）。
+fn health_targets(cfg: &AppConfig, pid: u32, exclude_port: u16) -> Vec<HealthTarget> {
+    let raw = cfg.health_check.as_deref().unwrap_or("").trim();
+    if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    if raw.eq_ignore_ascii_case("heartbeat") || raw.to_ascii_lowercase().starts_with("heartbeat?") {
+        let (_, within) = split_within(raw);
+        return vec![HealthTarget::Heartbeat(within)];
+    }
+    if raw.to_ascii_lowercase().starts_with("file:") {
+        let (spec, within) = split_within(raw);
+        let path = spec.trim_start_matches("file:").trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(dir) = cfg.working_directory.as_deref().filter(|d| !d.trim().is_empty()) {
+            PathBuf::from(dir).join(path)
+        } else {
+            path
+        };
+        return vec![HealthTarget::File(path, within)];
+    }
+    if !raw.is_empty() {
+        return vec![HealthTarget::Addr(raw.to_string())];
+    }
+    // 未配置：自动发现监听端口
+    let mut ports: Vec<u16> = sys::listen_ports_of(pid)
+        .into_iter()
+        .filter(|p| *p != exclude_port)
+        .collect();
+    ports.truncate(3);
+    ports.into_iter().map(HealthTarget::Port).collect()
+}
+
+
+/// 宽松探活（自动模式）：TCP 连上后发一个最小 HTTP 请求，**3 秒内收到任何字节或对端关闭**
+/// 都算存活（兼容非 HTTP 协议，避免把 gRPC/数据库等误判为死亡）；
+/// 连接成功但读超时 → 判定疑似假死（accept 队列在内核里完成握手，进程不处理请求）。
+fn probe_alive(port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    if port == 0 {
+        return Err("端口无效".to_string());
+    }
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| format!("地址无效：{e}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("连接 {addr} 失败：{e}"))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Err("连接成功但 3 秒内无任何响应（疑似假死）".to_string())
+        }
+        Err(e) => Err(format!("读取失败：{e}")),
+    }
+}
+
 /// 健康检查：`http://` 或 `tcp://host:port` / `host:port`。
 fn health_check(spec: &str) -> Result<(), String> {
     let spec = spec.trim();
@@ -634,3 +933,102 @@ fn health_check(spec: &str) -> Result<(), String> {
 
     Err(format!("不支持的健康检查地址：{}", spec))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-app-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn health_targets_modes() {
+        let mut cfg = AppConfig::default();
+
+        cfg.health_check = Some("off".to_string());
+        assert!(health_targets(&cfg, 1, 5501).is_empty(), "off 应关闭探活");
+
+        cfg.health_check = Some("http://127.0.0.1:8282/panel".to_string());
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::Addr(s) if s == "http://127.0.0.1:8282/panel"));
+
+        cfg.health_check = Some("heartbeat?within=60".to_string());
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::Heartbeat(60)));
+
+        let dir = temp_dir("targets");
+        let file = dir.join("run.log");
+        std::fs::write(&file, "a").unwrap();
+        cfg.health_check = Some(format!("file:{}?within=30", file.display()));
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::File(p, 30) if p == &file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_alive_flags_silent_listener() {
+        use std::net::TcpListener;
+        // 只 listen 不 accept：内核完成握手，进程不处理请求 → 正是「假死」形态
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = probe_alive(port).unwrap_err();
+        assert!(err.contains("疑似假死"), "{err}");
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_alive_accepts_responder() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+            }
+        });
+        assert!(probe_alive(port).is_ok());
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn file_activity_probe_detects_stall() {
+        let dir = temp_dir("stall");
+        let file = dir.join("out.log");
+        std::fs::write(&file, "x").unwrap();
+        let runtime = AppRuntime::new(&dir, AppConfig::default());
+        // 首次观测只建立基线
+        assert!(runtime.probe_file_activity(&file, 1).is_ok());
+        std::thread::sleep(Duration::from_millis(2_200));
+        // 窗口内没有变化 → 判定假死
+        let err = runtime.probe_file_activity(&file, 1).unwrap_err();
+        assert!(err.contains("无变化"), "{err}");
+        // 文件重新有变化 → 恢复正常
+        std::fs::write(&file, "xy").unwrap();
+        assert!(runtime.probe_file_activity(&file, 1).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_probe_skips_when_never_reported() {
+        let dir = temp_dir("heartbeat");
+        let runtime = AppRuntime::new(&dir, AppConfig::default());
+        // 从未上报 → 不判定（应用不支持心跳时不误杀）
+        assert!(runtime.probe_heartbeat(1).is_ok());
+        // 上报一次后正常
+        runtime.mark_heartbeat();
+        assert!(runtime.probe_heartbeat(60).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+

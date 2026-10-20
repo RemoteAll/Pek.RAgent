@@ -1363,7 +1363,14 @@ function renderServices(){
    html+=`<tr><td><div class="svc-name">${esc(s.Name)}</div></td>`;
    html+=`<td><div class="svc-file">${esc(s.FileName||'')}${s.Arguments?' '+esc(s.Arguments):''}</div></td>`;
    html+=`<td><span class="badge ${s.Enable?'badge-green':'badge-gray'}">${s.Enable?'启用':'禁用'}</span></td>`;
-   html+=`<td><span class="badge ${run?'badge-green':'badge-red'}">${run?'运行中':'已停止'}</span></td>`;
+   // 状态：运行中 + 探活结果（warn/fail 表示「进程在但不响应」，即假死/正在假死）
+   const health=s.Health||'off';
+   let stateCell=run?'<span class="badge badge-green">运行中</span>':'<span class="badge badge-red">已停止</span>';
+   if(run&&(health==='warn'||health==='fail')){
+    const txt=health==='fail'?'探活失败':('探活异常 '+(s.HealthFails||0)+'/3');
+    stateCell+=`<span class="badge" style="margin-left:4px;background:var(--orange);color:#fff" title="${escAttr(s.HealthError||'')}">${txt}</span>`;
+   }
+   html+=`<td>${stateCell}</td>`;
    html+=`<td style="font-family:var(--font-mono);font-size:12px">${run?(s.ProcessId||'')+(s.ProcessName?' '+esc(s.ProcessName):''):'-'}</td>`;
    html+=`<td style="font-size:12px;white-space:nowrap">${run?(s.CpuRate!=null?s.CpuRate.toFixed(1)+'%':'—')+(s.MemoryMB!=null?' · '+fmtMem(s.MemoryMB):''):'-'}</td>`;
    html+=`<td><div class="svc-actions">`;
@@ -1441,7 +1448,8 @@ function showServiceForm(svc,title){
   <div class="form-group"><label>部署模式</label><select id="sf-mode"><option value="Standard" ${mode==='Standard'?'selected':''}>Standard</option><option value="Shadow" ${mode==='Shadow'?'selected':''}>Shadow</option><option value="Hosted" ${mode==='Hosted'?'selected':''}>Hosted</option><option value="Task" ${mode==='Task'?'selected':''}>Task</option></select></div>
   <div class="form-group"><label>最大内存 (MB)</label><input type="number" id="sf-maxmem" value="${maxMem}" placeholder="0 不限制"></div>
  </div>
- <div class="form-group"><label>健康检查地址</label><input type="text" id="sf-health" value="${esc(health)}" placeholder="http://localhost:port/health"></div>
+ <div class="form-group"><label>健康检查地址</label><input type="text" id="sf-health" value="${esc(health)}" placeholder="留空=自动探测监听端口；或 http://…、file:/path/app.log、heartbeat"></div>
+<div class="text-muted" style="font-size:11px;margin:-6px 0 10px">留空自动探测该进程（含子进程）的监听端口；无端口的应用可用 <code>file:&lt;日志/输出文件&gt;</code>（窗口内无变化即判假死）或 <code>heartbeat</code>（应用每 5 分钟调一次 <code>POST /star/appHeartbeat?name=本应用</code>）；填 <code>off</code> 关闭探活。窗口可用 <code>?within=秒</code> 覆盖（默认 300）。</div>
  <div class="form-group"><label>环境变量</label><input type="text" id="sf-env" value="${esc(env)}" placeholder="KEY=VALUE;KEY2=VALUE2"></div>
  <div class="form-row">
   <div class="form-group"><label class="toggle"><input type="checkbox" id="sf-enable" ${enable?'checked':''}><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">启用</div></div>

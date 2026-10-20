@@ -728,6 +728,11 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     let mut controller = Controller::new("star");
 
     controller = controller.get("services", guarded(panel.clone(), PERM_SERVICES, services));
+    // 应用心跳（子服务调用；`HealthCheck=heartbeat` 时用于无端口应用的假死判定）
+    controller = controller.post(
+        "appHeartbeat",
+        guarded(panel.clone(), "", app_heartbeat),
+    );
     controller = controller.post(
         "startService",
         guarded(panel.clone(), PERM_SERVICES, |p, ctx| {
@@ -2116,6 +2121,21 @@ fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "ProcessId": st.pid,
             "ProcessName": st.process_name,
             "StartTime": st.start_time,
+            // 健康探活（假死可见化）：off 尚未探活 / ok / warn（失败未达重启阈值）/ fail
+            // 自动模式（未配置 HealthCheck 时按监听端口探测）同样会体现在这里
+            "Health": if st.health_fails >= 3 {
+                "fail"
+            } else if st.health_fails > 0 {
+                "warn"
+            } else if st.health_ok_at > 0 {
+                "ok"
+            } else {
+                "off"
+            },
+            "HealthFails": st.health_fails,
+            "HealthError": st.health_error,
+            "HealthOkAt": st.health_ok_at,
+            "LastHeartbeat": st.last_heartbeat,
         }));
     }
 
@@ -2567,6 +2587,22 @@ fn process_json(p: &sys::ProcItem) -> Json {
             String::new()
         },
     })
+}
+
+/// 应用心跳（子服务调用：`POST /star/appHeartbeat?name=<应用名>`）。
+///
+/// 供「不监听端口、无 Web 界面」的应用证明自己还活着：配置 `HealthCheck=heartbeat`
+/// （可加 `?within=秒`）后，RAgent 超时收不到心跳即判定假死并重启。
+fn app_heartbeat(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let name = arg(ctx, "name").unwrap_or_default();
+    if name.trim().is_empty() {
+        return json_error(400, "缺少应用名");
+    }
+    if panel.manager.mark_heartbeat(name.trim()) {
+        json_result(0, "ok", None)
+    } else {
+        json_error(404, "未找到应用")
+    }
 }
 
 /// Top 进程列表。
