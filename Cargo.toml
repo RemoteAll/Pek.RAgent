@@ -1,6 +1,6 @@
 [package]
 name = "pek-ragent"
-version = "0.1.50"
+version = "0.1.52"
 edition = "2024"
 description = "Pek.RAgent：星尘代理（StarAgent 的 Rust 实现）——多应用守护、影子目录部署、跨平台服务管理与本地 HTTP 控制接口"
 authors = ["PeiKeSmart"]
@@ -37,6 +37,11 @@ tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[lints.rust]
+# zig 交叉链接时会输出 “ignoring deprecated linker optimization setting” 提示（-Wl,-O1），
+# 属工具链噪音而非代码/链接问题；静默以免掩盖真正的构建告警。
+linker_messages = "allow"
 
 [target.'cfg(windows)'.dependencies]
 # 注：Windows 服务运行时（windows-service）已随 service 模块下沉至 dhrust

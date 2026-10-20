@@ -85,7 +85,8 @@ enum DenyRule {
     Exact,
     /// 禁止该目录及其全部子目录。
     Tree,
-    /// 禁止该目录与其一级子目录（更深层可由管理员显式指定）。
+    /// 禁止该目录与其一级子目录（更深层可由管理员显式指定）；仅 Windows 使用。
+    #[cfg_attr(not(windows), allow(dead_code))]
     OneLevel,
 }
 
@@ -906,6 +907,9 @@ fn clean_target(t: &Target) -> Result<(u64, u64), String> {
 // ————— HTTP 动作 —————
 
 /// `GET /star/logCleanScan`：扫描各分类占用。
+///
+/// 扫描需递归遍历可能很大的目录（含各用户 Temp），故与清理一样放独立线程执行，
+/// 避免阻塞 HTTP 请求线程。
 pub fn log_clean_scan(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -913,16 +917,61 @@ pub fn log_clean_scan(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.config();
     let categories = build_categories(panel.base(), &cfg);
     let warnings = custom_warnings(&cfg.log_cleanup_paths, panel.base());
-    let mut total_size = 0u64;
-    let mut total_count = 0u64;
-    let list: Vec<Json> = categories
+
+    let jobs: Vec<(String, String, String, Vec<Target>)> = categories
         .iter()
         .map(|c| {
+            (
+                c.key.to_string(),
+                c.name.to_string(),
+                c.description.to_string(),
+                c.targets.clone(),
+            )
+        })
+        .collect();
+    let (list, total_size, total_count) = {
+        let thread_jobs = jobs.clone();
+        match std::thread::Builder::new()
+            .name("ragent-logscan".to_string())
+            .spawn(move || scan_jobs(thread_jobs))
+        {
+            Ok(handle) => match handle.join() {
+                Ok(v) => v,
+                Err(_) => return json_error(500, "扫描线程异常退出"),
+            },
+            Err(e) => {
+                util::log_format(
+                    "日志清理：无法创建扫描线程（{}），改为同步执行",
+                    &[&e.to_string()],
+                );
+                scan_jobs(jobs)
+            }
+        }
+    };
+
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "categories": list,
+            "totalSize": total_size,
+            "totalCount": total_count,
+            "warnings": warnings,
+        })),
+    )
+}
+
+/// 执行扫描（供后台线程调用）：（分类 JSON 列表, 总字节, 总文件数）。
+fn scan_jobs(jobs: Vec<(String, String, String, Vec<Target>)>) -> (Vec<Json>, u64, u64) {
+    let mut total_size = 0u64;
+    let mut total_count = 0u64;
+    let list: Vec<Json> = jobs
+        .into_iter()
+        .map(|(key, name, description, targets)| {
             let mut size = 0u64;
             let mut count = 0u64;
             let mut truncated = false;
-            let targets: Vec<Json> = c
-                .targets
+            let detail: Vec<Json> = targets
                 .iter()
                 .map(|t| {
                     let (files, bytes, tr) = scan_target(t);
@@ -940,26 +989,17 @@ pub fn log_clean_scan(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             total_size += size;
             total_count += count;
             json!({
-                "key": c.key,
-                "name": c.name,
-                "description": c.description,
+                "key": key,
+                "name": name,
+                "description": description,
                 "size": size,
                 "count": count,
                 "truncated": truncated,
-                "targets": targets,
+                "targets": detail,
             })
         })
         .collect();
-    json_result(
-        0,
-        "",
-        Some(json!({
-            "categories": list,
-            "totalSize": total_size,
-            "totalCount": total_count,
-            "warnings": warnings,
-        })),
-    )
+    (list, total_size, total_count)
 }
 
 /// `POST /star/logCleanRun`：按分类 key 清理（`{keys: ["system", ...]}`）。
@@ -1362,6 +1402,22 @@ mod tests {
             assert!(
                 deny_reason(Path::new("relative\\logs"), &base).is_some(),
                 "相对路径必须拒绝"
+            );
+            // 各用户 Temp 允许清理（profile 根仍拒绝）
+            for p in [
+                "C:\\Users\\someuser\\AppData\\Local\\Temp",
+                "C:\\Users\\someuser\\AppData\\LocalLow\\Temp",
+                "C:\\Users\\someuser\\AppData\\Local\\Temp\\sub",
+            ] {
+                assert!(
+                    deny_reason(Path::new(p), &base).is_none(),
+                    "应允许：{p}（{:?}）",
+                    deny_reason(Path::new(p), &base)
+                );
+            }
+            assert!(
+                deny_reason(Path::new("C:\\Users\\someuser"), &base).is_some(),
+                "用户 profile 根必须拒绝"
             );
         }
         #[cfg(unix)]
