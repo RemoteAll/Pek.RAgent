@@ -635,13 +635,16 @@ function renderProcRows(){
   ?(num(b.cpuPercent)-num(a.cpuPercent))||(num(b.memoryMB)-num(a.memoryMB))
   :(num(b.memoryMB)-num(a.memoryMB))||(num(b.cpuPercent)-num(a.cpuPercent))).slice(0,20);
  body.innerHTML=rows.map(p=>{
-  const cmd=p.command||p.exe||'';
-  const path=p.exe||p.cwd||'';
+  const app=p.app||p.name;
+  const appPath=p.appPath||p.exe||'';
+  const cwd=p.cwd||'';
+  const host=(p.name&&app&&p.name.toLowerCase()!==app.toLowerCase())?(' · 宿主 '+p.name):'';
+  const hint=[p.command||'', cwd?('工作目录: '+cwd):''].filter(Boolean).join('\n');
   const cpu=num(p.cpuPercent);
   return `<tr>
    <td>${p.pid}</td>
    <td>${esc(p.user||'—')}</td>
-   <td style="font-family:var(--font-mono);font-size:12px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(cmd?cmd+'\n'+path:path)}">${esc(p.name)}${path?`<div class="text-muted" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc(path)}</div>`:''}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(hint)}">${esc(app)}${host?`<span class="text-muted" style="font-size:10px">${esc(host)}</span>`:''}${appPath?`<div class="text-muted" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc(appPath)}</div>`:''}</td>
    <td${cpu>=50?' class="text-yellow"':''}>${cpu.toFixed(1)}%</td>
    <td>${p.memoryMB} MB</td>
    <td>${p.threadCount||0}/${p.handleCount||0}</td>

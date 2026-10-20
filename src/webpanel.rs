@@ -2563,8 +2563,102 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
+/// 解释器宿主：这些进程的 exe 只是运行时，真正的应用在命令行参数里。
+const INTERPRETER_HOSTS: &[&str] = &[
+    "dotnet", "mono", "python", "python2", "python3", "node", "nodejs", "java", "php", "ruby",
+    "perl", "pwsh", "powershell", "bash", "sh", "zsh", "deno", "bun",
+];
+
+/// 从命令行解析「真正被加载的应用」。返回 `(短名, 完整路径)`。
+///
+/// - `dotnet /www/site/App.dll` → (`App.dll`, `/www/site/App.dll`)；
+/// - `python3 /opt/app/main.py` → (`main.py`, `/opt/app/main.py`)；
+/// - 直接运行的程序 → 用 exe 路径；
+/// - 相对路径按进程工作目录（cwd）补全，便于直接定位到部署目录。
+fn app_target(command: &str, exe: &str, cwd: &str) -> (String, String) {
+    let args = split_command(command);
+    let host = args.first().cloned().unwrap_or_default();
+    let host_name = base_name(&host).to_ascii_lowercase();
+    let host_name = host_name.trim_end_matches(".exe");
+
+    let is_interpreter = INTERPRETER_HOSTS.iter().any(|name| {
+        host_name == *name || host_name.starts_with(&format!("{name}."))
+    });
+    if is_interpreter {
+        if let Some(script) = args
+            .iter()
+            .skip(1)
+            .find(|arg| !arg.starts_with('-') && looks_like_app(arg))
+        {
+            let path = resolve_path(script, cwd);
+            return (base_name(&path), path);
+        }
+    }
+
+    if exe.is_empty() {
+        (base_name(&host), host)
+    } else {
+        (base_name(exe), exe.to_string())
+    }
+}
+
+/// 命令行切分（支持双引号包裹的空格路径）。
+fn split_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ' ' | '\t' if !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// 是否像「应用本体」（按扩展名判断，避免把 `--urls=http://...` 之类当应用）。
+fn looks_like_app(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    [
+        ".dll", ".exe", ".jar", ".py", ".js", ".mjs", ".php", ".sh", ".bin", ".cmd", ".bat",
+        ".wasm",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// 取路径最后一段（兼容 `/` 与 `\`）。
+fn base_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// 相对路径按工作目录补全。
+fn resolve_path(path: &str, cwd: &str) -> String {
+    let absolute = path.starts_with('/')
+        || path.starts_with('\\')
+        || path.chars().nth(1) == Some(':');
+    if absolute || cwd.trim().is_empty() {
+        path.to_string()
+    } else {
+        let relative = path.trim_start_matches("./").trim_start_matches(".\\");
+        format!("{}/{}", cwd.trim_end_matches('/'), relative)
+    }
+}
+
 /// 进程条目 → 面板 JSON（本机详情与「进程」接口共用；口径对齐 htop / 云监控）。
 fn process_json(p: &sys::ProcItem) -> Json {
+    let (app, app_path) = app_target(&p.command, &p.exe, &p.cwd);
     json!({
         "name": p.name,
         "pid": p.pid,
@@ -2577,6 +2671,9 @@ fn process_json(p: &sys::ProcItem) -> Json {
         "exe": p.exe,
         "command": p.command,
         "cwd": p.cwd,
+        // 真正被宿主加载的应用（如 `dotnet /www/xxx/App.dll` 里的 App.dll）
+        "app": app,
+        "appPath": app_path,
         "startTime": if p.start_time > 0 {
             Local
                 .timestamp_opt(p.start_time, 0)
@@ -3074,6 +3171,44 @@ fn schedule_service_restart(cfg: &AgentConfig) {
 mod tests {
     use super::*;
     use dhrust::net::http::HttpRequest;
+
+    #[test]
+    fn app_target_resolves_interpreter_hosts() {
+        // dotnet 宿主的 exe 只是运行时，真正的应用在参数里
+        assert_eq!(
+            app_target(
+                "dotnet /www/wwwroot/cloud.tdtbms.cn/HlkTechIoT.Web.dll",
+                "/usr/share/dotnet/dotnet",
+                "/www/wwwroot/cloud.tdtbms.cn"
+            ),
+            (
+                "HlkTechIoT.Web.dll".to_string(),
+                "/www/wwwroot/cloud.tdtbms.cn/HlkTechIoT.Web.dll".to_string()
+            )
+        );
+        // 相对路径按工作目录补全
+        assert_eq!(
+            app_target("dotnet bin/App.dll", "/usr/share/dotnet/dotnet", "/opt/app"),
+            ("App.dll".to_string(), "/opt/app/bin/App.dll".to_string())
+        );
+        // 选项参数不会被误当成应用
+        assert_eq!(
+            app_target(
+                "dotnet run --urls=http://0.0.0.0:8080",
+                "/usr/share/dotnet/dotnet",
+                ""
+            ),
+            (
+                "dotnet".to_string(),
+                "/usr/share/dotnet/dotnet".to_string()
+            )
+        );
+        // 非解释器：直接用 exe 路径
+        assert_eq!(
+            app_target("/usr/bin/htop", "/usr/bin/htop", ""),
+            ("htop".to_string(), "/usr/bin/htop".to_string())
+        );
+    }
 
     #[test]
     fn dhdeploy_mode_helpers() {
