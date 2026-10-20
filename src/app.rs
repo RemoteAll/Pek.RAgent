@@ -632,11 +632,11 @@ impl AppRuntime {
                         Handle::Owned(_) => "Owned",
                         Handle::Adopted(_) => "Adopted",
                     };
-                    let exited = handle.has_exited();
-                    if exited {
+                    let exit_status = exit_status_text(handle);
+                    if let Some(status) = exit_status {
                         // 诊断日志（2026-10-21）：区分“RAgent 误判退出”和“应用真实退出”。
-                        // Owned 用 Child::try_wait；这里额外用独立 PID 查询复核存活，
-                        // 并输出实际运行时长，便于判断 30 秒是应用运行时间还是守护周期。
+                        // Owned 直接读取 Child::try_wait 的 ExitStatus；这里额外用独立 PID
+                        // 查询复核存活，并输出实际运行时长与退出码（正常 0 / Ctrl+C / 崩溃）。
                         let alive = sys::is_alive(pid);
                         let process = sys::process_name(pid).unwrap_or_else(|| "-".to_string());
                         let run_secs = start_time
@@ -644,7 +644,7 @@ impl AppRuntime {
                             .map(|d| format!("{:.3}", d.as_secs_f64()))
                             .unwrap_or_else(|| "?".to_string());
                         util::log_format(
-                            "应用[{}]退出检测：handle={} pid={} is_alive={} process={} 实际运行={}s errorCount={}",
+                            "应用[{}]退出检测：handle={} pid={} is_alive={} process={} 实际运行={}s errorCount={} exit={}",
                             &[
                                 &self.name,
                                 handle_kind,
@@ -653,6 +653,7 @@ impl AppRuntime {
                                 &process,
                                 &run_secs,
                                 &error_count.to_string(),
+                                status.as_str(),
                             ],
                         );
                         just_exited = true;
@@ -801,6 +802,34 @@ impl AppRuntime {
         }
 
         reload_action != 0
+    }
+}
+
+/// 退出状态文本（诊断用）：Owned 直接取 `Child::try_wait` 的 `ExitStatus`，
+/// Adopted 只有 PID，无法取得退出码。
+///
+/// 退出码用于区分：0=正常退出、0xC000013A=Ctrl+C/控制台关闭、101=panic、
+/// 0xC0000005 等=崩溃；对应 Windows `ExitStatus` 的数值。
+fn exit_status_text(handle: &mut Handle) -> Option<String> {
+    match handle {
+        Handle::Owned(child) => match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status
+                    .code()
+                    .map(|c| format!("{c:#X}"))
+                    .unwrap_or_else(|| "无".to_string());
+                Some(format!("{status}（code={code}）"))
+            }
+            Ok(None) => None,
+            Err(e) => Some(format!("try_wait 错误：{e}")),
+        },
+        Handle::Adopted(pid) => {
+            if sys::is_alive(*pid) {
+                None
+            } else {
+                Some("已退出（接管 PID，无退出码）".to_string())
+            }
+        }
     }
 }
 
