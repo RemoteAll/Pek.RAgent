@@ -638,7 +638,9 @@ function renderProcRows(){
   const appPath=p.appPath||p.exe||'';
   const cwd=p.cwd||'';
   const host=(p.name&&app&&p.name.toLowerCase()!==app.toLowerCase())?(' · 宿主 '+p.name):'';
-  const hint=[p.command||'', cwd?('工作目录: '+cwd):''].filter(Boolean).join('\n');
+  const iisSites=Array.isArray(p.iisSites)?p.iisSites:[];
+  const hint=[p.command||'', cwd?('工作目录: '+cwd):'', p.appPool?('IIS 应用池: '+p.appPool):'',
+   ...iisSites.map(s=>(s.site||'')+(s.path||'')+': '+(s.physicalPath||''))].filter(Boolean).join('\n');
   const cpu=num(p.cpuPercent);
   const ports=Array.isArray(p.ports)?p.ports:[];
   // 每个端口一个 inline-block span：列窄时自动换行，不会把整表撑宽

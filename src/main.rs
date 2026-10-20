@@ -15,6 +15,7 @@ mod config;
 mod deploy;
 mod fileman;
 mod history;
+mod iis;
 mod logclean;
 mod manager;
 mod panel_ws;

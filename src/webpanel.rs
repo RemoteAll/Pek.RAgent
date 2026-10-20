@@ -2653,7 +2653,32 @@ fn resolve_path(path: &str, cwd: &str) -> String {
 
 /// 进程条目 → 面板 JSON（本机详情与「进程」接口共用；口径对齐 htop / 云监控）。
 fn process_json(p: &sys::ProcItem) -> Json {
-    let (app, app_path) = app_target(&p.command, &p.exe, &p.cwd);
+    // IIS w3wp：exe 只是宿主，真正的站点在 applicationHost.config；
+    // 能解析出应用池/站点时，显示站点名与物理路径（解析失败回退 exe 路径）。
+    let iis = crate::iis::lookup(p.pid, &p.name, &p.user);
+    let (mut app, mut app_path) = app_target(&p.command, &p.exe, &p.cwd);
+    if let Some(worker) = &iis {
+        let (site_app, site_path) = crate::iis::display(worker);
+        if !site_app.is_empty() {
+            app = site_app;
+            app_path = site_path;
+        }
+    }
+    let iis_sites: Vec<Json> = iis
+        .as_ref()
+        .map(|w| {
+            w.sites
+                .iter()
+                .map(|s| {
+                    json!({
+                        "site": s.site.clone(),
+                        "path": s.path.clone(),
+                        "physicalPath": s.physical_path.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     json!({
         "name": p.name,
         "pid": p.pid,
@@ -2666,9 +2691,12 @@ fn process_json(p: &sys::ProcItem) -> Json {
         "exe": p.exe,
         "command": p.command,
         "cwd": p.cwd,
-        // 真正被宿主加载的应用（如 `dotnet /www/xxx/App.dll` 里的 App.dll）
+        // 真正被宿主加载的应用（如 `dotnet /www/xxx/App.dll` 里的 App.dll；
+        // IIS w3wp 则为站点名）
         "app": app,
         "appPath": app_path,
+        "appPool": iis.as_ref().map(|w| w.app_pool.clone()).unwrap_or_default(),
+        "iisSites": iis_sites,
         // 监听端口（TCP LISTEN）：直接看出这个进程对外提供哪些服务；
         // 与「未配置 HealthCheck 时自动探活」用的是同一份快照
         "ports": p.ports,

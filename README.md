@@ -472,7 +472,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
 | `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
-| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程（`getProcessList?sort=cpu|memory&count=N`；字段口径对齐 htop / 云监控：`cpuPercent` 瞬时占单核百分比（可 >100）、`memoryMB`、`user`、`exe`、`command`、`cwd`、`threadCount`、`handleCount`（Linux 为打开文件数）、`startTime`；**`app`/`appPath` 为真正的应用**——`dotnet /path/App.dll` 这类解释器宿主会解析出 `App.dll` 及其完整路径，而不是只显示 `dotnet`） |
+| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程（`getProcessList?sort=cpu|memory&count=N`；字段口径对齐 htop / 云监控：`cpuPercent` 瞬时占单核百分比（可 >100）、`memoryMB`、`user`、`exe`、`command`、`cwd`、`threadCount`、`handleCount`（Linux 为打开文件数）、`startTime`；**`app`/`appPath` 为真正的应用**——`dotnet /path/App.dll` 这类解释器宿主会解析出 `App.dll` 及其完整路径，而不是只显示 `dotnet`；Windows `w3wp.exe`（IIS 工作进程）会自动解析应用池并显示站点/应用物理路径（读取 `applicationHost.config`，失败时回退为宿主路径），并额外返回 `appPool`/`iisSites`） |
 | `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制） |
 | `GET /star/trafficHistory` | 流量历史每日归档（`?days=90` 最近 N 天：网站按站/端口按天数据与保留天数） |
 | `GET /star/fileList`、`GET /star/fileRead`、`POST /star/fileWrite` | 文件管理：目录浏览 / 读取（在线编辑） / 保存 |
