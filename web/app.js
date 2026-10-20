@@ -2052,7 +2052,7 @@ function renderFileman(){
   const icon=it.isDir?(it.isLink?'🔗':'📁'):'📄';
   rows+=`<tr>
    <td style="width:34px"><input type="checkbox" ${checked} onchange="fmToggle('${escAttr(name)}',this.checked)"></td>
-   <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
+   <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0},${it.isDir?0:(it.size||0)})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
    <td style="width:92px" class="text-secondary">${it.isDir?fmSizeCell(name):fmtBytes(it.size)}</td>
    <td style="width:152px" class="text-muted">${esc(it.mtime||'')}</td>
    <td style="width:72px" class="text-muted">${esc(it.perm||'—')}</td>
@@ -2099,9 +2099,9 @@ function renderFileman(){
 }
 
 function fmToggle(name,checked){checked?fmSelected.add(name):fmSelected.delete(name);renderFileman()}
-function fmOpen(name,isDir){
+function fmOpen(name,isDir,size){
  if(isDir){fmNavigate(fmJoin(name));return}
- fmEdit(fmJoin(name));
+ fmEdit(fmJoin(name),size);
 }
 
 // 目录大小单元格：未计算显示“计算”，已计算显示大小（点击可重新计算）
@@ -2282,7 +2282,14 @@ function fmSearchPrompt(){
 
 function fmReveal(path){closeModal();fmNavigate(path)}
 
-async function fmEdit(path){
+async function fmEdit(path,size){
+ // 在线编辑需将全文载入内存并经 JSON 传输，上限 2MB（与服务端 MAX_EDIT_SIZE 一致）；
+ // 大文件在点击时即拦截，避免先发请求再弹“文件过大”
+ const EDIT_MAX=2*1024*1024;
+ if(size&&size>EDIT_MAX){
+  showToast(`该文件 ${fmtBytes(size)}，超出在线编辑上限 2MB，请用下载按钮（≤ 256MB）或 SFTP 查看`,'error');
+  return;
+ }
  try{
   const j=await api('/star/fileRead?path='+encodeURIComponent(path));
   if(j.code!==0){showToast(j.message||'读取失败','error');return}
