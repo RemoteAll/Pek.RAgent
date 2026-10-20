@@ -328,7 +328,7 @@ fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
         cats.push(Category {
             key: "system_cache",
             name: "系统缓存",
-            description: "Windows 错误报告、更新会话日志、缩略图缓存与系统临时文件（ProgramData / Temp，可放心清理；不含程序安装缓存 Package Cache）",
+            description: "Windows 错误报告、更新会话日志、缩略图缓存与临时文件（ProgramData / Windows\\Temp / 各用户 Temp，可放心清理；不含程序安装缓存 Package Cache）",
             targets: windows_system_cache_targets(),
         });
         cats.push(Category {
@@ -592,11 +592,12 @@ fn windows_system_targets() -> Vec<Target> {
     targets
 }
 
-/// Windows 系统缓存与临时文件（`%ProgramData%` + `%SystemRoot%\Temp`）。
+/// Windows 系统缓存与临时文件（`%ProgramData%` + `%SystemRoot%\Temp` + 各用户 Temp）。
 ///
 /// 只纳入「删除后系统自动重建、不影响程序卸载/修复」的目录：
 /// - Windows 错误报告归档/队列/临时文件（WER）、更新会话日志（USOShared）、图标缩略图缓存（Caches）、
-///   系统与第三方临时文件（`ProgramData\Temp`、`SystemRoot\Temp`）。
+///   系统与第三方临时文件（`ProgramData\Temp`、`SystemRoot\Temp`）、**各用户 profile 的 Temp**
+///   （应用池/服务账户的 `%TEMP%` 经常堆积大量不再使用的 `.tmp`）。
 /// - **不含 `ProgramData\Package Cache`**：VC++/VS 安装缓存，删除会导致后续修复/卸载失败；
 /// - **不含 Windows Defender 定义库 / AppRepository / SystemData**：属系统关键数据。
 #[cfg(windows)]
@@ -615,9 +616,46 @@ fn windows_system_cache_targets() -> Vec<Target> {
         let p = pd.join(rel);
         push_dir(&mut targets, &mut seen, &p.to_string_lossy());
     }
-    let tmp = system_root_dir().join("Temp");
+    let root = system_root_dir();
+    let tmp = root.join("Temp");
     push_dir(&mut targets, &mut seen, &tmp.to_string_lossy());
+    for p in user_temp_dirs(&root) {
+        push_dir(&mut targets, &mut seen, &p.to_string_lossy());
+    }
     targets
+}
+
+/// 各用户 profile 下的临时目录（跳过 `Public`/`Default`，不跟随重解析点）。
+#[cfg(windows)]
+fn user_temp_dirs(system_root: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let users = system_root
+        .parent()
+        .map(|p| p.join("Users"))
+        .unwrap_or_else(|| PathBuf::from("C:\\Users"));
+    let Ok(rd) = fs::read_dir(&users) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let Ok(ft) = entry.file_type() else {
+            continue;
+        };
+        if !ft.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.eq_ignore_ascii_case("Public") || name.eq_ignore_ascii_case("Default") {
+            continue;
+        }
+        for rel in ["AppData\\Local\\Temp", "AppData\\LocalLow\\Temp"] {
+            let t = entry.path().join(rel);
+            if t.is_dir() {
+                out.push(t);
+            }
+        }
+    }
+    out.sort();
+    out
 }
 
 #[cfg(windows)]
@@ -1240,16 +1278,22 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Windows 系统缓存目标必须落在 ProgramData / SystemRoot 之内，
+    /// Windows 系统缓存目标必须落在 ProgramData / SystemRoot / 用户目录之内，
     /// 且绝不能包含安装缓存、杀毒库等关键目录（清掉会导致修复/卸载/防护异常）。
     #[cfg(windows)]
     #[test]
     fn windows_system_cache_targets_stay_within_safe_dirs() {
         let pd = program_data_dir();
         let root = system_root_dir();
+        let users = root
+            .parent()
+            .map(|p| p.join("Users"))
+            .unwrap_or_else(|| PathBuf::from("C:\\Users"));
         for t in windows_system_cache_targets() {
             assert!(
-                t.path.starts_with(&pd) || t.path.starts_with(&root),
+                t.path.starts_with(&pd)
+                    || t.path.starts_with(&root)
+                    || t.path.starts_with(&users),
                 "意外的清理目标：{}",
                 t.path.display()
             );

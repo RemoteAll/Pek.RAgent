@@ -7,7 +7,7 @@
 //! - **删除/重命名/移动**对“根”“一级目录（如 `/etc`、`C:\Windows`）”“程序目录本身”
 //!   设保护（目录内部仍可操作）——防止误操作损毁系统；
 //! - 上传文件名与压缩包条目名做目录穿越拦截（`..`、绝对路径、分隔符）；
-//! - 下载上限 256MB、在线编辑上限 2MB（二进制拒读），大文件请用 SFTP。
+//! - 下载上限 256MB、在线编辑上限 10MB（二进制拒读），大文件请用 SFTP。
 
 use std::fs;
 use std::io::Write;
@@ -22,8 +22,8 @@ use serde_json::{json, Value as Json};
 use crate::util;
 use crate::webpanel::WebPanel;
 
-/// 在线编辑的文件大小上限（2MB）。
-const MAX_EDIT_SIZE: u64 = 2 * 1024 * 1024;
+/// 在线编辑的文件大小上限（10MB；需经 JSON 传输并由浏览器编辑框渲染，过大易卡死）。
+const MAX_EDIT_SIZE: u64 = 10 * 1024 * 1024;
 /// 面板下载的文件大小上限（256MB）。
 const MAX_DOWNLOAD_SIZE: u64 = 256 * 1024 * 1024;
 /// 批量操作（删除/复制/移动/压缩）单次条目上限。
@@ -562,7 +562,7 @@ pub fn file_read(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(400, "目标是目录，无法编辑");
     }
     if md.len() > MAX_EDIT_SIZE {
-        return json_error(400, "文件过大（上限 2MB），请使用下载或 SFTP");
+        return json_error(400, "文件过大（上限 10MB），请使用下载或 SFTP");
     }
     let Ok(data) = fs::read(&path) else {
         return json_error(500, "读取文件失败（权限不足？）");

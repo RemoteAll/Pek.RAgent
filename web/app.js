@@ -2093,7 +2093,7 @@ function renderFileman(){
    <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传/编辑上限 64MB/2MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传/编辑上限 64MB/10MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
 }
@@ -2283,11 +2283,11 @@ function fmSearchPrompt(){
 function fmReveal(path){closeModal();fmNavigate(path)}
 
 async function fmEdit(path,size){
- // 在线编辑需将全文载入内存并经 JSON 传输，上限 2MB（与服务端 MAX_EDIT_SIZE 一致）；
+ // 在线编辑需将全文载入内存并经 JSON 传输，上限 10MB（与服务端 MAX_EDIT_SIZE 一致）；
  // 大文件在点击时即拦截，避免先发请求再弹“文件过大”
- const EDIT_MAX=2*1024*1024;
+ const EDIT_MAX=10*1024*1024;
  if(size&&size>EDIT_MAX){
-  showToast(`该文件 ${fmtBytes(size)}，超出在线编辑上限 2MB，请用下载按钮（≤ 256MB）或 SFTP 查看`,'error');
+  showToast(`该文件 ${fmtBytes(size)}，超出在线编辑上限 10MB，请用下载按钮（≤ 256MB）或 SFTP 查看`,'error');
   return;
  }
  try{
