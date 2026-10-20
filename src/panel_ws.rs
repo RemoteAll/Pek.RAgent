@@ -45,6 +45,25 @@ pub fn pairing_pending() -> bool {
     PAIR_PENDING.load(Ordering::Relaxed)
 }
 
+/// 向平台发送一条上行事件（未连接时静默忽略）。
+///
+/// 用于把本机执行结果回报平台（如 `rebootResult`），避免"平台点了没反应、原因只在节点日志里"。
+pub fn send_event(agent_id: &str, mut v: Json) {
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert("agentId".to_string(), Json::String(agent_id.to_string()));
+    }
+    let text = v.to_string();
+    if let Some(client) = CURRENT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        && client.is_connected()
+    {
+        let _ = client.send_text(text);
+    }
+}
+
 /// 从升级源地址推导 WS 地址（origin + `/store/agents/ws`；仅 http/https）。
 pub fn ws_url(cfg: &AgentConfig) -> Option<String> {
     let raw = cfg.auto_upgrade_url.trim();
@@ -286,7 +305,10 @@ fn apply_node_token(manager: &AppManager, v: &Json) {
 }
 
 /// 执行平台下发的「重启服务器」指令（60 秒冷却：同一条指令重复到达只执行一次）。
-fn reboot_once(_manager: &AppManager) {
+///
+/// **重启的是整台服务器**（不是 Agent 进程）。执行前先预检（容器环境 / 非 root / 无重启工具），
+/// 预检失败立即把原因回报平台——平台会显示在节点行上，不再"点了没反应"。
+fn reboot_once(manager: &AppManager) {
     static LAST: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
     let mut last = LAST
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -300,8 +322,22 @@ fn reboot_once(_manager: &AppManager) {
     }
     *last = Some(Instant::now());
     drop(last);
-    util::log_info("平台下发「重启服务器」指令，3 秒后重启本机");
-    crate::sys::reboot_machine();
+    let agent_id = manager.config().agent_id;
+    if let Err(e) = crate::sys::reboot_precheck() {
+        util::log_error(&format!("拒绝执行系统重启：{e}"));
+        send_event(
+            &agent_id,
+            json!({ "type": "rebootResult", "ok": false, "reason": e }),
+        );
+        return;
+    }
+    // 先回报"已受理"：随后整机会断开，平台据此判断指令确实到达了节点
+    send_event(
+        &agent_id,
+        json!({ "type": "rebootResult", "ok": true, "reason": "已受理，主机将在数秒内重启" }),
+    );
+    util::log_info("平台下发「重启服务器」指令，3 秒后重启本机（整机重启，不是重启 Agent）");
+    crate::sys::reboot_machine(&agent_id);
 }
 
 /// 平台下发分发源配置（`storeConfig`）：插件源目录地址 + 签名公钥。
