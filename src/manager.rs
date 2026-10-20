@@ -318,25 +318,40 @@ impl AppManager {
         Ok(ok)
     }
 
-    /// 重启应用（保持启用状态；停止失败则中止，避免重复拉起）。
+    /// 重启应用（保持启用状态；停止失败时**强制终止并继续拉起**，绝不遗留停用状态）。
+    ///
+    /// 2026-10-20 实测：子进程忽略 SIGTERM（或被判定为“仍存活”）时，旧逻辑直接中止重启，
+    /// 而条目此前已被置 `Enable=false` → 守护循环不再拉起，表现为“点了升级没动静、服务起不来”，
+    /// 只能人工启用。现改为：停止失败 → 补一次强制终止 → 恢复启用状态 → 照常启动。
     pub fn restart_app(&self, name: &str, reason: &str) -> Result<bool, String> {
         let rt = self
             .find_runtime(name)
             .ok_or_else(|| format!("服务不存在：{}", name))?;
 
-        // 先禁用（确保停止失败时守护不会再次拉起），停止成功后再启用
+        // 先禁用（确保停止失败时守护不会再次拉起），停止结束后按原状态恢复
+        let was_enabled = rt.cfg().enable;
         self.set_app_enable(name, false);
         self.save_config();
         rt.set_cfg(self.config().find_app(name).cloned().unwrap_or(rt.cfg()));
 
         let stopped = rt.stop(reason);
         if !stopped {
-            return Err("停止服务失败（进程可能未退出），已中止重启".to_string());
+            let pid = rt.status().pid;
+            util::log_error(&format!(
+                "应用[{name}]停止超时（PID={pid}）：补一次强制终止后继续重启，并恢复启用状态"
+            ));
+            if pid > 0 {
+                let _ = dhrust::sys::process::stop_process(pid, 0);
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
         }
-        std::thread::sleep(Duration::from_millis(500));
 
-        self.set_app_enable(name, true);
-        self.save_config();
+        if was_enabled {
+            self.set_app_enable(name, true);
+            self.save_config();
+        }
         rt.set_cfg(self.config().find_app(name).cloned().unwrap_or(rt.cfg()));
 
         let cfg = self.config();

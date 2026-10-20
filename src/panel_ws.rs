@@ -170,6 +170,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 util::log_info("平台检测到节点标识与其他服务器重复，重新生成标识");
                 regenerate_agent_id(&msg_mgr);
             }
+            "storeConfig" => apply_store_config(&msg_mgr, &v),
             "checkUpgrade" => {
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
@@ -220,6 +221,56 @@ fn regenerate_agent_id(manager: &AppManager) {
     {
         client.close();
     }
+}
+
+/// 平台下发分发源配置（`storeConfig`）：插件源目录地址 + 签名公钥。
+///
+/// 只覆盖**非空且确有变化**的项，并先按节点自己的规则校验（地址必须 https 或 127.0.0.1，
+/// 公钥必须能解析），避免平台推一份本地用不了的配置把节点改坏。写盘后立即生效。
+fn apply_store_config(manager: &AppManager, v: &Json) {
+    let url = v
+        .get("pluginStoreUrl")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let pk = v
+        .get("pluginStorePubKey")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let url = if !url.is_empty() && crate::plugins::is_allowed_url(&url) {
+        url
+    } else {
+        String::new()
+    };
+    let pk = if !pk.is_empty() && dhrust::plugin::parse_pubkey(&pk).is_ok() {
+        pk
+    } else {
+        String::new()
+    };
+    if url.is_empty() && pk.is_empty() {
+        return;
+    }
+    let cur = manager.config();
+    let url_diff = !url.is_empty() && cur.plugin_store_url != url;
+    let pk_diff = !pk.is_empty() && cur.plugin_store_pubkey != pk;
+    if !url_diff && !pk_diff {
+        return;
+    }
+    manager.update_config(|cfg| {
+        if url_diff {
+            cfg.plugin_store_url = url.clone();
+        }
+        if pk_diff {
+            cfg.plugin_store_pubkey = pk.clone();
+        }
+    });
+    util::log_format(
+        "已同步平台下发的分发源配置（{}）",
+        &[if url.is_empty() { "仅签名公钥" } else { &url }],
+    );
 }
 
 /// `register` 报文（连接建立后发送）。

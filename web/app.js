@@ -275,11 +275,14 @@ function wafSaveJson(){
  try{const c=JSON.parse($('waf-json').value);wafPost(c)}catch(e){showToast('JSON 解析失败：'+e.message,'error')}
 }
 
-/* ── 页脚：服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
+/* ── 页脚：代理版本 + 服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
+let _agentVer='';      // 代理版本（来自 /api/status 的 selfUpgrade.current）
+let _lastElapsed='--'; // 最近一次服务端耗时
 function setSrvElapsed(v){
  const f=$('srv-foot');if(!f)return;
+ _lastElapsed=v;
  const t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
- f.textContent='服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
+ f.textContent=(_agentVer?('Pek.RAgent v'+_agentVer+' · '):'')+'服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
 }
 
 /* ── Dashboard ── */
@@ -294,6 +297,9 @@ async function loadDashboard(){
   const s=await api('/api/status');
   if(s.code!==0)return;statusData=s.data;
   const d=s.data;const h={data:d.health||null};
+  // 页脚版本号（与自升级卡片同源：selfUpgrade.current = 编译期版本）
+  const _ver=(d.selfUpgrade&&d.selfUpgrade.current)||'';
+  if(_ver&&_ver!==_agentVer){_agentVer=_ver;setSrvElapsed(_lastElapsed);}
   const title='StarAgent';
   document.title=title+' 管理面板';
   $('header-title').textContent=title+' 管理面板';
