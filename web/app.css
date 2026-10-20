@@ -226,6 +226,23 @@ html.light .info-table td{border-bottom-color:rgba(0,0,0,0.06)}
 .info-table td{padding:10px 14px;border-bottom:1px solid var(--border-subtle);vertical-align:middle}
 .info-table td:first-child{font-size:13px;font-weight:600;color:var(--text-secondary);white-space:nowrap;width:200px;padding-right:20px}
 .info-table td:last-child{font-size:13px;color:var(--text-primary);word-break:break-all}
+
+/* 进程表（Top N）：覆盖 info-table 的「首列 200px / 末列强制断行」——
+   PID/用户/CPU/内存/线程/启动时间这些短列用 width:1% 收到最窄（不再撑表），
+   剩余宽度全给「进程 / 可执行文件」列，长路径自动换行；
+   监听端口列允许在空格处换行。这样窗口窄时也不会把某列挤成「一列一个字」。 */
+.proc-table td{padding:8px 10px;vertical-align:top}
+.proc-table td:first-child{width:1%;padding-right:10px;font-size:12px;font-weight:500}
+.proc-table td:last-child{word-break:normal}
+.proc-table td:nth-child(1),
+.proc-table td:nth-child(2),
+.proc-table td:nth-child(5),
+.proc-table td:nth-child(6){width:1%;white-space:nowrap}
+.proc-table td:nth-child(3){word-break:break-all}
+.proc-table td:nth-child(4){white-space:normal;word-break:keep-all;max-width:150px}
+.proc-table td:nth-child(7),
+.proc-table td:nth-child(8){white-space:nowrap}
+.proc-table td:nth-child(8){padding-left:6px;padding-right:6px}
 .info-table tr:last-child td{border-bottom:none}
 /* ── 文件管理 ── */
 .fm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
