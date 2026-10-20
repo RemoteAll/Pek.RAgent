@@ -171,6 +171,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 regenerate_agent_id(&msg_mgr);
             }
             "storeConfig" => apply_store_config(&msg_mgr, &v),
+            "tokenIssue" => apply_node_token(&msg_mgr, &v),
             "reboot" => reboot_once(&msg_mgr),
             "checkUpgrade" => {
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
@@ -214,6 +215,35 @@ fn regenerate_agent_id(manager: &AppManager) {
         &[&manager.config().agent_id],
     );
     // 断开当前会话触发重连：配置检查周期（30 秒）最迟在下一拍以新标识重新注册
+    if let Some(client) = CURRENT
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+    {
+        client.close();
+    }
+}
+
+/// 平台下发节点专用令牌（`tokenIssue`）：校验格式 → 写配置 → 立即断开重连（用新令牌）。
+///
+/// 这样管理员在平台侧签发即可，无需逐台手抄令牌（与分发源配置自动下发同一思路）。
+fn apply_node_token(manager: &AppManager, v: &Json) {
+    let token = v
+        .get("token")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if token.len() != 64 || !token.chars().all(|c| c.is_ascii_hexdigit()) {
+        util::log_error("平台下发的节点专用令牌格式无效，已忽略");
+        return;
+    }
+    if manager.config().auto_upgrade_token == token {
+        return;
+    }
+    manager.update_config(|cfg| cfg.auto_upgrade_token = token.clone());
+    util::log_info("已接收平台下发的节点专用令牌（配置已更新），即将用新令牌重连");
     if let Some(client) = CURRENT
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
