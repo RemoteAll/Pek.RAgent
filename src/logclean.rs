@@ -149,8 +149,14 @@ fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
         cats.push(Category {
             key: "system",
             name: "系统日志",
-            description: "Windows 组件日志（CBS/DISM 更新与部署日志）",
+            description: "Windows 组件日志（CBS/DISM 更新与部署日志、Windows 更新日志）",
             targets: windows_system_targets(),
+        });
+        cats.push(Category {
+            key: "system_cache",
+            name: "系统缓存",
+            description: "Windows 错误报告、更新会话日志、缩略图缓存与系统临时文件（ProgramData / Temp，可放心清理；不含程序安装缓存 Package Cache）",
+            targets: windows_system_cache_targets(),
         });
         cats.push(Category {
             key: "website",
@@ -350,16 +356,67 @@ fn linux_mysql_targets() -> Vec<Target> {
     targets
 }
 
+/// Windows 系统盘根目录（`%SystemRoot%`，回退 `C:\Windows`）。
+/// 用环境变量解析，兼容系统盘不是 C: 的机器。
+#[cfg(windows)]
+fn system_root_dir() -> PathBuf {
+    std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("C:\\Windows"))
+}
+
+/// Windows 公共数据目录（`%ProgramData%`，回退 `C:\ProgramData`）。
+#[cfg(windows)]
+fn program_data_dir() -> PathBuf {
+    std::env::var_os("ProgramData")
+        .map(PathBuf::from)
+        .filter(|p| p.is_dir())
+        .unwrap_or_else(|| PathBuf::from("C:\\ProgramData"))
+}
+
 #[cfg(windows)]
 fn windows_system_targets() -> Vec<Target> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
-    for p in [
-        "C:\\Windows\\Logs\\CBS\\CBS.log",
-        "C:\\Windows\\Logs\\DISM\\dism.log",
-    ] {
-        push_file(&mut targets, &mut seen, p);
+    let root = system_root_dir();
+    for rel in ["Logs\\CBS\\CBS.log", "Logs\\DISM\\dism.log"] {
+        let p = root.join(rel);
+        push_file(&mut targets, &mut seen, &p.to_string_lossy());
     }
+    // Windows 更新日志（.etl，递归清空；目录会被系统按需重建）
+    for rel in ["Logs\\WindowsUpdate"] {
+        let p = root.join(rel);
+        push_dir(&mut targets, &mut seen, &p.to_string_lossy());
+    }
+    targets
+}
+
+/// Windows 系统缓存与临时文件（`%ProgramData%` + `%SystemRoot%\Temp`）。
+///
+/// 只纳入「删除后系统自动重建、不影响程序卸载/修复」的目录：
+/// - Windows 错误报告归档/队列/临时文件（WER）、更新会话日志（USOShared）、图标缩略图缓存（Caches）、
+///   系统与第三方临时文件（`ProgramData\Temp`、`SystemRoot\Temp`）。
+/// - **不含 `ProgramData\Package Cache`**：VC++/VS 安装缓存，删除会导致后续修复/卸载失败；
+/// - **不含 Windows Defender 定义库 / AppRepository / SystemData**：属系统关键数据。
+#[cfg(windows)]
+fn windows_system_cache_targets() -> Vec<Target> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let pd = program_data_dir();
+    for rel in [
+        "Microsoft\\Windows\\WER\\ReportArchive",
+        "Microsoft\\Windows\\WER\\ReportQueue",
+        "Microsoft\\Windows\\WER\\Temp",
+        "Microsoft\\Windows\\Caches",
+        "USOShared\\Logs",
+        "Temp",
+    ] {
+        let p = pd.join(rel);
+        push_dir(&mut targets, &mut seen, &p.to_string_lossy());
+    }
+    let tmp = system_root_dir().join("Temp");
+    push_dir(&mut targets, &mut seen, &tmp.to_string_lossy());
     targets
 }
 
@@ -860,5 +917,46 @@ mod tests {
         let list = glob_logs(&dir);
         assert_eq!(list.len(), 2);
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Windows 系统缓存目标必须落在 ProgramData / SystemRoot 之内，
+    /// 且绝不能包含安装缓存、杀毒库等关键目录（清掉会导致修复/卸载/防护异常）。
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_cache_targets_stay_within_safe_dirs() {
+        let pd = program_data_dir();
+        let root = system_root_dir();
+        for t in windows_system_cache_targets() {
+            assert!(
+                t.path.starts_with(&pd) || t.path.starts_with(&root),
+                "意外的清理目标：{}",
+                t.path.display()
+            );
+            let text = t
+                .path
+                .to_string_lossy()
+                .to_ascii_lowercase()
+                .replace('/', "\\");
+            for bad in ["package cache", "defender", "apprepository", "systemdata"] {
+                assert!(!text.contains(bad), "不得清理系统关键目录 {bad}：{text}");
+            }
+        }
+    }
+
+    /// 有可清理目录时才出现「系统缓存」分类（空机器不显示空分类）。
+    #[cfg(windows)]
+    #[test]
+    fn system_cache_category_appears_when_targets_exist() {
+        let has_any = windows_system_cache_targets().iter().any(|t| t.path.is_dir());
+        let cfg = AgentConfig::default();
+        let base = std::env::temp_dir().join("pek-logclean-none");
+        let cats = build_categories(&base, &cfg);
+        let present = cats.iter().any(|c| c.key == "system_cache");
+        assert_eq!(
+            present,
+            has_any,
+            "system_cache 分类出现与否应与目标目录是否存在一致（ProgramData={}）",
+            program_data_dir().display()
+        );
     }
 }
