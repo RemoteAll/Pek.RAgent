@@ -12,6 +12,7 @@
 //! 非 Windows / 非 IIS 环境返回 `None`，不影响原有进程展示。
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -162,6 +163,124 @@ fn read_apps_config() -> Option<String> {
 #[cfg(not(windows))]
 fn read_apps_config() -> Option<String> {
     None
+}
+
+/// IIS 站点日志（站点名 → 最新一个 `.log` 文件；供网站流量统计）。
+///
+/// 默认目录 `%SystemDrive%\inetpub\logs\LogFiles\W3SVC<站点Id>`；
+/// 也支持 site 级 `<logFile directory="...">` 自定义目录。
+#[cfg(windows)]
+pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
+    let default_root = default_log_root();
+    let mut dirs = read_apps_config()
+        .map(|text| log_dirs_from_xml(&text, &default_root))
+        .unwrap_or_default();
+    if dirs.is_empty() {
+        // 配置里没有站点时回退扫描默认/旧版 IIS 日志目录（W3SVC*）
+        let legacy_root = std::env::var_os("windir")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
+            .join("System32")
+            .join("LogFiles");
+        for root in [default_root, legacy_root] {
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name().to_string_lossy().to_string();
+                if path.is_dir() && name.to_ascii_lowercase().starts_with("w3svc") {
+                    dirs.push((name, path));
+                }
+            }
+        }
+    }
+    dirs.into_iter()
+        .filter_map(|(name, dir)| latest_log_file(&dir).map(|file| (name, file)))
+        .collect()
+}
+
+#[cfg(not(windows))]
+pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn default_log_root() -> PathBuf {
+    let drive = std::env::var_os("SystemDrive")
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "C:".to_string());
+    PathBuf::from(format!(r"{drive}\inetpub\logs\LogFiles"))
+}
+
+/// 从 applicationHost.config 提取站点日志目录（可单测的纯逻辑）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn log_dirs_from_xml(xml: &str, default_root: &Path) -> Vec<(String, PathBuf)> {
+    let mut out = Vec::new();
+    let Ok(value) = dhrust::config::read_xml_to_json(xml) else {
+        return out;
+    };
+    let root = value.get("configuration").unwrap_or(&value);
+    let Some(host) = root.get("system.applicationHost") else {
+        return out;
+    };
+    let Some(sites) = host.get("sites").and_then(|v| v.get("site")) else {
+        return out;
+    };
+    for site in as_values(sites) {
+        let name = str_attr(site, "name");
+        let id = str_attr(site, "id");
+        if name.is_empty() || id.is_empty() {
+            continue;
+        }
+        let log = site.get("logFile");
+        if let Some(log) = log {
+            if str_attr(log, "enabled").eq_ignore_ascii_case("false") {
+                continue;
+            }
+        }
+        let dir = log.map(|l| str_attr(l, "directory")).unwrap_or_default();
+        let dir = if dir.is_empty() {
+            default_root.join(format!("W3SVC{id}"))
+        } else {
+            let path = PathBuf::from(dir);
+            if path.is_absolute() {
+                path
+            } else {
+                default_root.join(path)
+            }
+        };
+        out.push((name, dir));
+    }
+    out
+}
+
+/// 目录里最近修改的 `.log` 文件（IIS 按日期滚动，取最新即当前文件）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn latest_log_file(dir: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let is_log = path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("log"));
+        if !is_log {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        if best.as_ref().is_none_or(|(at, _)| modified >= *at) {
+            best = Some((modified, path));
+        }
+    }
+    best.map(|(_, path)| path)
 }
 
 /// 解析 applicationHost.config：应用池 → `(站点, 应用路径, 物理路径)`。
@@ -400,6 +519,20 @@ mod tests {
         let (app, path) = display(&worker);
         assert_eq!(app, "gicisky.net 等 2 个应用");
         assert_eq!(path, r"D:\wwwroot\gicisky.net；D:\wwwroot\gicisky-api");
+    }
+
+    #[test]
+    fn maps_sites_to_iis_log_dirs() {
+        let xml = r#"<configuration><system.applicationHost><sites>
+            <site name="site1" id="1" />
+            <site name="site2" id="2"><logFile directory="custom" /></site>
+            <site name="site3" id="3"><logFile directory="off" enabled="false" /></site>
+        </sites></system.applicationHost></configuration>"#;
+        let root = Path::new("/logs");
+        let dirs = log_dirs_from_xml(xml, root);
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0], ("site1".to_string(), root.join("W3SVC1")));
+        assert_eq!(dirs[1], ("site2".to_string(), root.join("custom")));
     }
 
     #[test]

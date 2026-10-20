@@ -1610,14 +1610,11 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
         config_item("WebSessionHours", "登录保持时长（小时）", "Int32", cfg.web_session_hours.to_string(), "面板登录会话保持时长（滑动续期：期间用过面板就不掉线，重启/升级不用重新登录），默认 12；0=关闭持久化（仅进程内 24 小时）。修改需重启服务后生效（会话已落盘，重启不会掉登录）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
-        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
+        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache/IIS 访问日志（自动发现站点；IIS 需在日志字段中启用 sc-bytes 才能统计流量；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；端口自动取系统监听（个别端口可在配置文件 PortTrafficPorts 项指定）；修改后自动生效"),
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
-        config_item("PluginStoreUrl", "插件源地址（HTTPS）", "String", cfg.plugin_store_url.clone(), "在线插件目录（catalog.json）的地址；仅允许 https（127.0.0.1 例外便于本地调试）；留空=关闭在线插件。修改后自动生效"),
-        config_item("PluginStorePubKey", "插件源公钥（Ed25519 hex，可选）", "String", cfg.plugin_store_pubkey.clone(), "填写后强制校验插件源签名（catalog.json.sig），防止插件源被篡改；留空=仅 HTTPS+SHA-256 校验。修改后自动生效"),
-        config_item("AutoUpgradeUrl", "自动升级源地址（HTTPS）", "String", cfg.auto_upgrade_url.clone(), "星尘代理发行源（catalog.json）地址；默认已指向官方平台（p.sc8.fun）。仅允许 https（127.0.0.1 例外）；留空=关闭自动升级。配置「插件源公钥」后强制验签（留空=仅 HTTPS+SHA-256 校验）。修改后自动生效"),
-        config_item("AutoUpgradeIntervalMinutes", "自动升级检查间隔(分钟)", "Int32", cfg.auto_upgrade_interval_minutes.to_string(), "定期检查发行源新版本的间隔，默认 60（5~1440）。修改后自动生效"),
-    config_item("AutoUpgradeToken", "平台接入令牌", "Password", cfg.auto_upgrade_token.clone(), "Pek.RPanlServer「服务器节点」页生成的接入令牌；填写后启用实时通道：向平台上报机器数据（CPU/内存/磁盘/子服务），并接收「立即检查升级」指令。留空 = 不接入。修改后自动生效"),
+        // 安全/分发源类配置不提供在线编辑（防误改/被改乱），仅支持服务器配置文件修改：
+        // PluginStoreUrl / PluginStorePubKey / AutoUpgradeUrl / AutoUpgradeIntervalMinutes / AutoUpgradeToken
         config_item("AiEnabled", "AI 助手", "Boolean", cfg.ai_enabled.to_string(), "启用后可在「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）。修改后自动生效"),
         config_item("AiBaseUrl", "AI 接口地址", "String", cfg.ai_base_url.clone(), "OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时修改。修改后自动生效"),
         config_item("AiModel", "AI 模型", "String", cfg.ai_model.clone(), "模型名（如 deepseek-chat 对话 / deepseek-reasoner 推理；接入其他服务时填其模型名）。修改后自动生效"),
@@ -3136,17 +3133,8 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
             _ => false,
         },
         "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
-        "pluginstoreurl" => set_string(value, |s| cfg.plugin_store_url = s),
-        "pluginstorepubkey" => set_string(value, |s| cfg.plugin_store_pubkey = s),
-        "autoupgradeurl" => set_string(value, |s| cfg.auto_upgrade_url = s),
-        "autoupgradetoken" => set_string(value, |s| cfg.auto_upgrade_token = s),
-        "autoupgradeintervalminutes" => match value_u64(value) {
-            Some(v) if (5..=1440).contains(&v) => {
-                cfg.auto_upgrade_interval_minutes = v as u32;
-                true
-            }
-            _ => false,
-        },
+        // 插件源/自动升级/平台接入令牌属于安全项：不在线开放修改，
+        // 只能由管理员编辑 Config/StarAgent.config（防误改/被改乱）。
         "aienabled" => set_bool(value, |b| cfg.ai_enabled = b),
         "aibaseurl" => set_string(value, |s| cfg.ai_base_url = s),
         "aimodel" => set_string(value, |s| cfg.ai_model = s),
@@ -3670,6 +3658,36 @@ mod tests {
         assert!(panel.manager.config().find_app("demo").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sensitive_store_config_is_not_online_editable() {
+        let mut cfg = crate::config::AgentConfig::default();
+        assert!(!apply_config_value(
+            &mut cfg,
+            "PluginStoreUrl",
+            &json!("https://evil.example/catalog.json")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "PluginStorePubKey",
+            &json!("deadbeef")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeUrl",
+            &json!("https://evil.example/catalog.json")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeIntervalMinutes",
+            &json!(10)
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeToken",
+            &json!("stolen")
+        ));
     }
 
     #[test]

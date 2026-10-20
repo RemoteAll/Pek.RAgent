@@ -1744,7 +1744,8 @@ async function loadAgentConfig(){
   items.forEach(item=>{
    html+=`<tr><td>${esc(item.displayName)}</td><td>${renderConfigInput(item)}</td><td>${esc(item.description)}</td></tr>`;
   });
-  html+=`</tbody></table><div class="mt-16"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">部分配置需重启服务后生效</span></div></div>`;
+  html+=`</tbody></table><div class="mt-16"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">部分配置需重启服务后生效</span></div>`;
+  html+=`<p class="text-muted" style="font-size:12px;margin-top:12px">插件源地址/公钥、自动升级源/间隔、平台接入令牌等安全项已从面板移除，请直接在服务器 <code>Config/StarAgent.config</code> 中修改。</p></div>`;
 
   // 修改密码卡片：内置管理员在「用户」页管理凭据（用户名/密码），此处仅为数据库用户保留本人改密
   if(!(me&&me.isAdmin)){

@@ -1,4 +1,4 @@
-//! 网站流量统计（WebTraffic）：自动发现 nginx/apache 站点访问日志（`WebLogs` 手动补充），
+//! 网站流量统计（WebTraffic）：自动发现 nginx/apache/IIS 站点访问日志（`WebLogs` 手动补充），
 //! 后台增量解析（inode+offset 防轮转/截断），按站点聚合今日/昨日/累计流量、请求数、UV
 //! 与状态码分布，供 Web 面板 `/star/webTraffic` 展示。
 //!
@@ -10,6 +10,8 @@
 //! 支持格式：
 //! - combined / common（nginx 默认与宝塔、Apache 默认）：`ip - - [time] "req" status bytes ...`
 //! - JSON 行（Caddy 默认访问日志）：取 `status` / `size` / `request.remote_ip`
+//! - IIS W3C（Windows 默认）：按 `#Fields:` 头解析 `sc-status` / `sc-bytes` / `c-ip`；
+//!   IIS 日志默认不含 `sc-bytes` 时只能统计请求数/UV/状态码，流量为 0（需在 IIS 日志记录中勾选字节字段）。
 //!
 //! 持久化 `Data/web_traffic.json`（30 秒节流）：站点累计与文件读取位置（inode+offset），
 //! 重启续读不重复统计。UV 集合不持久化（重启后按“基数 + 新集合”近似）。
@@ -53,6 +55,14 @@ const RATE_WINDOW: usize = 5;
 
 // ————— 数据模型 —————
 
+/// IIS W3C 字段索引（来自 `#Fields:` 头）。
+#[derive(Clone, Debug)]
+struct W3cFields {
+    status: usize,
+    bytes: Option<usize>,
+    ip: Option<usize>,
+}
+
 /// 单个日志文件的读取状态。
 #[derive(Default)]
 struct FileState {
@@ -64,6 +74,8 @@ struct FileState {
     pending: Vec<u8>,
     /// 是否已初始化（决定首次读取的起始位置）
     initialized: bool,
+    /// IIS W3C 字段索引（非 IIS 日志为 None）
+    w3c: Option<W3cFields>,
     /// 错误日志节流（避免每秒刷屏）
     error_logged: bool,
 }
@@ -306,7 +318,13 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
             Ok(lines) => {
                 st.error_logged = false;
                 for line in lines {
-                    if let Some(ev) = parse_log_line(&line) {
+                    // IIS W3C：字段顺序由 #Fields 头决定；其它格式走 combined/JSON 解析。
+                    let parsed = if st.w3c.is_some() || looks_like_w3c_line(&line) {
+                        parse_w3c_line(&line, &mut st.w3c)
+                    } else {
+                        parse_log_line(&line)
+                    };
+                    if let Some(ev) = parsed {
                         events.push((src.site.clone(), ev));
                     }
                 }
@@ -441,7 +459,7 @@ pub(crate) fn snapshot_json() -> Json {
     let message = if !enabled {
         "网站流量统计未启用（配置 WebTraffic=true 开启）"
     } else if sites.is_empty() {
-        "未发现网站日志（自动扫描 nginx/apache 常见目录；如站点在非标准位置，可在配置文件 WebLogs 项手动指定：名称=路径;名称2=路径2）"
+        "未发现网站日志（自动扫描 nginx/apache/IIS 常见目录；如站点在非标准位置，可在配置文件 WebLogs 项手动指定：名称=路径;名称2=路径2）"
     } else {
         ""
     };
@@ -541,6 +559,113 @@ fn parse_json_line(line: &str) -> Option<LogLine> {
     Some(LogLine { ip, status, bytes })
 }
 
+/// IIS W3C 行是否值得尝试：`#Fields:` 头或以日期 `YYYY-MM-DD` 开头。
+fn looks_like_w3c_line(line: &str) -> bool {
+    let line = line.trim_start_matches('\u{feff}').trim_start();
+    line.to_ascii_lowercase().starts_with("#fields:")
+        || line
+            .split_whitespace()
+            .next()
+            .is_some_and(looks_like_w3c_date)
+}
+
+fn looks_like_w3c_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit)
+}
+
+/// 解析一行 IIS W3C 日志。
+///
+/// - `#Fields:` 头更新字段索引（`sc-status` 必需，`sc-bytes`/`c-ip` 可选）；
+/// - 没有头时，若首字段像日期则按 IIS 默认字段序解析（默认序通常不含 `sc-bytes`，
+///   此时只能统计请求数/UV/状态码，流量按 0）；
+/// - 非 W3C 行返回 `None`，由调用方回退到 combined/JSON 解析。
+fn parse_w3c_line(line: &str, fields: &mut Option<W3cFields>) -> Option<LogLine> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.to_ascii_lowercase().starts_with("#fields:") {
+        if let Some(parsed) = parse_w3c_fields(&line[8..]) {
+            *fields = Some(parsed);
+        }
+        return None;
+    }
+    if line.starts_with('#') {
+        return None;
+    }
+    let values: Vec<&str> = line.split_whitespace().collect();
+    if values.is_empty() {
+        return None;
+    }
+    if fields.is_none() {
+        if !looks_like_w3c_date(values[0]) {
+            return None;
+        }
+        *fields = Some(default_w3c_fields());
+    }
+    let f = fields.as_ref()?;
+    let status = values.get(f.status)?.parse::<u16>().ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
+    let bytes = f
+        .bytes
+        .and_then(|i| values.get(i))
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0);
+    let ip = f
+        .ip
+        .and_then(|i| values.get(i))
+        .and_then(|v| v.parse::<IpAddr>().ok());
+    Some(LogLine { ip, status, bytes })
+}
+
+fn parse_w3c_fields(header: &str) -> Option<W3cFields> {
+    let names: Vec<String> = header
+        .split_whitespace()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let status = names.iter().position(|name| name == "sc-status")?;
+    Some(W3cFields {
+        status,
+        bytes: names.iter().position(|name| name == "sc-bytes"),
+        ip: names.iter().position(|name| name == "c-ip"),
+    })
+}
+
+/// IIS 默认字段序（无 `#Fields:` 头时的回退；默认不含 `sc-bytes`）。
+fn default_w3c_fields() -> W3cFields {
+    W3cFields {
+        status: 11,
+        bytes: None,
+        ip: Some(8),
+    }
+}
+
+/// 读取文件开头的 `#Fields:` 头（首次从文件末尾续读老日志时使用）。
+fn read_w3c_header(path: &Path) -> Option<W3cFields> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.to_ascii_lowercase().starts_with("#fields:") {
+            return parse_w3c_fields(&line[8..]);
+        }
+        if !line.is_empty() && !line.starts_with('#') {
+            break;
+        }
+    }
+    None
+}
+
 // ————— 站点发现 —————
 
 /// 手动配置解析：`名称=路径;名称2=路径2`（分号/换行分隔）。
@@ -627,9 +752,19 @@ fn discover_sites() -> Vec<Source> {
 
     #[cfg(not(unix))]
     {
-        // Windows 等平台没有固定的 vhost 目录约定（nginx 多为绿色版自定义路径），
-        // 仅支持 WebLogs 手动配置
-        Vec::new()
+        // Windows：自动发现 IIS W3C 日志（applicationHost.config 站点 → 日志目录）；
+        // 绿色版 nginx/apache 仍可通过 WebLogs 手动指定。
+        #[cfg(windows)]
+        {
+            return crate::iis::discover_log_sites()
+                .into_iter()
+                .map(|(site, path)| Source { site, path })
+                .collect();
+        }
+        #[cfg(not(windows))]
+        {
+            Vec::new()
+        }
     }
 }
 
@@ -916,16 +1051,22 @@ fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String
     if !st.initialized {
         st.inode = ident;
         st.offset = if mtime_is_today(&meta) { 0 } else { len };
+        // 老 IIS 日志从末尾续读时看不到文件头的 #Fields，单独读取一次
+        if st.offset > 0 {
+            st.w3c = read_w3c_header(path);
+        }
         st.initialized = true;
     } else if ident != 0 && st.inode != ident {
         // 日志轮转：新文件从头读
         st.inode = ident;
         st.offset = 0;
         st.pending.clear();
+        st.w3c = None;
     } else if len < st.offset {
         // 截断：从头读
         st.offset = 0;
         st.pending.clear();
+        st.w3c = None;
     }
 
     let mut lines: Vec<String> = Vec::new();
@@ -1200,6 +1341,45 @@ mod tests {
 
         // 非访问日志的 JSON 行（无 status）被忽略
         assert!(parse_log_line(r#"{"level":"info","msg":"starting"}"#).is_none());
+    }
+
+    #[test]
+    fn parses_iis_w3c_with_fields_header() {
+        let mut fields = None;
+        assert!(parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken sc-bytes",
+            &mut fields
+        )
+        .is_none());
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET /Default.aspx - 80 - 1.2.3.4 Mozilla/5.0 - 200 0 0 123 4567";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 4567);
+        assert_eq!(ev.ip.unwrap().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn parses_iis_w3c_without_sc_bytes() {
+        let mut fields = None;
+        parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken",
+            &mut fields,
+        );
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 5.6.7.8 UA - 404 0 0 10";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 404);
+        assert_eq!(ev.bytes, 0, "IIS 默认字段无 sc-bytes，流量按 0 计");
+        assert_eq!(ev.ip.unwrap().to_string(), "5.6.7.8");
+    }
+
+    #[test]
+    fn parses_iis_w3c_default_fields_without_header() {
+        let mut fields = None;
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 9.9.9.9 UA - 200 0 0 10";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 0);
+        assert_eq!(ev.ip.unwrap().to_string(), "9.9.9.9");
     }
 
     // ————— nginx 配置 —————
