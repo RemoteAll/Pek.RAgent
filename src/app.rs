@@ -291,13 +291,17 @@ impl AppRuntime {
 
         let pid = child.id();
         let process_name = sys::process_name(pid).unwrap_or_else(|| prepared.program.clone());
+        let retry_text = if retry { "true" } else { "false" };
+        let error_count_text = st.error_count.to_string();
         util::log_format(
-            "启动成功：应用[{}] PID={} 进程={} 工作目录={}",
+            "启动成功：应用[{}] PID={} 进程={} 工作目录={} retry={} errorCount={}",
             &[
                 &self.name,
                 &pid.to_string(),
                 &process_name,
                 &prepared.work_dir.display().to_string(),
+                &retry_text,
+                &error_count_text,
             ],
         );
         if let Some(shadow) = &prepared.shadow {
@@ -377,6 +381,15 @@ impl AppRuntime {
         st.error_count += 1;
         let delay = global.delay.max(1_000);
         st.next_start = Some(Instant::now() + Duration::from_millis(delay));
+        util::log_format(
+            "应用[{}]记录失败：errorCount={}，退避 {}ms，守卫周期 {}ms",
+            &[
+                &self.name,
+                &st.error_count.to_string(),
+                &delay.to_string(),
+                &global.guard_period.to_string(),
+            ],
+        );
         if st.error_count >= global.max_fails && !st.fail_limit_logged {
             st.fail_limit_logged = true;
             util::log_format(
@@ -611,8 +624,37 @@ impl AppRuntime {
         {
             let mut st = self.state.lock().unwrap();
             if st.running {
+                let pid = st.pid;
+                let start_time = st.start_time;
+                let error_count = st.error_count;
                 if let Some(handle) = st.handle.as_mut() {
-                    if handle.has_exited() {
+                    let handle_kind = match &*handle {
+                        Handle::Owned(_) => "Owned",
+                        Handle::Adopted(_) => "Adopted",
+                    };
+                    let exited = handle.has_exited();
+                    if exited {
+                        // 诊断日志（2026-10-21）：区分“RAgent 误判退出”和“应用真实退出”。
+                        // Owned 用 Child::try_wait；这里额外用独立 PID 查询复核存活，
+                        // 并输出实际运行时长，便于判断 30 秒是应用运行时间还是守护周期。
+                        let alive = sys::is_alive(pid);
+                        let process = sys::process_name(pid).unwrap_or_else(|| "-".to_string());
+                        let run_secs = start_time
+                            .and_then(|t| SystemTime::now().duration_since(t).ok())
+                            .map(|d| format!("{:.3}", d.as_secs_f64()))
+                            .unwrap_or_else(|| "?".to_string());
+                        util::log_format(
+                            "应用[{}]退出检测：handle={} pid={} is_alive={} process={} 实际运行={}s errorCount={}",
+                            &[
+                                &self.name,
+                                handle_kind,
+                                &pid.to_string(),
+                                if alive { "true" } else { "false" },
+                                &process,
+                                &run_secs,
+                                &error_count.to_string(),
+                            ],
+                        );
                         just_exited = true;
                         util::log_format(
                             "应用[{}]进程已退出（PID={}）",

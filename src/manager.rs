@@ -344,6 +344,10 @@ impl AppManager {
             .find_runtime(name)
             .ok_or_else(|| format!("服务不存在：{}", name))?;
 
+        // 诊断日志（2026-10-21）：显式重启请求会记录调用原因与线程，
+        // 用于区分“RAgent 主动重启”与“RAgent 只是检测到应用退出后重试”。
+        util::log_format("重启应用[{}]：原因={}", &[&name, reason]);
+
         // 先禁用（确保停止失败时守护不会再次拉起），停止结束后按原状态恢复
         let was_enabled = rt.cfg().enable;
         self.set_app_enable(name, false);
