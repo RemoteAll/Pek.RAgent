@@ -894,7 +894,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "ureq",
- "zip 9.0.5",
+ "zip 2.4.2",
 ]
 
 [[package]]

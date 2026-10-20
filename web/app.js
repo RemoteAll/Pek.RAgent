@@ -158,9 +158,8 @@ function renderNav(){
   let show=true;
   if(k==='users')show=!!(me&&me.isAdmin);
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
-  else if(k==='config')show=canView('config')||canView('starconfig'); // 配置页含“星尘设置”子页签（任一权限可见）
+  else if(k==='config')show=canView('config')||canView('starconfig')||canView('control'); // 配置页含“星尘设置/安全”子页签（任一权限可见）
   else if(k==='services')show=canView('services')||canView('watchdog'); // 子服务页含“看门狗”卡片（任一权限可见）
-  else if(k==='security')show=canView('control'); // 安全页（WAF 在线管理）随「控制」权限
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -214,7 +213,6 @@ function switchPanel(name){
   services:loadServices,
   traffic:loadTraffic,
   control:updateControlStatus,
-  security:loadSecurity,
   config:loadConfig,
   logs:loadLogs,
   database:loadDatabase,
@@ -230,7 +228,7 @@ function switchPanel(name){
  let want='#'+name;
  if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
  if(name==='logs')want=logsSubFromHash()==='audit'?'#logs.audit':'#logs';
- if(name==='config')want=configSubFromHash()==='star'?'#config.star':'#config';
+ if(name==='config'){const s=configSubFromHash();want=s==='star'?'#config.star':(s==='security'?'#config.security':'#config');}
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
@@ -242,6 +240,7 @@ function panelFromHash(){
  if(h==='ports')return 'traffic';
  if(h==='audit')return 'logs';
  if(h==='starconfig')return 'config'; // 兼容早期独立页签书签
+ if(h==='security')return 'config'; // “安全”已并入“配置”页子页签
  if(h==='cleanup')return 'plugins'; // “日志清理”已迁移为插件（🧩 插件 → 日志清理）
  if(h==='watchdog')return 'services'; // “看门狗”已并入“子服务”页
  const name=h.split('.')[0];
@@ -277,7 +276,7 @@ window.addEventListener('hashchange',()=>{
  if(link&&!link.classList.contains('active'))switchPanel(h);
  else if(h==='traffic'&&$('traffic-sub-site'))applyTrafficSub(trafficSubFromHash()); // 流量页内子页签同步
  else if(h==='logs'&&$('logs-sub-tabs'))applyLogsSub(logsSubFromHash()); // 日志页内子页签同步
- else if(h==='config'&&$('config-sub-tabs'))applyConfigSub(configSubFromHash()); // 配置页内子页签同步
+ else if(h==='config'&&$('config-sub-tabs'))configSubSwitch(configSubFromHash()); // 配置页内子页签同步（含旧 #security 书签规范化）
 });
 
 /* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.json） ── */
@@ -289,13 +288,13 @@ function wafParseList(t){return String(t||'').split(/[,，;；\s]+/).filter(Bool
 async function loadSecurity(){
  try{
   const j=await api('/star/waf');
-  if(j.code!==0){$('panel-security').innerHTML='<div class="card"><h3>🛡 WAF</h3><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
+  if(j.code!==0){$('config-sub-security').innerHTML='<div class="card"><h3>🛡 WAF</h3><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
   wafCfg=j.data;renderSecurity();
  }catch(e){}
 }
 function renderSecurity(){
  const c=wafCfg||{};
- $('panel-security').innerHTML=`
+ $('config-sub-security').innerHTML=`
 <div class="card">
  <h3>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h3>
  <p class="text-muted" style="font-size:12px;margin:2px 0 10px">爬虫分级（放行正常搜索引擎/GEO-AI，拦恶意爬虫与扫描器）+ SQL 注入/路径探测防护 + CC 限速；保存后立即生效，并写入配置文件。</p>
@@ -1691,42 +1690,50 @@ async function doControl(action){
  });
 }
 
-/* ── Config（Agent 配置 / 星尘设置 子页签） ── */
+/* ── Config（Agent 配置 / 星尘设置 / 安全 子页签） ── */
 function ensureConfigShell(){
  if($('config-sub-tabs'))return;
  $('panel-config').innerHTML=`
   <div class="chart-tabs" id="config-sub-tabs" style="margin-bottom:14px">
    <span class="chart-tab active" data-sub="agent" id="config-tab-agent" onclick="configSubSwitch('agent')">⚙ Agent 配置</span>
    <span class="chart-tab" data-sub="star" id="config-tab-star" onclick="configSubSwitch('star')">🌐 星尘设置</span>
+   <span class="chart-tab" data-sub="security" id="config-tab-security" onclick="configSubSwitch('security')">🛡 安全</span>
   </div>
   <div id="config-sub-agent"></div>
-  <div id="config-sub-star" style="display:none"></div>`;
+  <div id="config-sub-star" style="display:none"></div>
+  <div id="config-sub-security" style="display:none"></div>`;
 }
-// 配置页子页签（agent Agent 配置 / star 星尘设置；兼容旧 #starconfig 独立页书签）
+// 配置页子页签（agent Agent 配置 / star 星尘设置 / security 安全；兼容旧 #starconfig、#security 书签）
 function configSubFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
+ if(h==='config.security'||h==='security')return 'security';
  return (h==='config.star'||h==='starconfig')?'star':'agent';
 }
 function configSubSwitch(sub){
- applyConfigSub(sub);
- const h=sub==='star'?'#config.star':'#config';
+ const effective=applyConfigSub(sub);
+ const h=effective==='star'?'#config.star':(effective==='security'?'#config.security':'#config');
  if(location.hash!==h)history.replaceState(null,'',h);
 }
-// 应用子页签：按权限显隐标签与内容（仅有 starconfig 权限时自动落到星尘设置子页）
+// 应用子页签：按权限显隐标签与内容（无当前子页权限时落到有权限的子页；返回最终生效子页）
 function applyConfigSub(sub){
- const agent=$('config-sub-agent'),star=$('config-sub-star');if(!agent||!star)return;
- const canAgent=canView('config'),canStar=canView('starconfig');
- const tabAgent=$('config-tab-agent'),tabStar=$('config-tab-star');
+ const agent=$('config-sub-agent'),star=$('config-sub-star'),security=$('config-sub-security');
+ if(!agent||!star||!security)return sub;
+ const canAgent=canView('config'),canStar=canView('starconfig'),canSecurity=canView('control');
+ const tabAgent=$('config-tab-agent'),tabStar=$('config-tab-star'),tabSecurity=$('config-tab-security');
  if(tabAgent)tabAgent.style.display=canAgent?'':'none';
  if(tabStar)tabStar.style.display=canStar?'':'none';
- if(sub==='star'&&!canStar)sub='agent';
- if(sub==='agent'&&!canAgent)sub='star';
- agent.style.display=sub==='star'?'none':'';
+ if(tabSecurity)tabSecurity.style.display=canSecurity?'':'none';
+ if(sub==='star'&&!canStar)sub=canAgent?'agent':(canSecurity?'security':'agent');
+ if(sub==='security'&&!canSecurity)sub=canAgent?'agent':(canStar?'star':'agent');
+ if(sub==='agent'&&!canAgent)sub=canStar?'star':(canSecurity?'security':'star');
+ agent.style.display=sub==='agent'?'':'none';
  star.style.display=sub==='star'?'':'none';
+ security.style.display=sub==='security'?'':'none';
  document.querySelectorAll('#config-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
- if(sub==='star')loadStarConfig();else loadAgentConfig();
+ if(sub==='security')loadSecurity();else if(sub==='star')loadStarConfig();else loadAgentConfig();
+ return sub;
 }
-async function loadConfig(){ensureConfigShell();applyConfigSub(configSubFromHash())}
+async function loadConfig(){ensureConfigShell();configSubSwitch(configSubFromHash())}
 
 async function loadAgentConfig(){
  try{

@@ -433,8 +433,7 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 - **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/**进程 Top 20**）/；
 - **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
-- **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
-- **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
+- **配置**：页内三个**子页签**（URL hash `#config` / `#config.star` / `#config.security`，兼容旧 `#starconfig`、`#security` 书签）——**⚙ Agent 配置**（面板与守护参数在线更新，部分需重启服务后生效）、**🌐 星尘设置**（`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护）、**🛡 安全**（Web 应用防火墙 WAF 在线开关与参考配置；权限跟随 `control`，保存后立即生效）；子页标签按权限显隐；
 - **日志**：页内两个**子页签**（交互对齐流量页）——**📋 系统日志**（`Log/` 目录文件列表与尾部内容查看，支持行数/文件/级别过滤）与 **📜 操作日志**（审计查询，见下）；子页标签按权限显隐（URL hash `#logs` / `#logs.audit`，兼容旧 `#audit` 书签）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
 - **文件管理**（对齐宝塔）：全盘浏览（根=盘符/`/`，符号链接可进入）、上传（多文件、带进度，≤64MB）/下载（≤256MB）、新建文件与文件夹、批量重命名/复制/移动/删除、ZIP 压缩/解压、在线编辑文本（≤2MB，UTF-8，二进制拒读）、Linux 权限修改（chmod）与递归搜索；删除/改名/移动对根、一级目录（`/etc`、`C:\Windows` 等）与程序目录本身设保护（目录内部照常可操作）；
@@ -593,4 +592,4 @@ src/
 
 ## 13. Web 应用防火墙（Pek.RWaf）
 
-面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.json` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。
+面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.json` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。面板「**配置 → 🛡 安全**」子页签提供在线开关与完整参考配置（保存后立即生效并写入配置文件）。
