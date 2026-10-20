@@ -282,7 +282,9 @@ function setSrvElapsed(v){
  const f=$('srv-foot');if(!f)return;
  _lastElapsed=v;
  const t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
- f.textContent=(_agentVer?('Pek.RAgent v'+_agentVer+' · '):'')+'服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
+ // 版本未上报时也显示产品名：一眼能分辨页脚来自新版前端（旧版没有产品名前缀）
+ const head='Pek.RAgent'+(_agentVer?(' v'+_agentVer):'');
+ f.textContent=head+' · 服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
 }
 
 /* ── Dashboard ── */
@@ -297,8 +299,8 @@ async function loadDashboard(){
   const s=await api('/api/status');
   if(s.code!==0)return;statusData=s.data;
   const d=s.data;const h={data:d.health||null};
-  // 页脚版本号（与自升级卡片同源：selfUpgrade.current = 编译期版本）
-  const _ver=(d.selfUpgrade&&d.selfUpgrade.current)||'';
+  // 页脚版本号（优先 /api/status 顶层 version；回退自升级卡片的 current）
+  const _ver=String(d.version||(d.selfUpgrade&&d.selfUpgrade.current)||'').trim();
   if(_ver&&_ver!==_agentVer){_agentVer=_ver;setSrvElapsed(_lastElapsed);}
   const title='StarAgent';
   document.title=title+' 管理面板';

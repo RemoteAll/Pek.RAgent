@@ -888,6 +888,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "uptime": dhrust::sys::process::format_uptime(uptime),
         "uptimeSeconds": uptime.as_secs(),
         "processId": pid,
+        // 代理版本（编译期常量）：面板页脚直接展示，不依赖自升级卡片是否启用
+        "version": env!("CARGO_PKG_VERSION"),
         "memoryMB": memory_mb,
         "memoryUsedMB": mem_used_mb,
         "memoryTotalMB": mem_total / 1024 / 1024,
