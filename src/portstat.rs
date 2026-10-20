@@ -263,7 +263,7 @@ fn reconfigure(t: &PortStat, cfg: &AgentConfig) {
     } else if cfg!(windows) {
         inner.mode = Mode::View;
         inner.message =
-            "Windows 平台暂不支持端口字节计数（无廉价内核接口），当前显示连接视图".to_string();
+            "Windows 无按端口字节计数接口，当前仅显示连接视图；HTTP/HTTPS 流量请查看「网站流量」（IIS 日志，可在线启用 sc-bytes），其他端口需部署到 Linux 使用 nftables 计数".to_string();
     } else {
         inner.mode = Mode::Unsupported;
         inner.message = "当前平台暂不支持端口流量统计".to_string();

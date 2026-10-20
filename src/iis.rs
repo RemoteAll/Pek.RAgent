@@ -149,20 +149,29 @@ fn apps_by_pool_cached() -> HashMap<String, Vec<IisSite>> {
 
 #[cfg(windows)]
 fn read_apps_config() -> Option<String> {
+    read_config_with_path().map(|(_, text)| text)
+}
+
+/// 读取实际生效的 applicationHost.config（含 IIS 共享配置转发），返回路径与内容。
+#[cfg(windows)]
+fn read_config_with_path() -> Option<(PathBuf, String)> {
     let root = std::env::var_os("windir")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
     let dir = root.join("System32").join("inetsrv").join("config");
-    let text = std::fs::read_to_string(dir.join("applicationHost.config")).ok()?;
+    let local = dir.join("applicationHost.config");
+    let text = std::fs::read_to_string(&local).ok()?;
     if text.contains("system.applicationHost") {
-        return Some(text);
+        return Some((local, text));
     }
     // IIS 共享配置：本地 applicationHost.config 只是转发文件，
     // 真正的站点配置由 redirection.config 指向（常见于多机统一管理）。
     let redirect = std::fs::read_to_string(dir.join("redirection.config")).ok()?;
     let value = dhrust::config::read_xml_to_json(&redirect).ok()?;
     let shared = shared_config_path(&value)?;
-    std::fs::read_to_string(expand_env_vars(&shared)).ok()
+    let path = PathBuf::from(expand_env_vars(&shared));
+    let text = std::fs::read_to_string(&path).ok()?;
+    Some((path, text))
 }
 
 /// 从 `redirection.config` 提取共享配置路径（`<redirection><configFile path="..."/>`）。
@@ -208,6 +217,8 @@ pub struct IisLogSite {
     pub format: String,
     /// 站点日志是否启用（`<logFile enabled="false">` 为关闭）
     pub enabled: bool,
+    /// 有效日志字段（`logExtFileFlags`，逗号分隔；空 = IIS 默认字段，不含 BytesSent）
+    pub flags: String,
 }
 
 /// 自动发现结果：可统计的站点给出日志文件，其余给出站点名与原因。
@@ -216,6 +227,13 @@ pub struct DiscoveredLog {
     pub name: String,
     pub file: Option<PathBuf>,
     pub note: String,
+    pub id: String,
+    pub enabled: bool,
+    /// IIS 运行状态（`Started` / `Stopped` / 空 = 未知）
+    pub state: String,
+    /// 有效日志字段是否包含 `BytesSent`（sc-bytes）
+    pub sc_bytes: bool,
+    pub format: String,
 }
 
 /// 自动发现 IIS 站点日志（Windows）。
@@ -250,16 +268,24 @@ pub fn discover_log_sites() -> Vec<DiscoveredLog> {
                         dir: path,
                         format: "W3C".to_string(),
                         enabled: true,
+                        flags: String::new(),
                     });
                 }
             }
         }
     }
-    sites.into_iter().map(describe_log_site).collect()
+    let states = site_states();
+    sites
+        .into_iter()
+        .map(|site| describe_log_site_with_state(site, &states))
+        .collect()
 }
 
 #[cfg(windows)]
-fn describe_log_site(site: IisLogSite) -> DiscoveredLog {
+fn describe_log_site_with_state(
+    site: IisLogSite,
+    states: &HashMap<String, String>,
+) -> DiscoveredLog {
     let mut note = String::new();
     let mut file = None;
     // IIS 在配置目录下再建 `W3SVC<站点Id>` 子目录；部分环境把站点目录直接指向子目录，
@@ -281,9 +307,14 @@ fn describe_log_site(site: IisLogSite) -> DiscoveredLog {
         note = format!("日志目录不存在（{}）", site.dir.display());
     }
     DiscoveredLog {
-        name: site.name,
+        name: site.name.clone(),
         file,
         note,
+        id: site.id,
+        enabled: site.enabled,
+        state: states.get(&site.name).cloned().unwrap_or_default(),
+        sc_bytes: has_flag(&site.flags, "BytesSent"),
+        format: site.format,
     }
 }
 
@@ -292,6 +323,295 @@ fn describe_log_site(site: IisLogSite) -> DiscoveredLog {
 fn supported_format(format: &str) -> bool {
     let f = format.trim();
     f.is_empty() || f.eq_ignore_ascii_case("W3C") || f.eq_ignore_ascii_case("NCSA")
+}
+
+/// 日志字段列表中是否包含指定标志（IIS 用 `BytesSent` 表示 sc-bytes）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn has_flag(flags: &str, name: &str) -> bool {
+    flags
+        .split(',')
+        .any(|f| f.trim().eq_ignore_ascii_case(name))
+}
+
+/// IIS 默认 W3C 字段（不含 BytesSent；用于未显式配置字段时补齐）。
+const DEFAULT_LOG_FLAGS: &str = "Date, Time, ClientIP, UserName, ServerIP, Method, UriStem, UriQuery, TimeTaken, HttpStatus, Win32Status, ServerPort, UserAgent, HttpSubStatus, Referer";
+
+/// 追加 `BytesSent`（sc-bytes）；字段为空时先补 IIS 默认字段，避免只剩字节列。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn flags_with_bytes(flags: &str) -> String {
+    if has_flag(flags, "BytesSent") {
+        return flags.trim().to_string();
+    }
+    if flags.trim().is_empty() {
+        format!("{DEFAULT_LOG_FLAGS}, BytesSent")
+    } else {
+        format!("{}, BytesSent", flags.trim())
+    }
+}
+
+/// 站点运行状态缓存（15 秒；面板 3 秒轮询不重复拉起 appcmd）。
+#[cfg(windows)]
+static STATE_CACHE: Mutex<Option<(Instant, HashMap<String, String>)>> = Mutex::new(None);
+#[cfg(windows)]
+const STATE_TTL: Duration = Duration::from_secs(15);
+
+/// 查询 IIS 站点运行状态（`Started` / `Stopped`；未知/非 Windows 返回空）。
+#[cfg(windows)]
+pub fn site_states() -> HashMap<String, String> {
+    {
+        let slot = STATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, map)) = slot.as_ref() {
+            if at.elapsed() < STATE_TTL {
+                return map.clone();
+            }
+        }
+    }
+    let map = query_site_states();
+    let mut slot = STATE_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *slot = Some((Instant::now(), map.clone()));
+    map
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn site_states() -> HashMap<String, String> {
+    HashMap::new()
+}
+
+#[cfg(windows)]
+fn query_site_states() -> HashMap<String, String> {
+    let Some(appcmd) = appcmd_path() else {
+        return HashMap::new();
+    };
+    let args = vec!["list".to_string(), "sites".to_string(), "/xml".to_string()];
+    let Ok(out) = run_hidden(&appcmd, &args) else {
+        return HashMap::new();
+    };
+    let map = parse_site_states_xml(&out);
+    if !map.is_empty() {
+        return map;
+    }
+    parse_site_states_text(&out)
+}
+
+/// 解析 `appcmd list sites /xml`（`<SITE SITE.NAME="x" state="Started"/>`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_site_states_xml(xml: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Ok(value) = dhrust::config::read_xml_to_json(xml) else {
+        return out;
+    };
+    let root = value.get("appcmd").unwrap_or(&value);
+    let Some(list) = root.get("SITE").or_else(|| root.get("site")) else {
+        return out;
+    };
+    for item in as_values(list) {
+        let mut name = str_attr(item, "SITE.NAME");
+        if name.is_empty() {
+            name = str_attr(item, "site.name");
+        }
+        let state = str_attr(item, "state");
+        if !name.is_empty() && !state.is_empty() {
+            out.insert(name, state);
+        }
+    }
+    out
+}
+
+/// 解析 `appcmd list sites` 文本（`SITE "name" (id:1,...,state:Started)`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn parse_site_states_text(text: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in text.lines() {
+        let line = line.trim();
+        let Some(rest) = line.strip_prefix("SITE ") else {
+            continue;
+        };
+        let Some(open) = rest.find('"') else {
+            continue;
+        };
+        let rest = &rest[open + 1..];
+        let Some(close) = rest.find('"') else {
+            continue;
+        };
+        let name = &rest[..close];
+        let tail = &rest[close + 1..];
+        let Some(pos) = tail.rfind("state:") else {
+            continue;
+        };
+        let state = tail[pos + 6..]
+            .split([',', ')'])
+            .next()
+            .unwrap_or("")
+            .trim();
+        if !name.is_empty() && !state.is_empty() {
+            out.insert(name.to_string(), state.to_string());
+        }
+    }
+    out
+}
+
+/// 为 IIS 站点启用日志记录并勾选 `BytesSent`（sc-bytes）。`None` = 全部站点。
+#[cfg(windows)]
+pub fn enable_sc_bytes(site: Option<&str>) -> Result<String, String> {
+    let default_root = default_log_root();
+    let Some((config_path, xml)) = read_config_with_path() else {
+        return Err("读取 IIS 配置失败（applicationHost.config）".to_string());
+    };
+    let sites = log_sites_from_xml(&xml, &default_root);
+    let targets: Vec<&IisLogSite> = match site {
+        Some(name) => sites
+            .iter()
+            .filter(|s| s.name.eq_ignore_ascii_case(name.trim()))
+            .collect(),
+        None => sites.iter().collect(),
+    };
+    if targets.is_empty() {
+        return Err(match site {
+            Some(name) => format!("未找到 IIS 站点：{name}"),
+            None => "未找到任何 IIS 站点".to_string(),
+        });
+    }
+    let Some(appcmd) = appcmd_path() else {
+        return Err("未找到 appcmd.exe（IIS 未安装？）".to_string());
+    };
+    // 修改前留一份覆盖式备份（失败不阻断；IIS 自身也有配置历史）
+    let backup = config_path.with_extension("config.pek-bak");
+    let _ = std::fs::copy(&config_path, &backup);
+
+    let mut changed = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for s in targets {
+        if s.name.contains('\'') || s.name.contains(']') {
+            errors.push(format!(
+                "{}：站点名含单引号/方括号，请手动在 IIS 中勾选",
+                s.name
+            ));
+            continue;
+        }
+        if !supported_format(&s.format) {
+            if site.is_some() {
+                return Err(format!(
+                    "站点 {} 的日志格式为 {}，请先在 IIS 中改为 W3C 再启用",
+                    s.name, s.format
+                ));
+            }
+            skipped += 1;
+            continue;
+        }
+        let need_log = !s.enabled;
+        let w3c = s.format.trim().is_empty() || s.format.eq_ignore_ascii_case("W3C");
+        let need_bytes = w3c && !has_flag(&s.flags, "BytesSent");
+        if !need_log && !need_bytes {
+            skipped += 1;
+            continue;
+        }
+        if need_log {
+            let filter = format!("/[name='{}'].logFile.enabled:true", s.name);
+            if let Err(e) = run_hidden(
+                &appcmd,
+                &[
+                    "set".to_string(),
+                    "config".to_string(),
+                    "-section:system.applicationHost/sites".to_string(),
+                    filter,
+                    "/commit:apphost".to_string(),
+                ],
+            ) {
+                errors.push(format!("{}：{e}", s.name));
+                continue;
+            }
+        }
+        if need_bytes {
+            let filter = format!(
+                "/[name='{}'].logFile.logExtFileFlags:{}",
+                s.name,
+                flags_with_bytes(&s.flags)
+            );
+            if let Err(e) = run_hidden(
+                &appcmd,
+                &[
+                    "set".to_string(),
+                    "config".to_string(),
+                    "-section:system.applicationHost/sites".to_string(),
+                    filter,
+                    "/commit:apphost".to_string(),
+                ],
+            ) {
+                errors.push(format!("{}：{e}", s.name));
+                continue;
+            }
+        }
+        changed += 1;
+    }
+    invalidate_cache();
+    if !errors.is_empty() {
+        return Err(format!(
+            "已处理 {changed} 个站点，失败 {} 个：{}",
+            errors.len(),
+            errors.join("；")
+        ));
+    }
+    let tail = if changed > 0 {
+        "（当前日志文件的字段表不会重写，新字段从 IIS 新建日志文件后生效，通常次日或日志滚动后）"
+    } else {
+        ""
+    };
+    Ok(format!(
+        "已为 {changed} 个站点启用日志/sc-bytes，{skipped} 个无需修改{tail}"
+    ))
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub fn enable_sc_bytes(_site: Option<&str>) -> Result<String, String> {
+    Err("仅 Windows/IIS 支持此操作".to_string())
+}
+
+/// 清除应用池/站点状态缓存（IIS 配置修改后调用）。
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn invalidate_cache() {
+    *CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    #[cfg(windows)]
+    {
+        *STATE_CACHE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
+#[cfg(windows)]
+fn appcmd_path() -> Option<PathBuf> {
+    let root = std::env::var_os("windir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let path = root
+        .join("System32")
+        .join("inetsrv")
+        .join("appcmd.exe");
+    path.is_file().then_some(path)
+}
+
+/// 执行命令并捕获输出（Windows：不弹控制台窗口）。
+#[cfg(windows)]
+fn run_hidden(program: &Path, args: &[String]) -> Result<String, String> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("启动 {} 失败：{e}", program.display()))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).to_string();
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).to_string();
+        let msg = if stderr.trim().is_empty() { stdout } else { stderr };
+        let name = program
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        return Err(format!("{name} 执行失败（{}）：{}", out.status, msg.trim()));
+    }
+    Ok(stdout)
 }
 
 #[cfg(not(windows))]
@@ -336,6 +656,9 @@ fn log_sites_from_xml(xml: &str, default_root: &Path) -> Vec<IisLogSite> {
         .map(|l| str_attr(l, "logFormat"))
         .unwrap_or_default();
     let default_enabled = defaults.map(|l| str_attr(l, "enabled")).unwrap_or_default();
+    let default_flags = defaults
+        .map(|l| str_attr(l, "logExtFileFlags"))
+        .unwrap_or_default();
     let Some(list) = sites.get("site") else {
         return out;
     };
@@ -357,6 +680,7 @@ fn log_sites_from_xml(xml: &str, default_root: &Path) -> Vec<IisLogSite> {
             dir: resolve_log_dir(&pick("directory", &default_dir), default_root),
             format: pick("logFormat", &default_format),
             enabled: !pick("enabled", &default_enabled).eq_ignore_ascii_case("false"),
+            flags: pick("logExtFileFlags", &default_flags),
         });
     }
     out
@@ -765,13 +1089,17 @@ mod tests {
         let sub = base.join("W3SVC7");
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("u_ex251020.log"), "#Fields: date time\n").unwrap();
-        let found = describe_log_site(IisLogSite {
-            name: "shop".to_string(),
-            id: "7".to_string(),
-            dir: base.clone(),
-            format: "W3C".to_string(),
-            enabled: true,
-        });
+        let found = describe_log_site_with_state(
+            IisLogSite {
+                name: "shop".to_string(),
+                id: "7".to_string(),
+                dir: base.clone(),
+                format: "W3C".to_string(),
+                enabled: true,
+                flags: String::new(),
+            },
+            &HashMap::new(),
+        );
         assert_eq!(found.file, Some(sub.join("u_ex251020.log")));
         assert!(found.note.is_empty());
         let _ = std::fs::remove_dir_all(&base);
@@ -815,6 +1143,52 @@ mod tests {
             shared_config_path(&value2).as_deref(),
             Some(r"D:\iis\applicationHost.config")
         );
+    }
+
+    #[test]
+    fn log_flags_inherit_and_detect_bytes_sent() {
+        let xml = r#"<configuration><system.applicationHost><sites>
+            <siteDefaults><logFile logExtFileFlags="Date, Time, ClientIP" /></siteDefaults>
+            <site name="a" id="1" />
+            <site name="b" id="2"><logFile logExtFileFlags="Date, Time, BytesSent" /></site>
+        </sites></system.applicationHost></configuration>"#;
+        let sites = log_sites_from_xml(xml, Path::new("/logs"));
+        assert_eq!(sites[0].flags, "Date, Time, ClientIP");
+        assert!(!has_flag(&sites[0].flags, "BytesSent"));
+        assert!(has_flag(&sites[1].flags, "BytesSent"));
+        assert_eq!(
+            flags_with_bytes("Date, Time, ClientIP"),
+            "Date, Time, ClientIP, BytesSent"
+        );
+        // 字段为空时补 IIS 默认字段，避免只勾选 BytesSent 丢掉日期/时间等列
+        assert_eq!(
+            flags_with_bytes(""),
+            format!("{DEFAULT_LOG_FLAGS}, BytesSent")
+        );
+        // 已包含时不重复追加
+        assert_eq!(
+            flags_with_bytes("Date, BytesSent"),
+            "Date, BytesSent"
+        );
+    }
+
+    #[test]
+    fn parses_site_states_from_appcmd() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<appcmd>
+  <SITE SITE.NAME="Default Web Site" SITE.ID="1" state="Started" />
+  <SITE SITE.NAME="shop" SITE.ID="2" state="Stopped" />
+</appcmd>"#;
+        let map = parse_site_states_xml(xml);
+        assert_eq!(
+            map.get("Default Web Site").map(String::as_str),
+            Some("Started")
+        );
+        assert_eq!(map.get("shop").map(String::as_str), Some("Stopped"));
+
+        let text = "SITE \"Default Web Site\" (id:1,bindings:http/*:80:,state:Started)\r\nSITE \"shop\" (id:2,state:Stopped)";
+        let map = parse_site_states_text(text);
+        assert_eq!(map.get("shop").map(String::as_str), Some("Stopped"));
     }
 
     #[test]

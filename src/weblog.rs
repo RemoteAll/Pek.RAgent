@@ -61,6 +61,8 @@ struct W3cFields {
     status: usize,
     bytes: Option<usize>,
     ip: Option<usize>,
+    /// 头部声明的字段数（用于识别“头未刷新但行尾新增 sc-bytes”的情况）
+    count: usize,
 }
 
 /// 单个日志文件的读取状态。
@@ -181,6 +183,17 @@ struct Discovery {
     sources: Vec<Source>,
     /// 站点存在但当前无法统计（日志关闭/格式不支持/暂无日志文件）
     pending: Vec<(String, String)>,
+    /// IIS 站点元信息（运行状态/日志字段；非 IIS 为空）
+    iis: Vec<(String, IisMeta)>,
+}
+
+/// IIS 站点面板展示信息。
+#[derive(Clone)]
+struct IisMeta {
+    state: String,
+    log_enabled: bool,
+    sc_bytes: bool,
+    format: String,
 }
 
 /// 模块共享状态。
@@ -188,6 +201,8 @@ struct Inner {
     sources: Vec<Source>,
     /// 配置中存在但暂时无法统计的站点（面板仍列出，避免“只剩 Default Web Site”）
     pending: Vec<(String, String)>,
+    /// IIS 站点元信息（站点名 → 状态/日志字段）
+    iis: HashMap<String, IisMeta>,
     stats: HashMap<String, SiteStats>,
     files: HashMap<PathBuf, FileState>,
     last_discover: Option<Instant>,
@@ -220,6 +235,7 @@ pub(crate) fn start(manager: Arc<AppManager>) {
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
                 pending: Vec::new(),
+                iis: HashMap::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -273,11 +289,30 @@ fn reconfigure(t: &WebTraffic, cfg: &AgentConfig) {
     }
     let manual = parse_manual_logs(&cfg.web_logs);
     let auto = discover_sites();
-    apply_sources(&mut inner, merge_sources(manual, auto.sources), auto.pending);
+    apply_sources(
+        &mut inner,
+        merge_sources(manual, auto.sources),
+        auto.pending,
+        auto.iis,
+    );
+}
+
+/// 外部修改了 IIS 日志配置后（如启用 sc-bytes），尽快重新发现站点日志。
+pub(crate) fn request_rediscover() {
+    if let Some(t) = INSTANCE.get() {
+        if let Ok(mut inner) = t.inner.lock() {
+            inner.last_discover = None;
+        }
+    }
 }
 
 /// 替换日志源并确保站点统计条目存在。
-fn apply_sources(inner: &mut Inner, sources: Vec<Source>, pending: Vec<(String, String)>) {
+fn apply_sources(
+    inner: &mut Inner,
+    sources: Vec<Source>,
+    pending: Vec<(String, String)>,
+    iis: Vec<(String, IisMeta)>,
+) {
     inner.last_discover = Some(Instant::now());
     // 已有日志源的站点（含手动指定）不再重复标记“暂不可统计”
     let pending: Vec<(String, String)> = pending
@@ -305,6 +340,7 @@ fn apply_sources(inner: &mut Inner, sources: Vec<Source>, pending: Vec<(String, 
     }
     inner.sources = sources;
     inner.pending = pending;
+    inner.iis = iis.into_iter().collect();
 }
 
 /// 单次采样：发现（如有必要）→ 读取增量 → 聚合 → 节流持久化。
@@ -323,7 +359,12 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
     if need_rediscover {
         let manual = parse_manual_logs(&cfg.web_logs);
         let auto = discover_sites();
-        apply_sources(&mut inner, merge_sources(manual, auto.sources), auto.pending);
+        apply_sources(
+            &mut inner,
+            merge_sources(manual, auto.sources),
+            auto.pending,
+            auto.iis,
+        );
     }
 
     // 跨天收尾与滚动（先归档旧日、再滚动，避免跨天瞬间写错日期）
@@ -412,8 +453,14 @@ pub(crate) fn snapshot_json() -> Json {
         });
     };
 
-    let inner = t.inner.lock().unwrap();
     let enabled = t.enabled.load(Ordering::Relaxed);
+    // 站点运行状态（appcmd 15 秒缓存）：持锁前查询，避免阻塞日志读取
+    let states = if enabled {
+        crate::iis::site_states()
+    } else {
+        HashMap::new()
+    };
+    let inner = t.inner.lock().unwrap();
 
     // 按站点聚合展示（同名多日志合并），保持发现顺序
     let mut order: Vec<String> = Vec::new();
@@ -428,9 +475,40 @@ pub(crate) fn snapshot_json() -> Json {
     }
     // 无法统计的站点同样列出（附原因），并排在日志源之后
     let mut notes: HashMap<String, String> = inner.pending.iter().cloned().collect();
-    // IIS 默认日志字段不含 sc-bytes：流量会恒为 0，明确提示而不是让用户以为统计坏了
+    // IIS 配置可判断字段是否包含 sc-bytes（比日志头解析更早、更准）；手动源仍回退到日志头判断
     for s in &inner.sources {
         if notes.contains_key(&s.site) {
+            continue;
+        }
+        if let Some(meta) = inner.iis.get(&s.site) {
+            if !meta.log_enabled {
+                notes.insert(
+                    s.site.clone(),
+                    "IIS 日志记录已关闭（需在 IIS 管理器中启用）".to_string(),
+                );
+            } else if meta.format.eq_ignore_ascii_case("W3C") {
+                if !meta.sc_bytes {
+                    notes.insert(
+                        s.site.clone(),
+                        "日志字段未包含 sc-bytes：流量统计为 0（IIS 日志 → 选择字段 → 勾选“发送的字节数”）"
+                            .to_string(),
+                    );
+                } else {
+                    // 配置已包含 sc-bytes，但当前日志文件的 #Fields 头仍是旧的（等 IIS 新建日志文件）
+                    let file_missing = inner
+                        .files
+                        .get(&s.path)
+                        .and_then(|f| f.w3c.as_ref())
+                        .is_some_and(|w| w.bytes.is_none());
+                    if file_missing {
+                        notes.insert(
+                            s.site.clone(),
+                            "配置已启用 sc-bytes：当前日志文件尚未生效（等 IIS 新建日志文件/滚动后开始统计）"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
             continue;
         }
         let missing_bytes = inner
@@ -489,6 +567,15 @@ pub(crate) fn snapshot_json() -> Json {
             "name": name,
             "logs": logs.get(name.as_str()).cloned().unwrap_or_default(),
             "note": notes.get(name.as_str()).map(String::as_str).unwrap_or(""),
+            "isIis": inner.iis.contains_key(name),
+            "iisState": states
+                .get(name)
+                .cloned()
+                .or_else(|| inner.iis.get(name).map(|m| m.state.clone()))
+                .unwrap_or_default(),
+            "logEnabled": inner.iis.get(name).map(|m| m.log_enabled).unwrap_or(true),
+            "scBytes": inner.iis.get(name).map(|m| m.sc_bytes).unwrap_or(false),
+            "logFormat": inner.iis.get(name).map(|m| m.format.clone()).unwrap_or_default(),
             "todayBytes": tb,
             "todayRequests": tr,
             "uv": uv,
@@ -663,11 +750,16 @@ fn parse_w3c_line(line: &str, fields: &mut Option<W3cFields>) -> Option<LogLine>
     if !(100..=599).contains(&status) {
         return None;
     }
-    let bytes = f
-        .bytes
-        .and_then(|i| values.get(i))
-        .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(0);
+    let bytes = match f.bytes {
+        Some(i) => values.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        // IIS 修改日志字段后，当前日志文件的 #Fields 头不会立即重写，新增的 BytesSent
+        // 会作为行尾附加列出现：字段数比头部多时取最后一列（本工具总是把 BytesSent 加到末尾）。
+        None if values.len() > f.count => values
+            .last()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+        None => 0,
+    };
     let ip = f
         .ip
         .and_then(|i| values.get(i))
@@ -685,6 +777,7 @@ fn parse_w3c_fields(header: &str) -> Option<W3cFields> {
         status,
         bytes: names.iter().position(|name| name == "sc-bytes"),
         ip: names.iter().position(|name| name == "c-ip"),
+        count: names.len(),
     })
 }
 
@@ -694,6 +787,7 @@ fn default_w3c_fields() -> W3cFields {
         status: 11,
         bytes: None,
         ip: Some(8),
+        count: 15,
     }
 }
 
@@ -799,6 +893,7 @@ fn discover_sites() -> Discovery {
         Discovery {
             sources: out,
             pending: Vec::new(),
+            iis: Vec::new(),
         }
     }
 
@@ -811,7 +906,17 @@ fn discover_sites() -> Discovery {
             // 绿色版 nginx/apache 仍可通过 WebLogs 手动指定。
             let mut sources = Vec::new();
             let mut pending = Vec::new();
+            let mut iis = Vec::new();
             for site in crate::iis::discover_log_sites() {
+                iis.push((
+                    site.name.clone(),
+                    IisMeta {
+                        state: site.state.clone(),
+                        log_enabled: site.enabled,
+                        sc_bytes: site.sc_bytes,
+                        format: site.format.clone(),
+                    },
+                ));
                 match site.file {
                     Some(path) => sources.push(Source {
                         site: site.name,
@@ -820,13 +925,18 @@ fn discover_sites() -> Discovery {
                     None => pending.push((site.name, site.note)),
                 }
             }
-            Discovery { sources, pending }
+            Discovery {
+                sources,
+                pending,
+                iis,
+            }
         }
         #[cfg(not(windows))]
         {
             Discovery {
                 sources: Vec::new(),
                 pending: Vec::new(),
+                iis: Vec::new(),
             }
         }
     }
@@ -1437,6 +1547,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_sc_bytes_appended_before_header_refresh() {
+        // 启用 sc-bytes 后，当前日志文件的 #Fields 头仍是旧的；新增列出现在行尾
+        let mut fields = None;
+        parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken",
+            &mut fields,
+        );
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 5.6.7.8 UA - 200 0 0 10 4567";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 4567, "旧头部+行尾新增 sc-bytes 也应立即统计");
+    }
+
+    #[test]
     fn parses_iis_w3c_default_fields_without_header() {
         let mut fields = None;
         let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 9.9.9.9 UA - 200 0 0 10";
@@ -1746,6 +1870,7 @@ server
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
                 pending: Vec::new(),
+                iis: HashMap::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -1776,6 +1901,7 @@ server
         let mut inner = Inner {
             sources: Vec::new(),
             pending: Vec::new(),
+            iis: HashMap::new(),
             stats: HashMap::new(),
             files: HashMap::new(),
             last_discover: None,

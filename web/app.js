@@ -775,23 +775,58 @@ function renderWebTraffic(d){
  if(!d.enabled){el.innerHTML=`<p class="text-muted">${esc(d.message||'网站流量统计未启用（配置 WebTraffic=true 开启）')}</p>`;return}
  const sites=d.sites||[];
  if(!sites.length){el.innerHTML=`<p class="text-muted">${esc(d.message||'未发现网站日志')}</p>`;return}
- let html=`<table class="info-table"><tr>`;
- html+=['站点','今日流量','请求','UV','2xx / 4xx / 5xx','速率','累计流量'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ const w3c=s=>String(s.logFormat||'W3C').toUpperCase()==='W3C';
+ const supported=s=>/^(W3C|NCSA)?$/i.test(String(s.logFormat||''));
+ const fixable=sites.filter(s=>s.isIis&&supported(s)&&((w3c(s)&&!s.scBytes)||s.logEnabled===false)).length;
+ let html='';
+ if(fixable&&canView('config')) html+=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><button class="btn btn-ghost btn-sm" id="iis-fix-all">🔧 为全部 ${fixable} 个站点启用 sc-bytes</button><span class="text-muted" style="font-size:12px">修改 IIS 配置（applicationHost.config），仅拥有配置权限的账号可操作</span></div>`;
+ html+=`<table class="info-table"><tr>`;
+ html+=['站点','状态','今日流量','请求','UV','2xx / 4xx / 5xx','速率','累计流量','操作'].map(h=>`<td style="${TH}">${h}</td>`).join('');
  html+=`</tr>`;
  sites.forEach(s=>{
   const logs=(s.logs||[]).join('\n');
   const note=s.note?`<div class="text-muted" style="font-size:11px;margin-top:2px">${esc(s.note)}</div>`:'';
+  let status='<span class="text-muted">—</span>';
+  if(s.isIis){
+   const st=String(s.iisState||'');
+   const state=st==='Started'?'<span class="text-green">运行中</span>':(st==='Stopped'?'<span class="text-red">已停止</span>':(st?esc(st):'<span class="text-muted">—</span>'));
+   const log=s.logEnabled===false?'<span class="text-yellow">日志关闭</span>':'<span class="text-muted">日志已开</span>';
+   status=state+'<div style="font-size:11px;margin-top:2px">'+log+'</div>';
+  }
+  const needBytes=s.isIis&&supported(s)&&w3c(s)&&!s.scBytes;
+  const needLog=s.isIis&&supported(s)&&s.logEnabled===false;
+  let action='';
+  if(needBytes||needLog){
+   const label=needBytes?'启用 sc-bytes':'启用日志';
+   action=canView('config')
+    ?`<button class="btn btn-ghost btn-sm" data-iis-fix="${escAttr(s.name)}" title="修改 IIS 配置：启用日志记录并勾选“发送的字节数（sc-bytes）”">${label}</button>`
+    :'<span class="text-muted" style="font-size:11px">需配置权限</span>';
+  }else if(s.isIis){action='<span class="text-muted">正常</span>'}
   html+=`<tr>
-   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${esc(logs)}">${esc(s.name)}${note}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${escAttr(logs)}">${esc(s.name)}${note}</td>
+   <td style="white-space:nowrap">${status}</td>
    <td>${fmtBytes(s.todayBytes)}</td>
    <td>${s.todayRequests||0}</td>
    <td>${s.uv||0}</td>
    <td><span class="text-green">${s.s2xx||0}</span> / <span class="${s.s4xx?'text-yellow':'text-muted'}">${s.s4xx||0}</span> / <span class="${s.s5xx?'text-red':'text-muted'}">${s.s5xx||0}</span></td>
    <td>${fmtRate(s.rateBps)}</td>
    <td>${fmtBytes(s.totalBytes)}</td>
+   <td style="white-space:nowrap">${action}</td>
   </tr>`;
  });
  el.innerHTML=html+`</table>`;
+ el.querySelectorAll('[data-iis-fix]').forEach(b=>{b.onclick=()=>iisLogFix(b.getAttribute('data-iis-fix'))});
+ const allBtn=$('iis-fix-all');if(allBtn)allBtn.onclick=()=>iisLogFix(null);
+}
+
+async function iisLogFix(site){
+ const what=site?('站点「'+site+'」'):'全部 IIS 站点';
+ if(!confirm('将为'+what+'启用日志记录并勾选 sc-bytes（发送的字节数）。\n修改会写入 IIS 配置 applicationHost.config，是否继续？'))return;
+ try{
+  const j=await api('/star/webLogFix',{method:'POST',body:JSON.stringify(site?{site}:{all:true})});
+  if(j.code===0){showToast(j.message||'已启用','success');setTimeout(loadTraffic,1200);}
+  else showToast(j.message||'操作失败','error');
+ }catch(e){}
 }
 function renderPortTraffic(d){
  const el=$('port-traffic-body');if(!el)return;
@@ -814,8 +849,8 @@ function renderPortTraffic(d){
    <td>${r.conns||0}</td>
    <td>${r.rxBytes==null?'—':fmtBytes(r.rxBytes)}</td>
    <td>${r.txBytes==null?'—':fmtBytes(r.txBytes)}</td>
-   <td>${fmtRate(r.rxBps)}</td>
-   <td>${fmtRate(r.txBps)}</td>
+   <td>${r.rxBytes==null?'—':fmtRate(r.rxBps)}</td>
+   <td>${r.txBytes==null?'—':fmtRate(r.txBps)}</td>
   </tr>`;
  });
  el.innerHTML=html+`</table>`;

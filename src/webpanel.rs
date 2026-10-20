@@ -639,6 +639,7 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("fileChmod", "修改文件权限"),
     ("fileSearch", "搜索文件"),
     ("fileSize", "计算目录大小"),
+    ("webLogFix", "启用 IIS 日志字段"),
     ("logCleanRun", "日志清理"),
     ("logCleanConfig", "日志清理配置"),
     ("logCleanConfigSave", "保存日志清理配置"),
@@ -771,6 +772,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get(
         "webTraffic",
         guarded(panel.clone(), PERM_TRAFFIC, web_traffic),
+    );
+    controller = controller.post(
+        "webLogFix",
+        guarded(panel.clone(), PERM_CONFIG, web_log_fix),
     );
     controller = controller.get(
         "portTraffic",
@@ -1296,6 +1301,37 @@ fn web_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(401, "Unauthorized");
     }
     json_result(0, "", Some(crate::weblog::snapshot_json()))
+}
+
+/// 为 IIS 站点启用日志记录并勾选 `BytesSent`（sc-bytes）；`{"site":"名称"}` 或 `{"all":true}`。
+fn web_log_fix(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let body = json_body(ctx).unwrap_or(Json::Null);
+    let all = body.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let site = body
+        .get("site")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !all && site.is_empty() {
+        return json_error(400, "缺少站点名称");
+    }
+    // appcmd 是阻塞调用：放独立线程，避免占用 tokio 运行时线程
+    let joined = std::thread::spawn(move || {
+        crate::iis::enable_sc_bytes(if all { None } else { Some(site.as_str()) })
+    })
+    .join();
+    match joined {
+        Ok(Ok(msg)) => {
+            crate::weblog::request_rediscover();
+            json_result(0, &msg, None)
+        }
+        Ok(Err(e)) => json_error(500, &e),
+        Err(_) => json_error(500, "操作线程异常退出"),
+    }
 }
 
 /// 端口流量统计（`/star/portTraffic`）：各端口收发字节/速率/连接数。
