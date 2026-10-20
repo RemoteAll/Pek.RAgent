@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use dhrust::net::controller::{
     arg, arg_i64, json_body, json_error, json_result, ActionResult, Controller,
 };
@@ -2487,20 +2487,16 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         })
         .collect();
 
-    let processes: Vec<Json> = sys::top_processes(15, false)
-        .into_iter()
-        .map(|p| {
-            json!({
-                "name": p.name,
-                "pid": p.pid,
-                "memoryMB": p.memory_mb.to_string(),
-                "cpuTime": format!("{:.1}s", p.cpu_seconds),
-                "threadCount": p.threads,
-                "handleCount": 0,
-                "startTime": "",
-            })
-        })
-        .collect();
+    // 进程 Top：CPU 前 20 与内存前 20 取并集（前端可切换排序，
+    // 避免只按单一口径取榜导致「CPU 高的看不到」或「内存高的看不到」）
+    let mut proc_items = sys::top_processes(20, true);
+    let seen: std::collections::HashSet<u32> = proc_items.iter().map(|p| p.pid).collect();
+    for item in sys::top_processes(20, false) {
+        if !seen.contains(&item.pid) {
+            proc_items.push(item);
+        }
+    }
+    let processes: Vec<Json> = proc_items.iter().map(process_json).collect();
 
     let os = json!({
         "os": format!("{} {}", sys::os_description(), std::env::consts::ARCH),
@@ -2547,6 +2543,32 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
+/// 进程条目 → 面板 JSON（本机详情与「进程」接口共用；口径对齐 htop / 云监控）。
+fn process_json(p: &sys::ProcItem) -> Json {
+    json!({
+        "name": p.name,
+        "pid": p.pid,
+        "memoryMB": p.memory_mb,
+        "cpuPercent": (p.cpu_percent * 10.0).round() / 10.0,
+        "cpuTime": format!("{:.1}s", p.cpu_seconds),
+        "threadCount": p.threads,
+        "handleCount": p.handles,
+        "user": p.user,
+        "exe": p.exe,
+        "command": p.command,
+        "cwd": p.cwd,
+        "startTime": if p.start_time > 0 {
+            Local
+                .timestamp_opt(p.start_time, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
+}
+
 /// Top 进程列表。
 fn get_process_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
@@ -2554,22 +2576,12 @@ fn get_process_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 
     let sort = arg(ctx, "sort").unwrap_or_else(|| "memory".to_string());
-    let count = arg_i64(ctx, "count").unwrap_or(10).clamp(1, 200) as usize;
+    let count = arg_i64(ctx, "count").unwrap_or(10).clamp(1, 300) as usize;
     let by_cpu = sort.eq_ignore_ascii_case("cpu");
 
     let processes: Vec<Json> = sys::top_processes(count, by_cpu)
-        .into_iter()
-        .map(|p| {
-            json!({
-                "name": p.name,
-                "pid": p.pid,
-                "memoryMB": p.memory_mb.to_string(),
-                "cpuSeconds": format!("{:.1}", p.cpu_seconds),
-                "threadCount": p.threads,
-                "handleCount": 0,
-                "startTime": "",
-            })
-        })
+        .iter()
+        .map(process_json)
         .collect();
 
     let total = processes.len();

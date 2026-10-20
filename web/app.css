@@ -141,6 +141,9 @@ html{overflow-anchor:none}
 .log-toolbar .filter-btn:hover{border-color:var(--border-strong);color:var(--text-primary)}
 .log-toolbar .filter-btn.active{background:var(--gradient-brand);color:#fff;border-color:transparent}
 .log-empty{text-align:center;color:var(--text-muted);padding:60px 0;font-size:14px}
+/* 进程表排序切换 */
+.proc-sort{cursor:pointer;text-decoration:underline;color:var(--brand-500);font-weight:500}
+.proc-sort.active{font-weight:700;text-decoration:none}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;animation:fadeIn var(--duration-fast) ease-out}
 .modal-box{background:var(--surface-1);border:1px solid var(--border-subtle);border-radius:var(--radius-xl);padding:28px;max-width:500px;width:90%;box-shadow:var(--shadow-modal);animation:scaleIn var(--duration-slow) var(--ease-out-expo)}
 .modal-box h3{font-size:17px;font-weight:700;margin-bottom:10px}

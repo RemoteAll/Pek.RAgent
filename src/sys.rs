@@ -13,7 +13,7 @@ pub(crate) use dhrust::sys::machine::{
 };
 pub(crate) use dhrust::sys::monitor::{
     disk_io, is_process_running, load_average, process_cpu_seconds, process_cpu_split,
-    process_stats, system_cpu_rate, tcp_counts, top_processes, DiskIo,
+    process_stats, system_cpu_rate, tcp_counts, top_processes, DiskIo, ProcItem,
 };
 pub(crate) use dhrust::sys::process::{
     empty_working_set, is_alive, memory_mb, process_name, raise_priority, set_oom_score_adjust,

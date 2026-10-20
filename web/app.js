@@ -597,14 +597,14 @@ async function loadMachineDetail(){
    html+=`</table>`;
   }
 
-  // 进程 Top
+  // 进程 Top（字段对齐 htop / 云监控：用户 / CPU% / 内存 / 线程句柄 / 启动时间 / 命令行与路径）
   if(d.processes&&d.processes.length>0){
-   html+=`<div class="section-title mt-16">进程 Top 15（按内存排序）</div><table class="info-table">`;
-   html+=`<tr><td style="font-size:11px;color:var(--text-tertiary)">进程名</td><td style="font-size:11px;color:var(--text-tertiary)">PID</td><td style="font-size:11px;color:var(--text-tertiary)">内存</td><td style="font-size:11px;color:var(--text-tertiary)">线程</td><td style="font-size:11px;color:var(--text-tertiary)">CPU时间</td></tr>`;
-   d.processes.forEach(p=>{
-    html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(p.name)}</td><td>${p.pid}</td><td>${p.memoryMB} MB</td><td>${p.threadCount}</td><td>${p.cpuTime}</td></tr>`;
-   });
-   html+=`</table>`;
+   _procData=d.processes;
+   html+=`<div class="section-title mt-16">进程 Top 20（排序：<span class="proc-sort" data-sort="cpu" onclick="setProcSort('cpu')">CPU</span> · <span class="proc-sort" data-sort="mem" onclick="setProcSort('mem')">内存</span>）</div>
+   <div style="overflow-x:auto"><table class="info-table" style="min-width:820px">
+    <tr><td style="${TH}">PID</td><td style="${TH}">用户</td><td style="${TH}">进程 / 可执行文件</td><td style="${TH}">CPU</td><td style="${TH}">内存</td><td style="${TH}">线程/句柄</td><td style="${TH}">启动时间</td></tr>
+    <tbody id="proc-rows"></tbody>
+   </table></div>`;
   }
 
   // GPU 信息
@@ -617,7 +617,38 @@ async function loadMachineDetail(){
   }
 
   el.innerHTML=html;
+  renderProcRows();
  }catch(e){el.innerHTML=`<p class="text-muted">加载失败</p>`}
+}
+
+/* ── 进程表（本机详情；可切换 CPU / 内存排序） ── */
+let _procData=[], _procSort='cpu';
+function setProcSort(k){
+ _procSort=k;
+ renderProcRows();
+ document.querySelectorAll('.proc-sort').forEach(s=>s.classList.toggle('active',s.dataset.sort===k));
+}
+function renderProcRows(){
+ const body=$('proc-rows');if(!body)return;
+ const num=v=>{const n=parseFloat(v);return isNaN(n)?0:n};
+ const rows=_procData.slice().sort((a,b)=>_procSort==='cpu'
+  ?(num(b.cpuPercent)-num(a.cpuPercent))||(num(b.memoryMB)-num(a.memoryMB))
+  :(num(b.memoryMB)-num(a.memoryMB))||(num(b.cpuPercent)-num(a.cpuPercent))).slice(0,20);
+ body.innerHTML=rows.map(p=>{
+  const cmd=p.command||p.exe||'';
+  const path=p.exe||p.cwd||'';
+  const cpu=num(p.cpuPercent);
+  return `<tr>
+   <td>${p.pid}</td>
+   <td>${esc(p.user||'—')}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(cmd?cmd+'\n'+path:path)}">${esc(p.name)}${path?`<div class="text-muted" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc(path)}</div>`:''}</td>
+   <td${cpu>=50?' class="text-yellow"':''}>${cpu.toFixed(1)}%</td>
+   <td>${p.memoryMB} MB</td>
+   <td>${p.threadCount||0}/${p.handleCount||0}</td>
+   <td style="font-size:11px">${esc(p.startTime||'—')}</td>
+  </tr>`;
+ }).join('');
+ document.querySelectorAll('.proc-sort').forEach(s=>s.classList.toggle('active',s.dataset.sort===_procSort));
 }
 
 /* ── 流量统计（网站访问日志 + 端口计数） ── */

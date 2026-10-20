@@ -430,7 +430,7 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 内置管理面板，浏览器访问 `http://127.0.0.1:5501/`（`LocalOnly=false` 时允许远程）：
 
 - **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；**登录会话默认保持 12 小时（`WebSessionHours`，滑动续期）且落盘，重启/升级不掉登录**；**密码不明文上网络**（`GET /api/loginChallenge` 下发一次性 nonce + 盐，前端本地算 `SHA-256(nonce:SHA-256(salt:password))` 提交，nonce 用完即废、2 分钟过期；旧版明文口令仍兼容）；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；改密码或「退出所有设备」立即注销其它会话；
-- **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
+- **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/**进程 Top 20**）/；
 - **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
 - **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
@@ -473,7 +473,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
 | `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
-| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
+| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程（`getProcessList?sort=cpu|memory&count=N`；字段口径对齐 htop / 云监控：`cpuPercent` 瞬时占单核百分比（可 >100）、`memoryMB`、`user`、`exe`、`command`、`cwd`、`threadCount`、`handleCount`（Linux 为打开文件数）、`startTime`） |
 | `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制） |
 | `GET /star/trafficHistory` | 流量历史每日归档（`?days=90` 最近 N 天：网站按站/端口按天数据与保留天数） |
 | `GET /star/fileList`、`GET /star/fileRead`、`POST /star/fileWrite` | 文件管理：目录浏览 / 读取（在线编辑） / 保存 |
