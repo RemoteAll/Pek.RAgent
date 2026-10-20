@@ -66,14 +66,19 @@
   <TrafficHistoryDays>90</TrafficHistoryDays>
   <!--日志清理自定义路径（高级选项，面板配置页不展示；仅直接编辑本文件时使用）。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
   <LogCleanupPaths></LogCleanupPaths>
-  <!--在线插件源（catalog.json）地址。仅允许 https（127.0.0.1 例外）；留空 = 关闭在线插件-->
+  <!--在线插件源（catalog.json）地址。一般**留空即可**：接入平台后由平台自动下发（含签名公钥）；留空且未接入平台 = 关闭在线插件-->
   <PluginStoreUrl></PluginStoreUrl>
-  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256。自动升级发行源验签复用本公钥-->
+  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。一般**留空即可**：接入平台后由平台自动下发；非空时强制校验 catalog.json.sig（防源被篡改）。自动升级发行源验签复用本公钥-->
   <PluginStorePubKey></PluginStorePubKey>
-  <!--代理自动升级源（星尘代理发行源 catalog.json）地址，默认官方平台。仅允许 https（127.0.0.1 例外）；留空 = 关闭自动升级（仍可用「上传即升级」手工通道）-->
+  <!--代理自动升级源（星尘代理发行源 catalog.json）地址，默认官方平台。仅允许 https（127.0.0.1 例外）；留空 = 关闭自动升级（仍可用「上传即升级」手工通道）。
+      平台实时通道的连接地址由本项推导（scheme://host[:port] + /store/agents/ws）-->
   <AutoUpgradeUrl>https://p.sc8.fun/store/agents/catalog.json</AutoUpgradeUrl>
-  <!--平台接入令牌（Pek.RPanlServer「服务器节点」页生成）。配置后启用 WebSocket 实时通道：向平台实时上报机器数据（CPU/内存/磁盘/子服务），并接收平台下发的「立即检查升级」指令；留空 = 不接入平台-->
+  <!--平台接入令牌。**可以留空**：留空且 <PairingEnabled>true</PairingEnabled> 时以「配对模式」接入——
+      节点只需能连上平台，平台「服务器节点」页会出现「待批准」条目，管理员点一下批准即自动下发本节点专用令牌（无需手抄）。
+      也可以由平台「服务器节点」页生成后填到这里（全局令牌），接上后平台会自动换成节专用令牌并写回本文件-->
   <AutoUpgradeToken></AutoUpgradeToken>
+  <!--免令牌配对接入。默认 true：令牌留空时也能接入平台，等待管理员批准；false = 必须填令牌（令牌空则不连接）-->
+  <PairingEnabled>true</PairingEnabled>
   <!--自动升级检查间隔（分钟），默认 60（5~1440）-->
   <AutoUpgradeIntervalMinutes>60</AutoUpgradeIntervalMinutes>
   <!--节点标识。平台「服务器节点」用于识别本机的唯一 ID：首次运行自动生成（32 位十六进制）并写入本文件、此后保持不变；克隆镜像/整机复制的服务器之间不会撞号。一般无需修改-->

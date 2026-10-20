@@ -951,6 +951,8 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "panelWs": {
             "enabled": crate::panel_ws::enabled(&cfg),
             "connected": crate::panel_ws::connected(),
+            // 配对模式：已连上平台但尚未被管理员批准（面板提示「等待批准」）
+            "pairPending": crate::panel_ws::pairing_pending(),
         },
         // 进程健康指标（原 /api/health 合并至此：面板每 3 秒刷新只需一次请求，
         // 且复用上面已采集的进程统计，省一次全进程快照与进程内存查询）

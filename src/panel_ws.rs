@@ -24,6 +24,8 @@ use crate::util;
 static STARTED: OnceLock<Instant> = OnceLock::new();
 /// 当前连接状态（会话钩子维护；面板状态展示用）。
 static CONNECTED: AtomicBool = AtomicBool::new(false);
+/// 是否处于「等待平台批准」状态（配对模式，平台已回 `pairPending`）。
+static PAIR_PENDING: AtomicBool = AtomicBool::new(false);
 /// 当前会话的客户端句柄（平台判定标识重复时用于立即断开触发重连）。
 static CURRENT: OnceLock<std::sync::Mutex<Option<WsClient>>> = OnceLock::new();
 
@@ -32,9 +34,15 @@ pub fn connected() -> bool {
     CONNECTED.load(Ordering::Relaxed)
 }
 
-/// 是否启用（升级源地址与接入令牌都非空）。
+/// 是否启用（升级源地址非空，且「有令牌」或「开配对」）。
 pub fn enabled(cfg: &AgentConfig) -> bool {
-    !cfg.auto_upgrade_url.trim().is_empty() && !cfg.auto_upgrade_token.trim().is_empty()
+    !cfg.auto_upgrade_url.trim().is_empty()
+        && (!cfg.auto_upgrade_token.trim().is_empty() || cfg.pairing_enabled)
+}
+
+/// 当前是否处于「已接入、等待平台批准」状态（面板展示用）。
+pub fn pairing_pending() -> bool {
+    PAIR_PENDING.load(Ordering::Relaxed)
 }
 
 /// 从升级源地址推导 WS 地址（origin + `/store/agents/ws`；仅 http/https）。
@@ -92,7 +100,13 @@ async fn run(manager: Arc<AppManager>) {
             continue;
         };
         let token = cfg.auto_upgrade_token.trim().to_string();
-        let full = format!("{url}?token={}", dhrust::web::url_encode(&token));
+        // 无令牌 → 配对模式（`?pair=1`）：平台会把本节点放进「待批准」队列，
+        // 批准后在本连接上下发 `tokenIssue`，写入配置并自动重连。
+        let full = if token.is_empty() {
+            format!("{url}?pair=1")
+        } else {
+            format!("{url}?token={}", dhrust::web::url_encode(&token))
+        };
         util::log_format("平台实时通道连接中：{}", &[&url]);
         // 会话当前标识（每次连接成功时由 on_connected 刷新）：配置中的标识变更（含平台判定
         // 重复后自动重建）即断开重连，重连时携带新标识重新注册
@@ -113,7 +127,8 @@ async fn run(manager: Arc<AppManager>) {
         loop {
             tokio::select! {
                 _ = hb.tick() => {
-                    if client.is_connected() {
+                    // 配对（待批准）期间不发心跳：平台此时不接收任何上报，省带宽也省日志
+                    if client.is_connected() && !PAIR_PENDING.load(Ordering::Relaxed) {
                         let _ = client.send_text(build_heartbeat(&manager));
                     }
                 }
@@ -145,6 +160,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
     let conn_id = session_id.clone();
     let on_connected = Arc::new(move |client: WsClient| {
         CONNECTED.store(true, Ordering::Relaxed);
+        PAIR_PENDING.store(false, Ordering::Relaxed);
         // 记录本会话实际使用的标识（重连时若配置已变更——如平台判定重复后重建——取新值）
         {
             let mut sid = conn_id.lock().unwrap_or_else(|e| e.into_inner());
@@ -166,6 +182,20 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
         };
         match v.get("type").and_then(|t| t.as_str()).unwrap_or("") {
             "hello" => util::log_info("平台实时通道已建立（节点已接入）"),
+            "pairPending" => {
+                PAIR_PENDING.store(true, Ordering::Relaxed);
+                util::log_info(
+                    "已向平台提交接入申请，等待管理员在「服务器节点」页批准（批准后自动下发令牌并上线）",
+                );
+            }
+            "pairDenied" => {
+                PAIR_PENDING.store(false, Ordering::Relaxed);
+                let reason = v
+                    .get("reason")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("平台拒绝配对接入");
+                util::log_error(&format!("平台拒绝配对接入：{reason}"));
+            }
             "idConflict" => {
                 util::log_info("平台检测到节点标识与其他服务器重复，重新生成标识");
                 regenerate_agent_id(&msg_mgr);
@@ -182,6 +212,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
     });
     let on_disconnected = Arc::new(move |reason: String| {
         CONNECTED.store(false, Ordering::Relaxed);
+        PAIR_PENDING.store(false, Ordering::Relaxed);
         util::log_format("平台实时通道已断开：{}（自动重连中）", &[&reason]);
     });
     WsHooks {

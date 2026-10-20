@@ -99,6 +99,9 @@ pub struct AgentConfig {
     /// 平台接入令牌（Pek.RPanlServer「服务器节点」页生成；配置后启用 WebSocket 实时通道：
     /// 上报机器数据到平台并接收「立即检查升级」指令。空 = 不接入）
     pub auto_upgrade_token: String,
+    /// 免令牌配对：令牌为空时是否仍尝试接入平台（默认 true）。
+    /// 接上后平台把它放进「待批准」队列，管理员批准即下发专用令牌并写回本配置。
+    pub pairing_enabled: bool,
     /// 节点标识（平台「服务器节点」识别本机的唯一 ID）。首次运行自动生成随机值并写入本文件，
     /// 此后保持不变；克隆镜像/整机复制的多台服务器也不会撞号。一般无需修改
     pub agent_id: String,
@@ -154,6 +157,7 @@ impl Default for AgentConfig {
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
             auto_upgrade_interval_minutes: 60,
             auto_upgrade_token: String::new(),
+            pairing_enabled: true,
             agent_id: String::new(),
             ai_enabled: true,
             ai_base_url: "https://api.deepseek.com/v1".to_string(),
