@@ -99,6 +99,8 @@ struct ViewEntry {
     listen: bool,
     /// 当前连接数（TCP ESTABLISHED / UDP 绑定数）
     conns: u32,
+    /// 占用该端口的进程 ID（Windows 连接表 OWNER_PID；Linux 暂为 0）
+    pid: u32,
 }
 
 /// 展示行。
@@ -116,6 +118,12 @@ struct Row {
     rx_bps: Option<u64>,
     /// 实时发送速率
     tx_bps: Option<u64>,
+    /// 占用该端口的进程 ID（0 = 未知）
+    pid: u32,
+    /// 进程名（如 dotnet.exe / nginx.exe）
+    process: String,
+    /// 进程可执行文件完整路径
+    path: String,
 }
 
 impl Row {
@@ -129,6 +137,9 @@ impl Row {
             tx_bytes: None,
             rx_bps: None,
             tx_bps: None,
+            pid: 0,
+            process: String::new(),
+            path: String::new(),
         }
     }
 }
@@ -321,8 +332,9 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
                         .map(|s| now.duration_since(s).as_secs_f64())
                         .filter(|d| *d >= 0.5)
                         .unwrap_or(0.0);
-                    let (rows, counters) =
+                    let (mut rows, counters) =
                         rows_nft(&rules, &ports, &views, &inner.last_counters, dt);
+                    enrich_process_info(&mut rows);
                     // 每日归档累计（必须在 last_counters 更新前，用上一轮读数做差分）
                     accumulate_daily(&t.base, inner, &counters, &today);
                     inner.rows = rows;
@@ -345,7 +357,9 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
                     inner.mode = Mode::View;
                     inner.message = format!("nftables 计数不可用（{e}），已降级为连接视图");
                     util::log_format("端口流量计数失败，降级为连接视图：{}", &[&e]);
-                    inner.rows = rows_view(&configured, &views);
+                    let mut rows = rows_view(&configured, &views);
+                    enrich_process_info(&mut rows);
+                    inner.rows = rows;
                     inner.last_counters.clear();
                     inner.last_sample = Some(Instant::now());
                     inner.last_retry = Some(Instant::now());
@@ -353,7 +367,9 @@ fn sample(t: &PortStat, cfg: &AgentConfig) {
             }
         }
         Mode::View => {
-            inner.rows = rows_view(&configured, &views);
+            let mut rows = rows_view(&configured, &views);
+            enrich_process_info(&mut rows);
+            inner.rows = rows;
         }
         Mode::Off | Mode::Unsupported => {}
     }
@@ -531,6 +547,9 @@ pub(crate) fn snapshot_json() -> Json {
                 "proto": r.proto.text(),
                 "listen": r.listen,
                 "conns": r.conns,
+                "pid": r.pid,
+                "process": r.process,
+                "path": r.path,
                 "rxBytes": r.rx_bytes,
                 "txBytes": r.tx_bytes,
                 "rxBps": r.rx_bps,
@@ -733,6 +752,10 @@ fn conn_views_windows() -> HashMap<(Proto, u16), ViewEntry> {
                     let row = rows.add(i);
                     let port = port_of((*row).dwLocalPort);
                     let e = map.entry((Proto::Tcp, port)).or_default();
+                    // 优先记录 LISTEN 行的 OWNER_PID；ESTABLISHED 仅在尚无 PID 时补位。
+                    if (*row).dwState == 2 || e.pid == 0 {
+                        e.pid = (*row).dwOwningPid;
+                    }
                     match (*row).dwState {
                         2 => e.listen = true, // MIB_TCP_STATE_LISTEN
                         5 => e.conns += 1,    // MIB_TCP_STATE_ESTAB
@@ -775,6 +798,7 @@ fn conn_views_windows() -> HashMap<(Proto, u16), ViewEntry> {
                     let e = map.entry((Proto::Udp, port)).or_default();
                     e.listen = true;
                     e.conns += 1;
+                    e.pid = (*row).dwOwningPid;
                 }
             }
         }
@@ -811,6 +835,7 @@ fn rows_nft(
         if let Some(e) = map.get_mut(key) {
             e.listen = v.listen;
             e.conns = v.conns;
+            e.pid = v.pid;
         }
     }
 
@@ -843,6 +868,7 @@ fn rows_view(configured: &[u16], views: &HashMap<(Proto, u16), ViewEntry>) -> Ve
                 let mut row = Row::new(key.1, key.0);
                 row.listen = true;
                 row.conns = v.conns;
+                row.pid = v.pid;
                 map.insert(*key, row);
             }
         }
@@ -856,12 +882,84 @@ fn rows_view(configured: &[u16], views: &HashMap<(Proto, u16), ViewEntry>) -> Ve
             if let Some(e) = map.get_mut(key) {
                 e.listen = v.listen;
                 e.conns = v.conns;
+                e.pid = v.pid;
             }
         }
     }
     let mut rows: Vec<Row> = map.into_values().collect();
     rows.truncate(MAX_ROWS);
     rows
+}
+
+/// 为端口行补全占用进程信息（按 PID 去重查询，避免每行重复打开进程）。
+fn enrich_process_info(rows: &mut [Row]) {
+    let mut cache: HashMap<u32, (String, String)> = HashMap::new();
+    for row in rows.iter_mut() {
+        if row.pid == 0 {
+            continue;
+        }
+        let (name, path) = cache
+            .entry(row.pid)
+            .or_insert_with(|| process_info(row.pid))
+            .clone();
+        row.process = name;
+        row.path = path;
+    }
+}
+
+/// 查询进程名与可执行文件完整路径（Windows：QueryFullProcessImageNameW）。
+#[cfg(windows)]
+fn process_info(pid: u32) -> (String, String) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+
+    if pid == 0 {
+        return (String::new(), String::new());
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return (String::new(), String::new());
+        }
+        let mut buf = vec![0u16; 32_768];
+        let mut len = buf.len() as u32;
+        let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+        let _ = CloseHandle(handle);
+        if ok == 0 || len == 0 {
+            return (String::new(), String::new());
+        }
+        let path = String::from_utf16_lossy(&buf[..len as usize]);
+        let name = Path::new(&path)
+            .file_name()
+            .map(|s| s.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (name, path)
+    }
+}
+
+/// 非 Windows：Linux 可按 PID 读 `/proc/{pid}/exe` 与 `comm`；其它平台留空。
+#[cfg(not(windows))]
+fn process_info(pid: u32) -> (String, String) {
+    if pid == 0 {
+        return (String::new(), String::new());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let name = std::fs::read_to_string(format!("/proc/{pid}/comm"))
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        return (name, path);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        (String::new(), String::new())
+    }
 }
 
 // ————— nftables 计数 —————
@@ -1175,6 +1273,7 @@ mod tests {
             ViewEntry {
                 listen: true,
                 conns: 7,
+                pid: 0,
             },
         );
         let mut last = HashMap::new();
@@ -1206,6 +1305,7 @@ mod tests {
             ViewEntry {
                 listen: true,
                 conns: 2,
+                pid: 0,
             },
         );
         views.insert(
@@ -1213,6 +1313,7 @@ mod tests {
             ViewEntry {
                 listen: false,
                 conns: 9,
+                pid: 0,
             },
         );
         views.insert(
@@ -1220,6 +1321,7 @@ mod tests {
             ViewEntry {
                 listen: true,
                 conns: 1,
+                pid: 0,
             },
         );
 

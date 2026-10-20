@@ -838,14 +838,18 @@ function renderPortTraffic(d){
  const note=d.message?`<p class="text-muted" style="margin-bottom:10px">${esc(d.message)}</p>`:'';
  if(!rows.length){el.innerHTML=note+'<p class="text-muted">暂无数据（采样中…）</p>';return}
  let html=note+`<table class="info-table"><tr>`;
- html+=['端口','协议','状态','连接数','接收','发送','↓ 速率','↑ 速率'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ html+=['端口','协议','状态','应用（PID）','路径','连接数','接收','发送','↓ 速率','↑ 速率'].map(h=>`<td style="${TH}">${h}</td>`).join('');
  html+=`</tr>`;
  rows.forEach(r=>{
   const st=r.listen?'<span class="text-green">监听中</span>':'—';
+  const proc=r.process?esc(r.process)+(r.pid?` (${r.pid})`:''):'—';
+  const path=r.path?`<span title="${esc(r.path)}" style="word-break:break-all">${esc(r.path)}</span>`:'—';
   html+=`<tr>
    <td style="font-family:var(--font-mono);font-size:12px">${r.port}</td>
    <td>${esc((r.proto||'').toUpperCase())}</td>
    <td>${st}</td>
+   <td style="font-size:12px;white-space:nowrap">${proc}</td>
+   <td style="font-family:var(--font-mono);font-size:11px;max-width:420px;word-break:break-all">${path}</td>
    <td>${r.conns||0}</td>
    <td>${r.rxBytes==null?'—':fmtBytes(r.rxBytes)}</td>
    <td>${r.txBytes==null?'—':fmtBytes(r.txBytes)}</td>
