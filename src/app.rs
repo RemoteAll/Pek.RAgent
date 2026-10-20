@@ -265,6 +265,43 @@ impl AppRuntime {
             });
         }
 
+        // 启动前防重复：影子目录共用一个可执行文件，代理重启/旧版本遗留时可能已有
+        // 同路径进程在跑（它占着监听端口，新实例会因绑定失败退出，形成重启循环）。
+        // 发现后直接接管其中一个，并清理多余实例；任务模式不接管（允许一次性并发）。
+        if !prepared.task {
+            if let Some(run_file) = prepared.run_file.as_deref() {
+                let shadow_base = prepared.shadow.as_deref().and_then(|p| p.parent());
+                let mut found = existing_instances(run_file, &self.name, shadow_base);
+                if !found.is_empty() {
+                    // 优先保留已有监听端口的实例，其次保留最早启动的（通常是旧的服务实例）。
+                    found.sort_by(|a, b| {
+                        b.ports
+                            .len()
+                            .cmp(&a.ports.len())
+                            .then(a.start_time.cmp(&b.start_time))
+                    });
+                    let keep = found.remove(0);
+                    for extra in &found {
+                        util::log_format(
+                            "应用[{}]发现重复实例 PID={}，停止以只保留一个实例",
+                            &[&self.name, &extra.pid.to_string()],
+                        );
+                        let _ = sys::stop_process(extra.pid, 3_000);
+                    }
+                    util::log_format(
+                        "应用[{}]启动前发现已运行实例 PID={} 进程={}，直接接管（不再重复启动）",
+                        &[&self.name, &keep.pid.to_string(), &keep.name],
+                    );
+                    drop(st);
+                    self.adopt(keep.pid, keep.name);
+                    return Ok(StartResult {
+                        started: true,
+                        task: false,
+                    });
+                }
+            }
+        }
+
         let log_file = if cfg.debug || (retry && global.debug) {
             Some(self.base.join("Log").join(format!("app-{}.log", cfg.name)))
         } else {
@@ -805,6 +842,85 @@ impl AppRuntime {
     }
 }
 
+/// 扫描系统进程，找出可执行文件路径与 `run_file` 相同的存活实例。
+///
+/// 影子模式共用同一路径；若上一任代理/旧版本遗留下的进程仍在跑，它就是监听端口的
+/// 真正持有者。此时必须接管它，否则新实例会绑定失败并退出，形成循环。
+fn existing_instances(
+    run_file: &Path,
+    app_name: &str,
+    shadow_base: Option<&Path>,
+) -> Vec<sys::ProcItem> {
+    let target = std::fs::canonicalize(run_file).unwrap_or_else(|_| run_file.to_path_buf());
+    let self_pid = std::process::id();
+    let prefix = format!("{app_name}-");
+    sys::top_processes(usize::MAX, true)
+        .into_iter()
+        .filter(|p| {
+            p.pid != 0
+                && p.pid != self_pid
+                && (same_exe(&p.exe, &target)
+                    || is_shadow_exe(&p.exe, shadow_base, &prefix))
+        })
+        .collect()
+}
+
+/// 是否为同一应用的影子目录进程（覆盖旧 MD5 影子路径，例如版本升级后遗留的租户）。
+fn is_shadow_exe(proc_exe: &str, shadow_base: Option<&Path>, prefix: &str) -> bool {
+    let Some(base) = shadow_base else {
+        return false;
+    };
+    if proc_exe.trim().is_empty() {
+        return false;
+    }
+    let path = std::fs::canonicalize(proc_exe).unwrap_or_else(|_| PathBuf::from(proc_exe));
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    // shadow/{app}-{hash}/{exe}：父目录名以 "{app}-" 开头，祖父目录是 shadow 根。
+    let Some(app_dir) = path.parent() else {
+        return false;
+    };
+    let Some(parent) = app_dir.parent() else {
+        return false;
+    };
+    let parent_same = {
+        #[cfg(windows)]
+        {
+            parent
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&base.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            parent == base
+        }
+    };
+    if !parent_same {
+        return false;
+    }
+    app_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+/// 可执行文件路径比较（Windows 大小写不敏感；先规范化再比）。
+fn same_exe(proc_exe: &str, target: &Path) -> bool {
+    if proc_exe.trim().is_empty() {
+        return false;
+    }
+    let proc_path = Path::new(proc_exe);
+    let a = std::fs::canonicalize(proc_path).unwrap_or_else(|_| proc_path.to_path_buf());
+    let b = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
 /// 退出状态文本（诊断用）：Owned 直接取 `Child::try_wait` 的 `ExitStatus`，
 /// Adopted 只有 PID，无法取得退出码。
 ///
@@ -1044,6 +1160,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn shadow_matcher_covers_old_hashes_and_ignores_other_apps() {
+        let base = temp_dir("shadow-base");
+        let app_dir = base.join("myapp-abc123");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let exe = app_dir.join("myapp.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let exe_text = exe.to_string_lossy().to_string();
+
+        assert!(is_shadow_exe(&exe_text, Some(&base), "myapp-"));
+        assert!(!is_shadow_exe(&exe_text, Some(&base), "other-"));
+        assert!(!is_shadow_exe(&exe_text, None, "myapp-"));
+    }
+
+    #[test]
+    fn same_exe_matches_current_process_binary() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(same_exe(&exe.to_string_lossy(), &exe));
     }
 
     #[test]

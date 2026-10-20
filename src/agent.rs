@@ -10,6 +10,7 @@ use dhrust::threading::Timer;
 use crate::config::AgentConfig;
 use crate::manager::AppManager;
 use crate::service::ServiceManager;
+use crate::sys;
 use crate::util;
 
 /// 全局停止标志（信号 / 服务控制 / 回车退出 共用）。
@@ -142,6 +143,14 @@ impl Agent {
 
 /// 核心运行：拉起应用、启动控制接口、守护循环、等待退出。
 fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period: u64) {
+    // 0) 单实例锁：同一基础目录只允许一个 RAgent 运行。
+    //    防止 Windows 服务与手动 `-run`/菜单实例同时守护同一批应用，
+    //    造成重复拉起、端口冲突与重启循环。
+    if let Err(e) = acquire_instance_lock(manager.base()) {
+        util::log_error(&e);
+        return;
+    }
+
     // 1) 拉起已启用应用（配置“加载即补齐”由 AgentConfig::load 内部自动完成）
     manager.start_all();
 
@@ -214,7 +223,62 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     drop(up_timer);
     drop(hb_timer);
     drop(au_timer);
+    release_instance_lock(manager.base());
     util::log_info("星尘代理已退出");
+}
+
+/// 获取代理单实例锁（`Data/agent.lock`）。
+///
+/// 锁文件只记录 PID：已存在且对应进程仍存活则拒绝启动；进程已退出视为残留锁并清理。
+/// 用 `create_new` 保证并发启动时只有一个能创建成功。
+fn acquire_instance_lock(base: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    let dir = base.join("Data");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建数据目录失败 {}：{e}", dir.display()))?;
+    let path = dir.join("agent.lock");
+    let self_pid = std::process::id();
+
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let _ = write!(f, "{self_pid}");
+                let _ = f.flush();
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    if let Ok(pid) = text.trim().parse::<u32>() {
+                        if pid != self_pid && sys::is_alive(pid) {
+                            return Err(format!(
+                                "已有星尘代理实例运行（PID={pid}），本实例退出：{}",
+                                path.display()
+                            ));
+                        }
+                    }
+                }
+                // 进程已不在（上次异常退出/升级移交）→ 清理残留锁后重试
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => return Err(format!("创建实例锁失败 {}：{e}", path.display())),
+        }
+    }
+    Err(format!("获取实例锁失败（并发冲突）：{}", path.display()))
+}
+
+/// 释放本进程持有的代理实例锁。
+fn release_instance_lock(base: &Path) {
+    let path = base.join("Data").join("agent.lock");
+    if let Ok(text) = std::fs::read_to_string(&path) {
+        if text.trim() == std::process::id().to_string() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 /// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并移交新版本——Unix 由旧进程
