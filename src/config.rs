@@ -70,6 +70,9 @@ pub struct AgentConfig {
     pub web_user_password: String,
     /// Web 面板鉴权级别。None 不鉴权；LocalOnly 本地免鉴权、远程需鉴权（默认）；Full 全部鉴权
     pub web_auth_level: String,
+    /// 面板登录会话保持时长（小时，滑动续期：期间用过面板就不掉线；重启/升级不掉登录）。
+    /// 默认 12；0 = 关闭持久化（仅进程内 24 小时，重启即失效）
+    pub web_session_hours: u32,
     /// 后台资源采样间隔（毫秒）。默认 1000；0 = 关闭后台采样（回退为面板请求时现采）
     pub sample_interval: u64,
     /// 网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + `web_logs` 手动补充），默认开启
@@ -141,6 +144,8 @@ impl Default for AgentConfig {
             web_user_name: "admin".to_string(),
             web_user_password: "admin".to_string(),
             web_auth_level: "LocalOnly".to_string(),
+            // 登录会话：默认保持 12 小时（滑动续期），避免重启后/隔天反复输入密码
+            web_session_hours: 12,
             sample_interval: 1000,
             // 网站流量：只读日志文件、无系统副作用，默认开启（面板直接可见）
             web_traffic: true,
@@ -393,6 +398,10 @@ impl AgentConfig {
         if self.web_auth_level.trim().is_empty() {
             self.web_auth_level = "LocalOnly".to_string();
         }
+        // 会话保持时长：0 = 关闭持久化；上限 8760 小时（365 天，防误配成天文数字）
+        if self.web_session_hours > 8760 {
+            self.web_session_hours = 8760;
+        }
         // 采样间隔：0 = 关闭后台采样；非 0 时限定 200ms~60s（防误配打爆 CPU 或采样过粗）
         if self.sample_interval != 0 {
             self.sample_interval = self.sample_interval.clamp(200, 60_000);
@@ -621,6 +630,12 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_nonempty(obj, "WebAuthLevel") {
         cfg.web_auth_level = v;
     }
+    if let Some(v) = parse_of::<u32>(obj, "WebSessionHours") {
+        cfg.web_session_hours = v;
+    } else if let Some(v) = parse_of::<u32>(obj, "WebSessionDays") {
+        // 兼容旧键（按天换算）
+        cfg.web_session_hours = v.saturating_mul(24);
+    }
     if let Some(v) = parse_of::<u64>(obj, "SampleInterval") {
         cfg.sample_interval = v;
     }
@@ -796,6 +811,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebUserName", cfg.web_user_name.clone());
         push("WebPassword", cfg.web_user_password.clone());
         push("WebAuthLevel", cfg.web_auth_level.clone());
+        push("WebSessionHours", cfg.web_session_hours.to_string());
         push("SampleInterval", cfg.sample_interval.to_string());
         push("WebTraffic", bool_text(cfg.web_traffic));
         push("WebLogs", cfg.web_logs.clone());

@@ -284,6 +284,7 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
 | `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（面板「用户」页管理：内置管理员行可改用户名/密码） |
 | `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
+| `WebSessionHours` | `12` | 登录会话保持时长（**小时**，**滑动续期**：期间用过面板就不掉线，重启/升级服务不用重新登录）；会话落盘 `Data/panel-sessions.json`（Unix 0600）；`0` = 关闭持久化（仅进程内 24 小时）；上限 8760（365 天）；修改需重启服务后生效（会话已落盘，重启不会掉登录） |
 | `SampleInterval` | `1000` | 后台资源采样间隔（毫秒）：面板 CPU/网络/磁盘速率按此窗口差分；`0`=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效 |
 | `WebTraffic` | `true` | 网站流量统计开关：后台解析站点访问日志（自动发现常见目录 + `WebLogs` 手动补充），零侵入只读；关闭后停止读取；统计口径默认响应体字节（`$body_bytes_sent`），日志行尾追加 `$bytes_sent` 时自动改用实际发送字节（响应头+响应体，推荐配置见 8. 面板“流量”节） |
 | `WebLogs` | 空 | 网站日志手动补充（高级选项，面板配置页不展示，一般无需填写）：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
@@ -428,7 +429,7 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 
 内置管理面板，浏览器访问 `http://127.0.0.1:5501/`（`LocalOnly=false` 时允许远程）：
 
-- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
+- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；**登录会话默认保持 12 小时（`WebSessionHours`，滑动续期）且落盘，重启/升级不掉登录**；**密码不明文上网络**（`GET /api/loginChallenge` 下发一次性 nonce + 盐，前端本地算 `SHA-256(nonce:SHA-256(salt:password))` 提交，nonce 用完即废、2 分钟过期；旧版明文口令仍兼容）；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；改密码或「退出所有设备」立即注销其它会话；
 - **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
 - **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
@@ -462,6 +463,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | 端点 | 说明 |
 |------|------|
 | `POST /api/login`、`POST /api/logout` | 登录（返回 Token）/ 注销 |
+| `GET /api/loginChallenge`、`POST /api/logoutAll` | 登录挑战（一次性 nonce + 盐，密码不出网）/ 退出所有其它设备（仅内置管理员） |
 | `GET /api/status`、`GET /api/health` | 服务状态 / 健康指标 |
 | `POST /api/control` | 启停重启代理（`{"action":"start|stop|restart"}`） |
 | `GET /api/freeMemory` | 释放内存 |

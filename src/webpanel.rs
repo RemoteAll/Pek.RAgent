@@ -33,6 +33,7 @@ use dhrust::net::panel_auth::{bearer_token, client_ip, is_loopback, AuthLevel, T
 use dhrust::net::router::Ctx;
 use dhrust::web::{format_bytes, format_speed};
 use pek_radmin::panel::{action_name_of, truncate_text};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
@@ -44,7 +45,7 @@ use crate::sys;
 use crate::util;
 
 /// 请求主体（已认证身份）：内置管理员或数据库面板用户。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Principal {
     /// 登录名（审计记录用；`None` 鉴权级别下远程请求记为 `anon`）
     pub name: String,
@@ -61,6 +62,23 @@ impl Principal {
     }
 }
 
+/// 面板会话文件相对路径（`WebSessionHours > 0` 时启用：未过期令牌落盘，重启/升级后免重登）。
+const SESSIONS_FILE: &str = "Data/panel-sessions.json";
+/// 内置管理员的虚拟盐值（挑战登录统一口径：`SHA-256(salt:password)`，与数据库用户一致）。
+const BUILTIN_SALT: &str = "staragent-builtin";
+/// 登录挑战有效期（秒；一次性，用完即废）。
+const CHALLENGE_TTL_SECS: i64 = 120;
+
+/// 登录挑战记录（`nonce` → 期望的密码摘要 + 用户名）。
+struct Challenge {
+    /// 发起挑战时的用户名（登录时必须一致）
+    user: String,
+    /// 期望的密码摘要（`SHA-256(salt:password)`，与库中存储口径一致）
+    expect: String,
+    /// 到期墙钟（毫秒）
+    expire: i64,
+}
+
 /// 面板共享状态。
 pub struct WebPanel {
     /// 应用管理器
@@ -73,8 +91,14 @@ pub struct WebPanel {
     started: Instant,
     /// 进程启动墙钟
     started_at: DateTime<Local>,
-    /// 令牌表（令牌 → 会话主体；实现下沉 `dhrust::net::panel_auth::TokenStore`，默认 24 小时）
+    /// 令牌表（令牌 → 会话主体；实现下沉 `dhrust::net::panel_auth::TokenStore`）
+    ///
+    /// 有效期由 `WebSessionHours` 决定（默认 12 小时），**滑动续期**：期间用过面板就不会掉线。
     tokens: TokenStore<Principal>,
+    /// 会话落盘文件（`None` = 不持久化；见 `WebSessionHours`）
+    sessions_file: Option<PathBuf>,
+    /// 登录挑战表（一次性 nonce；默认 2 分钟过期）
+    challenges: Mutex<HashMap<String, Challenge>>,
     /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
     logins: LoginGuard,
     /// Web 应用防火墙（「安全」页：在线开关 + 参考配置）
@@ -89,16 +113,105 @@ impl WebPanel {
         port: u16,
         waf: Arc<pek_rwaf::Waf>,
     ) -> Arc<WebPanel> {
-        Arc::new(WebPanel {
+        let cfg = manager.config();
+        let hours = i64::from(cfg.web_session_hours.min(8760));
+        // 0 = 关闭持久化：退回进程内 24 小时（旧行为），重启即失效
+        let ttl_ms = if hours > 0 {
+            hours * 3_600_000
+        } else {
+            24 * 3_600_000
+        };
+        let panel = Arc::new(WebPanel {
             manager,
             base: base.to_path_buf(),
             port,
             started: Instant::now(),
             started_at: Local::now(),
-            tokens: TokenStore::new(),
+            tokens: TokenStore::with_ttl_ms(ttl_ms),
+            sessions_file: (hours > 0).then(|| base.join(SESSIONS_FILE)),
+            challenges: Mutex::new(HashMap::new()),
             logins: LoginGuard::new(),
             waf,
-        })
+        });
+        panel.load_sessions();
+        panel
+    }
+
+    /// 恢复上次运行留下的登录会话（令牌文件不存在/损坏时静默跳过）。
+    fn load_sessions(&self) {
+        let Some(path) = &self.sessions_file else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(root) = serde_json::from_str::<Json>(&text) else {
+            util::log_error("面板会话文件格式错误，已忽略（下次登录会重建）");
+            return;
+        };
+        let mut items = Vec::new();
+        for item in root
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let (Some(token), Some(expire), Some(principal)) = (
+                item.get("token").and_then(|v| v.as_str()),
+                item.get("expire").and_then(|v| v.as_i64()),
+                item.get("principal").cloned(),
+            ) else {
+                continue;
+            };
+            let Ok(principal) = serde_json::from_value::<Principal>(principal) else {
+                continue;
+            };
+            items.push((token.to_string(), expire, principal));
+        }
+        let count = self.tokens.restore(items);
+        if count > 0 {
+            let restored = count.to_string();
+            util::log_format(
+                "面板会话已恢复：{} 个（重启后无需重新登录）",
+                &[&restored],
+            );
+        }
+    }
+
+    /// 会话落盘（原子替换；Unix 下权限 0600）。失败只记日志，不影响请求。
+    fn save_sessions(&self) {
+        let Some(path) = &self.sessions_file else {
+            return;
+        };
+        let sessions: Vec<Json> = self
+            .tokens
+            .snapshot()
+            .into_iter()
+            .map(|(token, expire, principal)| {
+                json!({ "token": token, "expire": expire, "principal": principal })
+            })
+            .collect();
+        let body = json!({
+            "version": 1,
+            "updatedAt": Local::now().to_rfc3339(),
+            "sessions": sessions,
+        });
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, body.to_string()) {
+            util::log_error(&format!("写入面板会话文件失败：{e}"));
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            util::log_error(&format!("替换面板会话文件失败：{e}"));
+        }
     }
 
     /// 面板端口。
@@ -177,6 +290,81 @@ impl WebPanel {
         Some(self.tokens.issue_with(principal))
     }
 
+    /// 按用户名解析主体（挑战登录通过后使用；权限/启用状态以当前库为准）。
+    fn principal_by_name(&self, user: &str) -> Option<Principal> {
+        let name = user.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let cfg = self.manager.config();
+        if !cfg.web_user_name.trim().is_empty()
+            && !cfg.web_user_password.is_empty()
+            && name.eq_ignore_ascii_case(cfg.web_user_name.trim())
+        {
+            return Some(Principal {
+                name: cfg.web_user_name.trim().to_string(),
+                is_admin: true,
+                perms: Vec::new(),
+            });
+        }
+        match audit::find_user(&self.base, name) {
+            Ok(Some(u)) if u.enabled => Some(Principal {
+                name: u.user_name.clone(),
+                is_admin: false,
+                perms: u.permissions.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 用户口令摘要 `(salt, SHA-256(salt:password))`：挑战登录用。
+    ///
+    /// 内置管理员用固定虚拟盐现算；数据库用户直接取库中盐与哈希（同一口径）。
+    /// 用户不存在/被禁用时返回 `None`（调用方回填随机值，避免用户名枚举）。
+    fn credential_digest(&self, user: &str) -> Option<(String, String)> {
+        let name = user.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let cfg = self.manager.config();
+        if !cfg.web_user_name.trim().is_empty()
+            && !cfg.web_user_password.is_empty()
+            && name.eq_ignore_ascii_case(cfg.web_user_name.trim())
+        {
+            return Some((
+                BUILTIN_SALT.to_string(),
+                dhrust::sign::salted_sha256_hex(BUILTIN_SALT, &cfg.web_user_password),
+            ));
+        }
+        match audit::find_user(&self.base, name) {
+            Ok(Some(u)) if u.enabled && !u.salt.is_empty() && !u.password_hash.is_empty() => {
+                Some((u.salt, u.password_hash))
+            }
+            _ => None,
+        }
+    }
+
+    /// 校验一次性挑战：`response == SHA-256(nonce + ":" + SHA-256(salt:password))`。
+    ///
+    /// `nonce` 一次性（无论成败都作废）、默认 2 分钟过期；**密码本身不经网络传输**，
+    /// 抓包只能得到一次性摘要，无法重放、也无法直接得到明文。
+    fn verify_challenge(&self, user: &str, nonce: &str, response: &str) -> Option<Principal> {
+        let now = dhrust::times::getmilltimestamp() as i64;
+        let record = {
+            let mut map = self.challenges.lock().unwrap();
+            map.retain(|_, c| c.expire > now);
+            map.remove(nonce)
+        }?;
+        if record.expire <= now || !record.user.eq_ignore_ascii_case(user.trim()) {
+            return None;
+        }
+        let expect = dhrust::sign::sha256_hex(format!("{nonce}:{}", record.expect).as_bytes());
+        if !expect.eq_ignore_ascii_case(response.trim()) {
+            return None;
+        }
+        self.principal_by_name(user)
+    }
+
     /// 校验令牌（测试辅助；生产路径直接用 `tokens.get`）。
     #[cfg(test)]
     fn validate_token(&self, token: &str) -> bool {
@@ -186,6 +374,14 @@ impl WebPanel {
     /// 吊销令牌（绑定主体随令牌一并失效）。
     fn revoke_token(&self, token: &str) {
         self.tokens.revoke(token);
+    }
+
+    /// 让「其它」会话立即失效（改密码/改用户后调用；保留当前令牌，避免自己掉线）。
+    fn revoke_other_sessions(&self, ctx: &Ctx) {
+        let current = bearer_token(ctx).unwrap_or_default();
+        if self.tokens.revoke_all_except(&current) > 0 {
+            self.save_sessions();
+        }
     }
 
     /// 重命名当前令牌绑定的会话主体（内置管理员改名后立即生效，无需重新登录）。
@@ -214,6 +410,10 @@ impl WebPanel {
     pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
         if let Some(token) = bearer_token(ctx) {
             if let Some(p) = self.tokens.get(&token) {
+                // 滑动续期：一直在用就一直有效；只有改动到期时间时才写盘（低频）
+                if self.tokens.touch(&token) {
+                    self.save_sessions();
+                }
                 return Some(p);
             }
         }
@@ -400,7 +600,9 @@ fn action_title(action: &str) -> String {
 /// 动作 → 中文名映射（审计展示；`action_name_of` 来自 `pek_radmin::panel`）。
 const ACTION_TITLES: &[(&str, &str)] = &[
     ("login", "登录"),
+    ("loginChallenge", "获取登录挑战"),
     ("logout", "退出登录"),
+    ("logoutAll", "退出所有设备"),
     ("control", "服务控制"),
     ("dhdeployPanel", "DHDeploy 面板访问"),
     ("freeMemory", "释放内存"),
@@ -471,8 +673,14 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     // 登录/退出：无需令牌（成功与失败均写操作审计）
     let p = panel.clone();
     controller = controller.post("login", move |ctx| login(&p, ctx));
+    // 登录挑战：一次性 nonce + 用户盐（前端算摘要，密码不经网络传输）
+    let p = panel.clone();
+    controller = controller.get("loginChallenge", move |ctx| login_challenge(&p, ctx));
     let p = panel.clone();
     controller = controller.post("logout", move |ctx| logout(&p, ctx));
+    // 退出所有设备（仅内置管理员；保留当前会话）
+    let p = panel.clone();
+    controller = controller.post("logoutAll", guarded(p, PERM_USERS, logout_all));
 
     // 当前主体（前端登录后取权限渲染菜单；仅认证不校验菜单权限）
     controller = controller.get("me", guarded(panel.clone(), "", me));
@@ -739,6 +947,58 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
 
 // ————— /api 动作 —————
 
+/// 下发登录挑战：一次性 `nonce` + 用户盐（摘要口径 `SHA-256(salt:password)`）。
+///
+/// 用户不存在/被禁用时同样返回随机盐与随机摘要（仅用于比对必败），避免用户名枚举。
+fn login_challenge(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let user = arg(ctx, "user").unwrap_or_default();
+    let (salt, expect) = panel
+        .credential_digest(&user)
+        .unwrap_or_else(|| (dhrust::random::hex(16), dhrust::random::hex(32)));
+    let nonce = dhrust::random::hex(16);
+    let now = dhrust::times::getmilltimestamp() as i64;
+    {
+        let mut map = panel.challenges.lock().unwrap();
+        map.retain(|_, c| c.expire > now);
+        map.insert(
+            nonce.clone(),
+            Challenge {
+                user: user.trim().to_string(),
+                expect,
+                expire: now + CHALLENGE_TTL_SECS * 1000,
+            },
+        );
+    }
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "nonce": nonce,
+            "salt": salt,
+            "expireIn": CHALLENGE_TTL_SECS,
+        })),
+    )
+}
+
+/// 退出所有其它设备：注销除当前请求以外的全部会话（会话文件同步更新）。
+fn logout_all(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(principal) = panel.principal(ctx) else {
+        return json_error(401, "Unauthorized");
+    };
+    if !principal.is_admin {
+        return json_error(403, "仅内置管理员可执行该操作");
+    }
+    let current = bearer_token(ctx).unwrap_or_default();
+    let removed = panel.tokens.revoke_all_except(&current);
+    panel.save_sessions();
+    let count = removed.to_string();
+    util::log_format(
+        "Web 面板已退出其它会话：{} 个（{}）",
+        &[&count, &principal.name],
+    );
+    json_result(0, &format!("已退出 {removed} 个其它会话"), None)
+}
+
 /// 登录：签发令牌（成功/失败均写入操作审计）。
 fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let ip = client_ip(ctx);
@@ -748,11 +1008,28 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 
     let user = arg(ctx, "user").unwrap_or_default();
-    let password = arg(ctx, "password").unwrap_or_default();
 
-    match panel.authenticate(&user, &password) {
+    // 优先挑战式登录（`nonce` + `response`，密码不出网）；未提供时兼容旧明文口令（脚本/旧前端）
+    let challenge = match (arg(ctx, "nonce"), arg(ctx, "response")) {
+        (Some(nonce), Some(response))
+            if !nonce.trim().is_empty() && !response.trim().is_empty() =>
+        {
+            Some((nonce, response))
+        }
+        _ => None,
+    };
+    let principal = match &challenge {
+        Some((nonce, response)) => panel.verify_challenge(&user, nonce.trim(), response.trim()),
+        None => {
+            let password = arg(ctx, "password").unwrap_or_default();
+            panel.authenticate(&user, &password)
+        }
+    };
+
+    match principal {
         Some(principal) => {
             let token = panel.tokens.issue_with(principal.clone());
+            panel.save_sessions();
             panel.logins.record_success(&ip);
             util::log_format("Web 面板登录成功：{}（{}）", &[&principal.name, &ip]);
             audit::record(
@@ -823,6 +1100,7 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         }
         panel.revoke_token(&token);
     }
+    panel.save_sessions();
     json_result(0, "ok", None)
 }
 
@@ -1325,6 +1603,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.manager.config();
     let items = vec![
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
+        config_item("WebSessionHours", "登录保持时长（小时）", "Int32", cfg.web_session_hours.to_string(), "面板登录会话保持时长（滑动续期：期间用过面板就不掉线，重启/升级不用重新登录），默认 12；0=关闭持久化（仅进程内 24 小时）。修改需重启服务后生效（会话已落盘，重启不会掉登录）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
         config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；端口自动取系统监听（个别端口可在配置文件 PortTrafficPorts 项指定）；修改后自动生效"),
@@ -1409,6 +1688,8 @@ fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         panel
             .manager
             .update_config(|cfg| cfg.web_user_password = new_password);
+        // 改密码后其它设备上的会话立即失效（当前会话保留）
+        panel.revoke_other_sessions(ctx);
         util::log_info("Web 面板密码已修改");
         return json_result(0, "密码已修改，下次登录请使用新密码", None);
     }
@@ -1421,6 +1702,7 @@ fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     ) {
         Ok(()) => {
             util::log_format("面板用户修改密码：{}", &[&principal.name]);
+            panel.revoke_other_sessions(ctx);
             json_result(0, "密码已修改，下次登录请使用新密码", None)
         }
         Err(e) => {
@@ -2425,6 +2707,7 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         if renamed {
             panel.rename_session(ctx, &new_name);
         }
+        panel.revoke_other_sessions(ctx);
         util::log_info("Web 面板内置管理员凭据已更新（用户管理）");
         return json_result(0, "内置管理员已更新", None);
     }
@@ -2437,6 +2720,14 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         &remark,
     ) {
         Ok(()) => {
+            // 权限/启用状态变更：该用户已有会话立即失效（下次登录取新快照）
+            if panel
+                .tokens
+                .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))
+                > 0
+            {
+                panel.save_sessions();
+            }
             util::log_format("面板用户已保存：{}", &[&name]);
             json_result(0, "已保存", None)
         }
@@ -2459,6 +2750,14 @@ fn user_delete(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
     match audit::delete_user(panel.base(), &name) {
         Ok(()) => {
+            // 用户删除后其会话立即失效
+            if panel
+                .tokens
+                .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))
+                > 0
+            {
+                panel.save_sessions();
+            }
             util::log_format("面板用户已删除：{}", &[&name]);
             json_result(0, "已删除", None)
         }
@@ -2635,6 +2934,13 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "webusername" => set_string(value, |s| cfg.web_user_name = s),
         "webauthlevel" => set_string(value, |s| cfg.web_auth_level = s),
+        "websessionhours" => match value_u64(value) {
+            Some(v) if v <= 8760 => {
+                cfg.web_session_hours = v as u32;
+                true
+            }
+            _ => false,
+        },
         "localport" => set_port(value, |p| cfg.local_port = p),
         "localonly" => set_bool(value, |b| cfg.local_only = b),
         "startwait" => set_u64(value, |v| cfg.start_wait = v),
@@ -2845,6 +3151,85 @@ mod tests {
         // 注销后失效
         let _ = logout(&panel, &context("POST", "/api/logout", "", Some(&token)));
         assert!(!panel.validate_token(&token));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_survives_restart() {
+        let (panel, dir) = panel_with_default_password();
+        let ok = body_json(login(
+            &panel,
+            &context(
+                "POST",
+                "/api/login",
+                r#"{"user":"admin","password":"admin"}"#,
+                None,
+            ),
+        ));
+        let token = ok["data"]["token"].as_str().unwrap().to_string();
+        assert!(panel.sessions_file.is_some(), "默认应启用会话持久化");
+        assert!(
+            dir.join(SESSIONS_FILE).is_file(),
+            "登录后应写出会话文件：{}",
+            SESSIONS_FILE
+        );
+
+        // 模拟进程重启：同一目录重新创建面板，旧令牌仍应有效
+        drop(panel);
+        let manager = AppManager::new(&dir, AgentConfig::default());
+        let waf = pek_rwaf::Waf::load_with_default(&dir, pek_rwaf::WafConfig::admin_api());
+        let restarted = WebPanel::new(manager, &dir, 5501, waf);
+        assert!(restarted.validate_token(&token), "重启后会话应恢复");
+        let status = body_json(status(
+            &restarted,
+            &context("GET", "/api/status", "", Some(&token)),
+        ));
+        assert_eq!(status["code"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_challenge_never_sends_password() {
+        let (panel, dir) = panel_with_default_password();
+        let challenge = body_json(login_challenge(
+            &panel,
+            &context("GET", "/api/loginChallenge", r#"{"user":"admin"}"#, None),
+        ));
+        assert_eq!(challenge["code"], 0);
+        let nonce = challenge["data"]["nonce"].as_str().unwrap().to_string();
+        let salt = challenge["data"]["salt"].as_str().unwrap().to_string();
+        assert_eq!(salt, BUILTIN_SALT);
+
+        // 客户端口径：SHA-256(nonce : SHA-256(salt:password))
+        let digest = dhrust::sign::salted_sha256_hex(&salt, "admin");
+        let response = dhrust::sign::sha256_hex(format!("{nonce}:{digest}").as_bytes());
+        let body = json!({ "user": "admin", "nonce": nonce, "response": response }).to_string();
+        let ok = body_json(login(&panel, &context("POST", "/api/login", &body, None)));
+        assert_eq!(ok["code"], 0);
+        let token = ok["data"]["token"].as_str().unwrap().to_string();
+        assert!(panel.validate_token(&token));
+
+        // nonce 一次性：同一挑战重放必须失败
+        let replay = body_json(login(&panel, &context("POST", "/api/login", &body, None)));
+        assert_eq!(replay["code"], 401, "重放的挑战应被拒绝");
+
+        // 错误密码算出的摘要同样失败（重新申请挑战，避免与上面的 nonce 消费混淆）
+        let challenge2 = body_json(login_challenge(
+            &panel,
+            &context("GET", "/api/loginChallenge", r#"{"user":"admin"}"#, None),
+        ));
+        let nonce2 = challenge2["data"]["nonce"].as_str().unwrap().to_string();
+        let wrong = dhrust::sign::sha256_hex(
+            format!(
+                "{nonce2}:{}",
+                dhrust::sign::salted_sha256_hex(&salt, "bad-password")
+            )
+            .as_bytes(),
+        );
+        assert!(panel.verify_challenge("admin", &nonce2, &wrong).is_none());
+        assert_ne!(digest, wrong);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -38,6 +38,9 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
 .login-box input:focus{border-color:var(--brand-500);box-shadow:0 0 0 3px rgba(91,91,255,0.25)}
 .login-box .err{color:var(--red);text-align:center;margin-top:12px;font-size:13px;display:none}
 .login-box .err.show{display:block}
+/* 「保持登录」复选框：避开 .login-box input 的全宽/上下留白 */
+.login-box .remember{display:flex;align-items:center;gap:8px;margin:-6px 0 16px;font-size:13px;font-weight:500;text-transform:none;letter-spacing:0;cursor:pointer}
+.login-box .remember input{width:16px;height:16px;margin:0;accent-color:var(--brand-500);cursor:pointer}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 20px;border:none;border-radius:var(--radius-md);font-size:14px;font-weight:600;cursor:pointer;transition:all var(--duration-normal) var(--ease-out-quart);outline:none;white-space:nowrap;letter-spacing:-0.005em}
 .btn:focus-visible{box-shadow:0 0 0 3px rgba(91,91,255,0.4)}
 .btn:disabled{opacity:0.45;cursor:not-allowed;transform:none!important}

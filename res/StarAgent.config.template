@@ -52,6 +52,8 @@
   <WebPassword>admin</WebPassword>
   <!--Web 面板鉴权级别。None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录-->
   <WebAuthLevel>LocalOnly</WebAuthLevel>
+  <!--面板登录会话保持时长（小时，滑动续期：期间用过面板就不掉线，重启/升级不用重新登录）。默认 12；0 = 关闭持久化（仅进程内 24 小时）-->
+  <WebSessionHours>12</WebSessionHours>
   <!--后台资源采样间隔（毫秒）。默认 1000（与任务管理器/宝塔同粒度）；0 = 关闭后台采样（改为面板请求时现采）-->
   <SampleInterval>1000</SampleInterval>
   <!--网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + 下方手动补充），默认 true-->

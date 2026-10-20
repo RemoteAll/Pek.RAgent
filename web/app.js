@@ -12,14 +12,91 @@ let histData=null,histDays=30,histSite='',histStamp=''; // 流量历史（每日
 let cmdHistory=JSON.parse(sessionStorage.getItem('agent_cmd_history')||'[]');
 const $=id=>document.getElementById(id);
 
+/* ── 令牌存储 ──
+   勾选「保持登录」→ localStorage（关浏览器、重启服务都不掉，服务端会话也已落盘）；
+   未勾选 → 仅本标签页（sessionStorage）。 */
+function setToken(t,remember){
+ token=t;
+ try{
+  if(remember){localStorage.setItem('agent_token',t);sessionStorage.removeItem('agent_token')}
+  else{sessionStorage.setItem('agent_token',t);localStorage.removeItem('agent_token')}
+ }catch(e){}
+}
+function clearToken(){
+ token='';
+ try{localStorage.removeItem('agent_token');sessionStorage.removeItem('agent_token')}catch(e){}
+}
+function storedToken(){
+ try{return localStorage.getItem('agent_token')||sessionStorage.getItem('agent_token')||''}catch(e){return ''}
+}
+
+/* ── 纯 JS SHA-256 ──
+   http 页面不是安全上下文，没有 crypto.subtle，只能自带实现（登录挑战摘要用）。 */
+const SHA256_K=new Uint32Array([
+ 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+ 0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+ 0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+ 0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+ 0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+ 0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+ 0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+ 0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+function sha256Hex(text){
+ const bytes=new TextEncoder().encode(text);
+ const len=bytes.length,bitLen=len*8;
+ const total=(((len+8)>>6)+1)<<6;
+ const buf=new Uint8Array(total);
+ buf.set(bytes);buf[len]=0x80;
+ const hi=Math.floor(bitLen/0x100000000),lo=bitLen>>>0;
+ buf[total-8]=(hi>>>24)&255;buf[total-7]=(hi>>>16)&255;buf[total-6]=(hi>>>8)&255;buf[total-5]=hi&255;
+ buf[total-4]=(lo>>>24)&255;buf[total-3]=(lo>>>16)&255;buf[total-2]=(lo>>>8)&255;buf[total-1]=lo&255;
+ const H=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+ const w=new Uint32Array(64);
+ const rotr=(x,n)=>((x>>>n)|(x<<(32-n)))>>>0;
+ for(let off=0;off<total;off+=64){
+  for(let t=0;t<16;t++) w[t]=((buf[off+t*4]<<24)|(buf[off+t*4+1]<<16)|(buf[off+t*4+2]<<8)|buf[off+t*4+3])>>>0;
+  for(let t=16;t<64;t++){
+   const s0=(rotr(w[t-15],7)^rotr(w[t-15],18)^(w[t-15]>>>3))>>>0;
+   const s1=(rotr(w[t-2],17)^rotr(w[t-2],19)^(w[t-2]>>>10))>>>0;
+   w[t]=(w[t-16]+s0+w[t-7]+s1)>>>0;
+  }
+  let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+  for(let t=0;t<64;t++){
+   const S1=(rotr(e,6)^rotr(e,11)^rotr(e,25))>>>0;
+   const ch=((e&f)^(~e&g))>>>0;
+   const t1=(h+S1+ch+SHA256_K[t]+w[t])>>>0;
+   const S0=(rotr(a,2)^rotr(a,13)^rotr(a,22))>>>0;
+   const maj=((a&b)^(a&c)^(b&c))>>>0;
+   const t2=(S0+maj)>>>0;
+   h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+  }
+  H[0]=(H[0]+a)>>>0;H[1]=(H[1]+b)>>>0;H[2]=(H[2]+c)>>>0;H[3]=(H[3]+d)>>>0;
+  H[4]=(H[4]+e)>>>0;H[5]=(H[5]+f)>>>0;H[6]=(H[6]+g)>>>0;H[7]=(H[7]+h)>>>0;
+ }
+ return Array.from(H).map(x=>x.toString(16).padStart(8,'0')).join('');
+}
+
 async function doLogin(){
  const u=$('luser').value,p=$('lpass').value,e=$('lerr');
+ const remember=$('lremember')?$('lremember').checked:true;
  e.classList.remove('show');
  if(!u&&!p){e.textContent='请输入用户名和密码';e.classList.add('show');return}
  if(!u){e.textContent='请输入用户名';e.classList.add('show');return}
  if(!p){e.textContent='请输入密码';e.classList.add('show');return}
  try{
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p})});
+  // 挑战式登录：服务端下发一次性随机数与盐，密码只在本地算摘要，
+  // 网络上看不到明文，抓到摘要也无法重放（nonce 用完即废）。
+  let payload=null;
+  try{
+   const cr=await fetch('/api/loginChallenge?user='+encodeURIComponent(u));
+   const cj=await cr.json();
+   if(cj&&cj.code===0&&cj.data&&cj.data.nonce&&cj.data.salt){
+    const digest=sha256Hex(cj.data.salt+':'+p);
+    payload={user:u,nonce:cj.data.nonce,response:sha256Hex(cj.data.nonce+':'+digest)};
+   }
+  }catch(ex){}
+  if(!payload)payload={user:u,password:p}; // 旧服务端（无挑战接口）回退明文
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const j=await r.json();
   if(j.code===429){e.textContent='登录失败次数过多，请稍后再试';e.classList.add('show');return}
   if(j.code!==0){
@@ -28,7 +105,7 @@ async function doLogin(){
    else e.textContent=j.message||'登录失败';
    e.classList.add('show');return
   }
-  token=j.data.token;sessionStorage.setItem('agent_token',token);showApp();
+  setToken(j.data.token,remember);showApp();
  }catch(ex){e.textContent='网络错误，请检查服务是否正常运行';e.classList.add('show')}
 }
 
@@ -36,11 +113,11 @@ async function logout(){
  // 幂等：已经在登录页时不再重复清理/抢焦点。
  // （否则多个并发的 3 秒轮询同时 401 会反复调 logout → 把光标从密码框拽回用户名框）
  if($('login').style.display!=='none'){
-  sessionStorage.removeItem('agent_token');token='';
+  clearToken();
   return;
  }
  try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'}})}catch(e){}
- sessionStorage.removeItem('agent_token');token='';
+ clearToken();
  clearInterval(timer);if(svcTimer)clearInterval(svcTimer);if(starTimer)clearInterval(starTimer);
  if(trafficTimer){clearInterval(trafficTimer);trafficTimer=null}
  const active=document.activeElement;
@@ -2517,15 +2594,32 @@ function renderUsers(){
  let html=`<div class="glass-card card">
   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
    <h2>👥 用户管理</h2>
-   <button class="btn btn-primary btn-sm" onclick="userEdit('')">➕ 新增用户</button>
+   <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-secondary btn-sm" onclick="logoutAllDevices()">🚪 退出所有设备</button>
+    <button class="btn btn-primary btn-sm" onclick="userEdit('')">➕ 新增用户</button>
+   </div>
   </div>
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr><th>用户名</th><th>菜单权限</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无用户</td></tr>'}</tbody>
   </table></div>
   <div class="text-muted" style="margin-top:10px;font-size:12px">内置管理员（配置文件凭据）拥有全部权限且不可删除（可在此编辑用户名/密码）；其余用户登录后仅能看到被勾选的菜单，越权请求会被服务端拒绝并记入操作日志。</div>
+  <div class="text-muted" style="margin-top:6px;font-size:12px">登录会话默认保持 12 小时（滑动续期，期间用过面板就不掉线；重启/升级服务无需重新登录），可在「配置」页 WebSessionHours 调整；改密码或「退出所有设备」会立即注销其它会话。</div>
  </div>`;
  $('panel-users').innerHTML=html;
+}
+
+// 退出所有其它设备（保留当前浏览器会话）
+function logoutAllDevices(){
+ showModal('退出所有设备',
+  '<div class="text-muted">将注销除当前浏览器以外的全部登录会话，其它设备下次打开面板需要重新输入密码；当前页面保持登录。</div>',
+  '确定退出',
+  async()=>{
+   try{
+    const j=await api('/api/logoutAll',{method:'POST',body:'{}'});
+    showToast(j.code===0?(j.message||'已退出'):(j.message||'操作失败'),j.code===0?'success':'error');
+   }catch(e){}
+  });
 }
 
 // 编辑内置管理员（用户名/密码，均写入配置文件凭据）
@@ -2673,7 +2767,7 @@ function installDropUpload(){
 }
 installDropUpload();
 
-token=sessionStorage.getItem('agent_token')||'';
+token=storedToken();
 if(token)showApp();
 else probeAuthlessAccess();
 
