@@ -224,16 +224,43 @@ fn regenerate_agent_id(manager: &AppManager) {
 
 /// `register` 报文（连接建立后发送）。
 fn build_register(manager: &AppManager) -> String {
+    with_panel_meta(
+        manager,
+        json!({
+            "type": "register",
+            "agentId": manager.config().agent_id,
+            "name": dhrust::sys::machine::hostname(),
+            "version": env!("CARGO_PKG_VERSION"),
+            "platform": crate::self_upgrade::current_platform(),
+            "os": dhrust::sys::machine::os_description(),
+            "hostname": dhrust::sys::machine::hostname(),
+        }),
+    )
+}
+
+/// 平台「服务器节点」展示用的面板元数据：端口 / 是否允许远程访问 / 内置管理员状态。
+///
+/// **不含密码与哈希**：只上报「是否仍为出厂默认凭据 admin/admin」这一布尔判定
+/// （与面板顶部横幅同口径），平台侧据此给节点打「默认密码」红标。
+fn panel_meta(manager: &AppManager) -> Json {
+    let cfg = manager.config();
     json!({
-        "type": "register",
-        "agentId": manager.config().agent_id,
-        "name": dhrust::sys::machine::hostname(),
-        "version": env!("CARGO_PKG_VERSION"),
-        "platform": crate::self_upgrade::current_platform(),
-        "os": dhrust::sys::machine::os_description(),
-        "hostname": dhrust::sys::machine::hostname(),
+        "webPort": cfg.local_port,
+        "remoteAccess": !cfg.local_only,
+        "webUser": cfg.web_user_name.trim(),
+        "defaultPassword": crate::webpanel::uses_default_credentials(&cfg),
     })
-    .to_string()
+}
+
+/// 把面板元数据并入报文（键名平铺，与平台 `agent_ws` 解析一致）。
+fn with_panel_meta(manager: &AppManager, base: Json) -> String {
+    let mut v = base;
+    if let (Some(obj), Json::Object(meta)) = (v.as_object_mut(), panel_meta(manager)) {
+        for (k, val) in meta {
+            obj.insert(k, val);
+        }
+    }
+    v.to_string()
 }
 
 /// `heartbeat` 报文（60 秒周期；机器数据 + 子服务状态）。
@@ -255,19 +282,21 @@ fn build_heartbeat(manager: &AppManager) -> String {
     let running = services.iter().filter(|(_, s)| s.running).count();
     let uptime = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let pid = std::process::id();
-    json!({
-        "type": "heartbeat",
-        "agentId": manager.config().agent_id,
-        "version": env!("CARGO_PKG_VERSION"),
-        "cpuRate": snap.cpu_rate.unwrap_or(0.0),
-        "memoryUsedMB": mem_used_mb,
-        "memoryTotalMB": mem_total_mb,
-        "diskUsedMB": disk_used / 1_048_576,
-        "diskTotalMB": disk_total / 1_048_576,
-        "uptimeSecs": uptime,
-        "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
-        "servicesRunning": running,
-        "servicesTotal": services.len(),
-    })
-    .to_string()
+    with_panel_meta(
+        manager,
+        json!({
+            "type": "heartbeat",
+            "agentId": manager.config().agent_id,
+            "version": env!("CARGO_PKG_VERSION"),
+            "cpuRate": snap.cpu_rate.unwrap_or(0.0),
+            "memoryUsedMB": mem_used_mb,
+            "memoryTotalMB": mem_total_mb,
+            "diskUsedMB": disk_used / 1_048_576,
+            "diskTotalMB": disk_total / 1_048_576,
+            "uptimeSecs": uptime,
+            "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
+            "servicesRunning": running,
+            "servicesTotal": services.len(),
+        }),
+    )
 }
