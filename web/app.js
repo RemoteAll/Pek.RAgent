@@ -33,11 +33,20 @@ async function doLogin(){
 }
 
 async function logout(){
+ // 幂等：已经在登录页时不再重复清理/抢焦点。
+ // （否则多个并发的 3 秒轮询同时 401 会反复调 logout → 把光标从密码框拽回用户名框）
+ if($('login').style.display!=='none'){
+  sessionStorage.removeItem('agent_token');token='';
+  return;
+ }
  try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'}})}catch(e){}
  sessionStorage.removeItem('agent_token');token='';
  clearInterval(timer);if(svcTimer)clearInterval(svcTimer);if(starTimer)clearInterval(starTimer);
  if(trafficTimer){clearInterval(trafficTimer);trafficTimer=null}
- $('login').style.display='';$('app').style.display='none';$('luser').focus()
+ const active=document.activeElement;
+ $('login').style.display='';$('app').style.display='none';
+ // 只在用户当前焦点不在登录框内时才自动聚焦，避免打字时被夺走
+ if(active!==$('luser')&&active!==$('lpass'))$('luser').focus();
 }
 
 function showApp(){
@@ -89,7 +98,13 @@ async function api(url,opt={}){
  const r=await fetch(url,{...opt,headers:{...h,'Content-Type':'application/json'}});
  const _el=r.headers.get('X-Elapsed-Ms');if(_el)setSrvElapsed(_el);
  const j=await r.json();
- if(j.code===401||r.status===401){logout();showToast('登录已过期，请重新登录','error');throw new Error('Unauthorized')}
+ if(j.code===401||r.status===401){
+  // 登录页上的轮询（旧 token 已失效）不应反复弹提示、也不应反复抢焦点
+  const onLoginPage=$('login').style.display!=='none';
+  logout();
+  if(!onLoginPage)showToast('登录已过期，请重新登录','error');
+  throw new Error('Unauthorized')
+ }
  return j;
 }
 
@@ -1490,7 +1505,10 @@ async function setDHDeploy(kind,value){
 }
 
 async function updateControlStatus(){
- if(document.hidden||!document.querySelector('#panel-control.active'))return;
+ if(document.hidden)return;
+ // 登录页不发任何轮询：否则 3 秒一次的 401 会反复触发登出流程（抢焦点 / 反复弹提示）
+ if($('login').style.display!=='none')return;
+ if(!document.querySelector('#panel-control.active'))return;
  try{
   const j=await api('/api/status');if(j.code!==0)return;const d=j.data;
   const el=$('ctrl-status');if(!el)return;
@@ -1508,12 +1526,18 @@ function renderUpgradeBox(d){
  const pw=d.panelWs||{};
  const chk=su.checkedAt?('最近检查：'+esc(su.checkedAt)):'';
  const info=su.message?esc(su.message):(su.latest?('最新版本 v'+esc(su.latest)):'');
- const pwText=pw.connected?'<span style="color:var(--green)">已连接</span>':(pw.enabled?'<span style="color:var(--yellow,#eab308)">连接中/离线</span>':'未配置');
+ const pwText=pw.connected?'<span style="color:var(--green)">已连接</span>'
+  :(pw.pairPending?'<span style="color:var(--yellow,#eab308)">等待平台批准</span>'
+   :(pw.enabled?'<span style="color:var(--yellow,#eab308)">连接中/离线</span>':'未配置'));
+ // 诊断：实际连接目标（由「升级源」推导）+ 凭据类型 + 最近一次断开原因
+ const pwDiag=(pw.url?('目标：'+esc(pw.url)):'')
+  +(pw.enabled?(pw.tokenConfigured?' · 凭据：节点令牌':' · 凭据：免令牌配对'):'')
+  +(pw.lastError?('<br><span style="color:var(--red)">最近断开：'+esc(pw.lastError)+'</span>'):'');
  box.innerHTML=`
   <div style="display:flex;gap:28px;flex-wrap:wrap;margin-bottom:10px">
    <div><div style="font-size:12px;color:var(--text-muted)">当前版本</div><div style="font-size:16px;font-weight:600">v${esc(su.current||'')}</div></div>
    <div><div style="font-size:12px;color:var(--text-muted)">自动升级</div><div style="font-size:16px;font-weight:600">${su.enabled?'<span style="color:var(--green)">已启用</span>':'未配置'}</div></div>
-   <div><div style="font-size:12px;color:var(--text-muted)">平台实时通道</div><div style="font-size:16px;font-weight:600">${pwText}</div></div>
+   <div><div style="font-size:12px;color:var(--text-muted)">平台实时通道</div><div style="font-size:16px;font-weight:600">${pwText}</div><div style="font-size:11px;color:var(--text-muted);max-width:420px;white-space:normal">${pwDiag}</div></div>
   </div>
   <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">${chk}${info?' · '+info:''}<br>升级源：${esc(su.url||'（未配置）')}${su.intervalMinutes?(' · 检查间隔 '+su.intervalMinutes+' 分钟'):''}</div>
   <button class="btn btn-sm btn-primary" onclick="checkUpgradeNow()">⬆️ 立即检查升级</button>

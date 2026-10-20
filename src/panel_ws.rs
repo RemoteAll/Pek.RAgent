@@ -45,6 +45,22 @@ pub fn pairing_pending() -> bool {
     PAIR_PENDING.load(Ordering::Relaxed)
 }
 
+/// 最近一次连接失败/断开的原因（面板诊断展示用）。
+static LAST_ERROR: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
+
+pub fn last_error() -> String {
+    LAST_ERROR
+        .get_or_init(|| std::sync::Mutex::new(String::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// 当前实际连接的目标地址（由升级源推导；面板展示"到底连的哪台"）。
+pub fn target_url(cfg: &AgentConfig) -> String {
+    ws_url(cfg).unwrap_or_default()
+}
+
 /// 向平台发送一条上行事件（未连接时静默忽略）。
 ///
 /// 用于把本机执行结果回报平台（如 `rebootResult`），避免"平台点了没反应、原因只在节点日志里"。
@@ -232,6 +248,11 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
     let on_disconnected = Arc::new(move |reason: String| {
         CONNECTED.store(false, Ordering::Relaxed);
         PAIR_PENDING.store(false, Ordering::Relaxed);
+        // 记下原因：面板「平台实时通道」可直接看到为什么没连上（不用去翻日志）
+        *LAST_ERROR
+            .get_or_init(|| std::sync::Mutex::new(String::new()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = reason.clone();
         util::log_format("平台实时通道已断开：{}（自动重连中）", &[&reason]);
     });
     WsHooks {

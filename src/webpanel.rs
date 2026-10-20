@@ -955,6 +955,10 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "connected": crate::panel_ws::connected(),
             // 配对模式：已连上平台但尚未被管理员批准（面板提示「等待批准」）
             "pairPending": crate::panel_ws::pairing_pending(),
+            // 诊断：实际连接目标（由 AutoUpgradeUrl 推导）+ 最近一次断开原因
+            "url": crate::panel_ws::target_url(&cfg),
+            "lastError": crate::panel_ws::last_error(),
+            "tokenConfigured": !cfg.auto_upgrade_token.trim().is_empty(),
         },
         // 进程健康指标（原 /api/health 合并至此：面板每 3 秒刷新只需一次请求，
         // 且复用上面已采集的进程统计，省一次全进程快照与进程内存查询）
