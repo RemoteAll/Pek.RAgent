@@ -171,6 +171,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 regenerate_agent_id(&msg_mgr);
             }
             "storeConfig" => apply_store_config(&msg_mgr, &v),
+            "reboot" => reboot_once(&msg_mgr),
             "checkUpgrade" => {
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
@@ -221,6 +222,25 @@ fn regenerate_agent_id(manager: &AppManager) {
     {
         client.close();
     }
+}
+
+/// 执行平台下发的「重启服务器」指令（60 秒冷却：同一条指令重复到达只执行一次）。
+fn reboot_once(_manager: &AppManager) {
+    static LAST: OnceLock<std::sync::Mutex<Option<Instant>>> = OnceLock::new();
+    let mut last = LAST
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(t) = *last
+        && t.elapsed() < Duration::from_secs(60)
+    {
+        util::log_info("重启指令重复（60 秒冷却内），已忽略");
+        return;
+    }
+    *last = Some(Instant::now());
+    drop(last);
+    util::log_info("平台下发「重启服务器」指令，3 秒后重启本机");
+    crate::sys::reboot_machine();
 }
 
 /// 平台下发分发源配置（`storeConfig`）：插件源目录地址 + 签名公钥。

@@ -20,6 +20,70 @@ pub(crate) use dhrust::sys::process::{
     signal_force, signal_graceful, spawn, stop_process, Handle, SpawnRequest,
 };
 
+/// 重启本机（平台「服务器节点」页下发 `reboot` 指令时调用）。
+///
+/// 延迟 3 秒执行：留出写日志与平台侧记录的时间。以服务身份运行（root / LocalSystem）才有权限，
+/// 权限不足时命令会失败并记日志。
+pub(crate) fn reboot_machine() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        crate::util::log_info("执行系统重启（平台下发指令）");
+        match do_reboot() {
+            Ok(()) => crate::util::log_info("已提交系统重启请求"),
+            Err(e) => crate::util::log_error(&format!("系统重启失败：{e}")),
+        }
+    });
+}
+
+#[cfg(windows)]
+fn do_reboot() -> Result<(), String> {
+    let st = std::process::Command::new("shutdown")
+        .args(["/r", "/t", "0", "/f"])
+        .status()
+        .map_err(|e| format!("调用 shutdown 失败：{e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("shutdown 返回 {st}"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn do_reboot() -> Result<(), String> {
+    let out = std::process::Command::new("systemctl")
+        .arg("reboot")
+        .output()
+        .map_err(|e| format!("调用 systemctl 失败：{e}"))?;
+    if out.status.success() {
+        return Ok(());
+    }
+    let st = std::process::Command::new("shutdown")
+        .args(["-r", "now"])
+        .status()
+        .map_err(|e| format!("调用 shutdown 失败：{e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "systemctl/shutdown 均失败（需 root 权限）：{}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn do_reboot() -> Result<(), String> {
+    let st = std::process::Command::new("shutdown")
+        .args(["-r", "now"])
+        .status()
+        .map_err(|e| format!("调用 shutdown 失败：{e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("shutdown 返回 {st}"))
+    }
+}
+
 /// 机器信息文本（用于 `-ShowMachineInfo`）。
 ///
 /// 信息面对齐 C# `ShowMachineInfo`（MachineInfo + 网络接口 + 磁盘列表）；

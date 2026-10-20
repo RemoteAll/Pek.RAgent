@@ -2509,11 +2509,18 @@ function userAdminEdit(name){
    <span class="text-secondary" style="font-size:12px">用户名</span>
    <input type="text" id="admin-name" value="${escAttr(name)}" style="width:100%;margin-top:4px">
    <span class="text-secondary" style="font-size:12px;display:block;margin-top:10px">新密码（留空则不修改）</span>
-   <input type="password" id="admin-pass" style="width:100%;margin-top:4px" autocomplete="new-password">`,
+   <input type="password" id="admin-pass" style="width:100%;margin-top:4px" autocomplete="new-password">
+   <span class="text-secondary" style="font-size:12px;display:block;margin-top:10px">确认新密码</span>
+   <input type="password" id="admin-pass2" style="width:100%;margin-top:4px" autocomplete="new-password" placeholder="再次输入以确认">`,
   '保存',async()=>{
    const nm=$('admin-name')?$('admin-name').value.trim():'';
    const pw=$('admin-pass')?$('admin-pass').value:'';
+   const pw2=$('admin-pass2')?$('admin-pass2').value:'';
    if(!nm){showToast('用户名不能为空','error');return}
+   if(pw || pw2){
+    if(pw.length<4){showToast('密码至少 4 位','error');return}
+    if(pw!==pw2){showToast('两次输入的密码不一致','error');return}
+   }
    if(nm.toLowerCase()===name.toLowerCase()&&!pw){showToast('未修改任何内容','error');return}
    const payload={name,newName:nm};
    if(pw)payload.password=pw;
@@ -2533,6 +2540,8 @@ function userEdit(name){
    <input type="text" id="user-name" value="${escAttr(name)}" ${u?'disabled':''} style="width:100%;margin-top:4px" placeholder="登录用户名"></div>
   <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">密码${u?'（留空则不修改）':'（必填）'}</span>
    <input type="password" id="user-pass" style="width:100%;margin-top:4px" placeholder="${u?'••••••':'设置初始密码'}" autocomplete="new-password"></div>
+  <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">确认密码</span>
+   <input type="password" id="user-pass2" style="width:100%;margin-top:4px" placeholder="再次输入以确认（防手误）" autocomplete="new-password"></div>
   <div style="margin-bottom:6px"><span class="text-secondary" style="font-size:12px">菜单权限</span></div>
   <div class="perm-grid">${boxes}</div>
   <div style="margin:8px 0 10px"><label class="perm-item" style="font-size:13px"><input type="checkbox" id="user-enabled" ${!u||u.enabled?'checked':''}> 启用该用户</label></div>
@@ -2542,10 +2551,17 @@ function userEdit(name){
   const nmEl=$('user-name');
   const nameVal=nmEl?nmEl.value.trim():name;
   const pass=$('user-pass')?$('user-pass').value:'';
+  const pass2=$('user-pass2')?$('user-pass2').value:'';
   const enabled=$('user-enabled')?$('user-enabled').checked:true;
   const remark=$('user-remark')?$('user-remark').value.trim():'';
   const permissions=[...document.querySelectorAll('.perm-grid input:checked')].map(c=>c.value);
   if(!nameVal){showToast('用户名不能为空','error');return}
+  // 新增用户密码必填；编辑时留空 = 不改密码；两次输入必须一致（防手误）
+  if(!u && !pass){showToast('请设置初始密码','error');return}
+  if(pass || pass2){
+   if(pass.length<4){showToast('密码至少 4 位','error');return}
+   if(pass!==pass2){showToast('两次输入的密码不一致','error');return}
+  }
   const builtin=(usersData&&usersData.users||[]).find(x=>x.isBuiltin);
   if(builtin&&nameVal.toLowerCase()===String(builtin.userName||'').toLowerCase()){showToast('该名称属于内置管理员，请另选名称','error');return}
   const payload={name:nameVal,enabled,remark,permissions};
