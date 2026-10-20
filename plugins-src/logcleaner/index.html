@@ -69,12 +69,16 @@
 <div id="toast"></div>
 <script>
 const $=id=>document.getElementById(id);
-const token=sessionStorage.getItem('agent_token')||'';
+// 与主面板令牌存储保持一致：勾选「保持登录」时 token 在 localStorage，否则在 sessionStorage
+function readToken(){
+ try{return localStorage.getItem('agent_token')||sessionStorage.getItem('agent_token')||''}catch(e){return ''}
+}
 let cleanData=null,cleanChecked=new Set(),cleanExpanded=new Set(),customPaths=[];
 function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
 function fmtBytes(n){if(!n||n<0)return '0 B';n=Number(n);const u=['B','KB','MB','GB','TB'];let i=0;while(n>=1024&&i<u.length-1){n/=1024;i++}return (i===0?n:n.toFixed(2))+' '+u[i]}
 function toast(msg,type){const t=$('toast');t.textContent=msg;t.style.background=type==='error'?'#b91c1c':(type==='success'?'#065f46':'#111827');t.classList.add('show');clearTimeout(t._tid);t._tid=setTimeout(()=>t.classList.remove('show'),3200)}
 async function api(path,opt={}){
+ const token=readToken(); // 每次请求动态读取：主面板重新登录后无需刷新插件
  const r=await fetch(path,{...opt,headers:Object.assign({'Content-Type':'application/json'},opt.headers||{},token?{'Authorization':'Bearer '+token}:{})});
  return r.json();
 }
