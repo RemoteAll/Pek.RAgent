@@ -201,6 +201,7 @@ pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
     Vec::new()
 }
