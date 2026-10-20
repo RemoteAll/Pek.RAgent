@@ -1558,7 +1558,22 @@ fn control(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(401, "Unauthorized");
     }
 
-    let action = arg(ctx, "action").unwrap_or_default().to_ascii_lowercase();
+    // 动作来源：优先 **请求体 JSON** `{action}`（面板当前用法），其次 query `?action=`。
+    // 注意不能用 `arg()`——它会先命中路由路径参数，把 URL 里的 `control` 当成 action，
+    // 于是「重启服务」会报 `Unknown action: control`。
+    let action = json_body(ctx)
+        .and_then(|b| {
+            b.get("action")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+        })
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            ctx.query_value("action")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
     let cfg = panel.manager.config();
 
     match action.as_str() {
