@@ -176,9 +176,18 @@ struct Source {
     path: PathBuf,
 }
 
+/// 自动发现结果：可统计的日志源 + 暂不可统计的站点（名称 + 原因）。
+struct Discovery {
+    sources: Vec<Source>,
+    /// 站点存在但当前无法统计（日志关闭/格式不支持/暂无日志文件）
+    pending: Vec<(String, String)>,
+}
+
 /// 模块共享状态。
 struct Inner {
     sources: Vec<Source>,
+    /// 配置中存在但暂时无法统计的站点（面板仍列出，避免“只剩 Default Web Site”）
+    pending: Vec<(String, String)>,
     stats: HashMap<String, SiteStats>,
     files: HashMap<PathBuf, FileState>,
     last_discover: Option<Instant>,
@@ -210,6 +219,7 @@ pub(crate) fn start(manager: Arc<AppManager>) {
             enabled: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
+                pending: Vec::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -258,31 +268,43 @@ fn reconfigure(t: &WebTraffic, cfg: &AgentConfig) {
     if !cfg.web_traffic {
         // 关闭时清空源（统计数据保留，重新启用后续读；文件偏移状态保留不重复读）
         inner.sources.clear();
+        inner.pending.clear();
         return;
     }
     let manual = parse_manual_logs(&cfg.web_logs);
     let auto = discover_sites();
-    apply_sources(&mut inner, merge_sources(manual, auto));
+    apply_sources(&mut inner, merge_sources(manual, auto.sources), auto.pending);
 }
 
 /// 替换日志源并确保站点统计条目存在。
-fn apply_sources(inner: &mut Inner, sources: Vec<Source>) {
+fn apply_sources(inner: &mut Inner, sources: Vec<Source>, pending: Vec<(String, String)>) {
     inner.last_discover = Some(Instant::now());
+    // 已有日志源的站点（含手动指定）不再重复标记“暂不可统计”
+    let pending: Vec<(String, String)> = pending
+        .into_iter()
+        .filter(|(name, _)| !sources.iter().any(|s| &s.site == name))
+        .collect();
     for s in &sources {
         inner.stats.entry(s.site.clone()).or_default();
     }
+    // 无法统计的站点也保留条目：面板会列出并显示原因（0 流量不是“没这个站点”）
+    for (name, _) in &pending {
+        inner.stats.entry(name.clone()).or_default();
+    }
     if sources.len() != inner.sources.len()
+        || pending != inner.pending
         || sources
             .iter()
             .zip(inner.sources.iter())
             .any(|(a, b)| a.site != b.site || a.path != b.path)
     {
         util::log_format(
-            "网站流量：发现 {} 个站点日志源",
-            &[&sources.len().to_string()],
+            "网站流量：发现 {} 个站点日志源（{} 个站点暂不可统计）",
+            &[&sources.len().to_string(), &pending.len().to_string()],
         );
     }
     inner.sources = sources;
+    inner.pending = pending;
 }
 
 /// 单次采样：发现（如有必要）→ 读取增量 → 聚合 → 节流持久化。
@@ -301,7 +323,7 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
     if need_rediscover {
         let manual = parse_manual_logs(&cfg.web_logs);
         let auto = discover_sites();
-        apply_sources(&mut inner, merge_sources(manual, auto));
+        apply_sources(&mut inner, merge_sources(manual, auto.sources), auto.pending);
     }
 
     // 跨天收尾与滚动（先归档旧日、再滚动，避免跨天瞬间写错日期）
@@ -404,6 +426,31 @@ pub(crate) fn snapshot_json() -> Json {
             .or_default()
             .push(s.path.display().to_string());
     }
+    // 无法统计的站点同样列出（附原因），并排在日志源之后
+    let mut notes: HashMap<String, String> = inner.pending.iter().cloned().collect();
+    // IIS 默认日志字段不含 sc-bytes：流量会恒为 0，明确提示而不是让用户以为统计坏了
+    for s in &inner.sources {
+        if notes.contains_key(&s.site) {
+            continue;
+        }
+        let missing_bytes = inner
+            .files
+            .get(&s.path)
+            .and_then(|f| f.w3c.as_ref())
+            .is_some_and(|w| w.bytes.is_none());
+        if missing_bytes {
+            notes.insert(
+                s.site.clone(),
+                "日志字段未包含 sc-bytes：流量统计为 0（IIS 日志 → 选择字段 → 勾选“发送的字节数”）"
+                    .to_string(),
+            );
+        }
+    }
+    for (name, _) in inner.pending.iter() {
+        if !order.iter().any(|n| n == name) {
+            order.push(name.clone());
+        }
+    }
 
     let mut sites: Vec<Json> = Vec::new();
     for name in &order {
@@ -441,6 +488,7 @@ pub(crate) fn snapshot_json() -> Json {
         sites.push(json!({
             "name": name,
             "logs": logs.get(name.as_str()).cloned().unwrap_or_default(),
+            "note": notes.get(name.as_str()).map(String::as_str).unwrap_or(""),
             "todayBytes": tb,
             "todayRequests": tr,
             "uv": uv,
@@ -465,6 +513,7 @@ pub(crate) fn snapshot_json() -> Json {
     };
     json!({
         "enabled": enabled,
+        "localTime": chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string(),
         "sites": sites,
         "message": message,
     })
@@ -710,7 +759,7 @@ fn merge_sources(manual: Vec<Source>, auto: Vec<Source>) -> Vec<Source> {
 }
 
 /// 自动发现站点日志（nginx/apache 常见目录；仅 Unix）。
-fn discover_sites() -> Vec<Source> {
+fn discover_sites() -> Discovery {
     #[cfg(unix)]
     {
         const NGINX_DIRS: &[&str] = &[
@@ -747,23 +796,38 @@ fn discover_sites() -> Vec<Source> {
                 }
             }
         }
-        out
+        Discovery {
+            sources: out,
+            pending: Vec::new(),
+        }
     }
 
     #[cfg(not(unix))]
     {
-        // Windows：自动发现 IIS W3C 日志（applicationHost.config 站点 → 日志目录）；
-        // 绿色版 nginx/apache 仍可通过 WebLogs 手动指定。
         #[cfg(windows)]
         {
-            return crate::iis::discover_log_sites()
-                .into_iter()
-                .map(|(site, path)| Source { site, path })
-                .collect();
+            // Windows：IIS 站点清单 → 最新 W3C 日志；无日志/日志关闭的站点也列出（附原因），
+            // 否则新站/停用站会让面板看起来“只剩 Default Web Site”。
+            // 绿色版 nginx/apache 仍可通过 WebLogs 手动指定。
+            let mut sources = Vec::new();
+            let mut pending = Vec::new();
+            for site in crate::iis::discover_log_sites() {
+                match site.file {
+                    Some(path) => sources.push(Source {
+                        site: site.name,
+                        path,
+                    }),
+                    None => pending.push((site.name, site.note)),
+                }
+            }
+            Discovery { sources, pending }
         }
         #[cfg(not(windows))]
         {
-            Vec::new()
+            Discovery {
+                sources: Vec::new(),
+                pending: Vec::new(),
+            }
         }
     }
 }
@@ -1681,6 +1745,7 @@ server
             enabled: AtomicBool::new(true),
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
+                pending: Vec::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -1710,6 +1775,7 @@ server
 
         let mut inner = Inner {
             sources: Vec::new(),
+            pending: Vec::new(),
             stats: HashMap::new(),
             files: HashMap::new(),
             last_discover: None,

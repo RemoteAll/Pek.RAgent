@@ -152,12 +152,44 @@ fn read_apps_config() -> Option<String> {
     let root = std::env::var_os("windir")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::path::PathBuf::from(r"C:\Windows"));
-    let path = root
-        .join("System32")
-        .join("inetsrv")
-        .join("config")
-        .join("applicationHost.config");
-    std::fs::read_to_string(path).ok()
+    let dir = root.join("System32").join("inetsrv").join("config");
+    let text = std::fs::read_to_string(dir.join("applicationHost.config")).ok()?;
+    if text.contains("system.applicationHost") {
+        return Some(text);
+    }
+    // IIS 共享配置：本地 applicationHost.config 只是转发文件，
+    // 真正的站点配置由 redirection.config 指向（常见于多机统一管理）。
+    let redirect = std::fs::read_to_string(dir.join("redirection.config")).ok()?;
+    let value = dhrust::config::read_xml_to_json(&redirect).ok()?;
+    let shared = shared_config_path(&value)?;
+    std::fs::read_to_string(expand_env_vars(&shared)).ok()
+}
+
+/// 从 `redirection.config` 提取共享配置路径（`<redirection><configFile path="..."/>`）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn shared_config_path(value: &Value) -> Option<String> {
+    let root = value.get("configuration").unwrap_or(value);
+    let file = root
+        .get("redirection")
+        .and_then(|r| r.get("configFile"))
+        .or_else(|| root.get("configFile"))?;
+    for item in as_values(file) {
+        let path = str_attr(item, "path");
+        if !path.is_empty() {
+            return Some(path);
+        }
+        if let Some(text) = item.as_str() {
+            if !text.trim().is_empty() {
+                return Some(text.trim().to_string());
+            }
+        }
+        if let Some(text) = item.get("#text").and_then(|v| v.as_str()) {
+            if !text.trim().is_empty() {
+                return Some(text.trim().to_string());
+            }
+        }
+    }
+    None
 }
 
 #[cfg(not(windows))]
@@ -165,18 +197,40 @@ fn read_apps_config() -> Option<String> {
     None
 }
 
-/// IIS 站点日志（站点名 → 最新一个 `.log` 文件；供网站流量统计）。
+/// IIS 站点日志配置（`<siteDefaults>` 继承 + 环境变量展开）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IisLogSite {
+    pub name: String,
+    pub id: String,
+    /// 日志根目录（未展开 `<目录>\W3SVC<站点Id>` 子目录）
+    pub dir: PathBuf,
+    /// 日志格式：`W3C`（默认）/ `IIS` / `NCSA`
+    pub format: String,
+    /// 站点日志是否启用（`<logFile enabled="false">` 为关闭）
+    pub enabled: bool,
+}
+
+/// 自动发现结果：可统计的站点给出日志文件，其余给出站点名与原因。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredLog {
+    pub name: String,
+    pub file: Option<PathBuf>,
+    pub note: String,
+}
+
+/// 自动发现 IIS 站点日志（Windows）。
 ///
-/// 默认目录 `%SystemDrive%\inetpub\logs\LogFiles\W3SVC<站点Id>`；
-/// 也支持 site 级 `<logFile directory="...">` 自定义目录。
+/// 返回**配置中的全部站点**：有日志文件的给出文件路径；日志关闭、格式不支持、
+/// 目录/文件尚未产生时给出 `file=None` 与原因——面板据此仍能列出全部站点，
+/// 而不是只剩“有日志文件的 Default Web Site”。
 #[cfg(windows)]
-pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
+pub fn discover_log_sites() -> Vec<DiscoveredLog> {
     let default_root = default_log_root();
-    let mut dirs = read_apps_config()
-        .map(|text| log_dirs_from_xml(&text, &default_root))
+    let mut sites = read_apps_config()
+        .map(|text| log_sites_from_xml(&text, &default_root))
         .unwrap_or_default();
-    if dirs.is_empty() {
-        // 配置里没有站点时回退扫描默认/旧版 IIS 日志目录（W3SVC*）
+    if sites.is_empty() {
+        // 配置读不到时回退扫描默认/旧版 IIS 日志目录（W3SVC*）
         let legacy_root = std::env::var_os("windir")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from(r"C:\Windows"))
@@ -190,19 +244,59 @@ pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
                 let path = entry.path();
                 let name = entry.file_name().to_string_lossy().to_string();
                 if path.is_dir() && name.to_ascii_lowercase().starts_with("w3svc") {
-                    dirs.push((name, path));
+                    sites.push(IisLogSite {
+                        name,
+                        id: String::new(),
+                        dir: path,
+                        format: "W3C".to_string(),
+                        enabled: true,
+                    });
                 }
             }
         }
     }
-    dirs.into_iter()
-        .filter_map(|(name, dir)| latest_log_file(&dir).map(|file| (name, file)))
-        .collect()
+    sites.into_iter().map(describe_log_site).collect()
+}
+
+#[cfg(windows)]
+fn describe_log_site(site: IisLogSite) -> DiscoveredLog {
+    let mut note = String::new();
+    let mut file = None;
+    // IIS 在配置目录下再建 `W3SVC<站点Id>` 子目录；部分环境把站点目录直接指向子目录，
+    // 两种布局都尝试（先子目录、后根目录），避免自定义日志目录被漏掉。
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if !site.id.trim().is_empty() {
+        candidates.push(site.dir.join(format!("W3SVC{}", site.id.trim())));
+    }
+    candidates.push(site.dir.clone());
+    if !site.enabled {
+        note = "IIS 日志记录已关闭（需在 IIS 管理器中启用）".to_string();
+    } else if !supported_format(&site.format) {
+        note = format!("日志格式为 {}（需改为 W3C 才能按字段统计）", site.format);
+    } else if let Some(path) = candidates.iter().find_map(|dir| latest_log_file(dir)) {
+        file = Some(path);
+    } else if candidates.iter().any(|dir| dir.is_dir()) {
+        note = format!("暂无日志文件（{}）", site.dir.display());
+    } else {
+        note = format!("日志目录不存在（{}）", site.dir.display());
+    }
+    DiscoveredLog {
+        name: site.name,
+        file,
+        note,
+    }
+}
+
+/// W3C/NCSA 可直接解析；IIS 原生逗号格式暂不支持。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn supported_format(format: &str) -> bool {
+    let f = format.trim();
+    f.is_empty() || f.eq_ignore_ascii_case("W3C") || f.eq_ignore_ascii_case("NCSA")
 }
 
 #[cfg(not(windows))]
 #[allow(dead_code)]
-pub fn discover_log_sites() -> Vec<(String, PathBuf)> {
+pub fn discover_log_sites() -> Vec<DiscoveredLog> {
     Vec::new()
 }
 
@@ -214,9 +308,15 @@ fn default_log_root() -> PathBuf {
     PathBuf::from(format!(r"{drive}\inetpub\logs\LogFiles"))
 }
 
-/// 从 applicationHost.config 提取站点日志目录（可单测的纯逻辑）。
+/// 从 applicationHost.config 提取全部站点日志配置（可单测的纯逻辑）。
+///
+/// 关键点：
+/// - site 级 `<logFile>` 常只写部分属性（例如只有 `logFormat`），其余从
+///   `<siteDefaults><logFile>` 继承（目录默认 `%SystemDrive%\inetpub\logs\LogFiles`）；
+/// - `%VAR%` 环境变量展开（IIS 默认值就是 `%SystemDrive%\...`）；
+/// - **不因日志文件不存在而丢弃站点**（站点停用/新站尚未产生日志是常态）。
 #[cfg_attr(not(windows), allow(dead_code))]
-fn log_dirs_from_xml(xml: &str, default_root: &Path) -> Vec<(String, PathBuf)> {
+fn log_sites_from_xml(xml: &str, default_root: &Path) -> Vec<IisLogSite> {
     let mut out = Vec::new();
     let Ok(value) = dhrust::config::read_xml_to_json(xml) else {
         return out;
@@ -225,33 +325,100 @@ fn log_dirs_from_xml(xml: &str, default_root: &Path) -> Vec<(String, PathBuf)> {
     let Some(host) = root.get("system.applicationHost") else {
         return out;
     };
-    let Some(sites) = host.get("sites").and_then(|v| v.get("site")) else {
+    let Some(sites) = host.get("sites") else {
         return out;
     };
-    for site in as_values(sites) {
+    let defaults = sites.get("siteDefaults").and_then(|d| d.get("logFile"));
+    let default_dir = defaults
+        .map(|l| str_attr(l, "directory"))
+        .unwrap_or_default();
+    let default_format = defaults
+        .map(|l| str_attr(l, "logFormat"))
+        .unwrap_or_default();
+    let default_enabled = defaults.map(|l| str_attr(l, "enabled")).unwrap_or_default();
+    let Some(list) = sites.get("site") else {
+        return out;
+    };
+    for site in as_values(list) {
         let name = str_attr(site, "name");
-        let id = str_attr(site, "id");
-        if name.is_empty() || id.is_empty() {
+        if name.is_empty() {
             continue;
         }
+        let id = str_attr(site, "id");
         let log = site.get("logFile");
-        if let Some(log) = log {
-            if str_attr(log, "enabled").eq_ignore_ascii_case("false") {
-                continue;
-            }
-        }
-        let dir = log.map(|l| str_attr(l, "directory")).unwrap_or_default();
-        let dir = if dir.is_empty() {
-            default_root.join(format!("W3SVC{id}"))
-        } else {
-            let path = PathBuf::from(dir);
-            if path.is_absolute() {
-                path
-            } else {
-                default_root.join(path)
-            }
+        let pick = |key: &str, fallback: &str| -> String {
+            log.map(|l| str_attr(l, key))
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| fallback.to_string())
         };
-        out.push((name, dir));
+        out.push(IisLogSite {
+            name,
+            id,
+            dir: resolve_log_dir(&pick("directory", &default_dir), default_root),
+            format: pick("logFormat", &default_format),
+            enabled: !pick("enabled", &default_enabled).eq_ignore_ascii_case("false"),
+        });
+    }
+    out
+}
+
+/// 日志根目录：空 → 默认根；支持 `%VAR%` 与相对路径。
+///
+/// 站点实际日志目录通常是 `<根目录>\W3SVC<站点Id>`（在 `describe_log_site` 中展开）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn resolve_log_dir(directory: &str, default_root: &Path) -> PathBuf {
+    let expanded = expand_env_vars(directory.trim());
+    if expanded.trim().is_empty() {
+        return default_root.to_path_buf();
+    }
+    let path = PathBuf::from(expanded);
+    if path.is_absolute() {
+        path
+    } else {
+        default_root.join(path)
+    }
+}
+
+/// 展开 `%NAME%` 环境变量（未知名原样保留）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn expand_env_vars(text: &str) -> String {
+    expand_env_vars_with(text, |name| std::env::var(name).ok())
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn expand_env_vars_with<F>(text: &str, lookup: F) -> String
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(text.len());
+    let mut i = 0;
+    while i < text.len() {
+        let Some(ch) = text[i..].chars().next() else {
+            break;
+        };
+        if ch != '%' {
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        let Some(rel) = text[i + 1..].find('%') else {
+            out.push('%');
+            i += 1;
+            continue;
+        };
+        let end = i + 1 + rel;
+        let name = &text[i + 1..end];
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '(' || c == ')');
+        if let (true, Some(value)) = (valid, lookup(name)) {
+            out.push_str(&value);
+            i = end + 1;
+        } else {
+            out.push('%');
+            i += 1;
+        }
     }
     out
 }
@@ -530,10 +697,124 @@ mod tests {
             <site name="site3" id="3"><logFile directory="off" enabled="false" /></site>
         </sites></system.applicationHost></configuration>"#;
         let root = Path::new("/logs");
-        let dirs = log_dirs_from_xml(xml, root);
-        assert_eq!(dirs.len(), 2);
-        assert_eq!(dirs[0], ("site1".to_string(), root.join("W3SVC1")));
-        assert_eq!(dirs[1], ("site2".to_string(), root.join("custom")));
+        let sites = log_sites_from_xml(xml, root);
+        // 日志关闭的站点也要保留（面板仍列出，附原因），不再直接丢弃
+        assert_eq!(sites.len(), 3);
+        assert_eq!(sites[0].name, "site1");
+        assert_eq!(sites[0].id, "1");
+        assert_eq!(sites[0].dir, root.to_path_buf());
+        assert!(sites[0].enabled);
+        assert_eq!(sites[1].name, "site2");
+        assert_eq!(sites[1].dir, root.join("custom"));
+        assert_eq!(sites[2].name, "site3");
+        assert!(!sites[2].enabled);
+    }
+
+    #[test]
+    fn inherits_site_defaults_and_site_overrides() {
+        let xml = r#"<configuration><system.applicationHost><sites>
+            <siteDefaults>
+                <logFile logFormat="NCSA" />
+            </siteDefaults>
+            <site name="Default Web Site" id="1" />
+            <site name="shop.example.com" id="2"><logFile logFormat="W3C" /></site>
+            <site name="api.example.com" id="3"><logFile directory="D:\weblogs\api" /></site>
+        </sites></system.applicationHost></configuration>"#;
+        let root = Path::new("/fallback");
+        let sites = log_sites_from_xml(xml, root);
+        assert_eq!(sites.len(), 3);
+        // 未写 logFile 的站点继承 siteDefaults 的格式与目录（目录为空 → 默认根）
+        assert_eq!(sites[0].name, "Default Web Site");
+        assert_eq!(sites[0].format, "NCSA");
+        assert_eq!(sites[0].dir, root.to_path_buf());
+        // 站点级 logFormat 覆盖默认值
+        assert_eq!(sites[1].format, "W3C");
+        // 站点级 directory 覆盖默认值
+        assert_eq!(sites[2].format, "NCSA");
+        #[cfg(windows)]
+        assert_eq!(sites[2].dir, PathBuf::from(r"D:\weblogs\api"));
+        #[cfg(not(windows))]
+        assert_eq!(sites[2].dir, root.join(r"D:\weblogs\api"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn inherits_site_defaults_directory_and_expands_env() {
+        // IIS 默认配置：只有 siteDefaults 写 directory（%SystemDrive%），站点不写 logFile
+        let xml = r#"<configuration><system.applicationHost><sites>
+            <siteDefaults><logFile directory="%SystemDrive%\inetpub\logs\LogFiles" /></siteDefaults>
+            <site name="Default Web Site" id="1" />
+            <site name="shop.example.com" id="2" />
+        </sites></system.applicationHost></configuration>"#;
+        let sites = log_sites_from_xml(xml, Path::new(r"C:\fallback"));
+        let drive = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".to_string());
+        let want = PathBuf::from(format!(r"{drive}\inetpub\logs\LogFiles"));
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].dir, want);
+        assert_eq!(sites[1].dir, want);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn finds_log_in_w3svc_subdir_or_base_dir() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let base = std::env::temp_dir().join(format!("pek-iis-log-{}-{stamp}", std::process::id()));
+        let sub = base.join("W3SVC7");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("u_ex251020.log"), "#Fields: date time\n").unwrap();
+        let found = describe_log_site(IisLogSite {
+            name: "shop".to_string(),
+            id: "7".to_string(),
+            dir: base.clone(),
+            format: "W3C".to_string(),
+            enabled: true,
+        });
+        assert_eq!(found.file, Some(sub.join("u_ex251020.log")));
+        assert!(found.note.is_empty());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn expands_known_env_vars_in_log_dir() {
+        assert_eq!(
+            expand_env_vars_with(r"%DRIVE%\logs\%SITE%", |name| match name {
+                "DRIVE" => Some("D:".to_string()),
+                "SITE" => Some("shop".to_string()),
+                _ => None,
+            }),
+            r"D:\logs\shop"
+        );
+        // 未定义变量与落单百分号原样保留
+        assert_eq!(expand_env_vars_with("100% %NOPE%", |_| None), "100% %NOPE%");
+        assert_eq!(expand_env_vars_with(r"C:\a\b", |_| None), r"C:\a\b");
+    }
+
+    #[test]
+    fn unsupported_log_format_is_flagged() {
+        assert!(supported_format("W3C"));
+        assert!(supported_format("ncsa"));
+        assert!(supported_format(""));
+        assert!(!supported_format("IIS"));
+    }
+
+    #[test]
+    fn parses_shared_config_redirection() {
+        let xml = r#"<configuration><redirection><configFile path="\\fs01\iis\applicationHost.config" /></redirection></configuration>"#;
+        let value = dhrust::config::read_xml_to_json(xml).unwrap();
+        assert_eq!(
+            shared_config_path(&value).as_deref(),
+            Some(r"\\fs01\iis\applicationHost.config")
+        );
+        // 兼容 <configuration><configFile path="..."/></configuration> 形式
+        let xml2 = r#"<configuration><configFile path="D:\iis\applicationHost.config" /></configuration>"#;
+        let value2 = dhrust::config::read_xml_to_json(xml2).unwrap();
+        assert_eq!(
+            shared_config_path(&value2).as_deref(),
+            Some(r"D:\iis\applicationHost.config")
+        );
     }
 
     #[test]

@@ -174,6 +174,8 @@ async function api(url,opt={}){
  const r=await fetch(url,{...opt,headers:{...h,'Content-Type':'application/json'}});
  const _el=r.headers.get('X-Elapsed-Ms');if(_el)setSrvElapsed(_el);
  const j=await r.json();
+ // 服务器时间锚点（/api/status、/star/webTraffic 等带 localTime）：页脚不再显示浏览器本机时间
+ if(j&&j.data&&j.data.localTime){setServerClock(j.data.localTime);if(_lastElapsed!=='--')setSrvElapsed(_lastElapsed);}
  if(j.code===401||r.status===401){
   // 登录页上的轮询（旧 token 已失效）不应反复弹提示、也不应反复抢焦点
   const onLoginPage=$('login').style.display!=='none';
@@ -369,13 +371,31 @@ function wafSaveJson(){
 /* ── 页脚：代理版本 + 服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
 let _agentVer='';      // 代理版本（来自 /api/status 的 selfUpgrade.current）
 let _lastElapsed='--'; // 最近一次服务端耗时
+let _srvClockMs=null;  // 服务器本地时间锚点（毫秒）
+let _srvClockAt=0;     // 锚点建立时的浏览器时钟
+function setServerClock(localTime){
+ // 取服务器“墙钟”时间（忽略时区偏移，避免浏览器时区不同导致显示错位）
+ const m=/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(String(localTime||'').trim());
+ if(!m)return;
+ _srvClockMs=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6]);
+ _srvClockAt=Date.now();
+}
+function serverClockText(){
+ const p=n=>String(n).padStart(2,'0');
+ if(_srvClockMs==null){
+  const t=new Date();
+  return `${p(t.getMonth()+1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
+ }
+ const d=new Date(_srvClockMs+(Date.now()-_srvClockAt));
+ return `${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
 function setSrvElapsed(v){
  const f=$('srv-foot');if(!f)return;
  _lastElapsed=v;
- const t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
+ const label=_srvClockMs==null?'本机时间':'服务器时间';
  // 版本未上报时也显示产品名：一眼能分辨页脚来自新版前端（旧版没有产品名前缀）
  const head='Pek.RAgent'+(_agentVer?(' v'+_agentVer):'');
- f.textContent=head+' · 服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
+ f.textContent=head+' · 服务端处理耗时：'+v+' ms（最近一次请求 · '+label+' '+serverClockText()+'）';
 }
 
 /* ── Dashboard ── */
@@ -683,7 +703,7 @@ function ensureTrafficShell(){
   </div>
   <div id="traffic-sub-site">
    <div class="glass-card card">
-    <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy）· 今日与累计</span></h2>
+    <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy / IIS）· 今日与累计</span></h2>
     <div id="web-traffic-body"><p class="text-muted">加载中…</p></div>
    </div>
    <div class="glass-card card">
@@ -760,8 +780,9 @@ function renderWebTraffic(d){
  html+=`</tr>`;
  sites.forEach(s=>{
   const logs=(s.logs||[]).join('\n');
+  const note=s.note?`<div class="text-muted" style="font-size:11px;margin-top:2px">${esc(s.note)}</div>`:'';
   html+=`<tr>
-   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${esc(logs)}">${esc(s.name)}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${esc(logs)}">${esc(s.name)}${note}</td>
    <td>${fmtBytes(s.todayBytes)}</td>
    <td>${s.todayRequests||0}</td>
    <td>${s.uv||0}</td>
