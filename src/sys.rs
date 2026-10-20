@@ -13,167 +13,18 @@ pub(crate) use dhrust::sys::machine::{
 };
 pub(crate) use dhrust::sys::monitor::{
     disk_io, is_process_running, load_average, process_cpu_seconds, process_cpu_split,
-    process_stats, system_cpu_rate, tcp_counts, top_processes, DiskIo, ProcItem,
+    process_stats, system_cpu_rate, tcp_counts, top_processes, top_processes_union, DiskIo,
+    ProcItem,
 };
 pub(crate) use dhrust::sys::process::{
     empty_working_set, is_alive, memory_mb, process_name, raise_priority, set_oom_score_adjust,
     signal_force, signal_graceful, spawn, stop_process, Handle, SpawnRequest,
 };
 
-/// 指定进程（含其子进程树）正在监听的 TCP 端口（升序去重）。
-///
-/// 用于「未配置 `HealthCheck`」时的自动探活：由 RAgent 自己找出子服务的监听口，
-/// 再发起探活请求。取不到（无监听 / 权限不足 / 非本平台）返回空。
-pub(crate) fn listen_ports_of(pid: u32) -> Vec<u16> {
-    let mut ports = listen_ports_of_impl(pid);
-    ports.sort_unstable();
-    ports.dedup();
-    ports
-}
-
-#[cfg(target_os = "linux")]
-fn listen_ports_of_impl(pid: u32) -> Vec<u16> {
-    use std::collections::{HashMap, HashSet};
-
-    // 1) LISTEN socket inode → 端口（/proc/net/tcp{,6} 第 10 列是 inode）
-    let mut inode_port: HashMap<u64, u16> = HashMap::new();
-    for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        for line in text.lines().skip(1) {
-            let cols: Vec<&str> = line.split_whitespace().collect();
-            if cols.len() < 10 || cols[3] != "0A" {
-                continue; // 仅 TCP LISTEN
-            }
-            let Ok(port) = u16::from_str_radix(
-                cols[1].rsplit(':').next().unwrap_or("0"),
-                16,
-            ) else {
-                continue;
-            };
-            let Ok(inode) = cols[9].parse::<u64>() else {
-                continue;
-            };
-            if port != 0 {
-                inode_port.insert(inode, port);
-            }
-        }
-    }
-    if inode_port.is_empty() {
-        return Vec::new();
-    }
-
-    // 2) 进程树（自身 + 后代）：应用常由包装脚本 / 服务宿主再 fork 出真正监听者
-    let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
-    if let Ok(dir) = std::fs::read_dir("/proc") {
-        for entry in dir.flatten() {
-            let Ok(p) = entry.file_name().to_string_lossy().parse::<u32>() else {
-                continue;
-            };
-            let Ok(stat) = std::fs::read_to_string(format!("/proc/{p}/stat")) else {
-                continue;
-            };
-            let Some(close) = stat.rfind(')') else { continue };
-            let rest: Vec<&str> = stat[close + 1..].split_whitespace().collect();
-            if let Some(ppid) = rest.get(1).and_then(|v| v.parse::<u32>().ok()) {
-                children.entry(ppid).or_default().push(p);
-            }
-        }
-    }
-    let mut pending = vec![pid];
-    let mut seen: HashSet<u32> = HashSet::new();
-    let mut pids = Vec::new();
-    while let Some(p) = pending.pop() {
-        if !seen.insert(p) {
-            continue;
-        }
-        pids.push(p);
-        if let Some(list) = children.get(&p) {
-            pending.extend(list.iter().copied());
-        }
-    }
-
-    // 3) 这些进程打开的 socket inode → 端口
-    let mut ports = Vec::new();
-    for p in pids {
-        let Ok(dir) = std::fs::read_dir(format!("/proc/{p}/fd")) else {
-            continue;
-        };
-        for entry in dir.flatten() {
-            let Ok(target) = std::fs::read_link(entry.path()) else {
-                continue;
-            };
-            let Some(text) = target.to_str() else { continue };
-            let Some(inode) = text
-                .strip_prefix("socket:[")
-                .and_then(|v| v.strip_suffix(']'))
-                .and_then(|v| v.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            if let Some(&port) = inode_port.get(&inode) {
-                ports.push(port);
-            }
-        }
-    }
-    ports
-}
-
-#[cfg(windows)]
-fn listen_ports_of_impl(pid: u32) -> Vec<u16> {
-    use windows_sys::Win32::NetworkManagement::IpHelper::{
-        GetExtendedTcpTable, MIB_TCPTABLE_OWNER_PID, TCP_TABLE_OWNER_PID_ALL,
-    };
-    use windows_sys::Win32::Networking::WinSock::AF_INET;
-
-    let mut ports = Vec::new();
-    unsafe {
-        let mut size: u32 = 0;
-        GetExtendedTcpTable(
-            std::ptr::null_mut(),
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if size == 0 {
-            return ports;
-        }
-        let mut buf = vec![0u8; size as usize];
-        let ret = GetExtendedTcpTable(
-            buf.as_mut_ptr() as *mut core::ffi::c_void,
-            &mut size,
-            0,
-            AF_INET as u32,
-            TCP_TABLE_OWNER_PID_ALL,
-            0,
-        );
-        if ret != 0 {
-            return ports;
-        }
-        let table = buf.as_ptr() as *const MIB_TCPTABLE_OWNER_PID;
-        let count = (*table).dwNumEntries as usize;
-        let rows = (*table).table.as_ptr();
-        for i in 0..count {
-            let row = rows.add(i);
-            if (*row).dwOwningPid != pid || (*row).dwState != 2 {
-                continue; // MIB_TCP_STATE_LISTEN
-            }
-            let port = (((*row).dwLocalPort & 0xffff) as u16).swap_bytes();
-            if port != 0 {
-                ports.push(port);
-            }
-        }
-    }
-    ports
-}
-
-#[cfg(not(any(windows, target_os = "linux")))]
-fn listen_ports_of_impl(_pid: u32) -> Vec<u16> {
-    Vec::new()
-}
+// 监听端口查询已下沉 `dhrust::sys::monitor`：进程 Top（`ProcItem.ports`）与
+// 「未配置 HealthCheck 时自动探活」共用同一份快照，避免两套实现口径漂移。
+// 再导出保持本模块既有调用路径 `sys::listen_ports_of` 不变。
+pub(crate) use dhrust::sys::monitor::listen_ports_of;
 
 /// 重启本机（平台「服务器节点」页下发 `reboot` 指令时调用）。
 ///

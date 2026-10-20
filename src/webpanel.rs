@@ -2508,14 +2508,9 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         .collect();
 
     // 进程 Top：CPU 前 20 与内存前 20 取并集（前端可切换排序，
-    // 避免只按单一口径取榜导致「CPU 高的看不到」或「内存高的看不到」）
-    let mut proc_items = sys::top_processes(20, true);
-    let seen: std::collections::HashSet<u32> = proc_items.iter().map(|p| p.pid).collect();
-    for item in sys::top_processes(20, false) {
-        if !seen.contains(&item.pid) {
-            proc_items.push(item);
-        }
-    }
+    // 避免只按单一口径取榜导致「CPU 高的看不到」或「内存高的看不到）。
+    // 一次系统扫描出两个榜（不重复遍历进程表），只需要 Top N 的重字段与监听端口。
+    let proc_items = sys::top_processes_union(20, 20);
     let processes: Vec<Json> = proc_items.iter().map(process_json).collect();
 
     let os = json!({
@@ -2674,6 +2669,9 @@ fn process_json(p: &sys::ProcItem) -> Json {
         // 真正被宿主加载的应用（如 `dotnet /www/xxx/App.dll` 里的 App.dll）
         "app": app,
         "appPath": app_path,
+        // 监听端口（TCP LISTEN）：直接看出这个进程对外提供哪些服务；
+        // 与「未配置 HealthCheck 时自动探活」用的是同一份快照
+        "ports": p.ports,
         "startTime": if p.start_time > 0 {
             Local
                 .timestamp_opt(p.start_time, 0)

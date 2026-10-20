@@ -601,8 +601,8 @@ async function loadMachineDetail(){
   if(d.processes&&d.processes.length>0){
    _procData=d.processes;
    html+=`<div class="section-title mt-16">进程 Top 20（排序：<span class="proc-sort" data-sort="cpu" onclick="setProcSort('cpu')">CPU</span> · <span class="proc-sort" data-sort="mem" onclick="setProcSort('mem')">内存</span>）</div>
-   <div style="overflow-x:auto"><table class="info-table" style="min-width:820px">
-    <tr><td style="${TH}">PID</td><td style="${TH}">用户</td><td style="${TH}">进程 / 可执行文件</td><td style="${TH}">CPU</td><td style="${TH}">内存</td><td style="${TH}">线程/句柄</td><td style="${TH}">启动时间</td></tr>
+   <div style="overflow-x:auto"><table class="info-table" style="min-width:940px">
+    <tr><td style="${TH}">PID</td><td style="${TH}">用户</td><td style="${TH}">进程 / 可执行文件</td><td style="${TH}">监听端口</td><td style="${TH}">CPU</td><td style="${TH}">内存</td><td style="${TH}">线程/句柄</td><td style="${TH}">启动时间</td></tr>
     <tbody id="proc-rows"></tbody>
    </table></div>`;
   }
@@ -641,10 +641,13 @@ function renderProcRows(){
   const host=(p.name&&app&&p.name.toLowerCase()!==app.toLowerCase())?(' · 宿主 '+p.name):'';
   const hint=[p.command||'', cwd?('工作目录: '+cwd):''].filter(Boolean).join('\n');
   const cpu=num(p.cpuPercent);
+  const ports=Array.isArray(p.ports)?p.ports:[];
+  const portCell=ports.length?ports.map(v=>`:${v}`).join(' '):'—';
   return `<tr>
    <td>${p.pid}</td>
    <td>${esc(p.user||'—')}</td>
    <td style="font-family:var(--font-mono);font-size:12px;max-width:420px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escAttr(hint)}">${esc(app)}${host?`<span class="text-muted" style="font-size:10px">${esc(host)}</span>`:''}${appPath?`<div class="text-muted" style="font-size:10px;overflow:hidden;text-overflow:ellipsis">${esc(appPath)}</div>`:''}</td>
+   <td style="font-family:var(--font-mono);font-size:11px;white-space:nowrap;${ports.length?'':'color:var(--text-tertiary)'}">${esc(portCell)}</td>
    <td${cpu>=50?' class="text-yellow"':''}>${cpu.toFixed(1)}%</td>
    <td>${p.memoryMB} MB</td>
    <td>${p.threadCount||0}/${p.handleCount||0}</td>

@@ -13,6 +13,13 @@ use crate::util;
 /// 连续健康检查失败多少次判定为「假死」并重启。
 const HEALTH_FAIL_LIMIT: u32 = 3;
 
+/// 探活间隔：守护循环 1 秒一跳，但真正探活最多这么一次。
+///
+/// 探活需要发 HTTP/TCP 请求（Linux 自动发现端口还要读 `/proc`），
+/// 每秒一次会把自己变成资源消耗源：10 秒一次 → 假死判定 30 秒内完成，
+/// 开销降到原来的 1/10。
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 应用状态快照。
 #[derive(Clone, Debug)]
 pub struct AppStatus {
@@ -80,6 +87,8 @@ struct AppState {
     activity: Option<(u64, u64, i64)>,
     /// 主动心跳：最后一次上报时间（Unix 秒；0 = 尚未上报）
     last_heartbeat: i64,
+    /// 上次真正探活的时刻（节流用：守护循环 1 秒一跳，探活最多 [`HEALTH_INTERVAL`] 一次）
+    health_at: Option<Instant>,
 }
 
 /// 应用运行时。
@@ -117,6 +126,7 @@ impl AppRuntime {
                 health_ok_at: 0,
                 activity: None,
                 last_heartbeat: 0,
+                health_at: None,
             }),
         }
     }
@@ -189,6 +199,7 @@ impl AppRuntime {
         st.health_ok_at = 0;
         st.activity = None;
         st.last_heartbeat = 0;
+        st.health_at = None;
         // 接管不经过 start()，需在此补算工作目录（文件变动监视/停止清理等依赖它；缺失会静默跳过）
         let wd = crate::deploy::work_dir(&self.base, &st.cfg);
         st.work_dir = wd;
@@ -309,6 +320,7 @@ impl AppRuntime {
         st.health_ok_at = 0;
         st.activity = None;
         st.last_heartbeat = 0;
+        st.health_at = None;
 
         // OOM 分值（仅 Linux）
         if cfg.oom_score_adjust != 0 {
@@ -468,6 +480,18 @@ impl AppRuntime {
             if started.elapsed().map(|d| d < grace).unwrap_or(false) {
                 return;
             }
+        }
+
+        // 探活节流：守护循环 1 秒一跳，探活不需每秒做（HTTP/TCP 请求 + 端口发现都要系统调用），
+        // 严格按 [`HEALTH_INTERVAL`] 一次，避免 RAgent 自己成为负担。
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(at) = st.health_at {
+                if at.elapsed() < HEALTH_INTERVAL {
+                    return;
+                }
+            }
+            st.health_at = Some(Instant::now());
         }
 
         let mut last_error = String::new();
@@ -870,9 +894,11 @@ fn health_targets(cfg: &AppConfig, pid: u32, exclude_port: u16) -> Vec<HealthTar
 }
 
 
-/// 宽松探活（自动模式）：TCP 连上后发一个最小 HTTP 请求，**3 秒内收到任何字节或对端关闭**
+/// 宽松探活（自动模式）：TCP 连上后发一个最小 HTTP 请求，**2 秒内收到任何字节或对端关闭**
 /// 都算存活（兼容非 HTTP 协议，避免把 gRPC/数据库等误判为死亡）；
 /// 连接成功但读超时 → 判定疑似假死（accept 队列在内核里完成握手，进程不处理请求）。
+///
+/// 超时取 2 秒（守护线程串行，卡太久会拖慢其它应用的调度）。
 fn probe_alive(port: u16) -> Result<(), String> {
     use std::io::{Read, Write};
     use std::net::{SocketAddr, TcpStream};
@@ -886,7 +912,7 @@ fn probe_alive(port: u16) -> Result<(), String> {
     let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
         .map_err(|e| format!("连接 {addr} 失败：{e}"))?;
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
     let mut buf = [0u8; 256];
     match stream.read(&mut buf) {
@@ -895,7 +921,7 @@ fn probe_alive(port: u16) -> Result<(), String> {
             if e.kind() == std::io::ErrorKind::WouldBlock
                 || e.kind() == std::io::ErrorKind::TimedOut =>
         {
-            Err("连接成功但 3 秒内无任何响应（疑似假死）".to_string())
+            Err("连接成功但 2 秒内无任何响应（疑似假死）".to_string())
         }
         Err(e) => Err(format!("读取失败：{e}")),
     }

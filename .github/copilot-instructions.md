@@ -13,6 +13,11 @@
 - **多实例**：配置按名称 upsert（**不能同名**）；多实例用不同子服务名分别注册（各自目录/配置/资源）。停止按 PID 定点，无同名连坐。
 - 自升级管线：热检测 + 影子冒烟 + 原子替换 + 移交（Unix `execv` 原地接管；Windows 服务交 SCM 失败恢复）。
 - **WAF（Pek.RWaf）**：HTTP 控制接口挂 `pek_rwaf` 中间件（`server.rs::build_router` 首行）——管理端预设（拦恶意爬虫/sqlmap/curl 默认 UA；路径探测拦截；CC 300/分钟）；`Config/Waf.json` 首启生成 + 10s 热重载；`/star/db|file|ai` 经 `skipAttackPrefixes` 跳过攻击检测（业务护栏负责）。**网络层 curl 实测须带浏览器 UA**（回环豁免）。面板「🛡 安全」页（`/star/waf` 查询 / `wafSave` 保存）提供在线开关与参考配置；响应带 `X-Elapsed-Ms`（页脚显示服务端处理耗时）；`csrfGuard` 默认开启。
+- **性能红线（守护循环 1 秒一跳）**：`agent.rs` 的 `Timer::new(1_000, …)` 每 1000ms 调一次 `manager.check_all()`——**任何周期任务都必须与之解耦**，否则代理自己就成了资源消耗源：
+  - 探活（HTTP/TCP）按 `app.rs::HEALTH_INTERVAL`（**10 秒**）节流，不要退回「每跳一次就探一次」；
+  - 进程扫描（`top_processes*`）先取轻字段全量排序，**只给榜单补**命令行/路径/句柄/端口；端口走 `listen_ports_many(&pids)`（只扫目标 pid + 2 秒缓存），禁止遍历全系统 `/proc/*/fd`；
+  - 面板要双榜时用 `top_processes_union(cpu, mem)`（一次扫描），不要连调两次 `top_processes`；
+  - 新增周期逻辑前先问：**这条为什么要每秒跑？** 能缓存/分频就分频（参考 `sampler.rs` 的 TCP 3 秒 / 线程句柄 5 秒分频）。
 
 ## 构建与验证
 - `cargo build --release`；`cargo test`；打包 `powershell -ExecutionPolicy Bypass -File scripts/build-release.ps1`（**默认自动递升补丁号**，`-NoBump` 关闭；版本守卫取自 `../DH.RustBase/tools/version-guard.ps1`；`-Targets` 默认 all = windows + 4 个 Linux musl 目标；zig 自动发现 `E:\Soft\zig-*`）。
