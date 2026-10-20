@@ -288,15 +288,15 @@ function wafParseList(t){return String(t||'').split(/[,，;；\s]+/).filter(Bool
 async function loadSecurity(){
  try{
   const j=await api('/star/waf');
-  if(j.code!==0){$('config-sub-security').innerHTML='<div class="card"><h3>🛡 WAF</h3><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
+  if(j.code!==0){$('config-sub-security').innerHTML='<div class="glass-card card"><h2>🛡 WAF</h2><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
   wafCfg=j.data;renderSecurity();
  }catch(e){}
 }
 function renderSecurity(){
  const c=wafCfg||{};
  $('config-sub-security').innerHTML=`
-<div class="card">
- <h3>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h3>
+<div class="glass-card card">
+ <h2>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h2>
  <p class="text-muted" style="font-size:12px;margin:2px 0 10px">爬虫分级（放行正常搜索引擎/GEO-AI，拦恶意爬虫与扫描器）+ SQL 注入/路径探测防护 + CC 限速；保存后立即生效，并写入配置文件。</p>
  <div class="waf-row">
   <label><input type="checkbox" id="waf-enable" ${c.enable?'checked':''}> <b>启用 WAF</b>（关闭后请求全放行）</label>
@@ -324,8 +324,8 @@ function renderSecurity(){
  </div>
  <div style="margin-top:12px"><button class="btn btn-primary" onclick="wafSave()">💾 保存并立即生效</button></div>
 </div>
-<div class="card">
- <h3>📖 参考配置（完整 JSON）</h3>
+<div class="glass-card card">
+ <h2>📖 参考配置（完整 JSON）</h2>
  <p class="text-muted" style="font-size:12px;margin:2px 0 8px">高级项（如规则集 <code>ruleset</code>、跳过检测前缀 <code>skipAttackPrefixes</code>）可直接编辑 JSON 保存；也可直接编辑服务器配置文件（修改后 10 秒内热生效）。</p>
  <textarea id="waf-json" class="waf-json" spellcheck="false">${JSON.stringify(c,null,2).replace(/</g,'\\u003c')}</textarea>
  <div style="margin-top:10px"><button class="btn btn-primary" onclick="wafSaveJson()">💾 保存 JSON</button></div>
