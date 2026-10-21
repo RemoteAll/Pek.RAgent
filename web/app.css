@@ -149,6 +149,10 @@ html{overflow-anchor:none}
 .modal-box h3{font-size:17px;font-weight:700;margin-bottom:10px}
 .modal-box p{font-size:13px;color:var(--text-secondary);margin-bottom:22px;line-height:1.6}
 .modal-box .modal-actions{display:flex;gap:10px;justify-content:flex-end}
+/* 宽版弹窗（文件在线编辑等大内容场景）：占满视口大部分，编辑器自适应填充 */
+.modal-box.modal-wide{max-width:min(1180px,95vw);width:min(1180px,95vw);height:min(880px,90vh);display:flex;flex-direction:column;padding:20px 22px}
+.modal-box.modal-wide #modal-body{flex:1;min-height:0;display:flex;flex-direction:column;margin-bottom:14px}
+.modal-box.modal-wide .fm-editor{flex:1;height:auto;min-height:0;font-size:13px;line-height:1.6}
 .toast{position:fixed;top:20px;right:20px;padding:14px 22px;border-radius:var(--radius-lg);font-size:13px;font-weight:600;z-index:9999;box-shadow:var(--shadow-modal);animation:slideInRight var(--duration-slow) var(--ease-out-expo);display:none;max-width:380px}
 .toast.success{background:#065f46;color:#d1fae5;border:1px solid rgba(34,197,94,0.3)}
 .toast.error{background:#7f1d1d;color:#fecaca;border:1px solid rgba(239,68,68,0.3)}

@@ -192,10 +192,12 @@ function showToast(msg,type='info'){
 }
 
 let _modalCb=null;
-function showModal(title,body,confirmText,cb){
+function showModal(title,body,confirmText,cb,wide){
  $('modal-title').textContent=title;
  $('modal-body').innerHTML=body;
  $('modal-confirm-btn').textContent=confirmText||'确认';
+ // 宽版弹窗（文件在线编辑等大内容）；每次打开显式切换，避免上一个弹窗的尺寸残留
+ const box=$('modal-box');if(box)box.classList.toggle('modal-wide',!!wide);
  $('modal-overlay').classList.remove('hidden');_modalCb=cb;
 }
 function closeModal(){$('modal-overlay').classList.add('hidden');_modalCb=null}
@@ -2301,7 +2303,7 @@ async function fmEdit(path,size){
     const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path,content})});
     if(r.code!==0){showToast(r.message||'保存失败','error');return}
     showToast('已保存','success');loadFileman();
-   });
+   },true);
   const el=$('fm-editor');if(el)el.value=j.data.content;
  }catch(e){}
 }
