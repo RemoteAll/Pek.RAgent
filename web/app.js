@@ -2297,7 +2297,7 @@ async function fmEdit(path,size){
   if(j.code!==0){showToast(j.message||'读取失败','error');return}
   const shortName=path.split(/[\\/]/).pop()||path;
   showModal('编辑：'+shortName,
-   `<div class="text-muted" style="margin-bottom:8px">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</div><textarea id="fm-editor" class="fm-editor" spellcheck="false"></textarea>`,
+   `<div class="text-muted" style="margin-bottom:8px;display:flex;align-items:center;gap:10px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</span><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmReloadEditor()">⟳ 重新加载</button></div><textarea id="fm-editor" class="fm-editor" spellcheck="false" data-path="${encodeURIComponent(path)}"></textarea>`,
    '保存',async()=>{
     const content=$('fm-editor')?$('fm-editor').value:'';
     const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path,content})});
@@ -2306,6 +2306,18 @@ async function fmEdit(path,size){
    },true);
   const el=$('fm-editor');if(el)el.value=j.data.content;
  }catch(e){}
+}
+
+/** 文件编辑弹窗：重新拉取服务端最新内容（日志跟进、外部改动时用） */
+async function fmReloadEditor(){
+ const el=$('fm-editor');if(!el||!el.dataset.path)return;
+ const path=decodeURIComponent(el.dataset.path);
+ try{
+  const j=await api('/star/fileRead?path='+encodeURIComponent(path));
+  if(j.code!==0){showToast(j.message||'重新加载失败','error');return}
+  el.value=j.data.content;
+  showToast('已重新加载最新内容（'+fmtBytes(j.data.size)+'）','success');
+ }catch(e){showToast('重新加载失败','error')}
 }
 
 /* ── 日志清理：已迁移为插件（🧩 插件 → 日志清理；后端接口 logCleanScan/logCleanRun/logCleanConfig 保留在核心） ── */
