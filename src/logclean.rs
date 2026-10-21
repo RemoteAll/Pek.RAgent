@@ -66,6 +66,9 @@ impl TargetKind {
 struct Target {
     kind: TargetKind,
     path: PathBuf,
+    /// 内置的明确安全目标，可越过目录黑名单（如 `/var/lib/systemd/coredump`、Docker 容器日志）。
+    /// **仅内置常量构目标使用；自定义路径始终受完整守卫约束。**
+    trusted: bool,
 }
 
 /// 清理分类（面板一行）。
@@ -183,6 +186,11 @@ fn deny_rules() -> Vec<(PathBuf, DenyRule)> {
 ///
 /// 覆盖：根目录、系统关键目录、程序目录（仅允许清理其 `Log` 子目录）。
 fn deny_reason(path: &Path, base: &Path) -> Option<String> {
+    deny_reason_impl(path, base, true)
+}
+
+/// `check_rules = false` 时跳过目录黑名单（仅用于内置 trusted 目标），仍校验绝对路径与程序目录。
+fn deny_reason_impl(path: &Path, base: &Path, check_rules: bool) -> Option<String> {
     if path.as_os_str().is_empty() {
         return Some("路径为空".to_string());
     }
@@ -192,37 +200,41 @@ fn deny_reason(path: &Path, base: &Path) -> Option<String> {
     if path.parent().is_none() {
         return Some("禁止清理根目录".to_string());
     }
-    let key = path_key(path);
-    let sep = std::path::MAIN_SEPARATOR;
-    for (rule_path, rule) in deny_rules() {
-        let rk = path_key(&rule_path);
-        if rk.is_empty() || key == rk {
-            return Some(format!("禁止清理系统关键目录：{}", rule_path.display()));
-        }
-        let inside = key.starts_with(&format!("{rk}{sep}"));
-        match rule {
-            DenyRule::Exact => {}
-            DenyRule::Tree if inside => {
+    if check_rules {
+        let key = path_key(path);
+        let sep = std::path::MAIN_SEPARATOR;
+        for (rule_path, rule) in deny_rules() {
+            let rk = path_key(&rule_path);
+            if rk.is_empty() || key == rk {
                 return Some(format!("禁止清理系统关键目录：{}", rule_path.display()));
             }
-            DenyRule::OneLevel if inside => {
-                let rest = &key[rk.len() + 1..];
-                if !rest.contains(sep) {
-                    let safe = SAFE_ONE_LEVEL_NAMES
-                        .iter()
-                        .any(|n| n.eq_ignore_ascii_case(rest));
-                    if !safe {
-                        return Some(format!(
-                            "禁止清理系统关键目录的一级子目录：{}",
-                            rule_path.display()
-                        ));
+            let inside = key.starts_with(&format!("{rk}{sep}"));
+            match rule {
+                DenyRule::Exact => {}
+                DenyRule::Tree if inside => {
+                    return Some(format!("禁止清理系统关键目录：{}", rule_path.display()));
+                }
+                DenyRule::OneLevel if inside => {
+                    let rest = &key[rk.len() + 1..];
+                    if !rest.contains(sep) {
+                        let safe = SAFE_ONE_LEVEL_NAMES
+                            .iter()
+                            .any(|n| n.eq_ignore_ascii_case(rest));
+                        if !safe {
+                            return Some(format!(
+                                "禁止清理系统关键目录的一级子目录：{}",
+                                rule_path.display()
+                            ));
+                        }
                     }
                 }
+                _ => {}
             }
-            _ => {}
         }
     }
     // 程序目录：本身与上级禁止，内部仅允许 Log 子目录
+    let sep = std::path::MAIN_SEPARATOR;
+    let key = path_key(path);
     let base_key = path_key(base);
     if !base_key.is_empty() {
         if key == base_key || base_key.starts_with(&format!("{key}{sep}")) {
@@ -240,22 +252,44 @@ fn deny_reason(path: &Path, base: &Path) -> Option<String> {
 
 /// 收集存在的文件目标（去重）。
 fn push_file(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str) {
+    push_file_with(targets, seen, path, false);
+}
+
+/// 收集存在的文件目标（trusted：跳过目录黑名单，仅内置使用）。
+#[cfg_attr(windows, allow(dead_code))]
+fn push_file_trusted(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str) {
+    push_file_with(targets, seen, path, true);
+}
+
+fn push_file_with(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str, trusted: bool) {
     let p = PathBuf::from(path);
     if p.is_file() && seen.insert(p.clone()) {
         targets.push(Target {
             kind: TargetKind::File,
             path: p,
+            trusted,
         });
     }
 }
 
 /// 收集存在的目录目标（去重）。
 fn push_dir(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str) {
+    push_dir_with(targets, seen, path, false);
+}
+
+/// 收集存在的目录目标（trusted：跳过目录黑名单，仅内置使用）。
+#[cfg_attr(windows, allow(dead_code))]
+fn push_dir_trusted(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str) {
+    push_dir_with(targets, seen, path, true);
+}
+
+fn push_dir_with(targets: &mut Vec<Target>, seen: &mut HashSet<PathBuf>, path: &str, trusted: bool) {
     let p = PathBuf::from(path);
     if p.is_dir() && seen.insert(p.clone()) {
         targets.push(Target {
             kind: TargetKind::Dir,
             path: p,
+            trusted,
         });
     }
 }
@@ -316,6 +350,18 @@ fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
             description: "MySQL/MariaDB 慢查询与运行日志",
             targets: linux_mysql_targets(),
         });
+        cats.push(Category {
+            key: "system_cache",
+            name: "系统缓存",
+            description: "包管理器缓存、崩溃转储与 Docker 容器日志（可放心清理；**不含 /tmp 与 /var/tmp**）",
+            targets: linux_system_cache_targets(),
+        });
+        cats.push(Category {
+            key: "user_cache",
+            name: "用户缓存",
+            description: "各用户 ~/.cache 与回收站（程序缓存，删除后按需重建；正在使用的文件自动跳过）",
+            targets: linux_user_cache_targets(),
+        });
     }
 
     #[cfg(windows)]
@@ -346,15 +392,23 @@ fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
     }
 
     // 安全守卫：内置与自定义目标统一过一遍危险路径检查（防御未来误加/误配）
+    // trusted 目标（内置常量，如 coredump/Docker 日志）跳过目录黑名单，但仍校验程序目录。
     for c in &mut cats {
-        c.targets.retain(|t| match deny_reason(&t.path, base) {
-            None => true,
-            Some(reason) => {
-                util::log_format(
-                    "日志清理：跳过不安全的目标 {}（{}）",
-                    &[&t.path.display().to_string(), &reason],
-                );
-                false
+        c.targets.retain(|t| {
+            let reason = if t.trusted {
+                deny_reason_impl(&t.path, base, false)
+            } else {
+                deny_reason(&t.path, base)
+            };
+            match reason {
+                None => true,
+                Some(reason) => {
+                    util::log_format(
+                        "日志清理：跳过不安全的目标 {}（{}）",
+                        &[&t.path.display().to_string(), &reason],
+                    );
+                    false
+                }
             }
         });
     }
@@ -410,6 +464,7 @@ fn agent_category(base: &Path) -> Category {
         targets.push(Target {
             kind: TargetKind::File,
             path: p,
+            trusted: false,
         });
     }
     Category {
@@ -433,11 +488,13 @@ fn custom_category(text: &str) -> Option<Category> {
             targets.push(Target {
                 kind: TargetKind::Dir,
                 path,
+                trusted: false,
             });
         } else if path.is_file() {
             targets.push(Target {
                 kind: TargetKind::File,
                 path,
+                trusted: false,
             });
         }
     }
@@ -490,6 +547,7 @@ fn linux_system_targets() -> Vec<Target> {
         targets.push(Target {
             kind: TargetKind::Journal,
             path: journal,
+            trusted: false,
         });
     }
     targets
@@ -554,6 +612,93 @@ fn linux_mysql_targets() -> Vec<Target> {
         for p in glob_logs(Path::new(dir)) {
             let text = p.to_string_lossy().to_string();
             push_file(&mut targets, &mut seen, &text);
+        }
+    }
+    targets
+}
+
+/// 目录下一层中匹配后缀的文件（不递归；空后缀=全部文件）。
+#[cfg_attr(windows, allow(dead_code))]
+fn glob_suffix(dir: &Path, suffix: &str) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.ends_with(suffix) {
+            let p = entry.path();
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// Linux 系统缓存与崩溃转储（含 Docker 容器日志；**有意不含 `/tmp`、`/var/tmp`**）。
+///
+/// - 包管理器缓存目录：删除安全（安装时按需重建）；
+/// - `/var/crash`、`/var/lib/systemd/coredump`：崩溃报告/转储；
+///   `/var/lib` 整体受守卫保护，此处用 trusted 目标明确豁免；
+/// - Docker `json-file` 日志：**截断**（容器持有句柄，截断后继续写入），不删目录；
+/// - `/tmp`、`/var/tmp` 存在运行中程序的 socket/锁/临时目录，清空会引发服务异常，故不纳入。
+#[cfg(unix)]
+fn linux_system_cache_targets() -> Vec<Target> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in [
+        "/var/cache/apt/archives",
+        "/var/cache/yum",
+        "/var/cache/dnf",
+        "/var/cache/zypper",
+        "/var/cache/PackageKit",
+        "/var/cache/man",
+        "/var/crash",
+    ] {
+        push_dir(&mut targets, &mut seen, dir);
+    }
+    push_dir_trusted(&mut targets, &mut seen, "/var/lib/systemd/coredump");
+    if let Ok(rd) = fs::read_dir("/var/lib/docker/containers") {
+        let mut dirs: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        dirs.sort();
+        for dir in dirs {
+            for p in glob_suffix(&dir, "-json.log") {
+                let text = p.to_string_lossy().to_string();
+                push_file_trusted(&mut targets, &mut seen, &text);
+            }
+        }
+    }
+    targets
+}
+
+/// Linux 各用户缓存与回收站（`~/.cache`、`~/.local/share/Trash`；不跟随重解析点）。
+#[cfg(unix)]
+fn linux_user_cache_targets() -> Vec<Target> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    let mut homes: Vec<PathBuf> = Vec::new();
+    if Path::new("/root").is_dir() {
+        homes.push(PathBuf::from("/root"));
+    }
+    if let Ok(rd) = fs::read_dir("/home") {
+        let mut sub: Vec<PathBuf> = rd
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect();
+        sub.sort();
+        homes.extend(sub);
+    }
+    for home in homes {
+        for rel in [".cache", ".local/share/Trash"] {
+            let p = home.join(rel);
+            push_dir(&mut targets, &mut seen, &p.to_string_lossy());
         }
     }
     targets
@@ -1200,6 +1345,7 @@ mod tests {
         let target = Target {
             kind: TargetKind::File,
             path: file.clone(),
+            trusted: false,
         };
         let (files, freed) = clean_target(&target).unwrap();
         assert_eq!((files, freed), (1, 10));
@@ -1220,6 +1366,7 @@ mod tests {
         let target = Target {
             kind: TargetKind::Dir,
             path: cache.clone(),
+            trusted: false,
         };
         let (files, freed) = clean_target(&target).unwrap();
         assert_eq!((files, freed), (2, 150));
@@ -1239,6 +1386,7 @@ mod tests {
         let target = Target {
             kind: TargetKind::Dir,
             path: cache.clone(),
+            trusted: false,
         };
         let (files, freed) = clean_target(&target).unwrap();
         assert_eq!(files, 3);
@@ -1292,14 +1440,17 @@ mod tests {
             Target {
                 kind: TargetKind::Dir,
                 path: parent.clone(),
+                trusted: false,
             },
             Target {
                 kind: TargetKind::Dir,
                 path: child,
+                trusted: false,
             },
             Target {
                 kind: TargetKind::File,
                 path: file,
+                trusted: false,
             },
         ];
         dedup_targets(&mut targets);
@@ -1515,6 +1666,7 @@ mod tests {
         let target = Target {
             kind: TargetKind::Dir,
             path: cache.clone(),
+            trusted: false,
         };
         clean_target(&target).unwrap();
         assert!(!cache.join("drop.bin").exists(), "普通文件应被清理");
@@ -1523,6 +1675,39 @@ mod tests {
             assert!(cache.join("link").exists(), "链接本身不得被删除");
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Linux 缓存目标必须落在预期目录内，且绝不包含 /tmp、/var/tmp 或系统关键目录。
+    #[cfg(unix)]
+    #[test]
+    fn linux_cache_targets_stay_within_safe_dirs() {
+        let base = std::env::temp_dir().join("pek-logclean-guardbase");
+        let mut all = linux_system_cache_targets();
+        all.extend(linux_user_cache_targets());
+        for t in &all {
+            let text = t.path.to_string_lossy().to_string();
+            let in_home = text.starts_with("/home/")
+                && (text.ends_with("/.cache") || text.ends_with("/.local/share/Trash"));
+            let ok = in_home
+                || text == "/root/.cache"
+                || text == "/root/.local/share/Trash"
+                || text.starts_with("/var/cache/")
+                || text == "/var/crash"
+                || text == "/var/lib/systemd/coredump"
+                || text.starts_with("/var/lib/docker/containers/");
+            assert!(ok, "意外的清理目标：{text}");
+            for bad in ["/tmp", "/var/tmp"] {
+                assert!(
+                    !text.ends_with(bad) && !text.contains(&format!("{bad}/")),
+                    "不得清理 {bad}：{text}"
+                );
+            }
+        }
+        // /var/lib 整体受守卫保护：普通目标拒绝，内置 trusted 目标放行
+        assert!(deny_reason(Path::new("/var/lib/systemd/coredump"), &base).is_some());
+        assert!(deny_reason_impl(Path::new("/var/lib/systemd/coredump"), &base, false).is_none());
+        // 即便 trusted，也不得触碰程序目录
+        assert!(deny_reason_impl(&base, &base, false).is_some());
     }
 
     /// 超大目录（条目超限）会提前停止，且不 panic。
