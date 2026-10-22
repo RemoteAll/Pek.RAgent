@@ -233,13 +233,17 @@ function switchPanel(name){
  if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
  if(name==='logs')want=logsSubFromHash()==='audit'?'#logs.audit':'#logs';
  if(name==='config'){const s=configSubFromHash();want=s==='star'?'#config.star':(s==='security'?'#config.security':'#config');}
+ if(name==='fileman')want=fmPath?'#fileman?path='+encodeURIComponent(fmPath):'#fileman';
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
 // 从 URL hash 解析页签名（非法/缺省/无权限返回空串；与导航实际可见页签比对，避免选择器注入）
 // 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports / #audit / #starconfig / #cleanup / #watchdog
+// 文件管理页带查询串：#fileman?path=D%3A%5Cwwwroot → 页签名仍为 fileman（path 由 fmPathFromHash 解析）
 function panelFromHash(){
- const h=(location.hash||'').replace(/^#\/?/,'');
+ const raw=(location.hash||'').replace(/^#\/?/,'');
+ if(!raw)return '';
+ const h=raw.split('?')[0];
  if(!h)return '';
  if(h==='ports')return 'traffic';
  if(h==='audit')return 'logs';
@@ -249,6 +253,16 @@ function panelFromHash(){
  if(h==='watchdog')return 'services'; // “看门狗”已并入“子服务”页
  const name=h.split('.')[0];
  return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
+}
+// 文件管理页目录（`#fileman?path=...`）；无则返回空串
+function fmPathFromHash(){
+ const raw=(location.hash||'').replace(/^#\/?/,'');
+ if(!raw.startsWith('fileman'))return '';
+ const q=raw.indexOf('?');
+ if(q<0)return '';
+ const m=/[?&]path=([^&]*)/.exec(raw.slice(q));
+ if(!m)return '';
+ try{return decodeURIComponent(m[1])}catch(e){return ''}
 }
 // 流量页子页签（site 网站流量 / ports 端口流量）
 function trafficSubFromHash(){
@@ -2017,8 +2031,9 @@ async function fetchLogContent(){
 
 /* ── 文件管理 ── */
 let fmData=null;
-// 目录记忆：下次进入「文件管理」自动回到上次访问的目录（服务端拒绝时自动回退根目录）
-let fmPath=(()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
+// 目录记忆：优先恢复 URL hash（`#fileman?path=...`，刷新/收藏/换标签页均不丢），
+// 其次 localStorage（下次打开面板回到上次访问的目录；服务端拒绝时自动回退根目录）
+let fmPath=fmPathFromHash() || (()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
 let fmSelected=new Set();
 let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
@@ -2038,6 +2053,11 @@ function fmReady(){if(fmData&&fmData.path)return true;showToast('请先进入具
 function fmNavigate(path){fmPath=path;loadFileman()}
 /** 记忆当前目录（下次进入文件管理自动回到这里） */
 function fmSavePath(p){try{localStorage.setItem('fm_path',p||'')}catch(e){}}
+/** 把当前目录同步进 URL hash（刷新/收藏可直达；replaceState 不产生浏览器历史记录） */
+function syncFmHash(){
+ const want=fmPath?'#fileman?path='+encodeURIComponent(fmPath):'#fileman';
+ if((location.hash||'')!==want)history.replaceState(null,'',want);
+}
 
 async function loadFileman(){
  try{
@@ -2049,6 +2069,7 @@ async function loadFileman(){
   }
   fmData=j.data;fmSelected=new Set();
   fmPath=j.data.path||'';fmSavePath(fmPath); // 以服务端归一化后的路径为准
+  syncFmHash();
   renderFileman();
  }catch(e){}
 }
