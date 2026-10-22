@@ -15,7 +15,7 @@ license = "MIT"
 # 插件协议（plugin：插件包格式 + 插件源目录 Ed25519 签名，与 Pek.RPanlServer 共用）、
 # AI 客户端（net::openai：OpenAI 兼容 /chat/completions）
 # 网络与 TLS：服务器节点 wss 通道依赖 net-tls（含 http-tls，覆盖 AI 助手/插件源等 HTTPS 调用）
-dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch"] }
+dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch", "fileman"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
