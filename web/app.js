@@ -2016,7 +2016,10 @@ async function fetchLogContent(){
 }
 
 /* ── 文件管理 ── */
-let fmData=null,fmPath='',fmSelected=new Set();
+let fmData=null;
+// 目录记忆：下次进入「文件管理」自动回到上次访问的目录（服务端拒绝时自动回退根目录）
+let fmPath=(()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
+let fmSelected=new Set();
 let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
 function fmJoin(name){
@@ -2033,14 +2036,35 @@ function fmParentText(){
 }
 function fmReady(){if(fmData&&fmData.path)return true;showToast('请先进入具体目录','error');return false}
 function fmNavigate(path){fmPath=path;loadFileman()}
+/** 记忆当前目录（下次进入文件管理自动回到这里） */
+function fmSavePath(p){try{localStorage.setItem('fm_path',p||'')}catch(e){}}
 
 async function loadFileman(){
  try{
   const j=await api('/star/fileList?path='+encodeURIComponent(fmPath||''));
-  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  if(j.code!==0){
+   // 记忆的目录可能已被删除/无权访问：清掉记忆并回退根目录（只回退一次，防死循环）
+   if(fmPath){fmPath='';fmSavePath('');showToast((j.message||'加载失败')+'，已回到根目录','error');return loadFileman()}
+   showToast(j.message||'加载失败','error');return;
+  }
   fmData=j.data;fmSelected=new Set();
+  fmPath=j.data.path||'';fmSavePath(fmPath); // 以服务端归一化后的路径为准
   renderFileman();
  }catch(e){}
+}
+
+/** 路径栏回车：跳转；Esc：放弃编辑回显当前目录 */
+function fmPathKey(e){
+ if(e.key==='Enter'){e.preventDefault();fmPathGo()}
+ else if(e.key==='Escape'){e.preventDefault();renderFileman()}
+}
+/** 按路径栏输入跳转（空=根目录/计算机） */
+function fmPathGo(){
+ const el=$('fm-path-input');if(!el)return;
+ const v=(el.value||'').trim();
+ if(!v){fmNavigate('');return}
+ if(v===((fmData&&fmData.path)||'')){el.blur();return}
+ fmNavigate(v);
 }
 
 function renderFileman(){
@@ -2082,7 +2106,8 @@ function renderFileman(){
   <div class="fm-toolbar">
    <button class="btn btn-ghost btn-sm" onclick="fmNavigate('')">🖥 根目录</button>
    <button class="btn btn-ghost btn-sm" ${canUp?'':'disabled'} onclick="fmNavigate(fmParentText())">⬆ 上一级</button>
-   <span class="fm-path" title="${escAttr(d.path||'计算机')}">${esc(d.path||'计算机')}</span>
+   <input type="text" id="fm-path-input" class="fm-path-input" spellcheck="false" value="${escAttr(d.path||'')}" placeholder="输入路径后回车切换（Windows 例：C:\\Windows；Linux 例：/var/log）" title="可直接编辑路径后回车跳转；Esc 取消" onkeydown="fmPathKey(event)">
+   <button class="btn btn-ghost btn-sm" onclick="fmPathGo()">» 前往</button>
    <span style="flex:1"></span>
    <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmCompress()">🗜 压缩</button>
    <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmExtract()">📤 解压</button>
@@ -2297,7 +2322,7 @@ async function fmEdit(path,size){
   if(j.code!==0){showToast(j.message||'读取失败','error');return}
   const shortName=path.split(/[\\/]/).pop()||path;
   showModal('编辑：'+shortName,
-   `<div class="text-muted" style="margin-bottom:8px;display:flex;align-items:center;gap:10px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</span><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmReloadEditor()">⟳ 重新加载</button></div><textarea id="fm-editor" class="fm-editor" spellcheck="false" data-path="${encodeURIComponent(path)}"></textarea>`,
+   `<div class="text-muted" style="margin-bottom:8px;display:flex;align-items:center;gap:10px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</span><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmReloadEditor()">⟳ 重新加载</button><button class="btn btn-secondary" id="fm-wrap-btn" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmToggleWrap()">↵ 自动换行</button></div><textarea id="fm-editor" class="fm-editor" spellcheck="false" data-path="${encodeURIComponent(path)}"></textarea>`,
    '保存',async()=>{
     const content=$('fm-editor')?$('fm-editor').value:'';
     const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path,content})});
@@ -2305,7 +2330,30 @@ async function fmEdit(path,size){
     showToast('已保存','success');loadFileman();
    },true);
   const el=$('fm-editor');if(el)el.value=j.data.content;
+  fmApplyWrap(el);
  }catch(e){}
+}
+
+/** 自动换行开关状态（记忆到 localStorage，默认开启：日志/长行默认折行可见） */
+function fmWrapOn(){try{return localStorage.getItem('fm_wrap')!=='0'}catch(e){return true}}
+/** 应用换行状态到编辑器与开关按钮 */
+function fmApplyWrap(el){
+ const e=el||$('fm-editor');if(!e)return;
+ const on=fmWrapOn();
+ // textarea 折行最终由 white-space 决定，切换 class 即可（同步 wrap 属性更稳妥）
+ e.wrap=on?'soft':'off';
+ e.classList.toggle('fm-nowrap',!on);
+ const b=$('fm-wrap-btn');
+ if(b){
+  b.textContent=on?'↵ 自动换行：开':'↵ 自动换行：关';
+  b.classList.toggle('btn-primary',on);
+  b.classList.toggle('btn-secondary',!on);
+ }
+}
+/** 切换自动换行 */
+function fmToggleWrap(){
+ try{localStorage.setItem('fm_wrap',fmWrapOn()?'0':'1')}catch(e){}
+ fmApplyWrap();
 }
 
 /** 文件编辑弹窗：重新拉取服务端最新内容（日志跟进、外部改动时用） */
