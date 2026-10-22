@@ -433,7 +433,7 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 
 - **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；**登录会话默认保持 12 小时（`WebSessionHours`，滑动续期）且落盘，重启/升级不掉登录**；**密码不明文上网络**（`GET /api/loginChallenge` 下发一次性 nonce + 盐，前端本地算 `SHA-256(nonce:SHA-256(salt:password))` 提交，nonce 用完即废、2 分钟过期；旧版明文口令仍兼容）；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；改密码或「退出所有设备」立即注销其它会话；
 - **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/**进程 Top 20**）/；
-- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
+- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；**一键部署应用包**——「📦 上传应用包」按钮或**直接把发布包拖进页面**（`.zip` / `.tar.gz` / `.tgz`），服务端自动解压（兼容根级与顶层目录两种包布局）、识别主程序（命名匹配 / 唯一 exe / 可执行位）、按名称推导服务名（可用包内主程序名，如 `dhdeploy-agent-rust`），落盘到 `../apps/{名称}` 并按**影子模式**注册与启动；升级=重复上传新包（同名自动更新并重启，旧影子目录自动清理）；跨平台包会被识别拒绝（Windows 传了 Linux 包等）；手动填写文件名/参数/工作目录的方式仍保留（「➕ 添加服务」）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
 - **配置**：页内三个**子页签**（URL hash `#config` / `#config.star` / `#config.security`，兼容旧 `#starconfig`、`#security` 书签）——**⚙ Agent 配置**（面板与守护参数在线更新，部分需重启服务后生效；插件源/自动升级/平台接入令牌等安全项仅支持配置文件修改）、**🌐 星尘设置**（`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护）、**🛡 安全**（Web 应用防火墙 WAF 在线开关与参考配置；权限跟随 `control`，保存后立即生效）；子页标签按权限显隐；
 - **日志**：页内两个**子页签**（交互对齐流量页）——**📋 系统日志**（`Log/` 目录文件列表与尾部内容查看，支持行数/文件/级别过滤）与 **📜 操作日志**（审计查询，见下）；子页标签按权限显隐（URL hash `#logs` / `#logs.audit`，兼容旧 `#audit` 书签）；
@@ -475,6 +475,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | `POST /api/syncTime` | 同步系统时间（`{"timeMs": 毫秒时间戳}`，以浏览器机时间为准；Linux 需 root、Windows 需服务账户/管理员） |
 | `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
 | `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
+| `POST /star/appDeploy` | 应用包一键部署（请求体=包内容；查询参数 `fileName` 包名、`name` 服务名（留空自动识别）、`arguments` 启动参数、`autoStart=1/0`）：自动解压 `.zip`/`.tar.gz`、识别主程序、写入工作目录并注册子服务 |
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
 | `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程（`getProcessList?sort=cpu|memory&count=N`；字段口径对齐 htop / 云监控：`cpuPercent` 瞬时占单核百分比（可 >100）、`memoryMB`、`user`、`exe`、`command`、`cwd`、`threadCount`、`handleCount`（Linux 为打开文件数）、`startTime`；**`app`/`appPath` 为真正的应用**——`dotnet /path/App.dll` 这类解释器宿主会解析出 `App.dll` 及其完整路径，而不是只显示 `dotnet`；Windows `w3wp.exe`（IIS 工作进程）会自动解析应用池并显示站点/应用物理路径（读取 `applicationHost.config`，失败时回退为宿主路径），并额外返回 `appPool`/`iisSites`） |
 | `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制；网站流量含 IIS 站点运行状态、日志开关与 sc-bytes 状态） |
@@ -560,6 +561,7 @@ src/
 ├─ manager.rs    应用管理器：多应用守护、控制、状态持久化、看门狗、配置热更新
 ├─ app.rs        单应用运行时：启动/停止/退出检测/内存/文件变动
 ├─ deploy.rs     部署：解压、影子目录、可执行文件检索、安全文件替换
+├─ apppkg.rs     应用包一键部署：解压（zip / tar.gz）、主程序识别、注册子服务
 ├─ server.rs     本地 HTTP 控制接口 + Web 面板路由（dhrust::net 控制器）
 ├─ webpanel.rs   Web 管理面板：登录鉴权/令牌/限流、/api 与 /star 控制器
 ├─ web/          面板前端（index.html，编译期内嵌）
@@ -570,7 +572,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（71 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
+- 单元测试：`cargo test`（171 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/应用包部署（zip/tar.gz 解压、主程序识别、同名升级）/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ### 11.1 版本号规范（发布约定）

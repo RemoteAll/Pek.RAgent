@@ -9,6 +9,7 @@
 mod agent;
 mod ai;
 mod app;
+mod apppkg;
 mod audit;
 mod cli;
 mod config;

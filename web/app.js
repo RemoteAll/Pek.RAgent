@@ -1441,7 +1441,12 @@ function renderServices(){
  if(canView('services')&&d){
  const svcs=d.services||[];
  html+=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📦 子服务管理</h2><span style="font-size:12px;color:var(--text-tertiary)">运行 ${d.running||0} / 总计 ${d.total||0}</span></div>`;
- html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button></div>`;
+ html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showAppPkgForm()">📦 上传应用包</button></div>`;
+ html+=`<div class="ap-drop-zone" onclick="showAppPkgForm()">
+  <div style="font-size:22px;line-height:1">📦</div>
+  <div style="margin-top:6px"><b>把发布包拖到这里自动部署</b>（.zip / .tar.gz / .tgz），或点击选择文件</div>
+  <div style="font-size:11px;margin-top:4px">自动解压、识别主程序、注册子服务并启动；需要自定义参数时用上方「添加服务」手动填写</div>
+ </div>`;
  if(svcs.length===0){
   html+=`<div class="empty-state"><div class="empty-icon">📦</div><p>暂无子服务</p><p style="font-size:11px;margin-top:4px">点击"添加服务"按钮创建第一个子服务</p></div>`;
  }else{
@@ -1490,6 +1495,37 @@ function renderServices(){
  }
  if(!html)return;
  $('panel-services').innerHTML=html;
+ servicesDragBind();
+}
+
+/* 子服务页拖拽上传：把发布包拖进页面即弹出部署确认（只接受 .zip / .tar.gz / .tgz）。
+   绑定在容器上（容器不随 3 秒轮询重绘，委托才不会被冲掉）。 */
+function servicesDragBind(){
+ const panel=$('panel-services');if(!panel||panel._apDragBound)return;
+ panel._apDragBound=true;
+ const hasFiles=e=>e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')>=0;
+ panel.addEventListener('dragover',e=>{
+  if(!hasFiles(e))return;
+  e.preventDefault();
+  try{e.dataTransfer.dropEffect='copy'}catch(err){}
+  panel.classList.add('ap-drag');
+ });
+ panel.addEventListener('dragleave',e=>{
+  // 仅在真正离开容器时取消高亮（子元素间移动会连发 dragleave）
+  if(e.target===panel||!panel.contains(e.relatedTarget))panel.classList.remove('ap-drag');
+ });
+ panel.addEventListener('drop',e=>{
+  panel.classList.remove('ap-drag');
+  if(!hasFiles(e))return;
+  e.preventDefault();
+  const f=e.dataTransfer.files&&e.dataTransfer.files[0];
+  if(!f)return;
+  const n=(f.name||'').toLowerCase();
+  if(!(n.endsWith('.zip')||n.endsWith('.tar.gz')||n.endsWith('.tgz'))){
+   showToast('请拖入 .zip / .tar.gz / .tgz 发布包','error');return;
+  }
+  showAppPkgForm(f);
+ });
 }
 
 function editServiceByIdx(idx){
@@ -1509,6 +1545,55 @@ async function doSvcAction(action,name){
 }
 
 function showAddService(){showServiceForm(null,'添加子服务')}
+
+/* ── 应用包一键部署（上传/拖拽 .zip / .tar.gz → 自动解压识别 → 注册子服务 → 启动） ── */
+let _apPkgFile=null; // 拖拽或选择得到的 File（input 无法用脚本赋值，故单独持有）
+function showAppPkgForm(file){
+ _apPkgFile=file||null;
+ const picked=_apPkgFile?`${esc(_apPkgFile.name)}（${fmtBytes(_apPkgFile.size)}）`:'未选择（支持 .zip / .tar.gz / .tgz）';
+ const html=`<div class="form-group"><label>发布包 *</label>
+  <div style="display:flex;gap:8px;align-items:center">
+   <label class="btn btn-secondary btn-sm" style="white-space:nowrap">📦 选择发布包<input type="file" id="ap-file" accept=".zip,.gz,.tgz" style="display:none" onchange="apFilePicked(this)"></label>
+   <span id="ap-file-name" class="text-muted" style="font-size:12px">${picked}</span>
+  </div>
+  <div class="text-muted" style="font-size:11px;margin-top:4px">也可以直接把发布包拖到「子服务」页面</div></div>
+ <div class="form-row">
+  <div class="form-group"><label>服务名称</label><input type="text" id="ap-name" placeholder="留空按包内主程序名自动识别"></div>
+  <div class="form-group"><label>启动参数</label><input type="text" id="ap-args" placeholder="留空=无参数（升级时保留原参数）"></div>
+ </div>
+ <div class="form-group"><label class="toggle"><input type="checkbox" id="ap-autostart" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">部署后立即启动（已运行的服务会自动重启到新版本）</div></div>
+ <div class="text-muted" style="font-size:11px">服务端自动解压、识别主程序并按影子模式注册子服务（工作目录默认 <code>../apps/{名称}</code>）；升级=重复上传新包，旧影子目录自动清理。</div>`;
+ showModal('上传应用包部署',html,'部署',()=>apDeploy());
+}
+function apFilePicked(el){
+ const f=el&&el.files?el.files[0]:null;
+ _apPkgFile=f||null;
+ const n=$('ap-file-name');
+ if(n)n.textContent=f?`${f.name}（${fmtBytes(f.size)}）`:'未选择（支持 .zip / .tar.gz / .tgz）';
+}
+function apDeploy(){
+ let f=_apPkgFile;
+ if(!f){const el=$('ap-file');f=el&&el.files?el.files[0]:null}
+ if(!f){showToast('请选择发布包（.zip / .tar.gz）','error');return}
+ const name=($('ap-name')?.value||'').trim();
+ const args=($('ap-args')?.value||'').trim();
+ const auto=($('ap-autostart')?.checked)?1:0;
+ const qs=`fileName=${encodeURIComponent(f.name)}&name=${encodeURIComponent(name)}&arguments=${encodeURIComponent(args)}&autoStart=${auto}`;
+ const xhr=new XMLHttpRequest();
+ xhr.open('POST','/star/appDeploy?'+qs);
+ if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+ xhr.setRequestHeader('Content-Type','application/octet-stream');
+ xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传部署包：${Math.round(e.loaded/e.total*100)}%`,'info')};
+ xhr.onload=()=>{
+  let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}
+  if(!j){showToast('部署失败：响应无法解析','error');return}
+  if(j.code!==0){showToast(j.message||'部署失败','error');return}
+  _apPkgFile=null;
+  showToast(j.message||'部署完成','success');loadServices();
+ };
+ xhr.onerror=()=>showToast('部署失败：网络错误','error');
+ xhr.send(f);
+}
 
 function showServiceForm(svc,title){
  const isEdit=svc!==null;

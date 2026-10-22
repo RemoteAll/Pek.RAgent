@@ -614,6 +614,7 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("stopService", "停止子服务"),
     ("restartService", "重启子服务"),
     ("addService", "添加/更新子服务"),
+    ("appDeploy", "部署应用包"),
     ("removeService", "删除子服务"),
     ("updateStarConfig", "更新星尘设置"),
     ("dbQuery", "数据库查询"),
@@ -754,6 +755,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "addService",
         guarded(panel.clone(), PERM_SERVICES, add_service),
+    );
+    controller = controller.post(
+        "appDeploy",
+        guarded(panel.clone(), PERM_SERVICES, app_deploy),
     );
     controller = controller.post(
         "removeService",
@@ -2314,9 +2319,67 @@ fn add_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
-/// 删除子服务。
-fn remove_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+/// 应用包一键部署：`POST /star/appDeploy?fileName=<包名>&name=&arguments=&autoStart=1`。
+///
+/// 请求体即发行包内容（`.zip` / `.tar.gz`）。服务端自动解压、识别主程序、
+/// 落到工作目录（`../apps/{名称}`）并按影子模式注册子服务（见 [`crate::apppkg`]），
+/// 无需人工填写文件名/工作目录/部署模式。
+fn app_deploy(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+
+    let package_name = arg(ctx, "fileName").unwrap_or_default();
+    let name_hint = arg(ctx, "name").unwrap_or_default();
+    let arguments = arg(ctx, "arguments").unwrap_or_default();
+    let auto_start = arg(ctx, "autoStart")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+
+    let name_opt = {
+        let t = name_hint.trim();
+        (!t.is_empty()).then_some(t)
+    };
+    let args_opt = {
+        let t = arguments.trim();
+        (!t.is_empty()).then_some(t)
+    };
+
+    match crate::apppkg::deploy_bytes(
+        panel.manager.as_ref(),
+        &package_name,
+        ctx.req.body.as_ref(),
+        name_opt,
+        args_opt,
+        auto_start,
+    ) {
+        Ok(d) => {
+            let state = if d.started {
+                "已启动".to_string()
+            } else if d.updated {
+                "已更新（未启动）".to_string()
+            } else {
+                "已安装（未启动）".to_string()
+            };
+            json_result(
+                0,
+                &format!("应用包部署完成：{} {state}", d.name),
+                Some(json!({
+                    "name": d.name,
+                    "program": d.program.display().to_string(),
+                    "workingDirectory": d.work_dir.display().to_string(),
+                    "files": d.files,
+                    "updated": d.updated,
+                    "started": d.started,
+                })),
+            )
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 删除子服务。
+fn remove_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {    if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
 
