@@ -96,7 +96,7 @@ pub(crate) fn start(interval_ms: u64) {
                 let mut prev: Option<Snapshot> = None;
                 loop {
                     let snapshot =
-                        tick(n % tcp_every == 0, n % stats_every == 0, prev.as_ref());
+                        tick(n.is_multiple_of(tcp_every), n.is_multiple_of(stats_every), prev.as_ref());
                     *SNAPSHOT.lock().unwrap() = Some(snapshot.clone());
                     prev = Some(snapshot);
                     n = n.wrapping_add(1);

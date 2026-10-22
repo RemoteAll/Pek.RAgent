@@ -356,11 +356,10 @@ fn result(success: bool, message: String, name: &str) -> HttpOutcome {
 fn param(ctx: &Ctx, name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     for (k, v) in ctx.query.iter().chain(ctx.form.iter()) {
-        if k.eq_ignore_ascii_case(name) || k.to_ascii_lowercase() == lower {
-            if !v.is_empty() {
+        if (k.eq_ignore_ascii_case(name) || k.to_ascii_lowercase() == lower)
+            && !v.is_empty() {
                 return Some(v.clone());
             }
-        }
     }
     None
 }

@@ -408,15 +408,14 @@ impl WebPanel {
     /// Bearer 令牌有效 → 会话绑定的用户与权限；无令牌时按鉴权级别兜底
     /// （详见 [`WebPanel::check_auth`]）。
     pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
-        if let Some(token) = bearer_token(ctx) {
-            if let Some(p) = self.tokens.get(&token) {
+        if let Some(token) = bearer_token(ctx)
+            && let Some(p) = self.tokens.get(&token) {
                 // 滑动续期：一直在用就一直有效；只有改动到期时间时才写盘（低频）
                 if self.tokens.touch(&token) {
                     self.save_sessions();
                 }
                 return Some(p);
             }
-        }
         let cfg = self.manager.config();
         let mut admin = Principal {
             name: cfg.web_user_name.trim().to_string(),
@@ -2612,8 +2611,8 @@ fn app_target(command: &str, exe: &str, cwd: &str) -> (String, String) {
     let is_interpreter = INTERPRETER_HOSTS.iter().any(|name| {
         host_name == *name || host_name.starts_with(&format!("{name}."))
     });
-    if is_interpreter {
-        if let Some(script) = args
+    if is_interpreter
+        && let Some(script) = args
             .iter()
             .skip(1)
             .find(|arg| !arg.starts_with('-') && looks_like_app(arg))
@@ -2621,7 +2620,6 @@ fn app_target(command: &str, exe: &str, cwd: &str) -> (String, String) {
             let path = resolve_path(script, cwd);
             return (base_name(&path), path);
         }
-    }
 
     if exe.is_empty() {
         (base_name(&host), host)

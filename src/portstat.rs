@@ -576,11 +576,10 @@ fn parse_port_list(text: &str) -> Vec<u16> {
         if item.is_empty() {
             continue;
         }
-        if let Ok(p) = item.parse::<u16>() {
-            if p > 0 {
+        if let Ok(p) = item.parse::<u16>()
+            && p > 0 {
                 set.insert(p);
             }
-        }
     }
     let mut v: Vec<u16> = set.into_iter().collect();
     v.sort_unstable();
@@ -626,13 +625,11 @@ fn collect_proc_listen(text: &str, tcp: bool, set: &mut HashSet<u16>) {
         if tcp && state != "0A" {
             continue;
         }
-        if let Some(port_hex) = local.rsplit(':').next() {
-            if let Ok(port) = u16::from_str_radix(port_hex, 16) {
-                if port != 0 {
+        if let Some(port_hex) = local.rsplit(':').next()
+            && let Ok(port) = u16::from_str_radix(port_hex, 16)
+                && port != 0 {
                     set.insert(port);
                 }
-            }
-        }
     }
 }
 
@@ -808,14 +805,17 @@ fn conn_views_windows() -> HashMap<(Proto, u16), ViewEntry> {
 
 // ————— 行构建（纯函数，便于测试） —————
 
+/// 上一轮计数快照：(协议, 端口) → (接收, 发送) 累计值（差分基线）。
+type CounterBaseline = HashMap<(Proto, u16), (u64, u64)>;
+
 /// nft 模式行构建：计数规则 + 连接视图 → 展示行与下一轮差分基线。
 fn rows_nft(
     rules: &[NftRule],
     ports: &[u16],
     views: &HashMap<(Proto, u16), ViewEntry>,
-    last: &HashMap<(Proto, u16), (u64, u64)>,
+    last: &CounterBaseline,
     dt: f64,
-) -> (Vec<Row>, HashMap<(Proto, u16), (u64, u64)>) {
+) -> (Vec<Row>, CounterBaseline) {
     let mut map: BTreeMap<(Proto, u16), Row> = BTreeMap::new();
     for p in ports {
         for proto in [Proto::Tcp, Proto::Udp] {
@@ -1419,7 +1419,7 @@ mod tests {
             Some(&crate::history::PortCounters { rx: 50, tx: 100 })
         );
         assert!(
-            ports.get("udp:53").is_none(),
+            !ports.contains_key("udp:53"),
             "零流量端口不应归档：{ports:?}"
         );
 

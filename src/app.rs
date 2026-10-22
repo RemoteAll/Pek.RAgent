@@ -268,8 +268,8 @@ impl AppRuntime {
         // 启动前防重复：影子目录共用一个可执行文件，代理重启/旧版本遗留时可能已有
         // 同路径进程在跑（它占着监听端口，新实例会因绑定失败退出，形成重启循环）。
         // 发现后直接接管其中一个，并清理多余实例；任务模式不接管（允许一次性并发）。
-        if !prepared.task {
-            if let Some(run_file) = prepared.run_file.as_deref() {
+        if !prepared.task
+            && let Some(run_file) = prepared.run_file.as_deref() {
                 let shadow_base = prepared.shadow.as_deref().and_then(|p| p.parent());
                 let mut found = existing_instances(run_file, &self.name, shadow_base);
                 if !found.is_empty() {
@@ -300,7 +300,6 @@ impl AppRuntime {
                     });
                 }
             }
-        }
 
         let log_file = if cfg.debug || (retry && global.debug) {
             Some(self.base.join("Log").join(format!("app-{}.log", cfg.name)))
@@ -337,7 +336,7 @@ impl AppRuntime {
                 &pid.to_string(),
                 &process_name,
                 &prepared.work_dir.display().to_string(),
-                &retry_text,
+                retry_text,
                 &error_count_text,
             ],
         );
@@ -381,8 +380,8 @@ impl AppRuntime {
         }
 
         // 健康检查（失败只记日志，与 C# 行为一致）
-        if let Some(hc) = cfg.health_check.as_deref() {
-            if !hc.trim().is_empty() {
+        if let Some(hc) = cfg.health_check.as_deref()
+            && !hc.trim().is_empty() {
                 let wait = global.start_wait;
                 drop(st);
                 std::thread::sleep(Duration::from_millis(wait));
@@ -404,7 +403,6 @@ impl AppRuntime {
                     Err(e) => util::log_format("健康检查失败（仅记录）：{}", &[&e]),
                 }
             }
-        }
 
         Ok(StartResult {
             started: true,
@@ -526,21 +524,19 @@ impl AppRuntime {
         }
         // 启动宽限：刚拉起未就绪时不判失败
         let grace = Duration::from_millis(global.start_wait.max(5_000));
-        if let Some(started) = started {
-            if started.elapsed().map(|d| d < grace).unwrap_or(false) {
+        if let Some(started) = started
+            && started.elapsed().map(|d| d < grace).unwrap_or(false) {
                 return;
             }
-        }
 
         // 探活节流：守护循环 1 秒一跳，探活不需每秒做（HTTP/TCP 请求 + 端口发现都要系统调用），
         // 严格按 [`HEALTH_INTERVAL`] 一次，避免 RAgent 自己成为负担。
         {
             let mut st = self.state.lock().unwrap();
-            if let Some(at) = st.health_at {
-                if at.elapsed() < HEALTH_INTERVAL {
+            if let Some(at) = st.health_at
+                && at.elapsed() < HEALTH_INTERVAL {
                     return;
                 }
-            }
             st.health_at = Some(Instant::now());
         }
 
@@ -1184,9 +1180,10 @@ mod tests {
 
     #[test]
     fn health_targets_modes() {
-        let mut cfg = AppConfig::default();
-
-        cfg.health_check = Some("off".to_string());
+        let mut cfg = AppConfig {
+            health_check: Some("off".to_string()),
+            ..AppConfig::default()
+        };
         assert!(health_targets(&cfg, 1, 5501).is_empty(), "off 应关闭探活");
 
         cfg.health_check = Some("http://127.0.0.1:8282/panel".to_string());

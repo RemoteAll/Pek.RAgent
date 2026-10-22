@@ -144,11 +144,10 @@ impl SiteStats {
             5 => self.today.s5xx += 1,
             _ => {}
         }
-        if let Some(ip) = line.ip {
-            if self.today.uv.len() < MAX_UV {
+        if let Some(ip) = line.ip
+            && self.today.uv.len() < MAX_UV {
                 self.today.uv.insert(ip);
             }
-        }
     }
 
     /// 速率推进（每 1 秒调用一次；5 秒滑动平均）。
@@ -299,11 +298,10 @@ fn reconfigure(t: &WebTraffic, cfg: &AgentConfig) {
 
 /// 外部修改了 IIS 日志配置后（如启用 sc-bytes），尽快重新发现站点日志。
 pub(crate) fn request_rediscover() {
-    if let Some(t) = INSTANCE.get() {
-        if let Ok(mut inner) = t.inner.lock() {
+    if let Some(t) = INSTANCE.get()
+        && let Ok(mut inner) = t.inner.lock() {
             inner.last_discover = None;
         }
-    }
 }
 
 /// 替换日志源并确保站点统计条目存在。
@@ -839,7 +837,7 @@ fn parse_manual_logs(text: &str) -> Vec<Source> {
 fn merge_sources(manual: Vec<Source>, auto: Vec<Source>) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for src in manual.into_iter().chain(auto.into_iter()) {
+    for src in manual.into_iter().chain(auto) {
         if out.len() >= MAX_SITES {
             break;
         }
@@ -1134,16 +1132,14 @@ fn parse_apache_vhosts(text: &str) -> Vec<(String, PathBuf)> {
             if server_name.is_none() {
                 server_name = parts.next().map(|s| s.to_string());
             }
-        } else if cmd.eq_ignore_ascii_case("CustomLog") {
-            if custom_log.is_none() {
-                if let Some(p) = parts.next() {
+        } else if cmd.eq_ignore_ascii_case("CustomLog")
+            && custom_log.is_none()
+                && let Some(p) = parts.next() {
                     // 仅接受绝对路径（相对路径基于 ServerRoot，无法可靠解析）
                     if p != "/dev/null" && looks_like_abs_path(p) {
                         custom_log = Some(PathBuf::from(p));
                     }
                 }
-            }
-        }
     }
     out
 }
@@ -1444,10 +1440,12 @@ fn load_persisted(base: &Path, inner: &mut Inner) {
 
     if let Some(files) = v.get("files").and_then(|x| x.as_object()) {
         for (p, f) in files {
-            let mut st = FileState::default();
-            st.inode = f.get("inode").and_then(|x| x.as_u64()).unwrap_or(0);
-            st.offset = f.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
-            st.initialized = true;
+            let st = FileState {
+                inode: f.get("inode").and_then(|x| x.as_u64()).unwrap_or(0),
+                offset: f.get("offset").and_then(|x| x.as_u64()).unwrap_or(0),
+                initialized: true,
+                ..FileState::default()
+            };
             inner.files.insert(PathBuf::from(p), st);
         }
     }
@@ -1890,10 +1888,12 @@ server
             });
             st.today.uv_base = 5; // 模拟历史 UV 基数
             inner.stats.insert("s1".to_string(), st);
-            let mut fst = FileState::default();
-            fst.inode = 42;
-            fst.offset = 1024;
-            fst.initialized = true;
+            let fst = FileState {
+                inode: 42,
+                offset: 1024,
+                initialized: true,
+                ..FileState::default()
+            };
             inner.files.insert(PathBuf::from("/x/a.log"), fst);
             save_persisted(&t, &inner);
         }

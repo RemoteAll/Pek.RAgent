@@ -252,16 +252,14 @@ fn acquire_instance_lock(base: &Path) -> Result<(), String> {
                 return Ok(());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Ok(text) = std::fs::read_to_string(&path) {
-                    if let Ok(pid) = text.trim().parse::<u32>() {
-                        if pid != self_pid && sys::is_alive(pid) {
+                if let Ok(text) = std::fs::read_to_string(&path)
+                    && let Ok(pid) = text.trim().parse::<u32>()
+                        && pid != self_pid && sys::is_alive(pid) {
                             return Err(format!(
                                 "已有星尘代理实例运行（PID={pid}），本实例退出：{}",
                                 path.display()
                             ));
                         }
-                    }
-                }
                 // 进程已不在（上次异常退出/升级移交）→ 清理残留锁后重试
                 let _ = std::fs::remove_file(&path);
             }
@@ -274,11 +272,10 @@ fn acquire_instance_lock(base: &Path) -> Result<(), String> {
 /// 释放本进程持有的代理实例锁。
 fn release_instance_lock(base: &Path) {
     let path = base.join("Data").join("agent.lock");
-    if let Ok(text) = std::fs::read_to_string(&path) {
-        if text.trim() == std::process::id().to_string() {
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && text.trim() == std::process::id().to_string() {
             let _ = std::fs::remove_file(path);
         }
-    }
 }
 
 /// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并移交新版本——Unix 由旧进程
@@ -728,18 +725,17 @@ pub(crate) fn collect_update_files(exe_dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             // 排除留证文件（`*.failed`）与已跳过文件（`*.skipped`）
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("failed") || ext.eq_ignore_ascii_case("skipped") {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("failed") || ext.eq_ignore_ascii_case("skipped")) {
                     continue;
                 }
-            }
             let Ok(modified) = meta.modified() else {
                 continue;
             };
             all.push((modified, path));
         }
     }
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|item| std::cmp::Reverse(item.0));
     all.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -761,15 +757,12 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
     }
 
     // 上传中保护：文件需静置一段时间（大小/mtime 稳定）
-    if min_age_secs > 0 {
-        if let Ok(modified) = meta.modified() {
-            if let Ok(age) = SystemTime::now().duration_since(modified) {
-                if age.as_secs() < min_age_secs {
+    if min_age_secs > 0
+        && let Ok(modified) = meta.modified()
+            && let Ok(age) = SystemTime::now().duration_since(modified)
+                && age.as_secs() < min_age_secs {
                     return Err(format!("升级文件上传中（静置 {min_age_secs} 秒后自动替换）"));
                 }
-            }
-        }
-    }
 
     // 形态校验：ELF（Linux/macOS）或 PE（Windows），避免把半截/错误文件换上
     let mut head = [0u8; 4];

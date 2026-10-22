@@ -478,11 +478,10 @@ pub fn remove_from_store(store: &Path, id: &str, key_file: &Path) -> Result<(), 
     catalog["updated"] = json!(chrono::Local::now().format("%Y-%m-%d").to_string());
     fs::write(&catalog_path, serde_json::to_string_pretty(&catalog).unwrap())
         .map_err(|e| format!("写入 catalog.json 失败：{e}"))?;
-    if let Some(f) = removed_file {
-        if f.ends_with(".zip") {
+    if let Some(f) = removed_file
+        && f.ends_with(".zip") {
             let _ = fs::remove_file(store.join(f));
         }
-    }
     sign_catalog_file(&catalog_path, key_file)
 }
 
@@ -784,10 +783,11 @@ mod tests {
     }
 
     fn store_cfg(url: &str, pubkey: &str) -> crate::config::AgentConfig {
-        let mut cfg = crate::config::AgentConfig::default();
-        cfg.plugin_store_url = url.to_string();
-        cfg.plugin_store_pubkey = pubkey.to_string();
-        cfg
+        crate::config::AgentConfig {
+            plugin_store_url: url.to_string(),
+            plugin_store_pubkey: pubkey.to_string(),
+            ..crate::config::AgentConfig::default()
+        }
     }
 
     fn hex_of(bytes: &[u8]) -> String {

@@ -495,6 +495,7 @@ impl AgentConfig {
     /// - 已存在同名（大小写不敏感）：覆盖程序路径，目录/参数传 `None` 时保留原值；
     /// - 不存在：新增条目；
     /// - 两者均置为启用（注册即启用，星尘启动/重载时会拉起）。
+    ///
     /// 返回 `true` 表示产生变化；名称或程序路径为空时返回 `false`。
     pub fn upsert_app(
         &mut self,
@@ -888,16 +889,14 @@ fn template_comments() -> HashMap<String, String> {
             pending = Some(comment.to_string());
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('<') {
-            if let Some(end) = rest.find('>') {
+        if let Some(rest) = trimmed.strip_prefix('<')
+            && let Some(end) = rest.find('>') {
                 let name = &rest[..end];
-                if !name.starts_with('/') && !name.starts_with('?') {
-                    if let Some(comment) = pending.take() {
+                if !name.starts_with('/') && !name.starts_with('?')
+                    && let Some(comment) = pending.take() {
                         map.insert(name.to_string(), comment);
                     }
-                }
             }
-        }
     }
     map
 }
@@ -950,15 +949,14 @@ fn render_services(previous: &[Json], apps: &[AppConfig]) -> String {
                 .and_then(|v| v.as_str())
                 .map(|n| n.eq_ignore_ascii_case(&app.name))
                 .unwrap_or(false)
-        }) {
-            if let Some(obj) = old.as_object() {
+        })
+            && let Some(obj) = old.as_object() {
                 for (key, value) in obj {
                     if !KNOWN_SERVICE_ATTRS.contains(&key.as_str()) {
                         attrs.push((key.clone(), value.as_str().unwrap_or("").to_string()));
                     }
                 }
             }
-        }
 
         // Rust 字段（固定顺序，对齐 C# `ServiceInfo` 声明序；Mode 写 C# 数值 10-13）
         attrs.push(("Name".to_string(), app.name.clone()));
@@ -1103,8 +1101,10 @@ mod tests {
         assert_eq!(cfg.sample_interval, 2500);
 
         // 归一化：下限/上限保护；0 = 关闭后台采样
-        let mut cfg = AgentConfig::default();
-        cfg.sample_interval = 50;
+        let mut cfg = AgentConfig {
+            sample_interval: 50,
+            ..AgentConfig::default()
+        };
         cfg.normalize();
         assert_eq!(cfg.sample_interval, 200);
         cfg.sample_interval = 999_999;
@@ -1115,8 +1115,10 @@ mod tests {
         assert_eq!(cfg.sample_interval, 0);
 
         // 渲染：写入模板骨架（保留注释）
-        let mut cfg = AgentConfig::default();
-        cfg.sample_interval = 2500;
+        let cfg = AgentConfig {
+            sample_interval: 2500,
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<SampleInterval>2500</SampleInterval>"),
@@ -1187,8 +1189,10 @@ mod tests {
         assert!(AgentConfig::default().log_cleanup_paths.is_empty());
 
         // 渲染：模板骨架带上新字段（注释由模板保障；空值也应写出空元素）
-        let mut cfg = AgentConfig::default();
-        cfg.log_cleanup_paths = "/www/wwwlogs;/tmp/cache".to_string();
+        let cfg = AgentConfig {
+            log_cleanup_paths: "/www/wwwlogs;/tmp/cache".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<LogCleanupPaths>/www/wwwlogs;/tmp/cache</LogCleanupPaths>"),
@@ -1211,8 +1215,10 @@ mod tests {
         let default = AgentConfig::default();
         assert!(default.plugin_store_url.is_empty());
         assert!(default.plugin_store_pubkey.is_empty());
-        let mut cfg = AgentConfig::default();
-        cfg.plugin_store_url = "https://x.example/catalog.json".to_string();
+        let cfg = AgentConfig {
+            plugin_store_url: "https://x.example/catalog.json".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<PluginStoreUrl>https://x.example/catalog.json</PluginStoreUrl>"),
@@ -1245,8 +1251,10 @@ mod tests {
         assert!(default.ai_enabled);
         assert!(default.ai_api_key.is_empty());
 
-        let mut cfg = AgentConfig::default();
-        cfg.ai_model = "deepseek-reasoner".to_string();
+        let cfg = AgentConfig {
+            ai_model: "deepseek-reasoner".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(text.contains("<AiModel>deepseek-reasoner</AiModel>"), "{text}");
         assert!(
@@ -1443,8 +1451,10 @@ mod tests {
     #[test]
     fn migrates_from_legacy_json() {
         let base = temp_base("migrate");
-        let mut old = AgentConfig::default();
-        old.local_port = 5601;
+        let mut old = AgentConfig {
+            local_port: 5601,
+            ..AgentConfig::default()
+        };
         old.apps = vec![AppConfig {
             name: "legacy".to_string(),
             file_name: "legacy.zip".to_string(),

@@ -607,11 +607,10 @@ pub fn file_write(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if path.is_dir() {
         return json_error(400, "目标是目录，无法写入");
     }
-    if let Some(parent) = path.parent() {
-        if !parent.is_dir() {
+    if let Some(parent) = path.parent()
+        && !parent.is_dir() {
             return json_error(400, &format!("上级目录不存在：{}", parent.display()));
         }
-    }
     if let Err(e) = dhrust::io::write_all_text(&path, &content) {
         return json_error(500, &format!("保存失败：{}", e));
     }
@@ -1072,11 +1071,10 @@ pub fn file_extract(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(".")),
     };
-    if !target.is_dir() {
-        if let Err(e) = fs::create_dir_all(&target) {
+    if !target.is_dir()
+        && let Err(e) = fs::create_dir_all(&target) {
             return json_error(500, &format!("创建目标目录失败：{}", e));
         }
-    }
     match extract_zip_file(&path, &target) {
         Ok((files, bytes)) => {
             util::log_format(

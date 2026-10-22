@@ -378,14 +378,12 @@ fn cmd_update(base: &Path, args: &[String]) -> i32 {
         .find(|a| !a.is_empty() && !a.starts_with('-') && !a.eq_ignore_ascii_case("update"))
         .map(PathBuf::from);
 
-    if let Some(src) = &src {
-        if *src != staged {
-            if let Err(e) = std::fs::copy(src, &staged) {
+    if let Some(src) = &src
+        && *src != staged
+            && let Err(e) = std::fs::copy(src, &staged) {
                 eprintln!("读取升级文件失败：{}（{e}）", src.display());
                 return 1;
             }
-        }
-    }
 
     if !staged.is_file() {
         eprintln!(
@@ -525,8 +523,8 @@ fn cmd_list_apps(base: &Path) -> i32 {
 
     println!("所有子服务列表：");
     println!(
-        "{:<5} {:<20} {:<6} {:<8} {:<8} {:<16} {}",
-        "序号", "服务名称", "启用", "状态", "进程Id", "进程名称", "启动时间"
+        "{:<5} {:<20} {:<6} {:<8} {:<8} {:<16} 启动时间",
+        "序号", "服务名称", "启用", "状态", "进程Id", "进程名称"
     );
     for (i, (name, enable, running, pid, pname, start_time)) in list.iter().enumerate() {
         println!(
@@ -1025,19 +1023,17 @@ fn save_server_args(base: &Path, args: &[String]) {
     let mut cfg = AgentConfig::load(base);
     let mut changed = false;
 
-    if let Some(s) = server {
-        if !s.is_empty() && cfg.server != s {
+    if let Some(s) = server
+        && !s.is_empty() && cfg.server != s {
             cfg.server = s;
             changed = true;
             println!("服务端地址已保存：{}（当前版本暂不对接）", cfg.server);
         }
-    }
-    if let Some(p) = project {
-        if !p.is_empty() && cfg.project != p {
+    if let Some(p) = project
+        && !p.is_empty() && cfg.project != p {
             cfg.project = p;
             changed = true;
         }
-    }
 
     if changed {
         let _ = cfg.save(base);

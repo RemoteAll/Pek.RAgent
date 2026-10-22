@@ -108,10 +108,7 @@ fn due(cfg: &AgentConfig, force: bool) -> bool {
     }
     let minutes = u64::from(cfg.auto_upgrade_interval_minutes.clamp(5, 1440));
     let interval = Duration::from_secs(minutes * 60);
-    match *LAST_ATTEMPT.lock().unwrap() {
-        Some(t) if t.elapsed() < interval => false,
-        _ => true,
-    }
+    !matches!(*LAST_ATTEMPT.lock().unwrap(), Some(t) if t.elapsed() < interval)
 }
 
 /// 触发检查（独立线程执行；并发去重；`force` 忽略间隔）。
@@ -349,9 +346,10 @@ mod tests {
 
     #[test]
     fn due_respects_interval_and_force() {
-        let mut cfg = AgentConfig::default();
-        // 清空默认地址 → 永不检查
-        cfg.auto_upgrade_url = String::new();
+        let mut cfg = AgentConfig {
+            auto_upgrade_url: String::new(),
+            ..AgentConfig::default()
+        };
         assert!(!due(&cfg, true));
         cfg.auto_upgrade_url = "https://x.example/catalog.json".to_string();
         // 首次：到点
@@ -365,8 +363,10 @@ mod tests {
 
     #[test]
     fn check_requires_configuration() {
-        let mut cfg = AgentConfig::default();
-        cfg.auto_upgrade_url = String::new();
+        let cfg = AgentConfig {
+            auto_upgrade_url: String::new(),
+            ..AgentConfig::default()
+        };
         let err = check_once(&cfg).unwrap_err();
         assert!(err.contains("未配置"), "实际：{err}");
         // 默认配置（地址已预置官方平台）即视为启用
