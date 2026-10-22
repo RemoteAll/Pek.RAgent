@@ -12,6 +12,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::time::Duration;
 
 use dhrust::sys::iis;
