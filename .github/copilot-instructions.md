@@ -1,4 +1,4 @@
-# Pek.RAgent 协作指令（Rust）
+﻿# Pek.RAgent 协作指令（Rust）
 
 > 组织级通用规范以**用户级指令**（`%APPDATA%\Code\User\prompts\跨项目接续协议.instructions.md`，随 Settings Sync 漫游）与 Pek.Skills 资产为准；本文件只写本仓库特有事实，简体中文回复。
 
@@ -12,7 +12,7 @@
 - **停止链**：先温和后强制、覆盖进程树（Windows `taskkill /PID /T` → 3s → `/T /F` → 2s 终检；Unix 组长按进程组）；【接管】仅基于 `data/state.json` 记录的 PID）。
 - **多实例**：配置按名称 upsert（**不能同名**）；多实例用不同子服务名分别注册（各自目录/配置/资源）。停止按 PID 定点，无同名连坐。
 - 自升级管线：热检测 + 影子冒烟 + 原子替换 + 移交（Unix `execv` 原地接管；Windows 服务交 SCM 失败恢复）。
-- **WAF（Pek.RWaf）**：HTTP 控制接口挂 `pek_rwaf` 中间件（`server.rs::build_router` 首行）——管理端预设（拦恶意爬虫/sqlmap/curl 默认 UA；路径探测拦截；CC 300/分钟）；`Config/Waf.json` 首启生成 + 10s 热重载；`/star/db|file|ai` 经 `skipAttackPrefixes` 跳过攻击检测（业务护栏负责）。**网络层 curl 实测须带浏览器 UA**（回环豁免）。面板「🛡 安全」页（`/star/waf` 查询 / `wafSave` 保存）提供在线开关与参考配置；响应带 `X-Elapsed-Ms`（页脚显示服务端处理耗时）；`csrfGuard` 默认开启。
+- **WAF（Pek.RWaf）**：HTTP 控制接口挂 `pek_rwaf` 中间件（`server.rs::build_router` 首行）——管理端预设（拦恶意爬虫/sqlmap/curl 默认 UA；路径探测拦截；CC 300/分钟）；`Config/Waf.toml` 首启生成 + 10s 热重载；`/star/db|file|ai` 经 `skipAttackPrefixes` 跳过攻击检测（业务护栏负责）。**网络层 curl 实测须带浏览器 UA**（回环豁免）。面板「🛡 安全」页（`/star/waf` 查询 / `wafSave` 保存）提供在线开关与参考配置；响应带 `X-Elapsed-Ms`（页脚显示服务端处理耗时）；`csrfGuard` 默认开启。
 - **性能红线（守护循环 1 秒一跳）**：`agent.rs` 的 `Timer::new(1_000, …)` 每 1000ms 调一次 `manager.check_all()`——**任何周期任务都必须与之解耦**，否则代理自己就成了资源消耗源：
   - 探活（HTTP/TCP）按 `app.rs::HEALTH_INTERVAL`（**10 秒**）节流，不要退回「每跳一次就探一次」；
   - 进程扫描（`top_processes*`）先取轻字段全量排序，**只给榜单补**命令行/路径/句柄/端口；端口走 `listen_ports_many(&pids)`（只扫目标 pid + 2 秒缓存），禁止遍历全系统 `/proc/*/fd`；

@@ -1367,7 +1367,7 @@ fn traffic_history(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
-// ————— WAF（/star/waf*：在线开关 + 参考配置；配置落盘 Config/Waf.json 并立即生效） —————
+// ————— WAF（/star/waf*：在线开关 + 参考配置；配置落盘 Config/Waf.toml 并立即生效） —————
 
 /// WAF 状态与完整配置（参考配置页数据源）。
 fn waf_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
@@ -1377,13 +1377,13 @@ fn waf_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.waf.config();
     let mut v = serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
+        // 路径取公共库常量（`Config/Waf.toml`），不要在本仓硬编码文件名
         obj.insert(
             "configFile".to_string(),
             serde_json::json!(
                 panel
                     .base()
-                    .join("Config")
-                    .join("Waf.json")
+                    .join(pek_rwaf::config::CONFIG_REL)
                     .display()
                     .to_string()
             ),

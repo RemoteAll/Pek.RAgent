@@ -109,7 +109,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     waf_cfg.skip_attack_prefixes =
         vec!["/star/db".to_string(), "/star/file".to_string(), "/star/ai".to_string()];
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
-    // 机器接口强制豁免（内存态，不受 Config/Waf.json 影响）：/api/* 供 DHDeploy 等机器调用，
+    // 机器接口强制豁免（内存态，不受 Config/Waf.toml 影响）：/api/* 供 DHDeploy 等机器调用，
     // 客户端 UA（RestSharp / HttpClient）不应被判为扫描器。
     waf.set_forced_skip_bot_prefixes(vec!["/api".to_string()]);
     router.use_middleware(waf.middleware());

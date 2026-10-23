@@ -1,4 +1,4 @@
-
+﻿
 document.getElementById('luser').addEventListener('keydown', e => {
  if (e.key === 'Enter') document.getElementById('lpass').focus();
 });
@@ -297,7 +297,7 @@ window.addEventListener('hashchange',()=>{
  else if(h==='config'&&$('config-sub-tabs'))configSubSwitch(configSubFromHash()); // 配置页内子页签同步（含旧 #security 书签规范化）
 });
 
-/* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.json） ── */
+/* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.toml） ── */
 let wafCfg=null;
 const WAF_ACTS=[['off','关闭'],['monitor','仅记录'],['block','拦截']];
 function wafActSel(id,v){return '<select id="'+id+'" class="waf-sel">'+WAF_ACTS.map(a=>'<option value="'+a[0]+'"'+(v===a[0]?' selected':'')+'>'+a[1]+'</option>').join('')+'</select>'}
@@ -314,7 +314,7 @@ function renderSecurity(){
  const c=wafCfg||{};
  $('config-sub-security').innerHTML=`
 <div class="glass-card card">
- <h2>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h2>
+ <h2>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.toml')}</span></h2>
  <p class="text-muted" style="font-size:12px;margin:2px 0 10px">爬虫分级（放行正常搜索引擎/GEO-AI，拦恶意爬虫与扫描器）+ SQL 注入/路径探测防护 + CC 限速；保存后立即生效，并写入配置文件。</p>
  <div class="waf-row">
   <label><input type="checkbox" id="waf-enable" ${c.enable?'checked':''}> <b>启用 WAF</b>（关闭后请求全放行）</label>

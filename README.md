@@ -1,4 +1,4 @@
-# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
+﻿# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
 
 部署在每台应用服务器 / 边缘节点上的节点守护代理，以系统服务方式运行，负责**多应用进程守护、影子目录部署、运行中文件替换与本地控制接口**。
 
@@ -599,4 +599,4 @@ src/
 
 ## 13. Web 应用防火墙（Pek.RWaf）
 
-面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.json` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。面板「**配置 → 🛡 安全**」子页签提供在线开关与完整参考配置（保存后立即生效并写入配置文件）。
+面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.toml` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。面板「**配置 → 🛡 安全**」子页签提供在线开关与完整参考配置（保存后立即生效并写入配置文件）。
