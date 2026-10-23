@@ -49,6 +49,12 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
         format!("0.0.0.0:{}", port)
     };
 
+    // 允许远程访问时自动放行本机防火墙端口；关闭时撤销规则（幂等，失败只记日志）
+    match dhrust::sys::firewall::ensure("Pek.RAgent", !local_only, port) {
+        Ok(msg) => dhrust::info!("{msg}"),
+        Err(e) => dhrust::warn!("防火墙自动放行失败（不影响运行）：{e}"),
+    }
+
     std::thread::Builder::new()
         .name("ragent-http".to_string())
         .spawn(move || {
