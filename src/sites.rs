@@ -1,4 +1,4 @@
-//! 站点清单（nginx / IIS）：域名、监听、现有证书、平台托管白名单。
+﻿//! 站点清单（nginx / IIS）：域名、监听、现有证书、平台托管白名单。
 //!
 //! 供 Pek.RPanlServer「证书」页盘点与下发匹配使用；**全部为只读操作**（读取配置与
 //! 证书文件，不执行任何命令、不修改任何文件）。真正的部署在 [`crate::certdeploy`]，
@@ -84,6 +84,9 @@ pub struct SiteView {
     pub cert: Option<CertView>,
     /// 是否在平台托管白名单（`CertManagedSites`）内
     pub managed: bool,
+    /// 命中的白名单规则原文（空 = 未命中）——面板用它解释“为什么已托管”，
+    /// 例如 `*.example.com`（通配符命中）或站点 key（精确命中）。
+    pub managed_by: String,
     /// 配置文件路径（nginx）
     pub file: String,
     /// 备注（无法读取证书的原因等）
@@ -485,7 +488,8 @@ fn nginx_sites(cfg: &AgentConfig, base: &Path, now: i64) -> Vec<SiteView> {
                 Some(d) => read_cert_view(&d.value, base, now),
                 None => (None, String::new()),
             };
-            let managed = is_managed(&cfg.cert_managed_sites, &key, &file_text, &domains);
+            let managed_by = managed_rule(&cfg.cert_managed_sites, &key, &file_text, &domains);
+            let managed = managed_by.is_some();
             out.push(SiteView {
                 key,
                 kind: "nginx".to_string(),
@@ -496,6 +500,7 @@ fn nginx_sites(cfg: &AgentConfig, base: &Path, now: i64) -> Vec<SiteView> {
                 key_path,
                 cert,
                 managed,
+                managed_by: managed_by.unwrap_or_default(),
                 file: file_text.clone(),
                 note,
             });
@@ -526,36 +531,41 @@ fn read_cert_view(path: &str, base: &Path, now: i64) -> (Option<CertView>, Strin
     }
 }
 
-/// 站点是否在平台托管白名单内。
+/// 返回命中的白名单规则原文（未命中返回 `None`）。
 ///
 /// 白名单项（逗号/分号/换行分隔）按任一命中为准：
 /// - `*`：全部站点（**不建议**，仅应急）；
 /// - 站点 key（`nginx:/path#1` / `iis:站点名`）；
 /// - nginx 配置文件路径（整份文件）；
 /// - 域名或域名通配符（`example.com` / `*.example.com`，与站点任一域名匹配）。
-pub fn is_managed(list: &str, key: &str, file: &str, domains: &[String]) -> bool {
+pub fn managed_rule(
+    list: &str,
+    key: &str,
+    file: &str,
+    domains: &[String],
+) -> Option<String> {
     for raw in list.split([',', ';', '\n']) {
         let pat = raw.trim();
         if pat.is_empty() {
             continue;
         }
         if pat == "*" {
-            return true;
+            return Some(pat.to_string());
         }
         if pat.eq_ignore_ascii_case(key) {
-            return true;
+            return Some(pat.to_string());
         }
         if !file.is_empty() && path_eq(pat, file) {
-            return true;
+            return Some(pat.to_string());
         }
         if domains
             .iter()
             .any(|d| dhrust::cert::domain_matches(pat, d))
         {
-            return true;
+            return Some(pat.to_string());
         }
     }
-    false
+    None
 }
 
 fn path_eq(a: &str, b: &str) -> bool {
@@ -669,7 +679,8 @@ fn iis_sites(cfg: &AgentConfig) -> Vec<SiteView> {
             }
         }
         let key = format!("iis:{name}");
-        let managed = is_managed(&cfg.cert_managed_sites, &key, &file_text, &domains);
+        let managed_by = managed_rule(&cfg.cert_managed_sites, &key, &file_text, &domains);
+        let managed = managed_by.is_some();
         out.push(SiteView {
             key,
             kind: "iis".to_string(),
@@ -680,6 +691,7 @@ fn iis_sites(cfg: &AgentConfig) -> Vec<SiteView> {
             key_path: String::new(),
             cert: None,
             managed,
+            managed_by: managed_by.unwrap_or_default(),
             file: file_text.clone(),
             note: if ssl {
                 String::new()
@@ -782,20 +794,29 @@ server {
 
     #[test]
     fn whitelist_matching_rules() {
+        fn managed(list: &str, key: &str, file: &str, domains: &[String]) -> bool {
+            managed_rule(list, key, file, domains).is_some()
+        }
         let domains = vec!["a.example.com".to_string()];
-        assert!(!is_managed("", "k", "/f", &domains));
-        assert!(is_managed("k", "k", "/f", &domains));
-        assert!(is_managed("/f", "k", "/f", &domains));
-        assert!(is_managed("*.example.com", "k", "/f", &domains));
-        assert!(is_managed("a.example.com", "k", "/f", &domains));
-        assert!(!is_managed("b.example.com", "k", "/f", &domains));
-        assert!(is_managed("*", "k", "/f", &domains));
-        assert!(is_managed(
+        assert!(!managed("", "k", "/f", &domains));
+        assert!(managed("k", "k", "/f", &domains));
+        assert!(managed("/f", "k", "/f", &domains));
+        assert!(managed("*.example.com", "k", "/f", &domains));
+        assert!(managed("a.example.com", "k", "/f", &domains));
+        assert!(!managed("b.example.com", "k", "/f", &domains));
+        assert!(managed("*", "k", "/f", &domains));
+        assert!(managed(
             "x; /f ; y",
             "k",
             "/f",
             &domains
         ));
+        // 命中的规则原文要能回传到面板（解释“为什么已托管”）
+        assert_eq!(
+            managed_rule("x; *.example.com", "k", "/f", &domains).as_deref(),
+            Some("*.example.com")
+        );
+        assert_eq!(managed_rule("", "k", "/f", &domains), None);
     }
 
     #[test]

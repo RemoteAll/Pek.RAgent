@@ -969,6 +969,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         "certAllow",
         guarded(panel.clone(), PERM_CERT, cert_allow),
     );
+    controller = controller.post(
+        "certDeny",
+        guarded(panel.clone(), PERM_CERT, cert_deny),
+    );
 
     controller.get(
         "getProcessList",
@@ -2217,18 +2221,9 @@ fn cert_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "证书托管设置已保存", None)
 }
 
-/// `POST /star/certAllow`：把指定站点追加进托管白名单（`CertManagedSites`）。
-///
-/// body：`{ "sites": ["nginx:/www/server/panel/vhost/nginx/a.conf#1", ...] }`
-///
-/// 用途：面板「站点盘点」每行的「➕ 加入白名单」按钮——省去手抄站点 key 的麻烦。
-/// 只**追加**（去重、保留原条目），不覆盖其它站点；写入后立即热生效。
-fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    let Some(body) = json_body(ctx) else {
-        return json_error(400, "缺少请求体");
-    };
-    let items: Vec<String> = body
-        .get("sites")
+/// 从请求体读取 `sites` 数组（去空、去重空格）。
+fn parse_site_list(body: &serde_json::Value) -> Vec<String> {
+    body.get("sites")
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
@@ -2237,7 +2232,20 @@ fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 .filter(|s| !s.is_empty())
                 .collect()
         })
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+/// `POST /star/certAllow`：把指定站点追加进托管白名单（`CertManagedSites`）。
+///
+/// body：`{ "sites": ["nginx:/www/server/panel/vhost/nginx/a.conf#1", ...] }`
+///
+/// 用途：面板「站点盘点」勾选「允许自动部署」——省去手抄站点 key 的麻烦。
+/// 只**追加**（去重、保留原条目），不覆盖其它站点；写入后立即热生效。
+fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let items = parse_site_list(&body);
     if items.is_empty() {
         return json_error(400, "未指定要加入白名单的站点");
     }
@@ -2255,7 +2263,7 @@ fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         .collect();
     let added = merge_whitelist(&mut list, &items);
     if added == 0 {
-        return json_result(0, "所选站点已在白名单内", None);
+        return json_result(0, "该站点已在允许清单中", None);
     }
     let merged = list.join("; ");
     if merged.len() > 2000 {
@@ -2270,7 +2278,7 @@ fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     );
     json_result(
         0,
-        &format!("已加入白名单（{added} 个站点）"),
+        "已允许自动部署",
         Some(json!({ "whitelist": merged })),
     )
 }
@@ -2290,6 +2298,57 @@ fn merge_whitelist(list: &mut Vec<String>, items: &[String]) -> usize {
         added += 1;
     }
     added
+}
+
+/// 从白名单列表移除指定条目（精确匹配、忽略大小写；返回移除条数）。
+fn drop_whitelist(list: &mut Vec<String>, items: &[String]) -> usize {
+    let before = list.len();
+    list.retain(|x| !items.iter().any(|it| x.eq_ignore_ascii_case(it.trim())));
+    before - list.len()
+}
+
+/// `POST /star/certDeny`：把站点从托管白名单移除（面板复选框「取消勾选」）。
+///
+/// body：`{ "sites": ["nginx:/path#1", ...] }`
+///
+/// 只移除**与站点 key 完全相同**的条目；若该站点是被通配符/目录规则（`*.example.com`、
+/// 配置文件路径）带进来的，返回提示让用户去高级设置里改（避免误删别的站点规则）。
+fn cert_deny(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let items = parse_site_list(&body);
+    if items.is_empty() {
+        return json_error(400, "未指定要移出白名单的站点");
+    }
+    let mut list: Vec<String> = panel
+        .manager
+        .config()
+        .cert_managed_sites
+        .split([',', ';', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let removed = drop_whitelist(&mut list, &items);
+    if removed == 0 {
+        return json_error(
+            400,
+            "该站点不是单独加入的（可能由域名通配符或配置文件规则托管），请在「高级」里修改那些规则",
+        );
+    }
+    let merged = list.join("; ");
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = merged.clone();
+    });
+    crate::util::log_format(
+        "已移出证书托管白名单：{}（剩余 {} 条）",
+        &[&items.join(", "), &list.len().to_string()],
+    );
+    json_result(
+        0,
+        "已取消允许（以后不再碰该站点）",
+        Some(json!({ "whitelist": merged })),
+    )
 }
 
 fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
@@ -3479,6 +3538,12 @@ mod tests {
         // 重复调用不再增长（幂等）
         assert_eq!(merge_whitelist(&mut list, &add), 0);
         assert_eq!(list.len(), 3);
+        // 取消勾选：精确移除，不误删通配符规则
+        let drop_list = vec!["nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1".to_string()];
+        assert_eq!(drop_whitelist(&mut list, &drop_list), 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(drop_whitelist(&mut list, &drop_list), 0);
+        assert_eq!(list[1], "*.example.com");
     }
 
     #[test]
