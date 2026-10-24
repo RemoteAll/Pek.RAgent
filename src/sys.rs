@@ -328,21 +328,13 @@ pub fn machine_info() -> String {
 
 /// 系统运行时长文本（如 `21天13小时`）。秒数来自 `dhrust::sys::machine`（Windows/Linux）；
 /// 其它平台返回 None。
+///
+/// 格式化复用 `dhrust::web::uptime_text_compact`（星尘 C# 口径，与 Rust 面板一致）。
 pub(crate) fn uptime_text() -> Option<String> {
     if !cfg!(any(windows, target_os = "linux")) {
         return None;
     }
-    let total_minutes = host_uptime_seconds() / 60;
-    let days = total_minutes / 1440;
-    let hours = (total_minutes % 1440) / 60;
-    let minutes = total_minutes % 60;
-    if days > 0 {
-        Some(format!("{days}天{hours}小时"))
-    } else if hours > 0 {
-        Some(format!("{hours}小时{minutes}分"))
-    } else {
-        Some(format!("{minutes}分"))
-    }
+    Some(dhrust::web::uptime_text_compact(host_uptime_seconds()))
 }
 
 /// 字节数友好格式（对齐 C# `ToGMK`：1024 进制，保留 1 位小数，如 `63.7G`）。
