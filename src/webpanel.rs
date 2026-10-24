@@ -2210,6 +2210,7 @@ fn cert_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         cfg.cert_nginx_dirs = dirs.clone();
         cfg.cert_nginx_bin = bin.clone();
     });
+    crate::sites::invalidate_cache();
     crate::util::log_format(
         "证书托管设置已保存（白名单：{}）",
         &[&if managed.is_empty() {
@@ -2272,6 +2273,7 @@ fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     panel.manager.update_config(|cfg| {
         cfg.cert_managed_sites = merged.clone();
     });
+    crate::sites::invalidate_cache();
     crate::util::log_format(
         "已加入证书托管白名单：{}（当前共 {} 条）",
         &[&items.join(", "), &list.len().to_string()],
@@ -2340,6 +2342,7 @@ fn cert_deny(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     panel.manager.update_config(|cfg| {
         cfg.cert_managed_sites = merged.clone();
     });
+    crate::sites::invalidate_cache();
     crate::util::log_format(
         "已移出证书托管白名单：{}（剩余 {} 条）",
         &[&items.join(", "), &list.len().to_string()],

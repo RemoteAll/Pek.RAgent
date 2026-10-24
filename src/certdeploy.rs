@@ -413,6 +413,49 @@ fn valid_cert_id(id: &str) -> bool {
 
 // ———————————————— nginx ————————————————
 
+// ———————————————— 证书 / 私钥配对校验 ————————————————
+
+/// 跑 openssl 子命令并返回 stdout（非 0 或找不到命令时返回可读错误）。
+fn openssl_stdout(args: &[&str]) -> Result<String, String> {
+    let out = std::process::Command::new("openssl")
+        .args(args)
+        .output()
+        .map_err(|e| format!("openssl 不可用：{e}"))?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return Err(format!("openssl {} 失败：{}", args.first().unwrap_or(&""), first_lines(&err, "", 3)));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// 去掉所有空白，便于比较 PEM 公钥文本。
+fn squeeze(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// 校验证书（链中第一张）与私钥是否配对。
+///
+/// 返回 `Ok(true)` 配对、`Ok(false)` 不配对；`Err` 表示无法校验（openssl 缺失等）。
+fn key_matches_cert(cert_pem: &str, key_pem: &str) -> Result<bool, String> {
+    let dir = std::env::temp_dir().join(format!("pek-cert-check-{}", dhrust::random::hex(6)));
+    std::fs::create_dir_all(&dir).map_err(|e| format!("创建临时目录失败：{e}"))?;
+    let cert_file = dir.join("c.pem");
+    let key_file = dir.join("k.pem");
+    let result = (|| -> Result<bool, String> {
+        std::fs::write(&cert_file, cert_pem).map_err(|e| format!("写临时证书失败：{e}"))?;
+        std::fs::write(&key_file, key_pem).map_err(|e| format!("写临时私钥失败：{e}"))?;
+        let (c, k) = (cert_file.to_string_lossy().to_string(), key_file.to_string_lossy().to_string());
+        let cert_pub = openssl_stdout(&["x509", "-in", &c, "-noout", "-pubkey"])?;
+        // `pkey` 兼容 RSA/EC/Ed25519；旧版 openssl 无 pkey 时回退 rsa/ec
+        let key_pub = openssl_stdout(&["pkey", "-in", &k, "-pubout"])
+            .or_else(|_| openssl_stdout(&["rsa", "-in", &k, "-pubout"]))
+            .or_else(|_| openssl_stdout(&["ec", "-in", &k, "-pubout"]))?;
+        Ok(squeeze(&cert_pub) == squeeze(&key_pub))
+    })();
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
 fn deploy_nginx(
     cfg: &AgentConfig,
     base: &Path,
@@ -424,6 +467,22 @@ fn deploy_nginx(
         item.ok = false;
         item.message = "该站点需要私钥 PEM（上传证书时未提供私钥）".to_string();
         return false;
+    }
+    // 配对自检：`nginx -t` **不校验**证书与私钥是否匹配（只在 reload 运行期报错），
+    // 这里提前拦住——演练阶段就能发现贴错私钥。openssl 不可用时仅记提示、不阻断。
+    match key_matches_cert(&req.cert_pem, &req.key_pem) {
+        Ok(true) => {}
+        Ok(false) => {
+            item.ok = false;
+            item.message =
+                "证书与私钥不匹配（请检查上传的私钥是否属于该证书），已中止，未改任何文件"
+                    .to_string();
+            return false;
+        }
+        Err(e) => {
+            item.changes
+                .push(format!("（未校验证书/私钥配对：{e}）"));
+        }
     }
     let file = PathBuf::from(&site.file);
     let text = match std::fs::read_to_string(&file) {

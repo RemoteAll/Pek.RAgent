@@ -54,6 +54,7 @@ $cert2 = Join-Path $root 'c2.pem'; $key2 = Join-Path $root 'k2.pem'
 cmd /c ('"' + $ssl + '" req -x509 -newkey rsa:2048 -nodes -keyout "' + $key1 + '" -out "' + $cert1 + '" -days 30 -subj "/CN=app.e2e.local" -addext "subjectAltName=DNS:app.e2e.local" 2>nul') | Out-Null
 cmd /c ('"' + $ssl + '" req -x509 -newkey rsa:2048 -nodes -keyout "' + $key2 + '" -out "' + $cert2 + '" -days 30 -subj "/CN=app.e2e.local" -addext "subjectAltName=DNS:app.e2e.local" 2>nul') | Out-Null
 
+$env:PATH = (Split-Path $ssl) + ';' + $env:PATH
 $env:PEK_RAGENT_BASE = $base
 $proc = Start-Process -FilePath $exe -ArgumentList '-run' -PassThru -WindowStyle Hidden
 $origin = "http://127.0.0.1:$Port"
@@ -96,6 +97,13 @@ try {
     if ($dry.data.items[0].action -ne 'enable_https') { throw "应识别为 enable_https：$($dry.data.items[0].action)" }
     if ((Get-FileHash $conf -Algorithm SHA256).Hash -ne $before) { throw "演练不应修改站点配置" }
     "2) 演练：action=$($dry.data.items[0].action)，文件未变"
+
+    # 证书与私钥不配对 → 演练即拒绝（nginx -t 查不出这种错，只能运行期暴露）
+    $bad = Deploy 'e2e-nginx-bad' $cert1 $key2 $site.key $true
+    if ($bad.code -ne 0) { throw "不匹配用例请求失败：$($bad.message)" }
+    if ($bad.data.ok) { throw "证书与私钥不匹配时应判失败" }
+    if ($bad.data.items[0].message -notlike '*不匹配*') { throw "错误信息应说明不匹配：$($bad.data.items[0].message)" }
+    "2.5) 私钥不匹配被拒绝：$($bad.data.items[0].message)"
 
     # 真实执行：启用 HTTPS
     $run = Deploy 'e2e-nginx-1' $cert1 $key1 $site.key $false

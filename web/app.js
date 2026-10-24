@@ -2476,7 +2476,7 @@ async function fmReloadEditor(){
 }
 
 /* ── 网站证书（站点盘点 + 本机演练/部署；仅白名单站点可写） ── */
-let certInv=null,certLast=null;
+let certInv=null,certLast=null,certData=null,certShowSystem=false;
 const certSel=new Set();
 
 async function loadCert(){
@@ -2484,7 +2484,7 @@ async function loadCert(){
   const j=await api('/star/sites');
   if(j.code!==0){showToast(j.message||'加载失败','error');return}
   const d=j.data||{};
-  certInv=d.inventory||{web:[],sites:[]};certLast=d.lastResult;
+  certInv=d.inventory||{web:[],sites:[]};certLast=d.lastResult;certData=d;
   // 先算好默认勾选集合再渲染（否则已托管站点渲染成未勾选、计数却是 N）
   certSel.clear();
   (certInv.sites||[]).forEach(s=>{if(s.managed&&(s.domains||[]).length)certSel.add(s.key)});
@@ -2495,10 +2495,13 @@ async function loadCert(){
 
 function certShellHtml(d){
  const inv=certInv||{web:[],sites:[]};
+ const all=inv.sites||[];
+ const sysCount=all.filter(s=>s.system).length;
+ const list=all.filter(s=>certShowSystem||!s.system);
  let rows='';
- for(const s of (inv.sites||[])){
+ for(const s of list){
   const cert=s.cert
-   ?`<span style="color:${s.cert.expired?'var(--red)':'var(--green,#16a34a)'};font-weight:600">${s.cert.expired?'已过期':(s.cert.daysLeft+' 天')}</span><div class="text-muted" style="font-size:11px">${esc((s.cert.domains||[]).join(', '))}</div>`
+   ?`<span style="color:${s.cert.expired?'var(--red)':'var(--green,#16a34a)'};font-weight:600">${s.cert.expired?'已过期':(s.cert.daysLeft+' 天')}</span><div class="text-muted" style="font-size:11px">${esc((s.cert.domains||[]).join(', '))}</div><div class="text-muted" style="font-size:11px">至 ${esc(certDate(s.cert.notAfter))} UTC · ${esc((s.cert.sha1||'').slice(0,12))}</div>`
    :(s.note?`<span class="text-muted" style="font-size:11px">${esc(s.note)}</span>`:'—');
   rows+=`<tr>
    <td>${esc(s.kind)}</td>
@@ -2529,7 +2532,11 @@ function certShellHtml(d){
   <div class="text-muted" style="font-size:13px">检测到的 Web 服务器：<b>${esc(web)}</b>。<b>在下面表格里勾选「允许自动部署」的那个站点，才会被本机和平台自动装证书</b>（不勾的站点一律不碰）——这是防误操作的安全闸。安装时会先备份配置 → 执行 <code>nginx -t</code> 校验 → 失败自动回滚，不会把站点改坏。</div>
  </div>
  <div class="glass-card card">
-  <div class="flex-between mb-16"><h2 style="font-size:16px">🌐 站点盘点</h2><span class="text-muted" style="font-size:12px">已允许 <b id="cert-sel-count">0</b> 个站点</span></div>
+  <div class="flex-between mb-16"><h2 style="font-size:16px">🌐 站点盘点</h2>
+   <div style="display:flex;gap:14px;align-items:center">
+    ${sysCount?`<label class="text-muted" style="font-size:12px;display:flex;gap:5px;align-items:center;cursor:pointer"><input type="checkbox" ${certShowSystem?'checked':''} onchange="certToggleSystem(this)"> 显示无域名站点（${sysCount}）</label>`:''}
+    <span class="text-muted" style="font-size:12px">已允许 <b id="cert-sel-count">0</b> 个站点</span>
+   </div></div>
   <table><thead><tr><th>类型</th><th>站点</th><th>域名</th><th>SSL</th><th>现有证书</th><th>允许自动部署</th></tr></thead><tbody>${rows}</tbody></table>
  </div>
  <details class="glass-card card" style="padding:16px">
@@ -2592,6 +2599,20 @@ async function certToggleSite(cb){
 }
 function certSyncSel(){
  const el=$('cert-sel-count');if(el)el.textContent=String(certSel.size);
+}
+/* 无域名站点（宝塔 0.default.conf / phpfpm_status 等）默认隐藏，可临时显示用于诊断 */
+function certToggleSystem(cb){
+ certShowSystem=!!(cb&&cb.checked);
+ const el=$('panel-cert');
+ if(el)el.innerHTML=certShellHtml(certData||{});
+ certSyncSel();
+}
+/* Unix 秒 → YYYY-MM-DD（与平台证书库的 UTC 口径一致） */
+function certDate(ts){
+ if(!ts)return '—';
+ const d=new Date(Number(ts)*1000);
+ const p=n=>String(n).padStart(2,'0');
+ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate());
 }
 function certReadFile(input,target){
  const f=input.files&&input.files[0];if(!f)return;

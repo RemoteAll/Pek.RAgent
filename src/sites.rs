@@ -8,6 +8,8 @@
 //! 值区间，供部署时精确改写（不重排整份配置、不丢注释）。
 
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -87,6 +89,9 @@ pub struct SiteView {
     /// 命中的白名单规则原文（空 = 未命中）——面板用它解释“为什么已托管”，
     /// 例如 `*.example.com`（通配符命中）或站点 key（精确命中）。
     pub managed_by: String,
+    /// 系统/占位站点（无域名或仅回环）：如宝塔 `0.default.conf`、`phpfpm_status.conf`，
+    /// 永远无法匹配证书，默认不展示、不上报心跳（避免噪音）。
+    pub system: bool,
     /// 配置文件路径（nginx）
     pub file: String,
     /// 备注（无法读取证书的原因等）
@@ -109,6 +114,7 @@ impl SiteInventory {
         let sites: Vec<serde_json::Value> = self
             .sites
             .iter()
+            .filter(|s| !s.system)
             .map(|s| {
                 serde_json::json!({
                     "key": s.key,
@@ -122,6 +128,23 @@ impl SiteInventory {
             .collect();
         serde_json::json!({ "web": self.web, "sites": sites })
     }
+}
+
+/// 系统/占位站点判定：没有域名，或域名全是回环（宝塔 `0.default.conf`、
+/// `phpfpm_status.conf`、IIS 无绑定的默认站点等）——永远匹配不到证书，属于噪音。
+pub fn is_system_site(domains: &[String]) -> bool {
+    if domains.is_empty() {
+        return true;
+    }
+    domains.iter().all(|d| {
+        let d = d.trim().to_ascii_lowercase();
+        d.is_empty()
+            || d == "_"
+            || d == "localhost"
+            || d == "127.0.0.1"
+            || d == "::1"
+            || d == "[::1]"
+    })
 }
 
 /// 盘点本机站点（只读；`base` 用于解析相对证书路径与备份目录）。
@@ -145,10 +168,105 @@ pub fn inventory(cfg: &AgentConfig, base: &Path) -> SiteInventory {
     SiteInventory { web, sites }
 }
 
-/// 站点摘要（心跳上报，控制体积）。
-pub fn summary(cfg: &AgentConfig, base: &Path) -> serde_json::Value {
+// ———————————————— 盘点缓存（心跳用） ————————————————
+
+/// 缓存兜底时长：配置一直不变时也不会无限期复用（证书到期天数等随时间变化）。
+const CACHE_TTL: Duration = Duration::from_secs(300);
+
+struct Cached {
+    sig: String,
+    at: Instant,
+    inv: SiteInventory,
+}
+
+fn cache() -> &'static Mutex<Option<Cached>> {
+    static C: OnceLock<Mutex<Option<Cached>>> = OnceLock::new();
+    C.get_or_init(|| Mutex::new(None))
+}
+
+/// 盘点签名：只看文件元数据（长度 + mtime，不读内容）+ 白名单与目录配置。
+///
+/// 只要站点配置、白名单、nginx 目录任一变化，签名就变 → 心跳立即重新盘点；
+/// 完全没变时心跳只做几十次 `metadata()`（亚毫秒级），不再每 60 秒全量读盘解析证书。
+fn inventory_signature(cfg: &AgentConfig) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    cfg.cert_managed_sites.hash(&mut h);
+    cfg.cert_nginx_dirs.hash(&mut h);
+    cfg.cert_nginx_bin.hash(&mut h);
+    let stamp = |p: &Path, h: &mut std::collections::hash_map::DefaultHasher| {
+        p.to_string_lossy().hash(h);
+        if let Ok(m) = std::fs::metadata(p) {
+            m.len().hash(h);
+            if let Ok(t) = m.modified()
+                && let Ok(d) = t.duration_since(std::time::UNIX_EPOCH)
+            {
+                d.as_secs().hash(h);
+                d.subsec_nanos().hash(h);
+            }
+        }
+    };
+    for p in nginx_config_paths(cfg) {
+        stamp(&p, &mut h);
+    }
+    #[cfg(windows)]
+    for p in iis_config_paths() {
+        stamp(&p, &mut h);
+    }
+    format!("{:x}", h.finish())
+}
+
+/// IIS 主配置路径（站点变更会改这两个文件的 mtime）。
+#[cfg(windows)]
+fn iis_config_paths() -> Vec<PathBuf> {
+    let root = std::env::var_os("windir")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let dir = root.join("System32").join("inetsrv").join("config");
+    vec![
+        dir.join("applicationHost.config"),
+        dir.join("redirection.config"),
+    ]
+}
+
+/// 带缓存的盘点（**心跳专用**）：配置与白名单都没变则复用上次结果。
+///
+/// 返回 `(盘点结果, 是否重新盘点)`——第二个值用于心跳**只在变化时携带站点摘要**，
+/// 避免每 60 秒重复上传几 KB 的站点清单（省带宽；平台侧保留上一次的值）。
+/// 面板 `/star/sites`、平台 `siteScan` 仍走实时 `inventory()`。
+pub fn inventory_cached(cfg: &AgentConfig, base: &Path) -> (SiteInventory, bool) {
+    let sig = inventory_signature(cfg);
+    {
+        let guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(c) = guard.as_ref()
+            && c.sig == sig
+            && c.at.elapsed() < CACHE_TTL
+        {
+            return (c.inv.clone(), false);
+        }
+    }
     let inv = inventory(cfg, base);
-    inv.summary()
+    let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = Some(Cached {
+        sig,
+        at: Instant::now(),
+        inv: inv.clone(),
+    });
+    (inv, true)
+}
+
+/// 清空盘点缓存（白名单/目录等配置变更后调用，保证下一次心跳立即反映）。
+pub fn invalidate_cache() {
+    let mut guard = cache().lock().unwrap_or_else(|e| e.into_inner());
+    *guard = None;
+}
+
+/// 心跳用的站点摘要：`(摘要, 是否需要上报)`。
+///
+/// `None` 表示本轮配置没有变化，心跳不必携带 `sites` 字段（平台保留旧值）。
+pub fn summary_cached(cfg: &AgentConfig, base: &Path) -> (serde_json::Value, bool) {
+    let (inv, fresh) = inventory_cached(cfg, base);
+    (inv.summary(), fresh)
 }
 
 // ———————————————— nginx ————————————————
@@ -405,8 +523,8 @@ pub fn parse_nginx_servers(text: &str) -> Vec<NginxServer> {
     out
 }
 
-/// 收集本机 nginx 站点配置（去重、限大小；`CertNginxDirs` 追加自定义目录）。
-pub fn nginx_config_files(cfg: &AgentConfig) -> Vec<(PathBuf, String)> {
+/// 收集本机 nginx 站点配置路径（去重、不读内容；缓存签名用它）。
+pub fn nginx_config_paths(cfg: &AgentConfig) -> Vec<PathBuf> {
     let mut dirs: Vec<String> = NGINX_DIRS.iter().map(|s| s.to_string()).collect();
     for raw in cfg
         .cert_nginx_dirs
@@ -457,6 +575,11 @@ pub fn nginx_config_files(cfg: &AgentConfig) -> Vec<(PathBuf, String)> {
     files.sort();
     files.dedup();
     files
+}
+
+/// 收集本机 nginx 站点配置（去重、限大小；`CertNginxDirs` 追加自定义目录）。
+pub fn nginx_config_files(cfg: &AgentConfig) -> Vec<(PathBuf, String)> {
+    nginx_config_paths(cfg)
         .into_iter()
         .filter_map(|p| {
             let meta = std::fs::metadata(&p).ok()?;
@@ -490,6 +613,7 @@ fn nginx_sites(cfg: &AgentConfig, base: &Path, now: i64) -> Vec<SiteView> {
             };
             let managed_by = managed_rule(&cfg.cert_managed_sites, &key, &file_text, &domains);
             let managed = managed_by.is_some();
+            let system = is_system_site(&domains);
             out.push(SiteView {
                 key,
                 kind: "nginx".to_string(),
@@ -501,6 +625,7 @@ fn nginx_sites(cfg: &AgentConfig, base: &Path, now: i64) -> Vec<SiteView> {
                 cert,
                 managed,
                 managed_by: managed_by.unwrap_or_default(),
+                system,
                 file: file_text.clone(),
                 note,
             });
@@ -681,6 +806,7 @@ fn iis_sites(cfg: &AgentConfig) -> Vec<SiteView> {
         let key = format!("iis:{name}");
         let managed_by = managed_rule(&cfg.cert_managed_sites, &key, &file_text, &domains);
         let managed = managed_by.is_some();
+        let system = is_system_site(&domains);
         out.push(SiteView {
             key,
             kind: "iis".to_string(),
@@ -692,6 +818,7 @@ fn iis_sites(cfg: &AgentConfig) -> Vec<SiteView> {
             cert: None,
             managed,
             managed_by: managed_by.unwrap_or_default(),
+            system,
             file: file_text.clone(),
             note: if ssl {
                 String::new()
@@ -817,6 +944,52 @@ server {
             Some("*.example.com")
         );
         assert_eq!(managed_rule("", "k", "/f", &domains), None);
+    }
+
+    /// 心跳盘点缓存：配置/白名单没变就复用；任一处变化必须立即重新盘点。
+    #[test]
+    fn inventory_cache_invalidates_on_change() {
+        let dir = std::env::temp_dir().join(format!("ragent-sites-cache-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let base = dir.clone();
+        let mut cfg = AgentConfig {
+            cert_nginx_dirs: dir.to_string_lossy().to_string(),
+            ..AgentConfig::default()
+        };
+
+        std::fs::write(
+            dir.join("a.conf"),
+            "server {\n    listen 80;\n    server_name a.example.com;\n}\n",
+        )
+        .unwrap();
+        let (inv1, fresh1) = inventory_cached(&cfg, &base);
+        assert!(fresh1, "首次必定重新盘点");
+        assert_eq!(inv1.sites.len(), 1);
+        assert!(!inv1.sites[0].managed);
+        // 没有任何变化 → 命中缓存（结果一致，且标记为「无需上报」）
+        let (inv_same, fresh_same) = inventory_cached(&cfg, &base);
+        assert_eq!(inv_same.sites.len(), 1);
+        assert!(!fresh_same, "无变化时心跳不应重复上报站点清单");
+
+        // 白名单变化 → 立即反映（不必等 TTL）
+        cfg.cert_managed_sites = "*.example.com".to_string();
+        let (inv2, fresh2) = inventory_cached(&cfg, &base);
+        assert!(fresh2);
+        assert!(inv2.sites[0].managed, "{:?}", inv2.sites[0]);
+
+        // 新增站点文件 → 立即反映
+        std::fs::write(
+            dir.join("b.conf"),
+            "server {\n    listen 80;\n    server_name b.example.com;\n}\n",
+        )
+        .unwrap();
+        let (inv3, fresh3) = inventory_cached(&cfg, &base);
+        assert!(fresh3);
+        assert_eq!(inv3.sites.len(), 2);
+
+        invalidate_cache();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

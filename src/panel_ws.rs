@@ -580,9 +580,10 @@ fn build_heartbeat(manager: &AppManager) -> String {
     let running = services.iter().filter(|(_, s)| s.running).count();
     let uptime = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let pid = std::process::id();
-    let site_summary = {
+    let (site_summary, sites_changed) = {
         let base = crate::util::base_dir();
-        crate::sites::summary(&manager.config(), &base)
+        // 带缓存：配置/白名单未变时只做元数据比对，且**不重复上传站点清单**（只置 sites:null）
+        crate::sites::summary_cached(&manager.config(), &base)
     };
     with_panel_meta(
         manager,
@@ -599,7 +600,8 @@ fn build_heartbeat(manager: &AppManager) -> String {
             "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
             "servicesRunning": running,
             "servicesTotal": services.len(),
-            "sites": site_summary,
+            // 仅在站点/白名单变化时携带清单（平台侧 null = 保留旧值），省带宽
+            "sites": if sites_changed { site_summary } else { serde_json::Value::Null },
         }),
     )
 }
