@@ -74,3 +74,11 @@ lto = "thin"
 strip = true
 # 启用增量编译：重打包时只重编改动部分（缓存位于 target/*/release/incremental）
 incremental = true
+
+# 本地快速构建（继承 release，关闭 LTO、提高并行）：cargo build --profile fast
+# 只用于日常调测，不作为交付物（交付走 scripts/build-release.ps1）
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
+incremental = true
