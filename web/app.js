@@ -2914,7 +2914,7 @@ async function aiSend(){
 /* ── 在线终端（真 PTY + xterm.js；WebSocket 流式，单区域、光标闪烁、命令回显） ── */
 let termSid=sessionStorage.getItem('term_sid')||'';
 if(!termSid){termSid=('t'+Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)).slice(0,40);sessionStorage.setItem('term_sid',termSid)}
-let termInst=null,termFit=null,termWs=null,termReconnectTimer=null;
+let termInst=null,termFit=null,termWs=null,termReconnectTimer=null,termBannerText=null,termBannerTimer=null,termBannerShown=false;
 
 // 资源按需加载（xterm.js 仅在进入终端页时拉取）
 function termEnsureAssets(cb){
@@ -2941,7 +2941,7 @@ function loadTerminal(){
  </div>`;
  termEnsureAssets(()=>termInit());
 }
-function termInit(){
+async function termInit(){
  const box=$('term-box');if(!box)return;
  if(!termInst){
   termInst=new Terminal({cursorBlink:true,fontSize:13,fontFamily:'Consolas,"Cascadia Mono",Menlo,"Courier New",monospace',theme:{background:'#0b1220',foreground:'#cbd5e1',cursor:'#60a5fa',selectionBackground:'#334155'},scrollback:5000});
@@ -2951,6 +2951,10 @@ function termInit(){
  }
  if(termInst.element){box.appendChild(termInst.element)}else{termInst.open(box)}
  try{termFit&&termFit.fit()}catch(e){}
+ // 新连接前先取「服务器概况」（失败不阻断：直接连终端）
+ if(!termBannerText){
+  try{const j=await api('/star/termBanner');if(j&&j.code===0&&j.data&&j.data.text)termBannerText=j.data.text}catch(e){}
+ }
  // 已有活连接（面板未离开过）则不重连，避免重复回放；仅同步状态文字
  if(termWs&&termWs.readyState===1){termSetState('已连接','ok');termInst.focus();return}
  termConnect();
@@ -2965,15 +2969,23 @@ function termConnect(){
  if(token)url+='&token='+encodeURIComponent(token);
  let ws;try{ws=new WebSocket(url)}catch(e){termSetState('连接失败','err');return}
  termWs=ws;
- ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');if(termInst){try{termInst.reset()}catch(e){}}try{termFit&&termFit.fit()}catch(e){}};
- ws.onmessage=ev=>{if(termInst&&typeof ev.data==='string')termInst.write(ev.data)};
+ ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');termBannerShown=false;try{termFit&&termFit.fit()}catch(e){}termScheduleBanner(700)};
+ ws.onmessage=ev=>{if(termInst&&typeof ev.data==='string'){termInst.write(ev.data);if(!termBannerShown)termScheduleBanner(450)}};
  ws.onclose=()=>{if(termWs!==ws)return;termWs=null;termSetState('已断开（3 秒后自动重连）','err');termReconnectTimer=setTimeout(()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active'))termConnect()},3000)};
  ws.onerror=()=>{};
 }
 function termSetState(text,kind){const el=$('term-state');if(el){el.textContent=text;el.className='term-state '+(kind||'')}}
+/* 服务器概况在「PTY 初始输出静默」后写入：ConPTY 启动会发清屏序列，早写会被擦掉 */
+function termScheduleBanner(ms){
+ clearTimeout(termBannerTimer);
+ termBannerTimer=setTimeout(()=>{
+  if(termBannerShown||!termBannerText||!termInst)return;
+  termBannerShown=true;
+  try{termInst.write(termBannerText)}catch(e){}
+ }, ms||500);
+}
 async function termReset(){
  try{await api('/star/termReset',{method:'POST',body:JSON.stringify({sid:termSid})})}catch(e){}
- if(termInst){try{termInst.reset()}catch(e){}}
  termConnect();
 }
 window.addEventListener('resize',()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active')&&termFit){try{termFit.fit()}catch(e){}}});

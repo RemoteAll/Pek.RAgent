@@ -22,7 +22,7 @@ use dhrust::net::panel_auth::client_ip;
 use dhrust::net::router::Ctx;
 use dhrust::net::ws::{WsServerConn, WsServerHooks, WsServerMessage};
 use dhrust::term::{valid_sid, TermOptions, Terminal};
-use serde_json::Value as Json;
+use serde_json::{json, Value as Json};
 
 use crate::audit;
 use crate::util;
@@ -41,6 +41,141 @@ fn engine(base: &std::path::Path) -> &'static Arc<Terminal> {
 }
 
 // ————— WebSocket 入口（server.rs 原始路由；认证在本函数内完成） —————
+
+/// 新会话进入终端时的「服务器概况」（相当于登录 MOTD）。
+///
+/// 只在新会话生成一次（重连回放不重复）；数据从本机采集，**不往 shell 注入命令**，
+/// 因此 Linux 的 bash 与 Windows 的 PowerShell/cmd 表现一致，也不污染命令历史。
+fn server_banner(manager: &crate::manager::AppManager) -> String {
+    const NL: &str = "\r\n";
+    const DIM: &str = "\x1b[90m";
+    const CYAN: &str = "\x1b[36m";
+    const RESET: &str = "\x1b[0m";
+
+    let mut s = String::new();
+    s.push_str(NL);
+    s.push_str(&format!("{CYAN}━━━ Pek.RAgent 在线终端 ━━━{RESET}{NL}"));
+    s.push_str(&format!(
+        "{DIM}主机{RESET}   {}{NL}{DIM}系统{RESET}   {} · {}{NL}",
+        dhrust::sys::machine::hostname(),
+        dhrust::sys::machine::os_description(),
+        std::env::consts::ARCH
+    ));
+
+    // CPU：不用请求差分口径（首次要 200ms 双采样），只报核数/型号/负载
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    let mut cpu = format!("{cores} 核");
+    if let Some(model) = dhrust::sys::machine::cpu_model()
+        && !model.is_empty()
+    {
+        cpu.push_str(&format!(" · {model}"));
+    }
+    if let Some((l1, l5, l15)) = dhrust::sys::monitor::load_average() {
+        cpu.push_str(&format!(" · 负载 {l1:.2}/{l5:.2}/{l15:.2}"));
+    }
+    s.push_str(&format!("{DIM}CPU{RESET}    {cpu}{NL}"));
+
+    if let Some((total, avail)) = dhrust::sys::machine::memory_info() {
+        let used = total.saturating_sub(avail);
+        let pct = used.checked_mul(100).and_then(|v| v.checked_div(total)).unwrap_or(0);
+        s.push_str(&format!(
+            "{DIM}内存{RESET}   {} / {}（{pct}%）{NL}",
+            dhrust::web::format_bytes(used),
+            dhrust::web::format_bytes(total)
+        ));
+    }
+
+    let disks: Vec<String> = dhrust::sys::machine::disks()
+        .into_iter()
+        .filter(|d| d.total > 0)
+        .take(3)
+        .map(|d| {
+            let used = d.total.saturating_sub(d.free);
+            let pct = used.checked_mul(100).and_then(|v| v.checked_div(d.total)).unwrap_or(0);
+            format!(
+                "{} {} / {}（{pct}%）",
+                d.name,
+                dhrust::web::format_bytes(used),
+                dhrust::web::format_bytes(d.total)
+            )
+        })
+        .collect();
+    if !disks.is_empty() {
+        s.push_str(&format!("{DIM}磁盘{RESET}   {}{NL}", disks.join("  ·  ")));
+    }
+
+    if let Some(iface) = dhrust::sys::machine::network_interfaces()
+        .into_iter()
+        .find(|i| i.up && !i.ips.is_empty())
+    {
+        s.push_str(&format!(
+            "{DIM}网络{RESET}   {} {}{NL}",
+            iface.name,
+            iface.ips.join(", ")
+        ));
+    }
+
+    // Web 服务器与站点数（复用缓存盘点：无变化时零磁盘读取）
+    let (inv, _) = crate::sites::inventory_cached(&manager.config(), manager.base());
+    let nginx = inv
+        .sites
+        .iter()
+        .filter(|x| x.kind == "nginx" && !x.system)
+        .count();
+    let iis = inv
+        .sites
+        .iter()
+        .filter(|x| x.kind == "iis" && !x.system)
+        .count();
+    let mut web: Vec<String> = Vec::new();
+    if nginx > 0 || inv.web.iter().any(|w| w == "nginx") {
+        web.push(format!("nginx（{nginx} 个站点）"));
+    }
+    if iis > 0 || inv.web.iter().any(|w| w == "iis") {
+        web.push(format!("IIS（{iis} 个站点）"));
+    }
+    if web.is_empty() {
+        web.push(if cfg!(windows) {
+            "未检测到 IIS".to_string()
+        } else {
+            "未检测到 nginx".to_string()
+        });
+    }
+    s.push_str(&format!("{DIM}Web{RESET}    {}{NL}", web.join(" · ")));
+
+    let list = manager.list();
+    let running = list.iter().filter(|(_, st)| st.running).count();
+    let mins = dhrust::sys::process::uptime().as_secs() / 60;
+    let uptime = if mins >= 60 {
+        format!("{}h{}m", mins / 60, mins % 60)
+    } else {
+        format!("{mins}m")
+    };
+    s.push_str(&format!(
+        "{DIM}代理{RESET}   Pek.RAgent v{} · 已运行 {uptime} · 子服务 {running}/{} · {}{NL}",
+        env!("CARGO_PKG_VERSION"),
+        list.len(),
+        if cfg!(windows) { "Windows" } else { "Linux" }
+    ));
+    s.push_str(&format!(
+        "{DIM}提示{RESET}   真 PTY 会话，可直接使用 vim/top 等交互程序；空闲 30 分钟自动回收，刷新页面可恢复最近输出。{NL}{NL}"
+    ));
+    s
+}
+
+/// `GET /star/termBanner`：服务器概况文本（前端在终端清屏后写入，相当于登录 MOTD）。
+///
+/// 数据全部本机采集、**不往 shell 注入命令**，Linux 的 bash 与 Windows 的 PowerShell/cmd
+/// 表现一致，也不污染命令历史。
+pub fn term_banner(panel: &WebPanel, _ctx: &Ctx) -> ActionResult {
+    json_result(
+        0,
+        "",
+        Some(json!({ "text": server_banner(panel.manager.as_ref()) })),
+    )
+}
 
 /// `GET /star/termWs`：WebSocket 升级（真 PTY 会话；认证支持查询参数 `token=` 回退）。
 pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
@@ -83,6 +218,8 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
             &[&principal.name, &cols.to_string(), &rows.to_string()],
         );
     }
+    // 新会话才生成「服务器概况」（重连不重复采集）——由前端清屏后写入，不与 PTY 输出交错
+    let _ = existed;
 
     // 审计：打开终端会话（有意不记录击键内容）
     audit::record(

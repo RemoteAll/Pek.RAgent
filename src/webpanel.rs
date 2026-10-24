@@ -954,6 +954,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         "termReset",
         guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_reset),
     );
+    controller = controller.get(
+        "termBanner",
+        guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_banner),
+    );
 
     // 网站证书（站点盘点 + 演练/部署；仅白名单站点可写）
     controller = controller.get("sites", guarded(panel.clone(), PERM_CERT, sites_info));
