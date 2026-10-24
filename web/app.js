@@ -221,6 +221,7 @@ function switchPanel(name){
   logs:loadLogs,
   database:loadDatabase,
   fileman:loadFileman,
+  cert:loadCert,
   plugins:loadPlugins,
   ai:loadAi,
   terminal:loadTerminal,
@@ -2472,6 +2473,153 @@ async function fmReloadEditor(){
   el.value=j.data.content;
   showToast('已重新加载最新内容（'+fmtBytes(j.data.size)+'）','success');
  }catch(e){showToast('重新加载失败','error')}
+}
+
+/* ── 网站证书（站点盘点 + 本机演练/部署；仅白名单站点可写） ── */
+let certInv=null,certLast=null;
+const certSel=new Set();
+
+async function loadCert(){
+ try{
+  const j=await api('/star/sites');
+  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  const d=j.data||{};
+  certInv=d.inventory||{web:[],sites:[]};certLast=d.lastResult;
+  $('panel-cert').innerHTML=certShellHtml(d);
+  certSel.clear();
+  (certInv.sites||[]).forEach(s=>{if(s.managed&&(s.domains||[]).length)certSel.add(s.key)});
+  certSyncSel();
+ }catch(e){}
+}
+
+function certShellHtml(d){
+ const inv=certInv||{web:[],sites:[]};
+ let rows='';
+ for(const s of (inv.sites||[])){
+  const cert=s.cert
+   ?`<span style="color:${s.cert.expired?'var(--red)':'var(--green,#16a34a)'};font-weight:600">${s.cert.expired?'已过期':(s.cert.daysLeft+' 天')}</span><div class="text-muted" style="font-size:11px">${esc((s.cert.domains||[]).join(', '))}</div>`
+   :(s.note?`<span class="text-muted" style="font-size:11px">${esc(s.note)}</span>`:'—');
+  rows+=`<tr>
+   <td>${esc(s.kind)}</td>
+   <td><div style="font-weight:600">${esc(s.name)}</div><div class="text-muted" style="font:11px ui-monospace,Consolas,monospace;word-break:break-all">${esc(s.key)}</div>${s.file?`<div class="text-muted" style="font-size:11px;word-break:break-all">${esc(s.file)}</div>`:''}</td>
+   <td style="max-width:260px;white-space:normal">${esc((s.domains||[]).join(', ')||'—')}</td>
+   <td>${s.ssl?'✓':'—'}</td>
+   <td>${cert}</td>
+   <td>${s.managed?'<span style="color:var(--green,#16a34a)">允许</span>':'<span class="text-muted">只读</span>'}</td>
+   <td><input type="checkbox" data-cert-site="${escAttr(s.key)}" ${certSel.has(s.key)?'checked':''} ${(s.managed&&(s.domains||[]).length)?'':'disabled'} onchange="certToggleSite(this)"></td>
+  </tr>`;
+ }
+ if(!rows)rows='<tr><td colspan="7" class="text-muted">（未发现站点：nginx 配置目录不存在或为 Windows/IIS 未安装；可在下方补充 nginx 目录后刷新）</td></tr>';
+ const last=certLast
+  ?`<pre style="max-height:260px;overflow:auto;font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(certLast,null,2))}</pre>`
+  :'<div class="text-muted">（本次进程尚未执行过部署）</div>';
+ const web=(inv.web||[]).join(' + ')||'未检测到';
+ return `<div class="glass-card card">
+  <div class="flex-between mb-16"><h2>🔐 网站证书</h2>
+   <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn btn-secondary btn-sm" onclick="loadCert()">⟳ 重新盘点</button>
+   </div></div>
+  <div class="text-muted" style="font-size:13px">检测到的 Web 服务器：<b>${esc(web)}</b>。本页只<b>盘点</b>站点（只读）；真正部署会先备份、执行 <code>nginx -t</code> 校验、失败自动回滚。平台下发的证书任务也走同一套保护。<b>只有「白名单」内的站点允许写入</b>（空白 = 全部只读）。</div>
+ </div>
+ <div class="glass-card card">
+  <div class="flex-between mb-16"><h2 style="font-size:16px">🛡 托管白名单</h2><span class="text-muted" style="font-size:12px">站点 key / 配置文件路径 / 域名或通配符（*.example.com），逗号或分号分隔</span></div>
+  <div style="display:grid;gap:8px">
+   <label class="text-muted" style="font-size:12px">托管白名单（CertManagedSites）</label>
+   <textarea id="cert-managed" rows="2" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="例：nginx:/www/server/panel/vhost/nginx/a.conf#1; *.example.com">${esc(d.whitelist||'')}</textarea>
+   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div><label class="text-muted" style="font-size:12px">nginx 额外配置目录（CertNginxDirs，逗号分隔）</label><input id="cert-nginxdirs" value="${escAttr(d.nginxDirs||'')}" style="width:100%"></div>
+    <div><label class="text-muted" style="font-size:12px">nginx 可执行文件（CertNginxBin，留空 = PATH）</label><input id="cert-nginxbin" value="${escAttr(d.nginxBin||'')}" placeholder="/www/server/nginx/sbin/nginx" style="width:100%"></div>
+   </div>
+   <div><button class="btn btn-primary btn-sm" onclick="certSaveSettings()">💾 保存设置</button></div>
+  </div>
+ </div>
+ <div class="glass-card card" style="overflow-x:auto">
+  <div class="flex-between mb-16"><h2 style="font-size:16px">🌐 站点盘点</h2><span class="text-muted" style="font-size:12px">已选 <b id="cert-sel-count">0</b> 个站点</span></div>
+  <table><thead><tr><th>类型</th><th>站点</th><th>域名</th><th>SSL</th><th>现有证书</th><th>白名单</th><th>选择</th></tr></thead><tbody>${rows}</tbody></table>
+ </div>
+ <div class="glass-card card">
+  <div class="flex-between mb-16"><h2 style="font-size:16px">📤 本机演练 / 部署</h2><span class="text-muted" style="font-size:12px">平台下发也使用同一逻辑（节点主动拉取证书）</span></div>
+  <div style="display:grid;gap:8px">
+   <div><label class="text-muted" style="font-size:12px">证书链 PEM（粘贴或选择文件）</label>
+    <div style="display:flex;gap:8px;align-items:center"><input type="file" id="cert-pem-file" accept=".pem,.crt,.cer,.txt" onchange="certReadFile(this,'cert-pem')"><span class="text-muted" id="cert-pem-name" style="font-size:12px"></span></div>
+    <textarea id="cert-pem" rows="3" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+   <div><label class="text-muted" style="font-size:12px">私钥 PEM（nginx 必需）</label>
+    <div style="display:flex;gap:8px;align-items:center"><input type="file" id="cert-key-file" accept=".key,.pem,.txt" onchange="certReadFile(this,'cert-key')"><span class="text-muted" id="cert-key-name" style="font-size:12px"></span></div>
+    <textarea id="cert-key" rows="2" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select id="cert-action" style="width:300px">
+     <option value="auto">自动（有证书指令则替换，否则启用 HTTPS）</option>
+     <option value="replace">仅替换现有证书</option>
+     <option value="enable_https">启用 HTTPS（新增 443 监听）</option>
+    </select>
+    <button class="btn btn-secondary" onclick="certRun(true)">🔍 演练（不写文件）</button>
+    <button class="btn btn-primary" onclick="certRunConfirm()">📤 真实部署</button>
+   </div>
+   <pre id="cert-result" style="max-height:320px;overflow:auto;font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all"></pre>
+  </div>
+ </div>
+ <div class="glass-card card">
+  <h2 style="font-size:16px;margin-bottom:8px">📋 上次执行结果（Data/CertLastResult.json）</h2>
+  ${last}
+ </div>`;
+}
+
+function certToggleSite(cb){
+ const k=cb.dataset.certSite;
+ if(cb.checked)certSel.add(k);else certSel.delete(k);
+ certSyncSel();
+}
+function certSyncSel(){
+ const el=$('cert-sel-count');if(el)el.textContent=String(certSel.size);
+}
+function certReadFile(input,target){
+ const f=input.files&&input.files[0];if(!f)return;
+ const nameEl=$(target+'-name');if(nameEl)nameEl.textContent=f.name+'（'+(f.size/1024).toFixed(1)+' KB）';
+ const r=new FileReader();
+ r.onload=()=>{const el=$(target);if(el)el.value=String(r.result||'')};
+ r.readAsText(f);
+}
+async function certSaveSettings(){
+ const j=await api('/star/certConfig',{method:'POST',body:JSON.stringify({
+  managedSites:$('cert-managed').value,
+  nginxDirs:$('cert-nginxdirs').value,
+  nginxBin:$('cert-nginxbin').value
+ })});
+ showToast(j.code===0?(j.message||'已保存'):(j.message||'保存失败'), j.code===0?'success':'error');
+ if(j.code===0)await loadCert();
+}
+function certRunConfirm(){
+ const n=certSel.size;
+ if(!n)return showToast('请先勾选要部署的站点','error');
+ showModal('确认部署证书',
+  `<div style="font-size:13px;line-height:1.7">将向 <b>${n}</b> 个站点写入证书：<br>· nginx：改站点配置 → <code>nginx -t</code> → reload（失败自动回滚）<br>· IIS：导入证书 → 绑定<br>· 仅限白名单站点<br><br>确定要真实执行吗？（建议先用「演练」确认计划）</div>`,
+  '确认部署',()=>certRun(false));
+}
+async function certRun(dryRun){
+ const sites=[...certSel];
+ if(!sites.length)return showToast('请先勾选站点','error');
+ const certPem=($('cert-pem')?$('cert-pem').value:'').trim();
+ if(!certPem)return showToast('请粘贴或选择证书链 PEM','error');
+ const out=$('cert-result');if(out)out.textContent='执行中…';
+ const body={
+  certId:'local-'+Date.now().toString(36),
+  certName:'本地上传',
+  certPem,
+  keyPem:($('cert-key')?$('cert-key').value:'').trim(),
+  domains:[],
+  sites,
+  action:$('cert-action')?$('cert-action').value:'auto',
+  dryRun:!!dryRun
+ };
+ try{
+  const j=await api('/star/certDeploy',{method:'POST',body:JSON.stringify(body)});
+  if(j.code!==0){if(out)out.textContent='';showToast(j.message||'执行失败','error');return}
+  const r=j.data||{};
+  if(out)out.textContent=JSON.stringify(r,null,2);
+  showToast(r.ok?'已'+(dryRun?'演练':'部署')+'完成':'含失败项', r.ok?'success':'error');
+  await loadCert();
+  const o=$('cert-result');if(o&&r.items)o.textContent=JSON.stringify(r,null,2);
+ }catch(e){if(out)out.textContent='执行失败';}
 }
 
 /* ── 日志清理：已迁移为插件（🧩 插件 → 日志清理；后端接口 logCleanScan/logCleanRun/logCleanConfig 保留在核心） ── */

@@ -68,6 +68,14 @@
   <TrafficHistoryDays>90</TrafficHistoryDays>
   <!--日志清理自定义路径（高级选项，面板配置页不展示；仅直接编辑本文件时使用）。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
   <LogCleanupPaths></LogCleanupPaths>
+  <!--证书托管白名单（高级选项）。**留空 = 全部站点只读**：平台只能盘点与生成计划，不能写入任何文件。
+      需要平台自动部署证书时，把允许管理的站点填进来（逗号/分号分隔）：站点 key（如 nginx:/www/server/panel/vhost/nginx/a.conf#1、iis:站点名）、
+      nginx 配置文件路径，或域名/域名通配符（如 *.example.com）。建议先只加试验站点，确认无误再逐步扩大-->
+  <CertManagedSites></CertManagedSites>
+  <!--nginx 站点配置目录（高级选项，逗号分隔；追加在自动发现目录之后，如 /data/nginx/vhost）-->
+  <CertNginxDirs></CertNginxDirs>
+  <!--nginx 可执行文件（高级选项；留空 = PATH 中的 nginx。宝塔常为 /www/server/nginx/sbin/nginx）-->
+  <CertNginxBin></CertNginxBin>
   <!--在线插件源（catalog.json）地址。一般**留空即可**：接入平台后由平台自动下发（含签名公钥）；留空且未接入平台 = 关闭在线插件-->
   <PluginStoreUrl></PluginStoreUrl>
   <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。一般**留空即可**：接入平台后由平台自动下发；非空时强制校验 catalog.json.sig（防源被篡改）。自动升级发行源验签复用本公钥-->

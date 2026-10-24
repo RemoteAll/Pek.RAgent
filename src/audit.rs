@@ -40,6 +40,7 @@ pub(crate) const ALL_PERMISSIONS: &[(&str, &str)] = &[
     ("plugins", "插件"),
     ("ai", "AI 助手"),
     ("terminal", "在线终端"),
+    ("cert", "网站证书"),
     ("audit", "操作日志"),
 ];
 

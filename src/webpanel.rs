@@ -476,6 +476,8 @@ pub(crate) const PERM_PLUGINS: &str = "plugins";
 pub(crate) const PERM_AUDIT: &str = "audit";
 pub(crate) const PERM_AI: &str = "ai";
 pub(crate) const PERM_TERMINAL: &str = "terminal";
+/// 网站证书（站点盘点 + 证书部署）。
+pub(crate) const PERM_CERT: &str = "cert";
 /// 用户管理：仅内置管理员（不参与授权列表）。
 pub(crate) const PERM_USERS: &str = "users";
 
@@ -951,6 +953,17 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "termReset",
         guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_reset),
+    );
+
+    // 网站证书（站点盘点 + 演练/部署；仅白名单站点可写）
+    controller = controller.get("sites", guarded(panel.clone(), PERM_CERT, sites_info));
+    controller = controller.post(
+        "certDeploy",
+        guarded(panel.clone(), PERM_CERT, cert_deploy),
+    );
+    controller = controller.post(
+        "certConfig",
+        guarded(panel.clone(), PERM_CERT, cert_config),
     );
 
     controller.get(
@@ -2117,6 +2130,89 @@ fn dhdeploy_state_json(mode: &str, service: &str) -> Json {
 // ————— /star 动作 —————
 
 /// 子服务列表。
+/// `GET /star/sites`：站点与证书盘点（只读；本地诊断与平台「证书」页共用）。
+fn sites_info(panel: &WebPanel, _ctx: &Ctx) -> ActionResult {
+    let cfg = panel.manager.config();
+    let base = panel.manager.base();
+    let inv = crate::sites::inventory(&cfg, base);
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "inventory": inv,
+            "whitelist": cfg.cert_managed_sites,
+            "nginxDirs": cfg.cert_nginx_dirs,
+            "nginxBin": cfg.cert_nginx_bin,
+            "lastResult": crate::certdeploy::last_result(base),
+        })),
+    )
+}
+
+/// `POST /star/certDeploy`：本地面板直接演练/部署证书（不依赖平台）。
+///
+/// body 同 `certdeploy::DeployRequest`（certPem/keyPem/sites/action/dryRun…）；
+/// 仍受本机白名单 `CertManagedSites` 约束（空 = 拒绝写入），默认演练。
+fn cert_deploy(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let req: crate::certdeploy::DeployRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("请求格式错误：{e}")),
+    };
+    let base = panel.manager.base();
+    let result = crate::certdeploy::deploy(&panel.manager.config(), base, &req);
+    json_result(
+        0,
+        "",
+        Some(serde_json::to_value(result).unwrap_or_default()),
+    )
+}
+
+/// `POST /star/certConfig`：保存证书托管设置（白名单 / nginx 目录 / nginx 可执行文件）。
+///
+/// 只改这三个键（写盘后热生效），不影响其它配置；白名单为空 = 全部站点只读。
+fn cert_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let managed = body
+        .get("managedSites")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let dirs = body
+        .get("nginxDirs")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let bin = body
+        .get("nginxBin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if managed.len() > 2000 || dirs.len() > 1000 || bin.len() > 300 {
+        return json_error(400, "配置内容过长");
+    }
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = managed.clone();
+        cfg.cert_nginx_dirs = dirs.clone();
+        cfg.cert_nginx_bin = bin.clone();
+    });
+    crate::util::log_format(
+        "证书托管设置已保存（白名单：{}）",
+        &[&if managed.is_empty() {
+            "空（全部站点只读）".to_string()
+        } else {
+            managed.clone()
+        }],
+    );
+    json_result(0, "证书托管设置已保存", None)
+}
+
 fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -4254,7 +4350,11 @@ mod tests {
         assert!(!users.is_empty());
         assert_eq!(users[0]["userName"], "admin");
         assert_eq!(users[0]["isBuiltin"], true);
-        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 15);
+        assert_eq!(
+            users[0]["permissionNames"].as_array().unwrap().len(),
+            crate::audit::ALL_PERMISSIONS.len(),
+            "内置管理员应拥有全部菜单权限（含新增的证书页）"
+        );
 
         // 删除内置管理员被拒
         let j = body_json(user_delete(

@@ -89,6 +89,15 @@ pub struct AgentConfig {
     /// 日志清理自定义路径（分号分隔；目录=清空内容、文件=截断清空）。
     /// 供 Web 面板「日志清理」页在平台内置分类之外额外扫描/清理
     pub log_cleanup_paths: String,
+    /// 证书托管白名单（逗号/分号分隔；**空 = 全部站点只读**，不接受任何平台下发的写入）。
+    ///
+    /// 平台「证书」页只能对白名单内的站点执行安装/替换；支持：
+    /// 站点 key（`nginx:/path#1` / `iis:站点名`）、nginx 配置文件路径、域名或域名通配符（`*.example.com`）。
+    pub cert_managed_sites: String,
+    /// nginx 站点配置目录（逗号分隔，追加在自动发现目录之后；如 `/data/nginx/vhost`）
+    pub cert_nginx_dirs: String,
+    /// nginx 可执行文件（空 = `nginx`，即 PATH 查找；宝塔常为 `/www/server/nginx/sbin/nginx`）
+    pub cert_nginx_bin: String,
     /// 在线插件源地址（`catalog.json` URL；仅 https，127.0.0.1 例外）。空 = 关闭在线插件
     pub plugin_store_url: String,
     /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
@@ -157,6 +166,11 @@ impl Default for AgentConfig {
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
             log_cleanup_paths: String::new(),
+            // 证书托管：默认**空**（全部站点只读，平台只能盘点/生成计划，不能写入）——
+            // 生产环境先只读盘点，确认无误后再把试验站点加入白名单
+            cert_managed_sites: String::new(),
+            cert_nginx_dirs: String::new(),
+            cert_nginx_bin: String::new(),
             plugin_store_url: String::new(),
             plugin_store_pubkey: String::new(),
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
@@ -658,6 +672,15 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "LogCleanupPaths") {
         cfg.log_cleanup_paths = v;
     }
+    if let Some(v) = text_of(obj, "CertManagedSites") {
+        cfg.cert_managed_sites = v;
+    }
+    if let Some(v) = text_of(obj, "CertNginxDirs") {
+        cfg.cert_nginx_dirs = v;
+    }
+    if let Some(v) = text_of(obj, "CertNginxBin") {
+        cfg.cert_nginx_bin = v;
+    }
     if let Some(v) = text_of(obj, "PluginStoreUrl") {
         cfg.plugin_store_url = v;
     }
@@ -820,6 +843,9 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
         push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
+        push("CertManagedSites", cfg.cert_managed_sites.clone());
+        push("CertNginxDirs", cfg.cert_nginx_dirs.clone());
+        push("CertNginxBin", cfg.cert_nginx_bin.clone());
         push("PluginStoreUrl", cfg.plugin_store_url.clone());
         push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
         push("AutoUpgradeUrl", cfg.auto_upgrade_url.clone());

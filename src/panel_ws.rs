@@ -34,6 +34,9 @@ pub fn connected() -> bool {
     CONNECTED.load(Ordering::Relaxed)
 }
 
+/// 证书部署串行锁（同一时刻只允许一个任务改配置）。
+static DEPLOY_BUSY: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
 /// 是否启用（升级源地址非空，且「有令牌」或「开配对」）。
 pub fn enabled(cfg: &AgentConfig) -> bool {
     !cfg.auto_upgrade_url.trim().is_empty()
@@ -209,6 +212,25 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
             *cur = Some(client.clone());
         }
         let _ = client.send_text(build_register(&reg_mgr));
+        // 上线后主动盘点一次站点（平台可能先于心跳建好节点卡片）
+        {
+            let mgr = reg_mgr.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_secs(2));
+                let base = crate::util::base_dir();
+                let inv = crate::sites::inventory(&mgr.config(), &base);
+                let agent_id = mgr.config().agent_id;
+                send_event(
+                    &agent_id,
+                    json!({
+                        "type": "siteInventory",
+                        "web": inv.web,
+                        "sites": inv.sites,
+                        "deploy": crate::certdeploy::last_result(&base),
+                    }),
+                );
+            });
+        }
     });
     let msg_mgr = manager.clone();
     let on_message = Arc::new(move |msg: WsMessage| {
@@ -238,6 +260,93 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
             "storeConfig" => apply_store_config(&msg_mgr, &v),
             "tokenIssue" => apply_node_token(&msg_mgr, &v),
             "reboot" => reboot_once(&msg_mgr),
+            // 平台盘点本机站点（只读；用于「证书」页匹配域名与生成计划）
+            "siteScan" => {
+                let mgr = msg_mgr.clone();
+                std::thread::spawn(move || {
+                    let base = crate::util::base_dir();
+                    let inv = crate::sites::inventory(&mgr.config(), &base);
+                    let agent_id = mgr.config().agent_id;
+                    send_event(
+                        &agent_id,
+                        json!({
+                            "type": "siteInventory",
+                            "web": inv.web,
+                            "sites": inv.sites,
+                            "deploy": crate::certdeploy::last_result(&base),
+                        }),
+                    );
+                });
+            }
+            // 平台下发证书任务（`certFetch`：只带票据 URL；节点**主动拉取**并在本地匹配站点）
+            "certFetch" => {
+                let mgr = msg_mgr.clone();
+                let payload = v.clone();
+                std::thread::spawn(move || {
+                    let agent_id = mgr.config().agent_id;
+                    {
+                        // 串行化：同一时刻只跑一个部署（避免两个任务改同一份配置）
+                        let mut lock = DEPLOY_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+                        if *lock {
+                            send_event(
+                                &agent_id,
+                                json!({"type": "certResult", "result": {
+                                    "certId": payload.get("certId").cloned().unwrap_or(json!("")),
+                                    "dryRun": payload.get("dryRun").cloned().unwrap_or(json!(true)),
+                                    "ok": false,
+                                    "items": [],
+                                    "message": "节点正在执行另一个证书任务，请稍后重试"
+                                }}),
+                            );
+                            return;
+                        }
+                        *lock = true;
+                    }
+                    let req: crate::certdeploy::FetchRequest =
+                        match serde_json::from_value(payload) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                send_event(
+                                    &agent_id,
+                                    json!({"type": "certResult", "result": {
+                                        "certId": "", "dryRun": true, "ok": false, "items": [],
+                                        "message": format!("证书任务参数无效：{e}")
+                                    }}),
+                                );
+                                if let Ok(mut l) = DEPLOY_BUSY.lock() {
+                                    *l = false;
+                                }
+                                return;
+                            }
+                        };
+                    util::log_format(
+                        "平台下发证书任务：{}（{}，目标：{}）",
+                        &[
+                            if req.cert_name.is_empty() {
+                                &req.cert_id
+                            } else {
+                                &req.cert_name
+                            },
+                            if req.dry_run { "演练" } else { "执行" },
+                            if req.sites.is_empty() {
+                                "本地匹配白名单站点"
+                            } else {
+                                "平台指定站点"
+                            },
+                        ],
+                    );
+                    let base = crate::util::base_dir();
+                    let result = crate::certdeploy::fetch_and_deploy(&mgr.config(), &base, &req);
+                    if let Ok(mut l) = DEPLOY_BUSY.lock() {
+                        *l = false;
+                    }
+                    util::log_format(
+                        "证书任务完成：{}（{}）",
+                        &[&result.message, if result.ok { "全部成功" } else { "含失败项" }],
+                    );
+                    send_event(&agent_id, json!({"type": "certResult", "result": result}));
+                });
+            }
             "checkUpgrade" => {
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
@@ -471,6 +580,10 @@ fn build_heartbeat(manager: &AppManager) -> String {
     let running = services.iter().filter(|(_, s)| s.running).count();
     let uptime = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let pid = std::process::id();
+    let site_summary = {
+        let base = crate::util::base_dir();
+        crate::sites::summary(&manager.config(), &base)
+    };
     with_panel_meta(
         manager,
         json!({
@@ -486,6 +599,7 @@ fn build_heartbeat(manager: &AppManager) -> String {
             "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
             "servicesRunning": running,
             "servicesTotal": services.len(),
+            "sites": site_summary,
         }),
     )
 }
