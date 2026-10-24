@@ -19,6 +19,7 @@ use crate::config::AgentConfig;
 use crate::sites::{self, NginxServer};
 
 /// IIS 证书绑定的固定 appid（http.sys 要求 GUID；与站点/证书无关即可）。
+#[cfg_attr(not(windows), allow(dead_code))]
 const IIS_APPID: &str = "{e2b3a4c5-6d7e-4f80-9a1b-2c3d4e5f6071}";
 
 /// 部署请求（平台 → Agent，JSON）。
