@@ -2485,9 +2485,10 @@ async function loadCert(){
   if(j.code!==0){showToast(j.message||'加载失败','error');return}
   const d=j.data||{};
   certInv=d.inventory||{web:[],sites:[]};certLast=d.lastResult;
-  $('panel-cert').innerHTML=certShellHtml(d);
+  // 先算好默认勾选集合再渲染（否则已托管站点渲染成未勾选、计数却是 N）
   certSel.clear();
   (certInv.sites||[]).forEach(s=>{if(s.managed&&(s.domains||[]).length)certSel.add(s.key)});
+  $('panel-cert').innerHTML=certShellHtml(d);
   certSyncSel();
  }catch(e){}
 }
@@ -2505,8 +2506,8 @@ function certShellHtml(d){
    <td style="max-width:260px;white-space:normal">${esc((s.domains||[]).join(', ')||'—')}</td>
    <td>${s.ssl?'✓':'—'}</td>
    <td>${cert}</td>
-   <td>${s.managed?'<span style="color:var(--green,#16a34a)">允许</span>':'<span class="text-muted">只读</span>'}</td>
-   <td><input type="checkbox" data-cert-site="${escAttr(s.key)}" ${certSel.has(s.key)?'checked':''} ${(s.managed&&(s.domains||[]).length)?'':'disabled'} onchange="certToggleSite(this)"></td>
+   <td>${s.managed?'<span style="color:var(--green,#16a34a)">✅ 已托管</span>':`<span class="text-muted" title="不在托管白名单（CertManagedSites）内：本机面板与平台下发都不会写入该站点">未托管（只读）</span><div><button class="btn btn-secondary btn-sm" style="margin-top:4px" onclick="certAllowSite(this)" data-cert-key="${escAttr(s.key)}">➕ 加入白名单</button></div>`}</td>
+   <td><input type="checkbox" data-cert-site="${escAttr(s.key)}" ${certSel.has(s.key)?'checked':''} ${(s.managed&&(s.domains||[]).length)?'':'disabled'} title="${(s.managed&&(s.domains||[]).length)?'勾选后参与本机演练/部署':(s.managed?'该站点没有域名，无法匹配证书':'未托管：先点左侧「➕ 加入白名单」')}" onchange="certToggleSite(this)"></td>
   </tr>`;
  }
  if(!rows)rows='<tr><td colspan="7" class="text-muted">（未发现站点：nginx 配置目录不存在或为 Windows/IIS 未安装；可在下方补充 nginx 目录后刷新）</td></tr>';
@@ -2519,10 +2520,10 @@ function certShellHtml(d){
    <div style="display:flex;gap:8px;align-items:center">
     <button class="btn btn-secondary btn-sm" onclick="loadCert()">⟳ 重新盘点</button>
    </div></div>
-  <div class="text-muted" style="font-size:13px">检测到的 Web 服务器：<b>${esc(web)}</b>。本页只<b>盘点</b>站点（只读）；真正部署会先备份、执行 <code>nginx -t</code> 校验、失败自动回滚。平台下发的证书任务也走同一套保护。<b>只有「白名单」内的站点允许写入</b>（空白 = 全部只读）。</div>
+  <div class="text-muted" style="font-size:13px">检测到的 Web 服务器：<b>${esc(web)}</b>。本页只<b>盘点</b>站点；真正部署会先备份、执行 <code>nginx -t</code> 校验、失败自动回滚，平台下发的任务也走同一套保护。<b>只有「托管白名单」内的站点允许写入</b>——白名单为<b>空</b>时所有站点一律只读（这是安全默认，防止误改生产站点）。要给某个站点部署证书，点该行「<b>➕ 加入白名单</b>」即可（只加这一条，不影响其它站点）。</div>
  </div>
  <div class="glass-card card">
-  <div class="flex-between mb-16"><h2 style="font-size:16px">🛡 托管白名单</h2><span class="text-muted" style="font-size:12px">站点 key / 配置文件路径 / 域名或通配符（*.example.com），逗号或分号分隔</span></div>
+  <div class="flex-between mb-16"><h2 style="font-size:16px">🛡 托管白名单</h2><span class="text-muted" style="font-size:12px">可填站点 key / 配置文件路径 / 域名或通配符（*.example.com），逗号或分号分隔；也可用下表「➕ 加入白名单」自动填入</span></div>
   <div style="display:grid;gap:8px">
    <label class="text-muted" style="font-size:12px">托管白名单（CertManagedSites）</label>
    <textarea id="cert-managed" rows="2" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="例：nginx:/www/server/panel/vhost/nginx/a.conf#1; *.example.com">${esc(d.whitelist||'')}</textarea>
@@ -2568,6 +2569,17 @@ function certToggleSite(cb){
  const k=cb.dataset.certSite;
  if(cb.checked)certSel.add(k);else certSel.delete(k);
  certSyncSel();
+}
+/* 一键把该站点加入托管白名单（只追加，不影响其它站点；写入后立即可勾选） */
+async function certAllowSite(btn){
+ const key=btn&&btn.dataset?btn.dataset.certKey:'';
+ if(!key)return;
+ btn.disabled=true;
+ try{
+  const j=await api('/star/certAllow',{method:'POST',body:JSON.stringify({sites:[key]})});
+  showToast(j.code===0?(j.message||'已加入白名单'):(j.message||'加入白名单失败'), j.code===0?'success':'error');
+  if(j.code===0)await loadCert();else btn.disabled=false;
+ }catch(e){btn.disabled=false}
 }
 function certSyncSel(){
  const el=$('cert-sel-count');if(el)el.textContent=String(certSel.size);

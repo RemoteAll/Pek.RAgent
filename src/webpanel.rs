@@ -965,6 +965,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         "certConfig",
         guarded(panel.clone(), PERM_CERT, cert_config),
     );
+    controller = controller.post(
+        "certAllow",
+        guarded(panel.clone(), PERM_CERT, cert_allow),
+    );
 
     controller.get(
         "getProcessList",
@@ -2213,6 +2217,81 @@ fn cert_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "证书托管设置已保存", None)
 }
 
+/// `POST /star/certAllow`：把指定站点追加进托管白名单（`CertManagedSites`）。
+///
+/// body：`{ "sites": ["nginx:/www/server/panel/vhost/nginx/a.conf#1", ...] }`
+///
+/// 用途：面板「站点盘点」每行的「➕ 加入白名单」按钮——省去手抄站点 key 的麻烦。
+/// 只**追加**（去重、保留原条目），不覆盖其它站点；写入后立即热生效。
+fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let items: Vec<String> = body
+        .get("sites")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if items.is_empty() {
+        return json_error(400, "未指定要加入白名单的站点");
+    }
+    if items.iter().any(|s| s.len() > 500) {
+        return json_error(400, "站点标识过长");
+    }
+
+    let mut list: Vec<String> = panel
+        .manager
+        .config()
+        .cert_managed_sites
+        .split([',', ';', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let added = merge_whitelist(&mut list, &items);
+    if added == 0 {
+        return json_result(0, "所选站点已在白名单内", None);
+    }
+    let merged = list.join("; ");
+    if merged.len() > 2000 {
+        return json_error(400, "白名单过长（>2000 字符），请精简后再试");
+    }
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = merged.clone();
+    });
+    crate::util::log_format(
+        "已加入证书托管白名单：{}（当前共 {} 条）",
+        &[&items.join(", "), &list.len().to_string()],
+    );
+    json_result(
+        0,
+        &format!("已加入白名单（{added} 个站点）"),
+        Some(json!({ "whitelist": merged })),
+    )
+}
+
+/// 把若干条目追加进白名单列表（去重，忽略大小写；返回新增条数）。
+fn merge_whitelist(list: &mut Vec<String>, items: &[String]) -> usize {
+    let mut added = 0usize;
+    for it in items {
+        let it = it.trim();
+        if it.is_empty() {
+            continue;
+        }
+        if list.iter().any(|x| x.eq_ignore_ascii_case(it)) {
+            continue;
+        }
+        list.push(it.to_string());
+        added += 1;
+    }
+    added
+}
+
 fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -3378,6 +3457,29 @@ fn schedule_service_restart(cfg: &AgentConfig) {
 mod tests {
     use super::*;
     use dhrust::net::http::HttpRequest;
+
+    /// 面板「➕ 加入白名单」：只追加、去重（忽略大小写）、不清空原有条目。
+    #[test]
+    fn merge_whitelist_appends_and_dedupes() {
+        let mut list: Vec<String> = vec![
+            "nginx:/www/server/panel/vhost/nginx/a.conf#1".to_string(),
+            "*.example.com".to_string(),
+        ];
+        let add = vec![
+            "NGINX:/www/server/panel/vhost/nginx/a.conf#1".to_string(),
+            "  nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1  ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(merge_whitelist(&mut list, &add), 1);
+        assert_eq!(list.len(), 3);
+        assert_eq!(
+            list[2],
+            "nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1"
+        );
+        // 重复调用不再增长（幂等）
+        assert_eq!(merge_whitelist(&mut list, &add), 0);
+        assert_eq!(list.len(), 3);
+    }
 
     #[test]
     fn app_target_resolves_interpreter_hosts() {
