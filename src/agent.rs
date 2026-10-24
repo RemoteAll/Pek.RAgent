@@ -323,48 +323,8 @@ pub(crate) fn check_self_upgrade(manager: &Arc<AppManager>) {
     }
 }
 
-/// exe 文件身份指纹（外部替换检测用）。
-///
-/// - Unix：设备号 + inode（最强信号，`touch`/属性变更不影响）；
-/// - Windows：大小 + 创建时间（运行中的 exe 无法被覆盖写；改名替换会刷新创建时间）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ExeIdentity {
-    len: u64,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    created: Option<SystemTime>,
-}
-
-/// 读取文件身份指纹（失败返回 None）。
-fn exe_identity(path: &Path) -> Option<ExeIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(ExeIdentity {
-            len: meta.len(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        Some(ExeIdentity {
-            len: meta.len(),
-            created: meta.created().ok(),
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Some(ExeIdentity { len: meta.len() })
-    }
-}
-
 /// 进程启动时的 exe 身份基线（启动即记录；`check_external_replace` 懒初始化兜底）。
-static EXE_IDENTITY: Mutex<Option<ExeIdentity>> = Mutex::new(None);
+static EXE_IDENTITY: Mutex<Option<dhrust::upgrade::FileIdentity>> = Mutex::new(None);
 /// 已校验失败的外部替换文件指纹（len, mtime 秒），避免周期性重复处理。
 static EXTERNAL_REJECTED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// 自升级检查累计次数（心跳日志展示，便于确认周期任务存活）。
@@ -390,7 +350,7 @@ fn heartbeat(manager: &AppManager) {
 fn record_exe_identity_baseline() {
     if let Ok(exe) = std::env::current_exe() {
         let exe = util::lexical_normalize(&exe);
-        if let Some(id) = exe_identity(&exe) {
+        if let Some(id) = dhrust::upgrade::identity_of(&exe) {
             *EXE_IDENTITY.lock().unwrap() = Some(id);
         }
     }
@@ -403,7 +363,7 @@ fn record_exe_identity_baseline() {
 /// 部分 FTP/SFTP/同步工具采用"临时文件 + 重命名"实现上传，或用户手动先删再传——
 /// 本检测在这些场景下补齐"替换后自动生效重启"的最后一环。
 fn check_external_replace(exe: &Path, manager: &Arc<AppManager>) {
-    let Some(identity) = exe_identity(exe) else {
+    let Some(identity) = dhrust::upgrade::identity_of(exe) else {
         return;
     };
     {
@@ -413,7 +373,7 @@ fn check_external_replace(exe: &Path, manager: &Arc<AppManager>) {
                 *slot = Some(identity);
                 return;
             }
-            Some(baseline) if baseline == identity => return,
+            Some(baseline) if !baseline.changed(&identity) => return,
             Some(_) => {}
         }
     }
@@ -500,11 +460,7 @@ fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager:
 
 /// 把未被采用的候选文件标记为 `*.skipped`（保留现场、不再参与自动升级）。
 fn skip_candidates(paths: &[PathBuf]) {
-    for p in paths {
-        let skipped = PathBuf::from(format!("{}.skipped", p.display()));
-        let _ = std::fs::remove_file(&skipped);
-        let _ = std::fs::rename(p, &skipped);
-    }
+    dhrust::upgrade::skip_candidates(paths);
 }
 
 /// 升级收尾（各升级路径共用）：把运行权交给新版本——启动次数最少、停顿最短、日志完整。
@@ -756,13 +712,14 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
         return Err("升级文件为空".to_string());
     }
 
-    // 上传中保护：文件需静置一段时间（大小/mtime 稳定）
+    // 上传中保护：文件需静置一段时间（大小/mtime 稳定）——dhrust::upgrade 统一口径
     if min_age_secs > 0
-        && let Ok(modified) = meta.modified()
-            && let Ok(age) = SystemTime::now().duration_since(modified)
-                && age.as_secs() < min_age_secs {
-                    return Err(format!("升级文件上传中（静置 {min_age_secs} 秒后自动替换）"));
-                }
+        && !dhrust::upgrade::is_stable(new_path, std::time::Duration::from_secs(min_age_secs))
+    {
+        return Err(format!(
+            "升级文件上传中（静置 {min_age_secs} 秒后自动替换）"
+        ));
+    }
 
     // 形态校验：ELF（Linux/macOS）或 PE（Windows），避免把半截/错误文件换上
     let mut head = [0u8; 4];
@@ -771,9 +728,7 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
         let mut f = std::fs::File::open(new_path).map_err(|e| format!("升级文件不可读：{e}"))?;
         let _ = f.read(&mut head).map_err(|e| format!("升级文件读取失败：{e}"))?;
     }
-    let is_elf = head == [0x7F, b'E', b'L', b'F'];
-    let is_pe = head[0] == b'M' && head[1] == b'Z';
-    if !is_elf && !is_pe {
+    if !dhrust::upgrade::is_executable(&head) {
         return Err("升级文件格式校验失败（非可执行文件，请确认上传完整）".to_string());
     }
 
@@ -792,34 +747,19 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
 /// 注意：通过 `PEK_RAGENT_BASE` 显式指定真实基础目录——影子文件可能位于 `Update/` 等
 /// 子目录，否则自检进程会把影子位置当作程序目录，在其下生成 Log/Config 污染目录。
 fn smoke_test(new_path: &Path, official_exe: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(new_path);
-    cmd.arg("-selftest");
+    let mut spec = dhrust::upgrade::SelftestSpec::new("-selftest");
     if let Some(dir) = official_exe.parent() {
-        cmd.env("PEK_RAGENT_BASE", dir);
+        spec = spec.with_env("PEK_RAGENT_BASE", dir.to_string_lossy().to_string());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：避免服务会话中出现控制台窗口
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    match cmd.output() {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { stderr } else { stdout };
-            let code = out.status.code();
-            if detail.is_empty() {
-                Err(format!("影子自检未通过（退出码 {code:?}）"))
-            } else {
-                Err(format!("影子自检未通过（退出码 {code:?}）：{detail}"))
-            }
+    // 公共实现返回「自检未通过（退出码 …）」/「自检启动失败…」/「自检超时…」/「自检程序不存在…」，
+    // 这里统一加「影子」前缀，保持原有运维文案口径（升级失败日志可读性不变）。
+    dhrust::upgrade::selftest(new_path, &spec).map_err(|e| {
+        if e.contains("未通过") {
+            format!("影子{e}")
+        } else {
+            format!("影子自检无法通过：{e}")
         }
-        Err(e) => Err(format!("影子自检无法启动：{e}")),
-    }
+    })
 }
 
 /// 自升级替换核心（校验 + 原子替换，不含影子冒烟；纯逻辑便于单测）。
@@ -1019,12 +959,18 @@ mod tests {
 
         let exe = dir.join("app");
         std::fs::write(&exe, b"v1").unwrap();
-        let first = exe_identity(&exe).unwrap();
-        assert_eq!(first, exe_identity(&exe).unwrap(), "同一文件身份应稳定");
+        let first = dhrust::upgrade::identity_of(&exe).unwrap();
+        assert!(
+            !first.changed(&dhrust::upgrade::identity_of(&exe).unwrap()),
+            "同一文件身份应稳定"
+        );
 
         std::fs::remove_file(&exe).unwrap();
         std::fs::write(&exe, b"v2-longer").unwrap();
-        assert_ne!(first, exe_identity(&exe).unwrap(), "替换后身份应变化");
+        assert!(
+            first.changed(&dhrust::upgrade::identity_of(&exe).unwrap()),
+            "替换后身份应变化"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
