@@ -236,19 +236,11 @@ fn allowed_fetch_url(url: &str) -> bool {
     if url.starts_with("https://") {
         return url.len() > "https://".len();
     }
-    let Some(rest) = url.strip_prefix("http://") else {
+    if !url.starts_with("http://") {
         return false;
-    };
-    let authority = rest.split('/').next().unwrap_or("");
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host = if host_port.starts_with('[') {
-        host_port
-            .split(']')
-            .next()
-            .map(|h| format!("{h}]"))
-            .unwrap_or_default()
-    } else {
-        host_port.split(':').next().unwrap_or("").to_string()
+    }
+    let Some(host) = dhrust::web::url_host(url) else {
+        return false;
     };
     matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]")
 }
