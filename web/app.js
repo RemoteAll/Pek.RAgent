@@ -637,11 +637,18 @@ async function loadMachineDetail(){
       <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
       <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
      </div>
-     <div class="swap-actions">
-      <span style="font-size:12px;color:var(--text-secondary)">swappiness</span>
-      <input id="swap-swap" type="number" min="0" max="100" value="${s.swappiness==null?'':s.swappiness}">
-      <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
-      <span class="swap-hint">建议 60；设 0 等于几乎不用 swap，内存紧张时仍会 OOM</span>
+     <div class="swap-actions" style="align-items:flex-start">
+      <div style="display:flex;flex-direction:column;gap:4px">
+       <span style="font-size:12px;color:var(--text-secondary)">换出积极度（swappiness）</span>
+       <div style="display:flex;gap:8px;align-items:center">
+        <input id="swap-swap" type="number" min="0" max="100" value="${s.swappiness==null?'':s.swappiness}">
+        <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
+        ${s.swappiness!==0?'<button class="btn btn-ghost btn-sm" onclick="swapSetRecommended()">用推荐值 60</button>':''}
+       </div>
+      </div>
+      <div class="swap-hint" style="flex:1;min-width:260px;line-height:1.7;${s.swappiness===0?'color:var(--yellow)':''}">${s.swappiness===0
+        ? '⚠️ 当前为 0：系统几乎不会把内存换出到交换区，建的 swap 等于闲置；物理内存一吃紧，内核会直接杀掉占用最多的进程（OOM）。改成 60 才会真正兜底。'
+        : '这个值决定「内存紧张时，系统多愿意把不常用的内存挪到交换区」。60 是系统默认的平衡值：内存够用时不动，紧张时兜底；不要在内存充裕的机器上盲目调大。'}</div>
      </div>
     </div>`;
    }
@@ -721,6 +728,12 @@ function swapSwappiness(){
  const v=parseInt((($('swap-swap')||{}).value)||'-1',10);
  if(!(v>=0&&v<=100)){showToast('swappiness 取值 0~100','error');return}
  swapSubmit({op:'swappiness',value:v});
+}
+/** 一键填推荐值 60 并保存（小白场景：不懂 swappiness 就直接用默认平衡值）。 */
+function swapSetRecommended(){
+ const el=$('swap-swap');if(!el){return}
+ el.value='60';
+ swapSwappiness();
 }
 
 /* ── 进程表（本机详情；可切换 CPU / 内存排序） ── */
