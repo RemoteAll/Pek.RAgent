@@ -3800,24 +3800,50 @@ mod tests {
         }
     }
 
-    /// 复现用户的「未知操作（action 应为 create / remove / swappiness）」：
-    /// JSON body 里的 `action` 必须能被 `arg()` 读到（非 Linux 应报「仅支持 Linux」）。
+    /// 复现用户的「未知操作 [swapConfig]」：
+    /// Controller 路由是 `/star/{action}`，路径段会被填进 `Ctx.params` 的 `action`，
+    /// 业务参数必须用 `op`，否则会被路径值覆盖。
     #[test]
-    fn swap_config_parses_action_from_json_body() {
+    fn swap_config_parses_op_even_when_route_param_action_exists() {
         let (panel, dir) = panel_with_default_password();
         let token = panel.issue_token("admin", "admin").unwrap();
-        let ctx = context(
+
+        // ① 真实路由环境：params 里已有 ("action","swapConfig")
+        let mut ctx = context(
             "POST",
             "/star/swapConfig",
             r#"{"op":"create","sizeMB":256,"path":"/swapfile","persist":"1"}"#,
             Some(&token),
         );
-        let r = body_json(swap_config(&panel, &ctx));
-        let message = r["message"].as_str().unwrap_or("");
+        ctx.params
+            .push(("action".to_string(), "swapConfig".to_string()));
+        let message = body_json(swap_config(&panel, &ctx))["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
         assert!(
             !message.starts_with("未知操作"),
-            "op 未从 JSON body 解析出来：{message}"
+            "op 未解析（被路由参数覆盖？）：{message}"
         );
+
+        // ② 旧前端只发 action 的 JSON：直读 body 兜底也必须认
+        let mut ctx = context(
+            "POST",
+            "/star/swapConfig",
+            r#"{"action":"remove","path":"/swapfile"}"#,
+            Some(&token),
+        );
+        ctx.params
+            .push(("action".to_string(), "swapConfig".to_string()));
+        let message = body_json(swap_config(&panel, &ctx))["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !message.starts_with("未知操作"),
+            "旧前端 action 兜底失效：{message}"
+        );
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 
