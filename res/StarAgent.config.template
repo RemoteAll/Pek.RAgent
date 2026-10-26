@@ -64,8 +64,8 @@
   <PortTraffic>true</PortTraffic>
   <!--端口流量统计端口（高级选项，面板配置页不展示；一般无需填写）。形如 `22,80,443,3306`；留空 = 自动取系统监听端口（上限 64 个）-->
   <PortTrafficPorts></PortTrafficPorts>
-  <!--面板 HTTPS。默认 false；为 true 时面板同端口改用 HTTPS（自签叶子证书 CA:FALSE，SAN 自动含本机全部网卡 IP，有效期 10 年，证书落 Config/keys/panel.pem）。浏览器首次访问前下载并导入该证书信任即可绿锁直开；修改需重启服务后生效-->
-  <Tls>false</Tls>
+  <!--面板 HTTPS。默认 true（同端口切换，不额外占端口）：浏览器用 https://内网IP:端口 访问，旧书签 http:// 会自动 301 到 https（不会连不上）；自签叶子证书 CA:FALSE，SAN 自动含本机全部网卡 IP，有效期 10 年，证书落 Config/keys/panel.pem，首次访问前下载并导入该证书信任即可绿锁直开。修改需重启服务后生效-->
+  <Tls>true</Tls>
   <!--流量历史保留天数。每日归档落 SQLite（Data/traffic.db，Pek.RCode 按 Entity/Model.xml 模型管理）；默认 90（7~3650），0 = 永久保留-->
   <TrafficHistoryDays>90</TrafficHistoryDays>
   <!--日志清理自定义路径（高级选项，面板配置页不展示；仅直接编辑本文件时使用）。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->

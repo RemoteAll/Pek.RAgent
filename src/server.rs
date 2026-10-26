@@ -100,6 +100,9 @@ pub fn start(
                 let options = HttpServerOptions {
                     // 每连接独立线程：管理操作可能阻塞（停止/启动应用），避免拖慢其他请求
                     thread_per_connection: true,
+                    // 单端口 HTTPS：明文 HTTP 请求（旧书签 http://ip:端口）由连接层识别后
+                    // 自动 301 到 https://同端口——不需要额外端口，也不会“连不上/协议错误”
+                    https_redirect_port: if https { Some(port) } else { None },
                     // WebSocket（在线终端）30 秒服务端 Ping：穿透反向代理的空闲断开
                     ws: dhrust::net::ws::WsServerOptions {
                         server_ping: Some(std::time::Duration::from_secs(30)),

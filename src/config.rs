@@ -85,7 +85,9 @@ pub struct AgentConfig {
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
     /// 面板 HTTPS（自签**叶子**证书，SAN 自动含本机全部网卡 IP；证书落 `Config/keys/panel.pem`）。
-    /// 启用后浏览器可用 `https://内网IP:端口` 直达（首次需导入一次证书信任）；**修改后重启服务生效**
+    /// **默认开启**（同端口切换，不额外占端口）：浏览器用 `https://内网IP:端口` 访问，
+    /// 旧书签 `http://` 会被自动 301 到 https（不会连不上）；首次访问前需导入一次证书信任。
+    /// **修改后重启服务生效**
     pub tls: bool,
     /// 流量历史保留天数（SQLite 每日归档 `Data/traffic.db`，模型见 `Entity/Model.xml`）。默认 90；0 = 永久保留
     pub traffic_history_days: u32,
@@ -166,8 +168,8 @@ impl Default for AgentConfig {
             // 关闭/卸载自动清理；无 nft/权限不足自动降级连接视图，Windows 为连接视图）
             port_traffic: true,
             port_traffic_ports: String::new(),
-            // 面板 HTTPS：默认关闭（保持既有 http 访问行为；开启后需重启服务）
-            tls: false,
+            // 面板 HTTPS：默认开启（同端口切换；明文请求自动 301 到 https）
+            tls: true,
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
             log_cleanup_paths: String::new(),
