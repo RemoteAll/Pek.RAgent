@@ -497,7 +497,7 @@ function buildDashboard(d,health){
  // 顺序与宝塔一致：负载 → CPU → 内存 → 磁盘（负载仅 Linux 显示）
  if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=ringGauge('CPU 使用率', (d.cpuCount||0)+' 核', '', cpuPct, 'gauge-cpu');
- html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem', '已使用', `<div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="freeMemoryAll()" style="width:100%" title="清理系统页缓存（宝塔口径）；进程自身占用的内存需重启对应服务">🧹 清理内存</button></div>`);
+ html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem', '已使用', `<div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary)"><span>已用 <b id="mem-used" style="color:var(--text-primary)">${fmtMem(memUsedMB)}</b></span><span>缓存 <b id="mem-cached" style="color:var(--text-primary)">${fmtMem(d.memoryCachedMB||0)}</b></span><span>空闲 <b id="mem-free" style="color:var(--text-primary)">${fmtMem(d.memoryFreeMB||0)}</b></span></div><div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="freeMemoryAll()" style="width:100%" title="清理系统页缓存（宝塔口径）；进程自身占用的内存需重启对应服务">🧹 清理内存</button></div>`);
  (d.disks||[]).forEach((x,i)=>{
   html+=ringGauge('磁盘 '+x.name, fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '', pct(x.usedMB,x.totalMB), 'gauge-disk-'+i);
  });
@@ -555,6 +555,11 @@ function updateDashboard(d,health){
  const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/(d.cpuCount*2)*100)) : 0;
  updateGauge('gauge-cpu', cpuPct, (d.cpuCount||0)+' 核', '');
  updateGauge('gauge-mem', memPct, fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '');
+ // 内存三栏（已用/缓存/空闲）随 3 秒轮询一起更新
+ const mu=$('mem-used'), mc=$('mem-cached'), mf=$('mem-free');
+ if(mu)mu.textContent=fmtMem(memUsedMB);
+ if(mc)mc.textContent=fmtMem(d.memoryCachedMB||0);
+ if(mf)mf.textContent=fmtMem(d.memoryFreeMB||0);
  (d.disks||[]).forEach((x,i)=>{
   updateGauge('gauge-disk-'+i, pct(x.usedMB,x.totalMB), fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '');
  });
@@ -646,7 +651,7 @@ async function loadMachineDetail(){
        <span style="font-size:12px;color:var(--text-secondary)">换出积极度（swappiness）</span>
        <div style="display:flex;gap:8px;align-items:center">
         <input id="swap-swap" type="number" min="0" max="100" value="${s.swappiness==null?'':s.swappiness}">
-        <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
+        <button class="btn btn-primary btn-sm" onclick="swapSwappiness()">保存</button>
         ${s.swappiness!==0?'<button class="btn btn-ghost btn-sm" onclick="swapSetRecommended()">用推荐值 60</button>':''}
        </div>
       </div>

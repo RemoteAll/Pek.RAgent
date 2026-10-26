@@ -1200,6 +1200,10 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let memory_mb = sys::memory_mb(pid).unwrap_or(0);
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
+    // 空闲 / 缓存（Linux `/proc/meminfo`：MemFree、Cached+SReclaimable；口径与宝塔/free 一致）
+    let mem_detail = dhrust::sys::machine::memory_detail();
+    let mem_free_mb = mem_detail.map(|m| m.free_bytes / 1024 / 1024).unwrap_or(0);
+    let mem_cached_mb = mem_detail.map(|m| m.cached_bytes / 1024 / 1024).unwrap_or(0);
     let disks = sys::disk_usages();
     // 进程 CPU 时间：供内嵌 health 字段使用（复用本次采集，避免前端第二次请求）
     let (cpu_total, cpu_kernel, cpu_user) = sys::process_cpu_seconds();
