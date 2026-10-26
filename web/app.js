@@ -504,14 +504,13 @@ function buildDashboard(d,health){
   html+=`<div class="collapse-body" id="gc-body"><div class="gc-stats">`;
   html+=gcStat('Gen 0',health.gcCollections.gen0,'gc-gen0')+gcStat('Gen 1',health.gcCollections.gen1,'gc-gen1')+gcStat('Gen 2',health.gcCollections.gen2,'gc-gen2');
   html+=gcStat('GC 内存',health.gcTotalMemory+' MB','gc-mem')+gcStat('CPU 时间',health.totalProcessorTime+'s','gc-cpu');
-  html+=`</div><div style="margin-top:12px;text-align:right"><button class="btn btn-ghost btn-sm" onclick="freeMemory()">🗑 释放内存</button></div></div></div>`;
+  html+=`</div></div></div>`;
  }
- html+=`</div>`;
-
- // 流量 / 磁盘 IO 趋势图（独立卡片，对齐宝塔：下划线页签 + 统计块 + 平滑双曲线）
- html+=`<div class="glass-card card"><div class="chart-head"><div class="chart-tabs"><span class="chart-tab active" id="tab-net" onclick="switchChart('net')">流量</span><span class="chart-tab" id="tab-disk" onclick="switchChart('disk')">磁盘 IO</span></div><span class="chart-hint">近 30 秒 · 每 3 秒采样</span></div>`;
- html+=`<div class="chart-stats" id="chart-stats"></div>`;
- html+=`<div class="chart-wrap"><svg id="trend-svg" viewBox="0 0 600 150"></svg></div></div>`;
+ // 内存操作按钮：常显（之前只在 GC 折叠框内，默认收起→用户找不到）
+ html+=`<div class="mt-12" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
+  <button class="btn btn-sm btn-ghost" onclick="freeMemory()" id="btn-free-mem-dash">🗑 释放本进程内存</button>
+  <button class="btn btn-sm btn-ghost" onclick="freeSystemMemory()" id="btn-free-sys-mem-dash">🧹 清理系统缓存</button>
+ </div>`;
 
  // 系统信息
  html+=`<div class="glass-card card"><h2>🖥 系统信息</h2><table class="info-table">`;
@@ -615,7 +614,6 @@ async function loadMachineDetail(){
   html+=infoRow('使用率',d.memory.memoryRatePercent,parseFloat(d.memory.memoryRate)>0.8?'text-yellow':'');
   html+=`</table>`;
   html+=`<div style="margin-top:8px"><button class="btn btn-ghost btn-sm" onclick="freeSystemMemory()">🧹 清理系统缓存（释放页缓存，不影响进程内存）</button></div>`;
-
   // 虚拟内存（swap）：Linux 支持在线创建/关闭；Windows 仅展示
   if(d.swap){
    const s=d.swap;
@@ -635,14 +633,20 @@ async function loadMachineDetail(){
    }
    if(s.configurable&&s.root){
     const defSize=String(keep.size||s.recommendedMB||2048);
-    html+=`<div class="text-muted" style="font-size:11px;margin-top:8px">推荐交换区 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>`;
-    html+=`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:12px">
-     <label>大小(MB) <input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:110px" value="${escAttr(defSize)}"></label>
-     <label>路径 <input id="swap-path" style="width:170px" value="${escAttr(keep.path||s.defaultPath)}"></label>
-     <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
-     <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
-     <label style="margin-left:6px">swappiness <input id="swap-swap" type="number" min="0" max="100" style="width:70px" value="${s.swappiness==null?'':s.swappiness}"></label>
-     <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
+    html+=`<div style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:var(--gradient-brand-soft)">
+     <div style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px">推荐交换区共 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>
+     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 12px;align-items:end">
+      <label style="font-size:12px">大小（MB）<br><input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:100%" value="${escAttr(defSize)}"></label>
+      <label style="font-size:12px">交换文件路径<br><input id="swap-path" style="width:100%" value="${escAttr(keep.path||s.defaultPath)}"></label>
+      <label style="font-size:12px;white-space:nowrap;padding-bottom:6px"><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
+      <button class="btn btn-primary btn-sm" style="height:32px" onclick="swapCreate()">➕ 创建并启用</button>
+     </div>
+     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12px;flex-wrap:wrap">
+      <span style="color:var(--text-tertiary)">swappiness</span>
+      <input id="swap-swap" type="number" min="0" max="100" style="width:70px" value="${s.swappiness==null?'':s.swappiness}">
+      <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
+      <span style="color:var(--text-muted);font-size:11px">建议 60；设 0 等于几乎不用 swap，内存紧张时仍会 OOM</span>
+     </div>
     </div>`;
    }
    if(s.hint)html+=`<div class="text-muted" style="font-size:11px;margin-top:6px">${esc(s.hint)}</div>`;
@@ -711,16 +715,16 @@ function swapCreate(){
  const persist=$('swap-persist')?$('swap-persist').checked:true;
  if(!size||size<128){showToast('请填写不小于 128 MB 的大小','error');return}
  if(!confirm(`将在 ${path} 创建 ${size} MB 交换文件并启用，继续？`))return;
- swapSubmit({action:'create',sizeMB:size,path:path,persist:persist?'1':'0'});
+ swapSubmit({op:'create',sizeMB:size,path:path,persist:persist?'1':'0'});
 }
 function swapRemove(path){
  if(!confirm(`关闭并删除交换区 ${path}？\n关闭时会把已换出的数据拉回内存，内存紧张时可能较慢或失败。`))return;
- swapSubmit({action:'remove',path:path});
+ swapSubmit({op:'remove',path:path});
 }
 function swapSwappiness(){
  const v=parseInt((($('swap-swap')||{}).value)||'-1',10);
  if(!(v>=0&&v<=100)){showToast('swappiness 取值 0~100','error');return}
- swapSubmit({action:'swappiness',value:v});
+ swapSubmit({op:'swappiness',value:v});
 }
 
 /* ── 进程表（本机详情；可切换 CPU / 内存排序） ── */

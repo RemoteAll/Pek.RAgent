@@ -1712,8 +1712,18 @@ fn swap_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
-    let action = arg(ctx, "action").unwrap_or_default();
-    let result = match action.as_str() {
+    // 坑：Controller 注册的路由是 `/star/{action}`——路径最后一段会被捕获成**路由参数 `action`**，
+    // 业务参数再叫 `action` 会被路径值（"swapConfig"）覆盖。所以用 `op`，并兼容旧前端直读 JSON 的 `action`。
+    let op = arg(ctx, "op")
+        .or_else(|| {
+            json_body(ctx).and_then(|b| {
+                b.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .unwrap_or_default();
+    let result = match op.as_str() {
         "create" => {
             let size_mb = arg_i64(ctx, "sizeMB").unwrap_or(0).max(0) as u64;
             let path = arg(ctx, "path").unwrap_or_else(|| "/swapfile".to_string());
@@ -1730,10 +1740,7 @@ fn swap_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             }
         }
         _ => {
-            // 旧版前端（浏览器缓存）发空 action 时会走到这里：明确提示强刷
-            Err(format!(
-                "未知操作「{action}」（应为 create / remove / swappiness）；如页面是旧缓存，请 Ctrl+F5 强制刷新面板"
-            ))
+            Err(format!("未知操作「{op}」（应为 create / remove / swappiness）"))
         }
     };
     match result {
@@ -3802,14 +3809,14 @@ mod tests {
         let ctx = context(
             "POST",
             "/star/swapConfig",
-            r#"{"action":"create","sizeMB":256,"path":"/swapfile","persist":"1"}"#,
+            r#"{"op":"create","sizeMB":256,"path":"/swapfile","persist":"1"}"#,
             Some(&token),
         );
         let r = body_json(swap_config(&panel, &ctx));
         let message = r["message"].as_str().unwrap_or("");
         assert!(
             !message.starts_with("未知操作"),
-            "action 未从 JSON body 解析出来：{message}"
+            "op 未从 JSON body 解析出来：{message}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
