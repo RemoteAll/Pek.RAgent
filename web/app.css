@@ -334,3 +334,14 @@ html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
 .ap-drop-zone{margin:12px 0 16px;padding:16px 14px;text-align:center;border:2px dashed var(--border-default);border-radius:var(--radius-md);color:var(--text-tertiary);font-size:13px;cursor:pointer;transition:border-color var(--duration-fast),background var(--duration-fast),color var(--duration-fast)}
 .ap-drop-zone:hover{border-color:var(--brand-500);color:var(--text-primary);background:var(--gradient-brand-soft)}
 #panel-services.ap-drag .ap-drop-zone{border-color:var(--brand-500);background:var(--gradient-brand-soft);color:var(--text-primary)}
+/* ── 虚拟内存（swap）表单：两列对齐 + 操作行 ── */
+.swap-box{margin-top:10px;padding:12px 14px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:var(--gradient-brand-soft)}
+.swap-note{font-size:11px;line-height:1.6;color:var(--text-tertiary);margin-bottom:10px}
+.swap-form{display:grid;grid-template-columns:180px minmax(240px,1fr);gap:12px 14px;align-items:start}
+.swap-form .form-group{margin-bottom:0}
+.swap-form input[type=number]{max-width:none}
+.swap-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:1px dashed var(--border-default)}
+.swap-actions label{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)}
+.swap-actions .swap-hint{font-size:11px;color:var(--text-muted)}
+.swap-actions input[type=number]{width:88px;max-width:88px}
+@media(max-width:768px){.swap-form{grid-template-columns:1fr}}

@@ -626,20 +626,22 @@ async function loadMachineDetail(){
     html+=`</table>`;
    }
    if(s.configurable&&s.root){
-    const defSize=String(keep.size||s.recommendedMB||2048);
-    html+=`<div style="margin-top:10px;padding:10px 12px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:var(--gradient-brand-soft)">
-     <div style="font-size:11px;color:var(--text-tertiary);margin-bottom:8px">推荐交换区共 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>
-     <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px 12px;align-items:end">
-      <label style="font-size:12px">大小（MB）<br><input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:100%" value="${escAttr(defSize)}"></label>
-      <label style="font-size:12px">交换文件路径<br><input id="swap-path" style="width:100%" value="${escAttr(keep.path||s.defaultPath)}"></label>
-      <label style="font-size:12px;white-space:nowrap;padding-bottom:6px"><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
-      <button class="btn btn-primary btn-sm" style="height:32px" onclick="swapCreate()">➕ 创建并启用</button>
+    const defSize=String(keep.size||s.recommendedMB||512);
+    html+=`<div class="swap-box">
+     <div class="swap-note">推荐交换区共 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>
+     <div class="swap-form">
+      <div class="form-group"><label>大小（MB）</label><input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" value="${escAttr(defSize)}"></div>
+      <div class="form-group"><label>交换文件路径</label><input id="swap-path" type="text" value="${escAttr(keep.path||s.defaultPath)}"></div>
      </div>
-     <div style="display:flex;gap:8px;align-items:center;margin-top:10px;font-size:12px;flex-wrap:wrap">
-      <span style="color:var(--text-tertiary)">swappiness</span>
-      <input id="swap-swap" type="number" min="0" max="100" style="width:70px" value="${s.swappiness==null?'':s.swappiness}">
+     <div class="swap-actions">
+      <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
+      <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
+     </div>
+     <div class="swap-actions">
+      <span style="font-size:12px;color:var(--text-secondary)">swappiness</span>
+      <input id="swap-swap" type="number" min="0" max="100" value="${s.swappiness==null?'':s.swappiness}">
       <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
-      <span style="color:var(--text-muted);font-size:11px">建议 60；设 0 等于几乎不用 swap，内存紧张时仍会 OOM</span>
+      <span class="swap-hint">建议 60；设 0 等于几乎不用 swap，内存紧张时仍会 OOM</span>
      </div>
     </div>`;
    }
