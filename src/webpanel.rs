@@ -708,6 +708,19 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
         "configMetadata",
         guarded(panel.clone(), PERM_CONFIG, config_metadata),
     );
+    // 面板 HTTPS：状态（证书 SAN/剩余天数/指纹）+ 重新签发 + 下载证书
+    controller = controller.get(
+        "tls",
+        guarded(panel.clone(), PERM_CONFIG, tls_status),
+    );
+    controller = controller.post(
+        "tlsRenew",
+        guarded(panel.clone(), PERM_CONFIG, tls_renew),
+    );
+    controller = controller.get(
+        "tlsCert",
+        guarded(panel.clone(), PERM_CONFIG, tls_cert),
+    );
     controller = controller.post(
         "updateConfig",
         guarded(panel.clone(), PERM_CONFIG, update_config),
@@ -1872,6 +1885,8 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.manager.config();
     let items = vec![
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
+        // 面板 HTTPS：自签叶子证书（SAN 含本机全部 IP）；修改后需重启服务生效
+        config_item("Tls", "面板HTTPS", "Boolean", cfg.tls.to_string(), "为真时面板同端口改用 HTTPS（自签证书，浏览器首次访问前需导入 Config/keys/panel.pem 信任）；修改需重启服务后生效"),
         config_item("WebSessionHours", "登录保持时长（小时）", "Int32", cfg.web_session_hours.to_string(), "面板登录会话保持时长（滑动续期：期间用过面板就不掉线，重启/升级不用重新登录），默认 12；0=关闭持久化（仅进程内 24 小时）。修改需重启服务后生效（会话已落盘，重启不会掉登录）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
         config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache/IIS 访问日志（自动发现站点；IIS 需在日志字段中启用 sc-bytes 才能统计流量；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
@@ -1893,6 +1908,55 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     ];
 
     json_result(0, "", Some(json!({ "items": items })))
+}
+
+// ————— 面板 HTTPS 证书 —————
+
+/// 面板 HTTPS 状态：证书是否存在、SAN（域名/IP）、剩余天数、指纹、建议访问地址。
+///
+/// 证书缺失或损坏时返回 `exists=false` 而非报错——面板在明文 HTTP 下也必须可用。
+fn tls_status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let cfg = panel.manager.config();
+    let body = crate::tlscfg::status(panel.manager.base(), cfg.tls, cfg.local_port);
+    json_result(0, "", Some(body))
+}
+
+/// 重新签发面板证书（删除旧证书后重建）；**重启服务后生效**。
+fn tls_renew(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::tlscfg::renew(panel.manager.base()) {
+        Ok(()) => {
+            util::log_info("Web 面板已重新签发 HTTPS 证书（重启服务后生效）");
+            let cfg = panel.manager.config();
+            let mut body = crate::tlscfg::status(panel.manager.base(), cfg.tls, cfg.local_port);
+            body["message"] = json!("证书已重新签发，重启服务后生效");
+            json_result(0, "", Some(body))
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 下载面板证书（PEM）——运维导入一次浏览器/系统信任库后，`https://内网IP:端口` 即绿锁直开。
+fn tls_cert(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let base = panel.manager.base();
+    // 首次点下载时顺带生成，省掉“先启用再下载”的来回
+    let _ = crate::tlscfg::ensure_pem(base);
+    let (cert_path, _) = crate::tlscfg::cert_paths(base);
+    match std::fs::read(&cert_path) {
+        Ok(bytes) => ActionResult::Response(
+            HttpResponse::bytes(200, "application/x-pem-file", bytes)
+                .with_header("Content-Disposition", "attachment; filename=\"panel.pem\""),
+        ),
+        Err(e) => json_error(500, &format!("读取证书失败：{e}")),
+    }
 }
 
 /// 更新面板配置（安全白名单，密码走 ChangePassword）。
@@ -3640,6 +3704,8 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "webusername" => set_string(value, |s| cfg.web_user_name = s),
         "webauthlevel" => set_string(value, |s| cfg.web_auth_level = s),
+        // 面板 HTTPS：写入配置后需重启服务才切换监听协议
+        "tls" => set_bool(value, |b| cfg.tls = b),
         "websessionhours" => match value_u64(value) {
             Some(v) if v <= 8760 => {
                 cfg.web_session_hours = v as u32;

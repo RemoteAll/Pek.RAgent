@@ -84,6 +84,9 @@ pub struct AgentConfig {
     pub port_traffic: bool,
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
+    /// 面板 HTTPS（自签**叶子**证书，SAN 自动含本机全部网卡 IP；证书落 `Config/keys/panel.pem`）。
+    /// 启用后浏览器可用 `https://内网IP:端口` 直达（首次需导入一次证书信任）；**修改后重启服务生效**
+    pub tls: bool,
     /// 流量历史保留天数（SQLite 每日归档 `Data/traffic.db`，模型见 `Entity/Model.xml`）。默认 90；0 = 永久保留
     pub traffic_history_days: u32,
     /// 日志清理自定义路径（分号分隔；目录=清空内容、文件=截断清空）。
@@ -163,6 +166,8 @@ impl Default for AgentConfig {
             // 关闭/卸载自动清理；无 nft/权限不足自动降级连接视图，Windows 为连接视图）
             port_traffic: true,
             port_traffic_ports: String::new(),
+            // 面板 HTTPS：默认关闭（保持既有 http 访问行为；开启后需重启服务）
+            tls: false,
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
             log_cleanup_paths: String::new(),
@@ -663,6 +668,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = bool_of(obj, "PortTraffic") {
         cfg.port_traffic = v;
     }
+    if let Some(v) = bool_of(obj, "Tls") {
+        cfg.tls = v;
+    }
     if let Some(v) = text_of(obj, "PortTrafficPorts") {
         cfg.port_traffic_ports = v;
     }
@@ -841,6 +849,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebLogs", cfg.web_logs.clone());
         push("PortTraffic", bool_text(cfg.port_traffic));
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
+        push("Tls", bool_text(cfg.tls));
         push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
         push("CertManagedSites", cfg.cert_managed_sites.clone());

@@ -961,10 +961,25 @@ fn zip_deploy(base: &Path, args: &[String]) -> i32 {
 // ————— 辅助 —————
 
 /// 调用本地控制接口。
+///
+/// 面板启用 HTTPS（`Tls=true`）时自动改用 `https://` 并跳过证书校验——
+/// 本机回环自签证书，校验无意义（对端就是自己），这样菜单/`-ListServices` 不受开关影响。
 fn api_get(base: &Path, action: &str, timeout: Duration) -> Result<String, String> {
     let cfg = AgentConfig::load(base);
-    let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
-    dhrust::net::http_client::blocking_get_text(&url, timeout).map_err(|e| e.to_string())
+    if cfg.tls {
+        let url = format!("https://127.0.0.1:{}/{}", cfg.local_port, action);
+        let options = dhrust::net::http_client::HttpClientOptions {
+            timeout,
+            insecure_tls: true,
+            ..Default::default()
+        };
+        dhrust::net::http_client::blocking_request_with("GET", &url, &[], None, Vec::new(), &options)
+            .map(|r| r.body_text())
+            .map_err(|e| e.to_string())
+    } else {
+        let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
+        dhrust::net::http_client::blocking_get_text(&url, timeout).map_err(|e| e.to_string())
+    }
 }
 
 /// 拉取子服务列表：`(名称, 启用, 运行中, 进程Id, 进程名称, 启动时间)`。

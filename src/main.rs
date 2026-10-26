@@ -32,6 +32,7 @@ mod sites;
 mod swap;
 mod sys;
 mod terminal;
+mod tlscfg;
 mod udp_rpc;
 mod util;
 mod weblog;

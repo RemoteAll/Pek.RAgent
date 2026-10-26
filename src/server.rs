@@ -33,7 +33,15 @@ struct ServiceOperationResult {
 }
 
 /// 启动 HTTP 控制服务。返回线程句柄（进程退出时自然结束）。
-pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thread::JoinHandle<()> {
+///
+/// `tls` 非空时同端口改用 **HTTPS**（自签叶子证书；证书/私钥 PEM 字节），
+/// 否则保持原有明文 HTTP 行为（默认）。UDP RPC 不受影响（UDP/TCP 分属不同协议）。
+pub fn start(
+    manager: Arc<AppManager>,
+    port: u16,
+    local_only: bool,
+    tls: Option<(Vec<u8>, Vec<u8>)>,
+) -> std::thread::JoinHandle<()> {
     // 资源采样器：按配置间隔（默认 1 秒）采样整机指标，面板接口读快照
     // （多客户端读数一致、请求零采集；SampleInterval=0 时关闭，改由请求时现采）
     crate::sampler::start(manager.config().sample_interval);
@@ -70,7 +78,12 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
             };
 
             runtime.block_on(async move {
-                let server = match HttpServer::bind(addr.as_str()).await {
+                let https = tls.is_some();
+                let bind_result = match &tls {
+                    Some((cert, key)) => HttpServer::bind_tls(addr.as_str(), cert, key).await,
+                    None => HttpServer::bind(addr.as_str()).await,
+                };
+                let server = match bind_result {
                     Ok(s) => s,
                     Err(e) => {
                         util::log_error(&format!("本地控制接口绑定失败 {}：{}", addr, e));
@@ -78,7 +91,10 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
                     }
                 };
 
-                util::log_format("本地控制接口已启动：http://{}", &[&addr]);
+                util::log_format(
+                    "本地控制接口已启动：{}://{}",
+                    &[if https { "https" } else { "http" }, &addr],
+                );
 
                 let router = build_router(manager, port);
                 let options = HttpServerOptions {

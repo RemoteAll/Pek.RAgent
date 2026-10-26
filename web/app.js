@@ -2042,8 +2042,60 @@ async function loadAgentConfig(){
   html+=`<button class="btn btn-primary" onclick="doUpgrade()">⬆ 上传并升级</button>`;
   html+=`<span id="upgrade-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
 
+  // 面板 HTTPS 证书卡片
+  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🔒 面板 HTTPS</h2>`;
+  html+=`<div id="tls-box" style="font-size:13px;color:var(--text-muted)">加载中…</div>`;
+  html+=`<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">`;
+  html+=`<button class="btn" onclick="downloadTlsCert()">⬇ 下载证书</button>`;
+  html+=`<button class="btn" onclick="renewTlsCert()">♻ 重新签发</button>`;
+  html+=`</div>`;
+  html+=`<p class="text-muted" style="font-size:12px;margin-top:10px">启用后浏览器用 <code>https://内网IP:端口</code> 打开面板：首次需导入下载的证书（Windows 双击 → 安装到「受信任的根证书颁发机构」；或 <code>certutil -addstore -f Root panel.pem</code>），之后即绿锁直开。<strong>切换协议需重启服务</strong>；证书为自签<strong>叶子</strong>证书（CA:FALSE），私钥泄露也无法冒充其他站点。</p></div>`;
+
   $('config-sub-agent').innerHTML=html;
+  loadTlsStatus();
  }catch(e){$('config-sub-agent').innerHTML=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><p class="text-muted">加载失败</p></div>`}
+}
+
+/* ── 面板 HTTPS 证书 ── */
+async function loadTlsStatus(){
+ const box=$('tls-box');if(!box)return;
+ try{
+  const j=await api('/api/tls');
+  if(j.code!==0){box.textContent='证书状态读取失败：'+(j.message||'');return}
+  const d=j.data||{};
+  const on=d.enabled?'<span style="color:#16a34a;font-weight:600">已启用 HTTPS</span>':'<span style="color:#d97706;font-weight:600">未启用（当前明文 HTTP）</span>';
+  let h=`<div>状态：${on}</div>`;
+  if(d.exists){
+   h+=`<div>证书：${esc(d.path)}</div>`;
+   h+=`<div>有效期至：${esc(d.notAfter)}（剩余 ${d.daysLeft} 天${d.expiringSoon?'，<span style="color:#dc2626">即将到期，请重新签发</span>':''}）</div>`;
+   h+=`<div>覆盖名称：${esc((d.sans||[]).join(', '))}</div>`;
+   h+=`<div style="word-break:break-all">SHA-256：${esc(d.sha256||'')}</div>`;
+  }else{
+   h+=`<div>证书：尚未生成（启用 HTTPS 或点「下载证书」时自动生成）</div>`;
+  }
+  h+=`<div>建议地址：<code>${esc(d.panelUrl||'')}</code></div>`;
+  box.innerHTML=h;
+ }catch(e){box.textContent='证书状态读取失败'}
+}
+async function downloadTlsCert(){
+ try{
+  const r=await fetch('/api/tlsCert',{headers:{'Authorization':'Bearer '+token}});
+  if(!r.ok){showToast('下载失败','error');return}
+  const blob=await r.blob();
+  if(!blob.size){showToast('下载失败：证书为空','error');return}
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='panel.pem';a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),3000);
+  showToast('已导出 panel.pem，请导入系统/浏览器信任','success');
+ }catch(e){showToast('下载失败','error')}
+}
+async function renewTlsCert(){
+ showModal('重新签发证书','将删除现有证书并重新生成（SAN 含本机全部 IP）。<br><span style="font-size:12px;color:var(--text-muted)">重启服务后生效；已导入信任的旧证书需重新导入一次。</span>','确认重签',async()=>{
+  try{
+   const j=await api('/api/tlsRenew',{method:'POST',body:'{}'});
+   showToast(j.message||(j.code===0?'已重新签发':'重签失败'),j.code===0?'success':'error');
+   loadTlsStatus();
+  }catch(e){showToast('重签失败','error')}
+ });
 }
 
 function renderConfigInput(item){

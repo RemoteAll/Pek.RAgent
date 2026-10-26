@@ -165,7 +165,21 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
             );
         }
     }
-    let _http = crate::server::start(manager.clone(), port, local_only);
+    // 2) 本地控制接口（线程持有；进程退出即结束）
+    //    面板 HTTPS：配置 `Tls=true` 时同端口改用 TLS（自签叶子证书，SAN 含本机全部 IP）。
+    //    证书生成/加载失败一律回退明文 HTTP 并告警——安全增强不得把管理员挡在面板外。
+    let tls = if manager.config().tls {
+        match crate::tlscfg::ensure_pem(manager.base()) {
+            Ok(pem) => Some(pem),
+            Err(e) => {
+                util::log_error(&format!("{e}；已回退为明文 HTTP"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _http = crate::server::start(manager.clone(), port, local_only, tls);
 
     // 2.1) 本地 UDP RPC 服务端（NewLife ApiClient 协议；DHDeploy 重启/拉起链路依赖）
     let _udp = crate::udp_rpc::start(manager.clone(), port);
