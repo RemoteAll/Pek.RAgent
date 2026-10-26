@@ -18,7 +18,8 @@ pub(crate) use dhrust::sys::monitor::{
 };
 pub(crate) use dhrust::sys::process::{
     empty_working_set, is_alive, memory_mb, process_name, raise_priority, set_oom_score_adjust,
-    signal_force, signal_graceful, spawn, stop_process, Handle, SpawnRequest,
+    signal_force, signal_graceful, spawn, stop_process, working_set_trim_supported, Handle,
+    SpawnRequest,
 };
 
 // 监听端口查询已下沉 `dhrust::sys::monitor`：进程 Top（`ProcItem.ports`）与

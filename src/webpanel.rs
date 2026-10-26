@@ -1596,7 +1596,12 @@ fn db_delete_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// 释放内存（尽力回收工作集）。
+/// 释放内存（清理可重建缓存 + 尽力回收工作集）。
+///
+/// 2026-10-26 重写：原实现只调 `empty_working_set`，而 Linux 静态包是 musl——
+/// 没有 `malloc_trim`，按钮实际什么都没做却报成功（用户实测「空操作」）。
+/// 现在先清理本进程可重建缓存（真实动作，占大头），再调平台回收并**如实**汇报：
+/// Windows 走 `EmptyWorkingSet`、glibc 走 `malloc_trim`、musl 无系统级接口。
 fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -1606,23 +1611,46 @@ fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let before = sys::memory_mb(pid).unwrap_or(0);
     util::log_format("Web 面板触发释放内存，释放前 {}MB", &[&before.to_string()]);
 
-    let success = sys::empty_working_set();
+    // ① 清理可重建缓存（站点 UV 集合收缩、站点/文件表多余容量）
+    let cleared = crate::weblog::release_caches();
+    // ② 系统级回收（musl 无此能力，仅返回 false）
+    let trimmed = sys::empty_working_set();
+    let supported = sys::working_set_trim_supported();
 
     let after = sys::memory_mb(pid).unwrap_or(0);
     let freed = before.saturating_sub(after);
     util::log_format(
-        "释放内存完成，释放后 {}MB，释放 {}MB",
-        &[&after.to_string(), &freed.to_string()],
+        "释放内存完成，释放后 {}MB，释放 {}MB（清理缓存 {} 字节）",
+        &[&after.to_string(), &freed.to_string(), &cleared.to_string()],
     );
 
+    let cleared_text = format_bytes(cleared as u64);
+    let how = if trimmed {
+        "，缓存清理 + 系统工作集回收"
+    } else if supported {
+        "，缓存清理（系统回收未生效）"
+    } else {
+        "，仅缓存清理（当前平台无系统级回收接口，由分配器按需归还）"
+    };
+    let message = if freed > 0 {
+        format!(
+            "释放内存完成：{before}MB → {after}MB，释放 {freed}MB，清理缓存 {cleared_text}{how}"
+        )
+    } else {
+        format!("释放内存完成：当前 {before}MB 已无多余缓存可回收，清理缓存 {cleared_text}{how}")
+    };
+
     json_result(
-        if success { 0 } else { 500 },
-        &if success {
-            format!("释放内存完成：{before}MB → {after}MB，释放 {freed}MB")
-        } else {
-            "释放内存失败".to_string()
-        },
-        Some(json!({ "beforeMB": before, "afterMB": after, "freedMB": freed })),
+        0,
+        &message,
+        Some(json!({
+            "beforeMB": before,
+            "afterMB": after,
+            "freedMB": freed,
+            "clearedBytes": cleared,
+            "systemTrim": trimmed,
+            "systemTrimSupported": supported,
+        })),
     )
 }
 

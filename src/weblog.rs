@@ -37,13 +37,23 @@ use crate::util;
 /// 日志轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// 单次读取上限（字节）：防首次回溯读超大文件时长时间占用（未读完下一轮继续）。
-const MAX_CHUNK: usize = 8 * 1024 * 1024;
+///
+/// 2026-10-26 由 8 MB 降到 1 MB：块内是一行一个字符串的临时分配，块越大
+/// 启动回溯时的瞬时堆峰值越高（8 MB 文本 ≈ 10 MB 堆），1 MB 足够摊薄系统调用。
+const MAX_CHUNK: usize = 1024 * 1024;
 /// 半行缓冲上限（畸形日志保护）。
 const MAX_LINE_BUF: usize = 1024 * 1024;
 /// 站点数量上限（保护）。
 const MAX_SITES: usize = 256;
-/// 今日 UV 集合上限（保护内存）。
-const MAX_UV: usize = 1_000_000;
+/// 精确 UV 集合的条数上限：超过后降级为 HyperLogLog（每集合固定 16 KB）。
+///
+/// 动机（2026-10-26）：首次回溯会把当天全部访问 IP 读进内存，百万级
+/// `HashSet<IpAddr>` 约 20~35 MB，是代理常驻内存的最大变量。UV 只作展示，
+/// 0.8% 误差可接受；小站点仍走精确集合，日常数据不受影响。
+const UV_EXACT_LIMIT: usize = 20_000;
+/// HyperLogLog 精度：p=14 → 16384 个寄存器（16 KB），标准误差 1.04/√m ≈ 0.81%。
+const HLL_P: usize = 14;
+const HLL_M: usize = 1 << HLL_P;
 /// 持久化节流间隔。
 const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 /// 自动发现重扫间隔（新站点上线后最多 5 分钟可见）。
@@ -82,6 +92,156 @@ struct FileState {
     error_logged: bool,
 }
 
+/// IP 的稳定散列（`DefaultHasher` 固定种子：同一次运行内外一致，无需持久化）。
+fn hash_ip(ip: IpAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ip.hash(&mut h);
+    h.finish()
+}
+
+/// `2^-r` 查表（HyperLogLog 估算用；避免每个寄存器都算一次 `powi`）。
+fn rank_table() -> &'static [f64; 64] {
+    static TABLE: std::sync::OnceLock<[f64; 64]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0f64; 64];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = 2f64.powi(-(i as i32));
+        }
+        table
+    })
+}
+
+/// 固定 16 KB 的基数估算器（HyperLogLog，标准误差约 0.81%）。
+#[derive(Clone)]
+struct HyperLogLog {
+    regs: Vec<u8>,
+}
+
+impl HyperLogLog {
+    fn new() -> Self {
+        Self {
+            regs: vec![0u8; HLL_M],
+        }
+    }
+
+    fn add_hash(&mut self, hash: u64) {
+        // 高 p 位做桶下标，其余位的前导零个数 + 1 作为 rank（上限 64-p+1）
+        let index = (hash >> (64 - HLL_P)) as usize;
+        let rest = hash << HLL_P;
+        let rank = if rest == 0 {
+            (64 - HLL_P + 1) as u8
+        } else {
+            rest.leading_zeros() as u8 + 1
+        };
+        if rank > self.regs[index] {
+            self.regs[index] = rank;
+        }
+    }
+
+    /// 基数估算（标准 HLL：原始估计 + 小范围线性计数修正）。
+    fn estimate(&self) -> u64 {
+        let table = rank_table();
+        let m = HLL_M as f64;
+        let sum: f64 = self
+            .regs
+            .iter()
+            .map(|&r| table[(r as usize).min(table.len() - 1)])
+            .sum();
+        let alpha = 0.7213 / (1.0 + 1.079 / m);
+        let raw = alpha * m * m / sum;
+        let zeros = self.regs.iter().filter(|&&r| r == 0).count();
+        let value = if raw <= 2.5 * m && zeros > 0 {
+            // 小范围修正：寄存器大量为 0 时原始估计偏差大
+            m * (m / zeros as f64).ln()
+        } else {
+            raw
+        };
+        value.round().max(0.0) as u64
+    }
+
+    #[cfg(test)]
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.regs.capacity()
+    }
+}
+
+/// UV 集合：小基数精确（`HashSet`），大基数自动降级为 HyperLogLog。
+#[derive(Clone)]
+enum UvSet {
+    Exact(HashSet<IpAddr>),
+    Approx(HyperLogLog),
+}
+
+impl Default for UvSet {
+    fn default() -> Self {
+        Self::Exact(HashSet::new())
+    }
+}
+
+impl UvSet {
+    /// 记录一个访客 IP（同一 IP 重复只计一次）。
+    fn add(&mut self, ip: IpAddr) {
+        match self {
+            Self::Exact(set) => {
+                if set.contains(&ip) {
+                    return;
+                }
+                if set.len() < UV_EXACT_LIMIT {
+                    set.insert(ip);
+                    return;
+                }
+                // 超过上限：把已收集的精确集合灌进 HyperLogLog 后切换（一次性开销）
+                let mut hll = HyperLogLog::new();
+                for old in set.iter() {
+                    hll.add_hash(hash_ip(*old));
+                }
+                hll.add_hash(hash_ip(ip));
+                *self = Self::Approx(hll);
+            }
+            Self::Approx(hll) => hll.add_hash(hash_ip(ip)),
+        }
+    }
+
+    fn estimate(&self) -> u64 {
+        match self {
+            Self::Exact(set) => set.len() as u64,
+            Self::Approx(hll) => hll.estimate(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_approx(&self) -> bool {
+        matches!(self, Self::Approx(_))
+    }
+
+    #[cfg(test)]
+    fn memory_bytes(&self) -> usize {
+        match self {
+            // hashbrown：每桶 ≈ 键大小 + 1 字节控制位，按容量估算即可（只用于展示）
+            Self::Exact(set) => {
+                std::mem::size_of::<Self>()
+                    + set.capacity() * (std::mem::size_of::<IpAddr>() + 1)
+            }
+            Self::Approx(hll) => std::mem::size_of::<Self>() + hll.memory_bytes(),
+        }
+    }
+
+    /// 释放内存：精确集合收缩到实际大小（估算集合本就定长）。返回释放字节数估算。
+    fn compact(&mut self) -> usize {
+        match self {
+            Self::Exact(set) => {
+                let per_slot = std::mem::size_of::<IpAddr>() + 1;
+                let before = std::mem::size_of::<Self>() + set.capacity() * per_slot;
+                set.shrink_to_fit();
+                let after = std::mem::size_of::<Self>() + set.capacity() * per_slot;
+                before.saturating_sub(after)
+            }
+            Self::Approx(_) => 0,
+        }
+    }
+}
+
 /// 单日统计。
 #[derive(Default, Clone)]
 struct DayStats {
@@ -91,8 +251,8 @@ struct DayStats {
     s3xx: u64,
     s4xx: u64,
     s5xx: u64,
-    /// 今日 UV 集合（本次运行期间新见到的 IP）
-    uv: HashSet<IpAddr>,
+    /// 今日 UV 集合（本次运行期间新见到的 IP；大基数自动降级为估算）
+    uv: UvSet,
     /// UV 基数（持久化恢复的历史数量；重启后集合从零，基数为准）
     uv_base: u64,
 }
@@ -100,7 +260,7 @@ struct DayStats {
 impl DayStats {
     /// UV 展示值（基数 + 本次集合）。
     fn uv_total(&self) -> u64 {
-        self.uv_base + self.uv.len() as u64
+        self.uv_base + self.uv.estimate()
     }
 }
 
@@ -144,10 +304,9 @@ impl SiteStats {
             5 => self.today.s5xx += 1,
             _ => {}
         }
-        if let Some(ip) = line.ip
-            && self.today.uv.len() < MAX_UV {
-                self.today.uv.insert(ip);
-            }
+        if let Some(ip) = line.ip {
+            self.today.uv.add(ip);
+        }
     }
 
     /// 速率推进（每 1 秒调用一次；5 秒滑动平均）。
@@ -370,41 +529,47 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
     // 历史保留清理（内部每天最多执行一次，开销可忽略）
     history::maybe_prune(&t.base, cfg.traffic_history_days);
 
-    // 读取增量并聚合成事件（先收集，避免多字段可变借用冲突）
+    // 读取增量并就地聚合（流式：读一块聚一块，不累积全量事件——
+    // 首次回溯几十 MB 日志时，原实现的事件缓冲是启动内存峰值的主要来源）
     let sources = inner.sources.clone();
-    let mut events: Vec<(String, LogLine)> = Vec::new();
-    for src in &sources {
-        let st = inner.files.entry(src.path.clone()).or_default();
-        match read_increment(&src.path, st) {
-            Ok(lines) => {
-                st.error_logged = false;
-                for line in lines {
-                    // IIS W3C：字段顺序由 #Fields 头决定；其它格式走 combined/JSON 解析。
-                    let parsed = if st.w3c.is_some() || looks_like_w3c_line(&line) {
-                        parse_w3c_line(&line, &mut st.w3c)
-                    } else {
-                        parse_log_line(&line)
-                    };
-                    if let Some(ev) = parsed {
-                        events.push((src.site.clone(), ev));
+    let mut any = false;
+    {
+        // 字段级拆分：文件状态与站点统计同时可变借用（不同字段，互不冲突）
+        let Inner { files, stats, .. } = &mut *inner;
+        for src in &sources {
+            let st = files.entry(src.path.clone()).or_default();
+            let site = stats.entry(src.site.clone()).or_default();
+            let mut added = 0usize;
+            let result = read_increment(&src.path, st, |line, w3c| {
+                // IIS W3C：字段顺序由 #Fields 头决定；其它格式走 combined/JSON 解析。
+                let parsed = if w3c.is_some() || looks_like_w3c_line(line) {
+                    parse_w3c_line(line, w3c)
+                } else {
+                    parse_log_line(line)
+                };
+                if let Some(ev) = parsed {
+                    site.add(&ev);
+                    added += 1;
+                }
+            });
+            match result {
+                Ok(_) => st.error_logged = false,
+                Err(e) => {
+                    if !st.error_logged {
+                        st.error_logged = true;
+                        util::log_format(
+                            "网站日志读取失败：{}（{}）",
+                            &[&src.path.display().to_string(), &e.to_string()],
+                        );
                     }
                 }
             }
-            Err(e) => {
-                if !st.error_logged {
-                    st.error_logged = true;
-                    util::log_format(
-                        "网站日志读取失败：{}（{}）",
-                        &[&src.path.display().to_string(), &e.to_string()],
-                    );
-                }
+            if added > 0 {
+                any = true;
             }
         }
     }
-    for (site, ev) in &events {
-        inner.stats.entry(site.clone()).or_default().add(ev);
-    }
-    if !events.is_empty() {
+    if any {
         inner.dirty = true;
     }
 
@@ -437,6 +602,36 @@ fn flush(t: &WebTraffic) {
     for date in stat_dates(&inner.stats) {
         write_day_file(&t.base, &date, &inner.stats);
     }
+}
+
+/// 释放内存（面板「释放内存」按钮）：清理可重建的缓存，返回可释放字节数估算。
+///
+/// 只清理不影响统计口径的东西：站点 UV 集合收缩到实际大小（大基数集合在采集时
+/// 已降级为 16 KB 的 HyperLogLog）、站点/文件表的多余容量。**不动**日志半行缓冲
+/// （清掉会丢失未完成的一行）。
+///
+/// 为什么需要它（2026-10-26）：musl（Linux 静态包）没有 `malloc_trim`，面板按钮
+/// 原来在 Linux 上实际是空操作；改为先清理本进程缓存，再由分配器在释放大块时归还，
+/// RSS 才会真降。
+pub(crate) fn release_caches() -> usize {
+    let Some(t) = INSTANCE.get() else {
+        return 0;
+    };
+    let Ok(mut inner) = t.inner.lock() else {
+        return 0;
+    };
+    let mut freed = 0usize;
+    for st in inner.stats.values_mut() {
+        freed += st.today.uv.compact();
+        freed += st.yesterday.uv.compact();
+    }
+    let before = inner.stats.capacity() + inner.files.capacity();
+    inner.stats.shrink_to_fit();
+    inner.files.shrink_to_fit();
+    let after = inner.stats.capacity() + inner.files.capacity();
+    // 每个槽位按 (键 + 值 + 控制位) 粗略估算（只用于展示释放量）
+    freed += before.saturating_sub(after) * 128;
+    freed
 }
 
 // ————— 面板快照 —————
@@ -1207,13 +1402,24 @@ fn today_string() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 读取文件增量，返回完整行列表（不完整行留在缓冲，下一轮拼接）。
+/// 读取文件增量并**逐行回调**（不完整行留在缓冲，下一轮拼接）。
+///
+/// 为什么流式（2026-10-26）：首次回溯会把当天整个日志读一遍。原实现先把所有行
+/// 收集成 `Vec<String>`、解析后再全部聚合成一个事件 `Vec`，几十 MB 日志会把瞬时堆
+/// 推到几十 MB（"刚启动就占 40+ MB"的主因之一）。现改为「读一块 → 解析一块 → 聚合
+/// 一块」，峰值只与单块大小相关。
 ///
 /// 处理三类边界：
 /// - 首次读取：文件今天更新过 → 从头读（补今日已有数据）；否则跳到末尾（只统计增量）；
 /// - 日志轮转：文件身份变化（inode 不同）→ 新文件从头读；
 /// - 截断（copytruncate）：长度小于已读偏移 → 从头读。
-fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String>> {
+///
+/// 回调参数：行文本（已去掉行尾 `\r`）、IIS W3C 字段状态（解析时可更新）。
+/// 返回本次产出的完整行数。
+fn read_increment<F>(path: &Path, st: &mut FileState, mut on_line: F) -> std::io::Result<usize>
+where
+    F: FnMut(&str, &mut Option<W3cFields>),
+{
     let meta = std::fs::metadata(path)?;
     let len = meta.len();
     let ident = file_identity(path, &meta);
@@ -1239,7 +1445,7 @@ fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String
         st.w3c = None;
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = 0usize;
     if len > st.offset {
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(st.offset))?;
@@ -1250,20 +1456,24 @@ fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String
         st.offset += n as u64;
 
         st.pending.extend_from_slice(&chunk);
+        // 同一结构体的不同字段分别可变借用（逐行回调期间不经过 `st` 的方法）
+        let pending = &mut st.pending;
+        let w3c = &mut st.w3c;
         let mut start = 0usize;
-        for i in 0..st.pending.len() {
-            if st.pending[i] == b'\n' {
-                let line = &st.pending[start..i];
-                lines.push(String::from_utf8_lossy(line).trim_end_matches('\r').to_string());
+        for i in 0..pending.len() {
+            if pending[i] == b'\n' {
+                let raw = String::from_utf8_lossy(&pending[start..i]);
+                on_line(raw.trim_end_matches('\r'), w3c);
+                lines += 1;
                 start = i + 1;
             }
         }
         if start > 0 {
-            st.pending.drain(..start);
+            pending.drain(..start);
         }
-        if st.pending.len() > MAX_LINE_BUF {
+        if pending.len() > MAX_LINE_BUF {
             // 畸形保护：超长无换行内容直接丢弃
-            st.pending.clear();
+            pending.clear();
         }
     }
     Ok(lines)
@@ -1332,7 +1542,7 @@ fn day_from_json(v: Option<&Json>) -> DayStats {
         s3xx: get("s3xx"),
         s4xx: get("s4xx"),
         s5xx: get("s5xx"),
-        uv: HashSet::new(),
+        uv: UvSet::default(),
         uv_base: get("uv"),
     }
 }
@@ -1767,23 +1977,27 @@ server
 
         let mut st = FileState::default();
         // 首次读取：mtime 是今天 → 从头读
-        let lines = read_increment(&log, &mut st).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 2, "半行不应产出：{lines:?}");
 
         // 无新增：无行
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert!(lines.is_empty());
 
         // 补全半行：产出完整行
         append(&log, "0 300\n");
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GET /3"));
 
         // 模拟 logrotate：改名旧文件 + 新文件
         std::fs::rename(&log, dir.join("access.log.1")).unwrap();
         append(&log, "2.2.2.2 - - [t] \"GET /new HTTP/1.1\" 500 50\n");
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1, "轮转后应读取新文件：{lines:?}");
         assert!(lines[0].contains("GET /new"));
 
@@ -1796,15 +2010,80 @@ server
         let log = dir.join("a.log");
         append(&log, "1.1.1.1 - - [t] \"GET /1 HTTP/1.1\" 200 100\n");
         let mut st = FileState::default();
-        assert_eq!(read_increment(&log, &mut st).unwrap().len(), 1);
+        let mut lines: Vec<String> = Vec::new();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
+        assert_eq!(lines.len(), 1);
 
         // 截断重写（copytruncate）
         std::fs::write(&log, "1.1.1.9 - - [t] \"GET /2 HTTP/1.1\" 200 1\n").unwrap();
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GET /2"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ————— UV 基数（精确 → HyperLogLog 降级） —————
+
+    #[test]
+    fn uv_counts_unique_ips_only() {
+        let mut uv = UvSet::default();
+        for _ in 0..5 {
+            uv.add("1.2.3.4".parse().unwrap());
+        }
+        uv.add("1.2.3.5".parse().unwrap());
+        assert!(!uv.is_approx());
+        assert_eq!(uv.estimate(), 2);
+    }
+
+    #[test]
+    fn uv_degrades_to_hyperloglog_beyond_limit() {
+        let mut uv = UvSet::default();
+        for i in 0..UV_EXACT_LIMIT {
+            let ip: IpAddr = format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256)
+                .parse()
+                .unwrap();
+            uv.add(ip);
+        }
+        assert!(!uv.is_approx(), "上限内应保持精确集合");
+        assert_eq!(uv.estimate(), UV_EXACT_LIMIT as u64);
+
+        uv.add("192.168.9.9".parse().unwrap());
+        assert!(uv.is_approx(), "超限后应降级为 HyperLogLog");
+        let est = uv.estimate() as f64;
+        let expect = (UV_EXACT_LIMIT + 1) as f64;
+        let err = (est - expect).abs() / expect;
+        assert!(err < 0.05, "降级后估算误差过大：{est} vs {expect}");
+        assert!(
+            uv.memory_bytes() < 32 * 1024,
+            "估算集合应固定小体积：{} 字节",
+            uv.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn hyperloglog_estimates_large_cardinality() {
+        let mut hll = HyperLogLog::new();
+        let n = 100_000u32;
+        for i in 0..n {
+            let ip: IpAddr = std::net::Ipv4Addr::from(i).into();
+            hll.add_hash(hash_ip(ip));
+        }
+        let est = hll.estimate() as f64;
+        let err = (est - n as f64).abs() / n as f64;
+        assert!(err < 0.03, "HLL 误差过大：{:.2}%（估算 {est}）", err * 100.0);
+    }
+
+    #[test]
+    fn hyperloglog_is_accurate_for_small_sets() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u32 {
+            let ip: IpAddr = std::net::Ipv4Addr::from(i).into();
+            hll.add_hash(hash_ip(ip));
+        }
+        let est = hll.estimate() as i64;
+        assert!((est - 100).abs() <= 5, "小基数估算偏差过大：{est}");
     }
 
     // ————— 聚合与滚动 —————
