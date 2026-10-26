@@ -682,7 +682,7 @@ async function loadMachineDetail(){
   // 进程 Top（字段对齐 htop / 云监控：用户 / CPU% / 内存 / 线程句柄 / 启动时间 / 命令行与路径）
   if(d.processes&&d.processes.length>0){
    _procData=d.processes;
-   html+=`<div class="section-title mt-16">进程 Top 20（排序：<span class="proc-sort" data-sort="cpu" onclick="setProcSort('cpu')">CPU</span> · <span class="proc-sort" data-sort="mem" onclick="setProcSort('mem')">内存</span>）</div>
+   html+=`<div class="section-title mt-16">进程 Top 20（排序：<span class="proc-sort" data-sort="cpu" onclick="setProcSort('cpu')">CPU</span> · <span class="proc-sort" data-sort="mem" onclick="setProcSort('mem')">内存</span>）<button class="btn btn-ghost btn-sm" style="float:right;margin-top:-4px" onclick="loadMachineDetail()">↻ 刷新</button></div>
    <div style="overflow-x:auto"><table class="info-table proc-table" style="min-width:640px">
     <tr><td style="${TH};white-space:nowrap">PID</td><td style="${TH};white-space:nowrap">用户</td><td style="${TH}">进程 / 可执行文件</td><td style="${TH};white-space:nowrap">监听端口</td><td style="${TH};white-space:nowrap">CPU</td><td style="${TH};white-space:nowrap">内存</td><td style="${TH};white-space:nowrap">线程/句柄</td><td style="${TH};white-space:nowrap">启动时间</td></tr>
     <tbody id="proc-rows"></tbody>
