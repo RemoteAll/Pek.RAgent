@@ -586,6 +586,8 @@ async function loadMachineDetail(){
   const j=await api('/star/machine');
   if(j.code!==0){el.innerHTML=`<p class="text-muted">加载失败</p>`;return}
   const d=j.data;
+  // 保留用户正在填写的虚拟内存表单（页面每 30 秒重绘一次）
+  const keep={size:(($('swap-size')||{}).value||''),path:(($('swap-path')||{}).value||''),persist:$('swap-persist')?$('swap-persist').checked:true};
   let html='';
 
   // 系统概览
@@ -612,6 +614,36 @@ async function loadMachineDetail(){
   html+=infoRow('可用',d.memory.availableMemory,'text-green');
   html+=infoRow('使用率',d.memory.memoryRatePercent,parseFloat(d.memory.memoryRate)>0.8?'text-yellow':'');
   html+=`</table>`;
+
+  // 虚拟内存（swap）：Linux 支持在线创建/关闭；Windows 仅展示
+  if(d.swap){
+   const s=d.swap;
+   const warn=parseFloat(s.usedPercent)>80?'text-yellow':'';
+   html+=`<div class="section-title mt-16">虚拟内存（Swap）</div><table class="info-table">`;
+   html+=infoRow('总量',s.totalMB>0?s.totalText:'未启用');
+   html+=infoRow('已用',s.totalMB>0?s.usedText:'—',warn);
+   html+=infoRow('使用率',s.totalMB>0?s.usedPercent:'—',warn);
+   if(s.swappiness!=null)html+=infoRow('swappiness',String(s.swappiness));
+   html+=`</table>`;
+   if(s.entries&&s.entries.length>0){
+    html+=`<table class="info-table" style="margin-top:8px"><tr><td style="${TH};font-size:11px">交换文件</td><td style="${TH};font-size:11px">大小</td><td style="${TH};font-size:11px">已用</td><td style="${TH};font-size:11px">优先级</td><td></td></tr>`;
+    s.entries.forEach(e=>{
+     html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(e.path)}</td><td>${esc(e.sizeText)}</td><td>${esc(e.usedText)}</td><td>${e.priority}</td><td><button class="btn btn-ghost btn-sm" onclick="swapRemove('${escAttr(e.path)}')">关闭并删除</button></td></tr>`;
+    });
+    html+=`</table>`;
+   }
+   if(s.configurable&&s.root){
+    html+=`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:12px">
+     <label>大小(MB) <input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:110px" value="${escAttr(keep.size||'2048')}"></label>
+     <label>路径 <input id="swap-path" style="width:170px" value="${escAttr(keep.path||s.defaultPath)}"></label>
+     <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
+     <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
+     <label style="margin-left:6px">swappiness <input id="swap-swap" type="number" min="0" max="100" style="width:70px" value="${s.swappiness==null?'':s.swappiness}"></label>
+     <button class="btn btn-ghost btn-sm" onclick="swapSwappiness()">保存</button>
+    </div>`;
+   }
+   if(s.hint)html+=`<div class="text-muted" style="font-size:11px;margin-top:6px">${esc(s.hint)}</div>`;
+  }
 
   // 磁盘分区
   if(d.drives&&d.drives.length>0){
@@ -655,6 +687,37 @@ async function loadMachineDetail(){
   el.innerHTML=html;
   renderProcRows();
  }catch(e){el.innerHTML=`<p class="text-muted">加载失败</p>`}
+}
+
+/* ── 虚拟内存（swap）操作 ── */
+let _swapBusy=false;
+async function swapSubmit(payload){
+ if(_swapBusy)return;_swapBusy=true;
+ showToast('处理中，请稍候...','info');
+ try{
+  const j=await api('/star/swapConfig',{method:'POST',body:JSON.stringify(payload)});
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'操作失败'),'error')}
+  loadMachineDetail();
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{_swapBusy=false}
+}
+function swapCreate(){
+ const size=parseInt((($('swap-size')||{}).value)||'0',10);
+ const path=((($('swap-path')||{}).value)||'/swapfile').trim();
+ const persist=$('swap-persist')?$('swap-persist').checked:true;
+ if(!size||size<128){showToast('请填写不小于 128 MB 的大小','error');return}
+ if(!confirm(`将在 ${path} 创建 ${size} MB 交换文件并启用，继续？`))return;
+ swapSubmit({action:'create',sizeMB:size,path:path,persist:persist?'1':'0'});
+}
+function swapRemove(path){
+ if(!confirm(`关闭并删除交换区 ${path}？\n关闭时会把已换出的数据拉回内存，内存紧张时可能较慢或失败。`))return;
+ swapSubmit({action:'remove',path:path});
+}
+function swapSwappiness(){
+ const v=parseInt((($('swap-swap')||{}).value)||'-1',10);
+ if(!(v>=0&&v<=100)){showToast('swappiness 取值 0~100','error');return}
+ swapSubmit({action:'swappiness',value:v});
 }
 
 /* ── 进程表（本机详情；可切换 CPU / 内存排序） ── */
@@ -1675,6 +1738,7 @@ function confirmRemoveService(name){
 
 /* ── Control ── */
 let _freeMemRunning=false;
+let _freeSysMemRunning=false;
 
 async function freeMemory(){
  if(_freeMemRunning)return;_freeMemRunning=true;
@@ -1690,6 +1754,20 @@ async function freeMemory(){
   setTimeout(()=>{loadDashboard();},1000);
  }catch(e){showToast('❌ 请求失败','error')}
  finally{if(btn)btn.disabled=false;_freeMemRunning=false}
+}
+
+/* 清理系统页缓存（Linux sync + drop_caches）：只释放页缓存，不动任何进程的内存 */
+async function freeSystemMemory(){
+ if(_freeSysMemRunning)return;_freeSysMemRunning=true;
+ const btn=$('btn-free-sys-mem');if(btn)btn.disabled=true;
+ showToast('正在清理系统缓存...','info');
+ try{
+  const j=await api('/api/freeSystemMemory');
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'清理失败'),'error')}
+  setTimeout(()=>{loadDashboard();},1200);
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{if(btn)btn.disabled=false;_freeSysMemRunning=false}
 }
 
 let _syncingTime=false;
@@ -1742,6 +1820,7 @@ async function changePassword(){
  <button class="btn btn-danger btn-lg" onclick="doControl('stop')" id="btn-stop">⏹ 停止服务</button>
  <button class="btn btn-lg" style="background:var(--orange);color:#fff;box-shadow:0 2px 8px rgba(249,115,22,0.3)" onclick="doControl('restart')" id="btn-restart">↻ 重启服务</button>
  <button class="btn btn-lg" style="background:var(--gradient-brand);color:#fff;box-shadow:0 2px 8px rgba(91,91,255,0.3)" onclick="freeMemory()" id="btn-free-mem">🗑 释放内存</button>
+ <button class="btn btn-lg btn-ghost" onclick="freeSystemMemory()" id="btn-free-sys-mem">🧹 清理系统缓存</button>
  </div>`;
  html+=`<div class="section-title">操作记录</div><div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">通过本面板发起的启停操作，保存在浏览器本地存储</div><div class="cmd-history" id="cmd-history">`;
  if(cmdHistory.length===0)html+=`<div class="text-muted" style="font-size:12px">暂无操作记录</div>`;

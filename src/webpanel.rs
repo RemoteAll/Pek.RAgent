@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, TimeZone};
 use dhrust::net::controller::{
-    arg, arg_i64, json_body, json_error, json_result, ActionResult, Controller,
+    ActionResult, Controller, arg, arg_bool, arg_i64, json_body, json_error, json_result,
 };
 use dhrust::net::http::HttpResponse;
 use dhrust::net::login_guard::LoginGuard;
@@ -607,6 +607,8 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("control", "服务控制"),
     ("dhdeployPanel", "DHDeploy 面板访问"),
     ("freeMemory", "释放内存"),
+    ("freeSystemMemory", "清理系统缓存"),
+    ("swapConfig", "虚拟内存设置"),
     ("updateConfig", "更新配置"),
     ("changePassword", "修改密码"),
     ("upgrade", "程序升级"),
@@ -691,6 +693,11 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("status", guarded(panel.clone(), PERM_DASHBOARD, status));
     controller = controller.get("health", guarded(panel.clone(), PERM_DASHBOARD, health));
     controller = controller.get("freeMemory", guarded(panel.clone(), PERM_CONTROL, free_memory));
+    // 清理系统页缓存（Linux sync + drop_caches；不释放进程自身内存）
+    controller = controller.get(
+        "freeSystemMemory",
+        guarded(panel.clone(), PERM_CONTROL, free_system_memory),
+    );
     controller = controller.get(
         "configMetadata",
         guarded(panel.clone(), PERM_CONFIG, config_metadata),
@@ -775,6 +782,11 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_STARCONFIG, update_star_config),
     );
     controller = controller.get("machine", guarded(panel.clone(), PERM_DASHBOARD, machine));
+    // 虚拟内存（swap）在线配置：create / remove / swappiness
+    controller = controller.post(
+        "swapConfig",
+        guarded(panel.clone(), PERM_CONTROL, swap_config),
+    );
     controller = controller.get(
         "webTraffic",
         guarded(panel.clone(), PERM_TRAFFIC, web_traffic),
@@ -1652,6 +1664,77 @@ fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "systemTrimSupported": supported,
         })),
     )
+}
+
+/// 清理系统内存缓存（Linux `sync` + `drop_caches`）。
+///
+/// 与「释放内存」的区别：
+/// - 「释放内存」只处理**本代理自己**（清自身缓存 + EmptyWorkingSet/malloc_trim）；
+/// - 本接口清理**整机的页缓存/目录项/inode 缓存**（宝塔同类按钮的口径），
+///   但不释放任何进程占用的内存——那必须重启对应进程（面板「进程 Top」可定位）。
+fn free_system_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::memsys::drop_caches() {
+        Ok(r) => {
+            let freed = r.freed();
+            let tip = if freed < 32 * 1024 * 1024 {
+                "（当前可回收的页缓存不多；进程占用的内存需重启对应服务才能释放）"
+            } else {
+                "（页缓存已释放；进程自身占用的内存不受影响）"
+            };
+            json_result(
+                0,
+                &format!(
+                    "系统缓存已清理：可用内存 {} → {}，释放 {}{tip}",
+                    format_bytes(r.before_avail),
+                    format_bytes(r.after_avail),
+                    format_bytes(freed)
+                ),
+                Some(json!({
+                    "beforeAvailMB": r.before_avail / 1024 / 1024,
+                    "afterAvailMB": r.after_avail / 1024 / 1024,
+                    "freedMB": freed / 1024 / 1024,
+                    "beforeCachedMB": r.before_cached / 1024 / 1024,
+                    "afterCachedMB": r.after_cached / 1024 / 1024,
+                })),
+            )
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 虚拟内存（swap）在线配置：`action=create|remove|swappiness`。
+///
+/// 成功时把最新状态一并返回，前端无需二次拉取。
+fn swap_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let action = arg(ctx, "action").unwrap_or_default();
+    let result = match action.as_str() {
+        "create" => {
+            let size_mb = arg_i64(ctx, "sizeMB").unwrap_or(0).max(0) as u64;
+            let path = arg(ctx, "path").unwrap_or_else(|| "/swapfile".to_string());
+            let persist = arg_bool(ctx, "persist").unwrap_or(true);
+            crate::swap::create(&path, size_mb, persist)
+        }
+        "remove" => crate::swap::remove(&arg(ctx, "path").unwrap_or_default()),
+        "swappiness" => {
+            let value = arg_i64(ctx, "value").unwrap_or(-1);
+            if !(0..=100).contains(&value) {
+                Err("swappiness 取值 0~100".to_string())
+            } else {
+                crate::swap::set_swappiness(value as u32)
+            }
+        }
+        _ => Err("未知操作（action 应为 create / remove / swappiness）".to_string()),
+    };
+    match result {
+        Ok(msg) => json_result(0, &msg, Some(crate::swap::status_json())),
+        Err(e) => json_error(400, &e),
+    }
 }
 
 /// 同步系统时间（`{"timeMs": 毫秒时间戳}`；Web 面板“同步时间”按钮）。
@@ -2915,6 +2998,7 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "os": os,
             "cpu": cpu,
             "memory": memory,
+            "swap": crate::swap::status_json(),
             "drives": drives,
             "nics": nics,
             "processes": processes,
