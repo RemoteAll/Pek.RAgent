@@ -101,6 +101,39 @@ pub(crate) fn delete_user(base: &Path, user_name: &str) -> Result<(), String> {
     auth().delete_user(&*store(base)?, user_name)
 }
 
+// ————— 平台统一下发（2026-10-26） —————
+
+/// 列出全部用户（内部结构，含密码哈希；平台统一下发与摘要计算用，**不得外泄**）。
+pub(crate) fn list_users(base: &Path) -> Result<Vec<pek_radmin::panel::PanelUser>, String> {
+    auth().list_users(&*store(base)?)
+}
+
+/// 用户清单摘要（排序后 SHA-256）：心跳上报给平台，用于判断是否需要同步。
+pub(crate) fn users_digest(base: &Path) -> Result<String, String> {
+    auth().users_digest(&*store(base)?)
+}
+
+/// 直接写入密码哈希/盐（平台下发场景不接触明文；哈希口径 `SHA-256(salt:password)`）。
+pub(crate) fn save_user_hashed(
+    base: &Path,
+    user_name: &str,
+    password_hash: &str,
+    salt: &str,
+    permissions: &[String],
+    enabled: bool,
+    remark: &str,
+) -> Result<(), String> {
+    auth().save_user_hashed(
+        &*store(base)?,
+        user_name,
+        password_hash,
+        salt,
+        permissions,
+        enabled,
+        remark,
+    )
+}
+
 // ————— 审计 —————
 
 /// 写入一条审计记录（失败只记程序日志，不影响业务）。

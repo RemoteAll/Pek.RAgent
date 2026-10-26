@@ -351,6 +351,74 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
             }
+            // ————— 平台统一管控面板子用户（平台权威；内置管理员不接管） —————
+            "panelUserList" => {
+                let base = crate::util::base_dir();
+                let agent_id = msg_mgr.config().agent_id;
+                let reply = match crate::panel_users::list_json(&base) {
+                    Ok(data) => json!({ "type": "panelUsers", "ok": true, "data": data }),
+                    Err(e) => json!({ "type": "panelUsers", "ok": false, "message": e }),
+                };
+                send_event(&agent_id, reply);
+            }
+            "panelUserUpsert" | "panelUserDelete" | "panelUserSync" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                // DB 写入放到独立线程：不阻塞实时通道（心跳/其它指令照常）
+                std::thread::spawn(move || {
+                    let base = crate::util::base_dir();
+                    let cfg = mgr.config();
+                    let agent_id = cfg.agent_id.clone();
+                    let action = cmd
+                        .get("type")
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let result = match action.as_str() {
+                        "panelUserUpsert" => crate::panel_users::upsert(&base, &cfg, &cmd)
+                            .map(|name| json!({ "userName": name })),
+                        "panelUserDelete" => crate::panel_users::delete(&base, &cfg, &cmd)
+                            .map(|name| json!({ "userName": name })),
+                        _ => {
+                            let users = cmd
+                                .get("users")
+                                .and_then(|x| x.as_array())
+                                .cloned()
+                                .unwrap_or_default();
+                            let prune = cmd
+                                .get("prune")
+                                .and_then(|x| x.as_bool())
+                                .unwrap_or(true);
+                            crate::panel_users::sync(&base, &cfg, &users, prune).map(
+                                |(applied, removed, skipped)| {
+                                    json!({ "applied": applied, "removed": removed, "skipped": skipped })
+                                },
+                            )
+                        }
+                    };
+                    match result {
+                        Ok(data) => {
+                            send_event(
+                                &agent_id,
+                                json!({ "type": "panelUserResult", "action": action, "ok": true, "data": data }),
+                            );
+                            // 立即回传新摘要：平台无需等下一次心跳即可确认已对齐
+                            let (digest, count) = crate::panel_users::summary(&base);
+                            send_event(
+                                &agent_id,
+                                json!({ "type": "panelUserSummary", "panelUsersVersion": digest, "panelUsersCount": count }),
+                            );
+                        }
+                        Err(e) => {
+                            util::log_error(&format!("平台下发用户操作失败（{action}）：{e}"));
+                            send_event(
+                                &agent_id,
+                                json!({ "type": "panelUserResult", "action": action, "ok": false, "message": e }),
+                            );
+                        }
+                    }
+                });
+            }
             _ => {}
         }
     });
@@ -558,6 +626,8 @@ fn with_panel_meta(manager: &AppManager, base: Json) -> String {
             obj.insert(k, val);
         }
     }
+    // 统一管控面板子用户：`caps` + 用户清单摘要（平台判断是否需要同步，无需拉全量）
+    crate::panel_users::merge_summary(&crate::util::base_dir(), &mut v);
     v.to_string()
 }
 

@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local, TimeZone};
@@ -411,6 +411,13 @@ impl WebPanel {
     pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
         if let Some(token) = bearer_token(ctx)
             && let Some(p) = self.tokens.get(&token) {
+                // 平台远程改/删用户后：非管理员会话必须重新确认「用户仍存在且启用」
+                // （命中缓存则零 SQL；平台下发时清空缓存，下一次请求即生效，无需等令牌过期）。
+                if !p.is_admin && !user_still_active(&self.base, &p.name) {
+                    self.tokens.revoke(&token);
+                    self.save_sessions();
+                    return None;
+                }
                 // 滑动续期：一直在用就一直有效；只有改动到期时间时才写盘（低频）
                 if self.tokens.touch(&token) {
                     self.save_sessions();
@@ -457,6 +464,49 @@ impl WebPanel {
     fn auth_level(&self) -> AuthLevel {
         AuthLevel::parse(&self.manager.config().web_auth_level)
     }
+}
+
+// ————— 子用户在线状态（平台统一管控后即时失效） —————
+
+/// 子用户「仍存在且启用」缓存：`用户名(小写) → (校验时刻, 是否有效)`。
+///
+/// 每次带令牌请求都查库太贵；30 秒 TTL 兜底，平台下发变更时 [`invalidate_user_cache`]
+/// 立即清空 → 下一个请求即拒绝（删除/禁用用户后不必等会话过期）。
+static USER_ACTIVE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+
+fn user_active_cache() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
+    USER_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 清空子用户状态缓存（面板本地改用户、平台下发变更后调用）。
+pub(crate) fn invalidate_user_cache() {
+    user_active_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// 子用户是否仍存在且启用（30 秒缓存；查不到/禁用 = 无效）。
+fn user_still_active(base: &Path, name: &str) -> bool {
+    let key = name.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    {
+        let cache = user_active_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, ok)) = cache.get(&key)
+            && at.elapsed() < Duration::from_secs(30)
+        {
+            return *ok;
+        }
+    }
+    let ok = matches!(audit::find_user(base, name), Ok(Some(u)) if u.enabled);
+    let mut cache = user_active_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    cache.insert(key, (Instant::now(), ok));
+    ok
 }
 
 // ————— 动作守卫（认证 + 权限 + 审计） —————
@@ -3678,6 +3728,7 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     ) {
         Ok(()) => {
             // 权限/启用状态变更：该用户已有会话立即失效（下次登录取新快照）
+            invalidate_user_cache();
             if panel
                 .tokens
                 .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))
@@ -3708,6 +3759,7 @@ fn user_delete(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     match audit::delete_user(panel.base(), &name) {
         Ok(()) => {
             // 用户删除后其会话立即失效
+            invalidate_user_cache();
             if panel
                 .tokens
                 .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))

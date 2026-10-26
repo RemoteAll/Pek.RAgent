@@ -23,6 +23,7 @@ mod manager;
 mod memsys;
 mod migrate;
 mod panel_ws;
+mod panel_users;
 mod plugins;
 mod portstat;
 mod sampler;
