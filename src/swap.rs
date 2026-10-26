@@ -59,6 +59,17 @@ pub(crate) fn status_json() -> Json {
         ""
     };
 
+    // 推荐值：按物理内存规模估算（服务器无休眠场景），并扣除已启用的交换区
+    let phys_mb = crate::sys::memory_info()
+        .map(|(total, _)| total / 1024 / 1024)
+        .unwrap_or(0);
+    let recommended_total = recommended_swap_mb(phys_mb);
+    let current_mb = info.total_bytes / 1024 / 1024;
+    let recommended_add = {
+        let add = recommended_total.saturating_sub(current_mb);
+        if add < MIN_SIZE_MB { 0 } else { add }
+    };
+
     json!({
         "supported": supported,
         "configurable": info.configurable,
@@ -73,8 +84,32 @@ pub(crate) fn status_json() -> Json {
         "defaultPath": "/swapfile",
         "minMB": MIN_SIZE_MB,
         "maxMB": MAX_SIZE_MB,
+        "physMB": phys_mb,
+        "recommendedTotalMB": recommended_total,
+        "recommendedMB": recommended_add,
         "hint": hint,
     })
+}
+
+/// 推荐交换区总量（MB）：服务器（无休眠场景）的经验值。
+///
+/// - 物理内存 ≤ 2 GB：2 × 物理内存（小内存机器最容易 OOM）
+/// - 2 GB ~ 8 GB：等于物理内存
+/// - > 8 GB：8 GB
+///
+/// 结果向上对齐到 512 MB，并夹在 `[512, 32768]`；物理内存读不到时给 2048。
+fn recommended_swap_mb(phys_mb: u64) -> u64 {
+    if phys_mb == 0 {
+        return 2048;
+    }
+    let raw = if phys_mb <= 2048 {
+        phys_mb * 2
+    } else if phys_mb <= 8192 {
+        phys_mb
+    } else {
+        8192
+    };
+    (raw.div_ceil(512) * 512).clamp(512, 32_768)
 }
 
 /// 创建并启用交换文件（`persist=true` 时写入 `/etc/fstab`，重启后仍生效）。
@@ -418,6 +453,26 @@ fn remove_fstab(path: &str) -> Result<bool, String> {
     body.push('\n');
     std::fs::write(conf, body).map_err(|e| format!("写入 {conf} 失败：{e}"))?;
     Ok(true)
+}
+
+#[cfg(test)]
+mod recommend_tests {
+    use super::*;
+
+    #[test]
+    fn recommends_swap_by_physical_memory() {
+        // 小内存机器：2 倍物理内存
+        assert_eq!(recommended_swap_mb(1024), 2048);
+        assert_eq!(recommended_swap_mb(2048), 4096);
+        // 中等内存：等于物理内存
+        assert_eq!(recommended_swap_mb(4096), 4096);
+        assert_eq!(recommended_swap_mb(8192), 8192);
+        // 大内存：固定 8 GB
+        assert_eq!(recommended_swap_mb(16384), 8192);
+        assert_eq!(recommended_swap_mb(65536), 8192);
+        // 读不到物理内存时的兜底
+        assert_eq!(recommended_swap_mb(0), 2048);
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]

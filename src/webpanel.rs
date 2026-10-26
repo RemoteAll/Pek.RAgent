@@ -1729,7 +1729,12 @@ fn swap_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 crate::swap::set_swappiness(value as u32)
             }
         }
-        _ => Err("未知操作（action 应为 create / remove / swappiness）".to_string()),
+        _ => {
+            // 旧版前端（浏览器缓存）发空 action 时会走到这里：明确提示强刷
+            Err(format!(
+                "未知操作「{action}」（应为 create / remove / swappiness）；如页面是旧缓存，请 Ctrl+F5 强制刷新面板"
+            ))
+        }
     };
     match result {
         Ok(msg) => json_result(0, &msg, Some(crate::swap::status_json())),
@@ -3786,6 +3791,27 @@ mod tests {
             }
             _ => panic!("应为响应"),
         }
+    }
+
+    /// 复现用户的「未知操作（action 应为 create / remove / swappiness）」：
+    /// JSON body 里的 `action` 必须能被 `arg()` 读到（非 Linux 应报「仅支持 Linux」）。
+    #[test]
+    fn swap_config_parses_action_from_json_body() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+        let ctx = context(
+            "POST",
+            "/star/swapConfig",
+            r#"{"action":"create","sizeMB":256,"path":"/swapfile","persist":"1"}"#,
+            Some(&token),
+        );
+        let r = body_json(swap_config(&panel, &ctx));
+        let message = r["message"].as_str().unwrap_or("");
+        assert!(
+            !message.starts_with("未知操作"),
+            "action 未从 JSON body 解析出来：{message}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

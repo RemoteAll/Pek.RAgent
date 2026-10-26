@@ -614,6 +614,7 @@ async function loadMachineDetail(){
   html+=infoRow('可用',d.memory.availableMemory,'text-green');
   html+=infoRow('使用率',d.memory.memoryRatePercent,parseFloat(d.memory.memoryRate)>0.8?'text-yellow':'');
   html+=`</table>`;
+  html+=`<div style="margin-top:8px"><button class="btn btn-ghost btn-sm" onclick="freeSystemMemory()">🧹 清理系统缓存（释放页缓存，不影响进程内存）</button></div>`;
 
   // 虚拟内存（swap）：Linux 支持在线创建/关闭；Windows 仅展示
   if(d.swap){
@@ -633,8 +634,10 @@ async function loadMachineDetail(){
     html+=`</table>`;
    }
    if(s.configurable&&s.root){
+    const defSize=String(keep.size||s.recommendedMB||2048);
+    html+=`<div class="text-muted" style="font-size:11px;margin-top:8px">推荐交换区 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>`;
     html+=`<div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:10px;font-size:12px">
-     <label>大小(MB) <input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:110px" value="${escAttr(keep.size||'2048')}"></label>
+     <label>大小(MB) <input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" style="width:110px" value="${escAttr(defSize)}"></label>
      <label>路径 <input id="swap-path" style="width:170px" value="${escAttr(keep.path||s.defaultPath)}"></label>
      <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
      <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
