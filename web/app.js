@@ -494,7 +494,7 @@ function buildDashboard(d,health){
  // 顺序与宝塔一致：负载 → CPU → 内存 → 磁盘（负载仅 Linux 显示）
  if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=ringGauge('CPU 使用率', (d.cpuCount||0)+' 核', '', cpuPct, 'gauge-cpu');
- html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem');
+ html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem', '已使用', `<div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="freeMemoryAll()" style="width:100%" title="清理系统页缓存（宝塔口径）；进程自身占用的内存需重启对应服务">🧹 清理内存</button></div>`);
  (d.disks||[]).forEach((x,i)=>{
   html+=ringGauge('磁盘 '+x.name, fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '', pct(x.usedMB,x.totalMB), 'gauge-disk-'+i);
  });
@@ -506,11 +506,6 @@ function buildDashboard(d,health){
   html+=gcStat('GC 内存',health.gcTotalMemory+' MB','gc-mem')+gcStat('CPU 时间',health.totalProcessorTime+'s','gc-cpu');
   html+=`</div></div></div>`;
  }
- // 内存操作按钮：常显（之前只在 GC 折叠框内，默认收起→用户找不到）
- html+=`<div class="mt-12" style="display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end">
-  <button class="btn btn-sm btn-ghost" onclick="freeMemory()" id="btn-free-mem-dash">🗑 释放本进程内存</button>
-  <button class="btn btn-sm btn-ghost" onclick="freeSystemMemory()" id="btn-free-sys-mem-dash">🧹 清理系统缓存</button>
- </div>`;
 
  // 系统信息
  html+=`<div class="glass-card card"><h2>🖥 系统信息</h2><table class="info-table">`;
@@ -613,7 +608,6 @@ async function loadMachineDetail(){
   html+=infoRow('可用',d.memory.availableMemory,'text-green');
   html+=infoRow('使用率',d.memory.memoryRatePercent,parseFloat(d.memory.memoryRate)>0.8?'text-yellow':'');
   html+=`</table>`;
-  html+=`<div style="margin-top:8px"><button class="btn btn-ghost btn-sm" onclick="freeSystemMemory()">🧹 清理系统缓存（释放页缓存，不影响进程内存）</button></div>`;
   // 虚拟内存（swap）：Linux 支持在线创建/关闭；Windows 仅展示
   if(d.swap){
    const s=d.swap;
@@ -1350,7 +1344,7 @@ function infoRow(lbl,val,cls='',id=''){return `<tr><td>${esc(lbl)}</td><td><span
 function gcStat(lbl,val,id=''){return `<div class="gc-stat"><div class="gc-val"${id?` id="${id}"`:''}>${esc(val)}</div><div class="gc-lbl">${lbl}</div></div>`}
 function pct(v,max){return max>0?Math.min(100,Math.round(v/max*100)):0}
 function fmtMem(mb){return mb>=1024?(mb/1024).toFixed(1)+' GB':Math.round(mb)+' MB'}
-function ringGauge(label,val,max,pctVal,id,unit='已使用'){
+function ringGauge(label,val,max,pctVal,id,unit='已使用',extra=''){
  const r=48,c=2*Math.PI*r,offset=c-(pctVal/100)*c;
  const cls=pctVal>80?'#ef4444':pctVal>50?'#f59e0b':'url(#gaugeGrad)';
  return `<div class="gauge-card glass-card"${id?` id="${id}-card"`:''}><div class="gauge-label">${label}</div>
@@ -1358,7 +1352,7 @@ function ringGauge(label,val,max,pctVal,id,unit='已使用'){
  <svg width="120" height="120" viewBox="0 0 120 120"><defs><linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#5b5bff"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
  <circle class="ring-bg" cx="60" cy="60" r="${r}"/><circle class="ring-fill" cx="60" cy="60" r="${r}" stroke="${cls}" stroke-dasharray="${c}" stroke-dashoffset="${offset}"${id?` id="${id}-fill"`:''}/></svg>
  <div class="ring-text"><span class="pct"${id?` id="${id}-pct"`:''}>${pctVal}%</span><span class="unit">${unit}</span></div></div>
- <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)}${max?` / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}`:''}</div></div>`;
+ <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)}${max?` / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}`:''}</div>${extra}</div>`;
 }
 
 /* ── 流量 / 磁盘 IO 趋势图（SVG 手绘，对齐宝塔：双曲线 + 渐变面积 + 页签） ── */
@@ -1775,6 +1769,19 @@ async function freeSystemMemory(){
   setTimeout(()=>{loadDashboard();},1200);
  }catch(e){showToast('❌ 请求失败','error')}
  finally{if(btn)btn.disabled=false;_freeSysMemRunning=false}
+}
+
+/* 一键清理内存：本进程缓存 + 系统页缓存（状态页「内存」卡片按钮） */
+async function freeMemoryAll(){
+ if(_freeMemRunning)return;_freeMemRunning=true;
+ showToast('正在清理内存...','info');
+ try{
+  const j=await api('/api/freeMemoryAll');
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'清理失败'),'error')}
+  setTimeout(()=>{loadDashboard();},1200);
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{_freeMemRunning=false}
 }
 
 let _syncingTime=false;

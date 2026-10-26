@@ -607,6 +607,7 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("control", "服务控制"),
     ("dhdeployPanel", "DHDeploy 面板访问"),
     ("freeMemory", "释放内存"),
+    ("freeMemoryAll", "清理内存"),
     ("freeSystemMemory", "清理系统缓存"),
     ("swapConfig", "虚拟内存设置"),
     ("updateConfig", "更新配置"),
@@ -693,6 +694,11 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("status", guarded(panel.clone(), PERM_DASHBOARD, status));
     controller = controller.get("health", guarded(panel.clone(), PERM_DASHBOARD, health));
     controller = controller.get("freeMemory", guarded(panel.clone(), PERM_CONTROL, free_memory));
+    // 一键清理：本进程缓存 + 系统页缓存（状态页「内存」卡片按钮）
+    controller = controller.get(
+        "freeMemoryAll",
+        guarded(panel.clone(), PERM_CONTROL, free_memory_all),
+    );
     // 清理系统页缓存（Linux sync + drop_caches；不释放进程自身内存）
     controller = controller.get(
         "freeSystemMemory",
@@ -1662,6 +1668,76 @@ fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "clearedBytes": cleared,
             "systemTrim": trimmed,
             "systemTrimSupported": supported,
+        })),
+    )
+}
+
+/// 一键清理内存（状态页「内存」卡片按钮）：本进程缓存 + 系统页缓存（Linux）。
+///
+/// 与两个细分接口的关系：
+/// - `free_memory`：只清代理自己；
+/// - `free_system_memory`：只清系统页缓存；
+/// - 本接口 = 两者合并，给用户一个「点一下就行」的入口（对齐宝塔的使用习惯）。
+fn free_memory_all(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let pid = std::process::id();
+    let self_before = sys::memory_mb(pid).unwrap_or(0);
+    let cleared = crate::weblog::release_caches();
+    let trimmed = sys::empty_working_set();
+    let self_after = sys::memory_mb(pid).unwrap_or(0);
+    let self_freed = self_before.saturating_sub(self_after);
+
+    let system = crate::memsys::drop_caches();
+    util::log_format(
+        "一键清理内存：代理自身 {} → {} MB，系统缓存 {}",
+        &[
+            &self_before.to_string(),
+            &self_after.to_string(),
+            &match &system {
+                Ok(r) => format!("释放 {}", format_bytes(r.freed())),
+                Err(e) => format!("未执行（{e}）"),
+            },
+        ],
+    );
+
+    let message = match &system {
+        Ok(r) => format!(
+            "清理完成：系统页缓存释放 {}，可用内存 {} → {}（代理自身 {} → {} MB）",
+            format_bytes(r.freed()),
+            format_bytes(r.before_avail),
+            format_bytes(r.after_avail),
+            self_before,
+            self_after
+        ),
+        Err(e) => format!(
+            "已清理代理自身缓存（{} → {} MB，清理 {}）；系统页缓存未清理：{e}",
+            self_before,
+            self_after,
+            format_bytes(cleared as u64)
+        ),
+    };
+
+    let (before_avail, after_avail, sys_freed) = match &system {
+        Ok(r) => (r.before_avail, r.after_avail, r.freed()),
+        Err(_) => {
+            let avail = sys::memory_info().map(|(_, a)| a).unwrap_or(0);
+            (avail, avail, 0)
+        }
+    };
+
+    json_result(
+        0,
+        &message,
+        Some(json!({
+            "beforeAvailMB": before_avail / 1024 / 1024,
+            "afterAvailMB": after_avail / 1024 / 1024,
+            "sysFreedMB": sys_freed / 1024 / 1024,
+            "selfFreedMB": self_freed,
+            "clearedBytes": cleared,
+            "systemTrim": trimmed,
+            "systemTrimSupported": sys::working_set_trim_supported(),
         })),
     )
 }
