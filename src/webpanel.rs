@@ -721,6 +721,11 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
         "tlsCert",
         guarded(panel.clone(), PERM_CONFIG, tls_cert),
     );
+    // 一键导入脚本（单文件、内嵌证书）：运维在**自己电脑**上下载后双击/执行一次即可
+    controller = controller.get(
+        "tlsInstall",
+        guarded(panel.clone(), PERM_CONFIG, tls_install),
+    );
     controller = controller.post(
         "updateConfig",
         guarded(panel.clone(), PERM_CONFIG, update_config),
@@ -1957,6 +1962,115 @@ fn tls_cert(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         ),
         Err(e) => json_error(500, &format!("读取证书失败：{e}")),
     }
+}
+
+/// 下载「一键导入证书」脚本（**单文件、内嵌证书**，无需再传 crt）。
+///
+/// `?os=win` → `.cmd`（双击 → 导入当前用户 + 尝试导入本机，后者需管理员）；
+/// 其它 → `.sh`（macOS 走 security，Linux 走 update-ca-certificates）。
+///
+/// 说明：证书信任必须在**发起访问的那台电脑**上完成，服务端无法代劳（操作系统安全边界）；
+/// 这里把“找文件 + 选存储 + 多步向导”压缩成一次双击。
+fn tls_install(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let base = panel.manager.base();
+    let (cert_path, _) = crate::tlscfg::cert_paths(base);
+    let _ = crate::tlscfg::ensure_pem(base);
+    let Ok(pem) = std::fs::read(&cert_path) else {
+        return json_error(500, "读取证书失败");
+    };
+    let b64 = dhrust::sign::base64_encode(&pem);
+    let os = ctx
+        .query_value("os")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    if os == "win" || os == "windows" {
+        let script = build_win_install_script(&b64);
+        return ActionResult::Response(
+            HttpResponse::bytes(200, "text/plain; charset=utf-8", script.into_bytes())
+                .with_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"install-panel-cert.cmd\"",
+                ),
+        );
+    }
+    let script = build_sh_install_script(&b64);
+    ActionResult::Response(
+        HttpResponse::bytes(200, "text/plain; charset=utf-8", script.into_bytes()).with_header(
+            "Content-Disposition",
+            "attachment; filename=\"install-panel-cert.sh\"",
+        ),
+    )
+}
+
+/// Windows 一键导入脚本（CRLF；证书以 base64 内嵌，运行时释放到临时文件）。
+fn build_win_install_script(b64: &str) -> String {
+    let body = format!(
+        r#"@echo off
+setlocal
+chcp 65001 >nul
+title 导入 Pek.RAgent 面板证书
+set "B64={b64}"
+set "CRT=%TEMP%\pek-ragent-panel-%RANDOM%.crt"
+echo 正在释放证书...
+powershell -NoProfile -Command "[IO.File]::WriteAllBytes('%CRT%', [Convert]::FromBase64String('%B64%'))"
+if not exist "%CRT%" (
+  echo [错误] 释放证书失败，请确认系统支持 PowerShell。
+  pause
+  exit /b 1
+)
+echo.
+echo [1/2] 导入到「当前用户 -^> 受信任的根证书颁发机构」（无需管理员）
+certutil -user -addstore -f Root "%CRT%" >nul 2>&1 && echo   完成 || echo   失败（可手动双击证书导入）
+echo.
+echo [2/2] 导入到「本机 -^> 受信任的根证书颁发机构」（需管理员；失败不影响第 1 步）
+certutil -addstore -f Root "%CRT%" >nul 2>&1 && echo   完成 || echo   未获得管理员权限（可右键以管理员身份运行本文件重试）
+del "%CRT%" >nul 2>&1
+echo.
+echo 全部完成。请**完全退出并重新启动浏览器**（Chrome / Edge）后再打开面板。
+echo 注意：Firefox 使用独立证书库，需在 设置 -^> 隐私与安全 -^> 证书 -^> 查看证书 -^> 导入 手动导入面板证书。
+echo.
+pause
+"#
+    );
+    // .cmd 必须 CRLF
+    body.replace('\n', "\r\n")
+}
+
+/// Linux / macOS 一键导入脚本。
+fn build_sh_install_script(b64: &str) -> String {    format!(
+        r#"#!/bin/sh
+# 一键导入 Pek.RAgent 面板自签证书（单文件，证书已内嵌）
+set -e
+B64='{b64}'
+TMP="$(mktemp /tmp/pek-ragent-panel.XXXXXX.crt)"
+if base64 -d </dev/null >/dev/null 2>&1; then
+  DEC="base64 -d"
+else
+  DEC="base64 -D"
+fi
+printf '%s' "$B64" | $DEC > "$TMP"
+echo "证书已释放到 $TMP"
+if [ "$(uname -s)" = "Darwin" ]; then
+  echo "需要管理员密码（导入到 macOS 系统钥匙串）..."
+  sudo security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain "$TMP"
+  echo "完成：已导入 macOS 系统钥匙串"
+else
+  echo "需要管理员密码（导入到系统 CA 目录）..."
+  sudo cp "$TMP" /usr/local/share/ca-certificates/pek-ragent-panel.crt
+  sudo update-ca-certificates
+  echo "完成：已导入系统 CA（update-ca-certificates）"
+fi
+rm -f "$TMP"
+echo
+echo "请重新启动浏览器后再打开面板。"
+echo "注意：Firefox 使用独立证书库，需在 首选项 -> 隐私与安全 -> 证书 -> 查看证书 -> 导入 手动导入。"
+"#
+    )
 }
 
 /// 更新面板配置（安全白名单，密码走 ChangePassword）。
@@ -3789,6 +3903,34 @@ fn schedule_service_restart(cfg: &AgentConfig) {
 mod tests {
     use super::*;
     use dhrust::net::http::HttpRequest;
+
+    /// Windows 一键导入脚本：内嵌 base64 证书、双存储导入、CRLF、含 Firefox 提示。
+    #[test]
+    fn win_install_script_is_valid_cmd() {
+        let s = build_win_install_script("QUJD");
+        assert!(s.contains("set \"B64=QUJD\""), "证书 base64 必须内嵌");
+        assert!(s.contains("certutil -user -addstore -f Root"));
+        assert!(s.contains("certutil -addstore -f Root"));
+        assert!(s.contains("Firefox"), "必须提醒 Firefox 用自己的证书库");
+        // .cmd 必须是纯 CRLF（混入 LF 会让批处理解析出错）
+        assert!(s.contains("\r\n"));
+        assert!(
+            !s.replace("\r\n", "").contains('\n'),
+            "存在裸 LF，.cmd 必须是 CRLF"
+        );
+    }
+
+    /// Linux/macOS 一键导入脚本：带 shebang、内嵌证书、双平台分支、macOS base64 -D 回退。
+    #[test]
+    fn sh_install_script_covers_darwin_and_linux() {
+        let s = build_sh_install_script("QUJD");
+        assert!(s.starts_with("#!/bin/sh"));
+        assert!(s.contains("B64='QUJD'"));
+        assert!(s.contains("security add-trusted-cert"), "macOS 需导入系统钥匙串");
+        assert!(s.contains("update-ca-certificates"), "Linux 需 update-ca-certificates");
+        assert!(s.contains("base64 -D"), "macOS 的 base64 是大写 -D");
+        assert!(s.contains("Firefox"));
+    }
 
     /// 面板「➕ 加入白名单」：只追加、去重（忽略大小写）、不清空原有条目。
     #[test]

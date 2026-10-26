@@ -2046,10 +2046,12 @@ async function loadAgentConfig(){
   html+=`<div class="glass-card card" style="margin-top:16px"><h2>🔒 面板 HTTPS</h2>`;
   html+=`<div id="tls-box" style="font-size:13px;color:var(--text-muted)">加载中…</div>`;
   html+=`<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">`;
-  html+=`<button class="btn" onclick="downloadTlsCert()">⬇ 下载证书</button>`;
+  html+=`<button class="btn btn-primary" onclick="downloadTlsInstall('win')">⬇ Windows 一键导入</button>`;
+  html+=`<button class="btn btn-primary" onclick="downloadTlsInstall('sh')">⬇ Linux / macOS 一键导入</button>`;
+  html+=`<button class="btn" onclick="downloadTlsCert()">⬇ 仅下载证书 (.crt)</button>`;
   html+=`<button class="btn" onclick="renewTlsCert()">♻ 重新签发</button>`;
   html+=`</div>`;
-  html+=`<p class="text-muted" style="font-size:12px;margin-top:10px">启用后浏览器用 <code>https://内网IP:端口</code> 打开面板：首次需导入下载的证书（Windows 双击 → 安装到「受信任的根证书颁发机构」；或 <code>certutil -addstore -f Root panel.pem</code>），之后即绿锁直开。<strong>切换协议需重启服务</strong>；证书为自签<strong>叶子</strong>证书（CA:FALSE），私钥泄露也无法冒充其他站点。</p></div>`;
+  html+=`<p class="text-muted" style="font-size:12px;margin-top:10px">导入必须在<strong>打开浏览器的这台电脑</strong>上做（服务器无法代劳）。一键脚本已内嵌证书：<br>· Windows：下载后双击 → UAC 点“是” → <strong>完全退出并重开浏览器</strong>；<br>· Linux/macOS：<code>sh install-panel-cert.sh</code>（要求 sudo）；<br>· <strong>Firefox 例外</strong>：它用自己的证书库，需在 设置 → 隐私与安全 → 证书 → 查看证书 → 导入 手动导一次。<br>不导入也能用：浏览器点「高级 → 继续前往」即可，链路仍是加密的。</p></div>`;
 
   $('config-sub-agent').innerHTML=html;
   loadTlsStatus();
@@ -2078,14 +2080,23 @@ async function loadTlsStatus(){
  }catch(e){box.textContent='证书状态读取失败'}
 }
 async function downloadTlsCert(){
+ await downloadFromApi('/api/tlsCert','panel.crt','已导出 panel.crt')
+}
+/* 一键导入脚本（单文件、内嵌证书）：os = win | sh */
+async function downloadTlsInstall(os){
+ const name = os==='win' ? 'install-panel-cert.cmd' : 'install-panel-cert.sh'
+ await downloadFromApi('/api/tlsInstall?os='+os, name, '已导出 '+name+'（在目标电脑双击/执行一次即可）')
+}
+/* 通用下载：带 Bearer 取二进制并触发浏览器保存 */
+async function downloadFromApi(path, filename, okMsg){
  try{
-  const r=await fetch('/api/tlsCert',{headers:{'Authorization':'Bearer '+token}});
+  const r=await fetch(path,{headers:{'Authorization':'Bearer '+token}});
   if(!r.ok){showToast('下载失败','error');return}
   const blob=await r.blob();
-  if(!blob.size){showToast('下载失败：证书为空','error');return}
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='panel.pem';a.click();
+  if(!blob.size){showToast('下载失败：内容为空','error');return}
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;a.click();
   setTimeout(()=>URL.revokeObjectURL(a.href),3000);
-  showToast('已导出 panel.pem，请导入系统/浏览器信任','success');
+  showToast(okMsg||'已下载','success');
  }catch(e){showToast('下载失败','error')}
 }
 async function renewTlsCert(){
