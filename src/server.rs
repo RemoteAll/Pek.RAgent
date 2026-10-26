@@ -104,14 +104,20 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
 fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let mut router = Router::new();
 
-    // 〇 WAF（管理端预设：拦恶意爬虫与扫描器 + 路径探测/CC；在线 SQL/文件管理/AI 端点跳过攻击检测，由业务护栏负责）
+    // 〇 WAF（管理端预设：拦恶意爬虫与扫描器 + 路径探测/CC）
+    //
+    // 面板自己的接口（`/api/*`、`/star/*`）**不做攻击检测与机器人判定**：
+    // - 这些路径固定、全部要求 Bearer 鉴权，攻击面由业务护栏（参数化 SQL、fileman 路径白名单、
+    //   login_guard 限流、CSRF）负责；WAF 的正则反而会误伤正常操作（SQL 含关键字、文件名带引号、
+    //   AI 对话内容），历史上已多次为此逐个加白名单；
+    // - 保留 **IP 黑白名单 + CC 限流（默认 600 次/分钟/IP）**——面板 3 秒轮询约 40 次/分钟，余量充足。
     let mut waf_cfg = pek_rwaf::WafConfig::admin_api();
-    waf_cfg.skip_attack_prefixes =
-        vec!["/star/db".to_string(), "/star/file".to_string(), "/star/ai".to_string()];
+    waf_cfg.skip_attack_prefixes = vec!["/api".to_string(), "/star".to_string()];
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
-    // 机器接口强制豁免（内存态，不受 Config/Waf.toml 影响）：/api/* 供 DHDeploy 等机器调用，
-    // 客户端 UA（RestSharp / HttpClient）不应被判为扫描器。
-    waf.set_forced_skip_bot_prefixes(vec!["/api".to_string()]);
+    // 强制豁免走内存态（不受 Config/Waf.toml 在线修改影响）：面板与机器接口（DHDeploy 的
+    // RestSharp / HttpClient UA）不应被判为扫描器。
+    waf.set_forced_skip_bot_prefixes(vec!["/api".to_string(), "/star".to_string()]);
+    waf.set_forced_skip_attack_prefixes(vec!["/api".to_string(), "/star".to_string()]);
     router.use_middleware(waf.middleware());
 
     // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板；WAF 用于「安全」页在线管理）

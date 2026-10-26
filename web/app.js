@@ -572,8 +572,9 @@ function updateDashboard(d,health){
    setText('gc-cpu',health.totalProcessorTime+'s');
   }
  }
- // 每60秒刷新本机详情（非状态页不扫：进程 Top 是全量采集，约 34ms/次）
- if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(()=>{if(_activePanel==='dashboard')loadMachineDetail()},60000)}
+ // 本机详情（含进程 Top，全量采集约 34ms/次）：只在状态页轮询，30 秒一次；
+ // 整机 CPU/内存卡片由 /api/status 3 秒刷新（轻量），进程明细不需要秒级。
+ if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(()=>{if(_activePanel==='dashboard')loadMachineDetail()},30000)}
 }
 
 async function loadMachineDetail(){
