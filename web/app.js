@@ -130,8 +130,8 @@ function showApp(){
  $('login').style.display='none';$('app').style.display='block';
  loadMe().then(()=>{
   // 按权限启动轮询（无权限的页签不发起请求）：仪表盘 / 子服务
-  if(canView('dashboard')){loadDashboard();timer=setInterval(loadDashboard,3000);}
-  if(canView('services')||canView('watchdog')){loadServices();svcTimer=setInterval(loadServices,3000);}
+  if(canView('dashboard')){loadDashboard();timer=setInterval(()=>{if(_activePanel==='dashboard')loadDashboard()},3000);}
+  if(canView('services')||canView('watchdog')){loadServices();svcTimer=setInterval(()=>{if(_activePanel==='services')loadServices()},3000);}
   // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法/无权限时回退到首个可用页）
   restorePanelFromHash();
  });
@@ -148,6 +148,8 @@ document.addEventListener('visibilitychange',()=>{
 
 // 当前登录主体（/api/me：用户名/是否内置管理员/菜单权限）；加载失败时降级为不限制
 let me=null;
+// 当前激活页签：各页的轮询只在本页运行（非当前页发请求纯属浪费 CPU/带宽）
+let _activePanel='dashboard';
 async function loadMe(){
  try{const j=await api('/api/me');me=(j&&j.code===0)?j.data:null;}catch(e){me=null}
  renderNav();
@@ -204,6 +206,7 @@ function closeModal(){$('modal-overlay').classList.add('hidden');_modalCb=null}
 function confirmModal(){const cb=_modalCb;closeModal();if(cb)cb()}
 
 function switchPanel(name){
+ _activePanel=name;
  document.querySelectorAll('nav a').forEach(a=>a.classList.remove('active'));
  const link=document.querySelector(`nav a[data-panel="${name}"]`);if(link)link.classList.add('active');
  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -569,8 +572,8 @@ function updateDashboard(d,health){
    setText('gc-cpu',health.totalProcessorTime+'s');
   }
  }
- // 每30秒刷新本机详情
- if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(loadMachineDetail,30000)}
+ // 每60秒刷新本机详情（非状态页不扫：进程 Top 是全量采集，约 34ms/次）
+ if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(()=>{if(_activePanel==='dashboard')loadMachineDetail()},60000)}
 }
 
 async function loadMachineDetail(){
@@ -1861,7 +1864,7 @@ async function changePassword(){
  html+=`<div class="glass-card card" style="margin-top:16px"><h2>⬆️ 自动升级 / 平台通道</h2><div id="upgrade-box"><div class="text-muted" style="font-size:12px">加载中...</div></div></div>`;
  $('panel-control').innerHTML=html;
  // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
- setInterval(updateControlStatus,3000);updateControlStatus();
+ setInterval(()=>{if(_activePanel==='control')updateControlStatus()},3000);updateControlStatus();
 })();
 
 // DHDeploy Agent（Rust）访问控制：本机 8282 控制接口（仅回环）；节流探测，切换后延时刷新

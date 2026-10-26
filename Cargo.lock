@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "pek-ragent"
-version = "0.1.81"
+version = "0.1.82"
 dependencies = [
  "chrono",
  "dhrust",
