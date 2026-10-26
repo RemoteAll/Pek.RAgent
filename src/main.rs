@@ -21,6 +21,7 @@ mod iis;
 mod logclean;
 mod manager;
 mod memsys;
+mod migrate;
 mod panel_ws;
 mod plugins;
 mod portstat;

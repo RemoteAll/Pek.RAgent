@@ -4,7 +4,8 @@
 //! - `/api/*`：login / logout / status / control / freeMemory / configMetadata /
 //!   updateConfig / changePassword / logs / logFiles / health / watchdog / syncTime
 //! - `/star/*`：services / startService / stopService / restartService / addService /
-//!   removeService / getStarConfig / updateStarConfig / machine / webTraffic / portTraffic /
+//!   removeService / appDeploy / starAgentScan / starAgentMigrate / getStarConfig /
+//!   updateStarConfig / machine / webTraffic / portTraffic /
 //!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
 //!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup /
 //!   fileList / fileRead / fileWrite / fileMkdir / fileNewFile / fileDelete / fileRename /
@@ -620,6 +621,8 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("restartService", "重启子服务"),
     ("addService", "添加/更新子服务"),
     ("appDeploy", "部署应用包"),
+    ("starAgentScan", "扫描 C# 星尘"),
+    ("starAgentMigrate", "迁移 C# 星尘"),
     ("removeService", "删除子服务"),
     ("updateStarConfig", "更新星尘设置"),
     ("dbQuery", "数据库查询"),
@@ -792,6 +795,15 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "appDeploy",
         guarded(panel.clone(), PERM_SERVICES, app_deploy),
+    );
+    // C# 版星尘迁移（面板一键；不依赖 SSH）：先 GET 预览，再 POST 执行
+    controller = controller.get(
+        "starAgentScan",
+        guarded(panel.clone(), PERM_SERVICES, star_agent_scan),
+    );
+    controller = controller.post(
+        "starAgentMigrate",
+        guarded(panel.clone(), PERM_SERVICES, star_agent_migrate),
     );
     controller = controller.post(
         "removeService",
@@ -1250,6 +1262,9 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "memoryMB": memory_mb,
         "memoryUsedMB": mem_used_mb,
         "memoryTotalMB": mem_total / 1024 / 1024,
+        // 内存三栏（面板内存卡：已用 / 缓存 / 空闲；Linux 口径 MemFree、Cached+SReclaimable）
+        "memoryFreeMB": mem_free_mb,
+        "memoryCachedMB": mem_cached_mb,
         "threadCount": threads,
         "handleCount": handles,
         "processCpuRate": format!("{proc_cpu:.1}"),
@@ -2928,6 +2943,125 @@ fn app_deploy(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                     "files": d.files,
                     "updated": d.updated,
                     "started": d.started,
+                })),
+            )
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 扫描 C# 版星尘（迁移向导）：`GET /star/starAgentScan?dir=`。
+///
+/// 只读解析源配置，返回子服务清单与 C# 服务状态。未找到时仍返回 HTTP 200：
+/// `data.found=false` + `message` 原因 + `data.candidates` 常见安装目录，
+/// 前端据此提示“填路径 / 换一台机器”。
+fn star_agent_scan(_panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let dir = arg(ctx, "dir").unwrap_or_default();
+    let dir = dir.trim();
+    let dir_opt = (!dir.is_empty()).then(|| PathBuf::from(dir));
+    match crate::migrate::scan(dir_opt.as_deref()) {
+        Ok(s) => json_result(
+            0,
+            "",
+            Some(json!({
+                "found": true,
+                "dir": s.dir.display().to_string(),
+                "configPath": s.config_path.display().to_string(),
+                "serviceName": s.service_name,
+                "serviceInstalled": s.service_installed,
+                "serviceRunning": s.service_running,
+                "localPort": s.local_port,
+                "apps": s.apps.iter().map(|a| json!({
+                    "name": a.name,
+                    "fileName": a.file_name,
+                    "arguments": a.arguments.clone().unwrap_or_default(),
+                    "workingDirectory": a.working_directory.clone().unwrap_or_default(),
+                    "mode": crate::deploy::DeployMode::parse(&a.mode).as_str(),
+                    "enable": a.enable,
+                })).collect::<Vec<_>>(),
+                "warnings": s.warnings,
+            })),
+        ),
+        Err(e) => json_result(
+            0,
+            &e,
+            Some(json!({
+                "found": false,
+                "candidates": crate::migrate::candidates()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+    }
+}
+
+/// 执行 C# 星尘迁移：`POST /star/starAgentMigrate?dir=&names=&startApps=&stopApps=&stopService=&disableService=`。
+///
+/// `names` 为逗号分隔的服务名（空 = 全部）；其余开关默认全开（停 C# 子服务、停并禁用
+/// C# 星尘服务、迁移后启动）。执行细节见 [`crate::migrate::migrate`]。
+fn star_agent_migrate(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let dir = arg(ctx, "dir").unwrap_or_default();
+    let dir = dir.trim().to_string();
+    if dir.is_empty() {
+        return json_error(400, "请填写 C# 版星尘安装目录");
+    }
+    let flag = |name: &str, def: bool| {
+        arg(ctx, name)
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | ""
+                )
+            })
+            .unwrap_or(def)
+    };
+    let only: Vec<String> = arg(ctx, "names")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let opts = crate::migrate::Options {
+        dir: PathBuf::from(dir),
+        stop_source_apps: flag("stopApps", true),
+        stop_source_service: flag("stopService", true),
+        disable_source_service: flag("disableService", true),
+        start_apps: flag("startApps", true),
+        only,
+    };
+    match crate::migrate::migrate(panel.manager.as_ref(), &opts) {
+        Ok(r) => {
+            let started = r.imported.iter().filter(|i| i.started).count();
+            let msg = format!(
+                "迁移完成：导入 {} 个子服务（启动 {}）；C# 服务停止={} 禁用={}",
+                r.imported.len(),
+                started,
+                if r.source_service_stopped { "是" } else { "否" },
+                if r.source_service_disabled { "是" } else { "否" }
+            );
+            json_result(
+                0,
+                &msg,
+                Some(json!({
+                    "dir": r.dir,
+                    "serviceName": r.service_name,
+                    "apps": r.imported.iter().map(|i| json!({
+                        "name": i.name,
+                        "fileName": i.file_name,
+                        "workingDirectory": i.working_directory,
+                        "mode": i.mode,
+                        "enable": i.enable,
+                        "started": i.started,
+                        "note": i.note,
+                    })).collect::<Vec<_>>(),
+                    "sourceAppsStopped": r.source_apps_stopped,
+                    "sourceServiceStopped": r.source_service_stopped,
+                    "sourceServiceDisabled": r.source_service_disabled,
+                    "sourceAgentProcessStopped": r.source_agent_process_stopped,
+                    "warnings": r.warnings,
                 })),
             )
         }

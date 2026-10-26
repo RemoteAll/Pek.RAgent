@@ -561,6 +561,15 @@ impl AgentConfig {
 
 /// 读取 XML 配置（键值 + `Services/ServiceInfo` 属性列表）。
 fn read_xml_config(path: &Path) -> Result<AgentConfig, String> {
+    read_config_file(path).map(|(cfg, _)| cfg)
+}
+
+/// 只读读取**任意路径**的星尘 XML 配置（不生成默认、不补齐、不写盘）。
+///
+/// 返回（配置对象, 原始根对象）：原始根对象供调用方读取 Rust 未建模的 C# 键
+/// （如 C# 版 `LocalPort`/`ServiceName` 的“未填写”与默认值区分）。仅用于
+/// 从 C# 版星尘迁移（见 `crate::migrate`）等需要“看一眼别人配置”的场景。
+pub fn read_config_file(path: &Path) -> Result<(AgentConfig, Json), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let json = dhrust::config::read_xml_to_json(&text).map_err(|e| e.to_string())?;
     let root = json
@@ -571,7 +580,7 @@ fn read_xml_config(path: &Path) -> Result<AgentConfig, String> {
     if !root.is_object() {
         return Err("未识别的配置结构（缺少根节点）".to_string());
     }
-    Ok(config_from_json(&root))
+    Ok((config_from_json(&root), root))
 }
 
 /// XML（JSON 形态）→ 配置。缺失键取默认值；C# 特有字段忽略但保留在文件中。

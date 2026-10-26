@@ -1521,6 +1521,7 @@ async function loadServices(){
   if(sj&&sj.code===0)_servicesData=sj.data;
   if(wj&&wj.code===0)_watchdogData=(wj.data&&wj.data.services)||[];
   renderServices();
+  mgDetectOnce();
  }catch(e){}
 }
 
@@ -1530,7 +1531,11 @@ function renderServices(){
  if(canView('services')&&d){
  const svcs=d.services||[];
  html+=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📦 子服务管理</h2><span style="font-size:12px;color:var(--text-tertiary)">运行 ${d.running||0} / 总计 ${d.total||0}</span></div>`;
- html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showAppPkgForm()">📦 上传应用包</button></div>`;
+ html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showAppPkgForm()">📦 上传应用包</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showMigrateForm()">🔄 迁移 C# 星尘</button></div>`;
+ if(_mgHint)html+=`<div class="mb-12" style="border-left:3px solid var(--orange);background:rgba(255,153,0,.08);padding:10px 12px;border-radius:8px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
+  <div style="font-size:12.5px">🔄 检测到 C# 版星尘：<code>${esc(_mgHint.dir)}</code> · 服务 <b>${esc(_mgHint.serviceName)}</b>（${_mgHint.serviceRunning?'运行中':'已停止'}）· ${(_mgHint.apps||[]).length} 个子服务</div>
+  <div style="white-space:nowrap"><button class="btn btn-primary btn-sm" onclick="showMigrateForm('${escAttr(_mgHint.dir)}')">一键迁移</button>
+  <button class="btn btn-ghost btn-sm" onclick="_mgHint=null;renderServices()">忽略</button></div></div>`;
  html+=`<div class="ap-drop-zone" onclick="showAppPkgForm()">
   <div style="font-size:22px;line-height:1">📦</div>
   <div style="margin-top:6px"><b>把发布包拖到这里自动部署</b>（.zip / .tar.gz / .tgz），或点击选择文件</div>
@@ -1682,6 +1687,95 @@ function apDeploy(){
  };
  xhr.onerror=()=>showToast('部署失败：网络错误','error');
  xhr.send(f);
+}
+
+/* ── 从 C# 版星尘迁移（面板一键；无需 SSH） ──
+   流程：GET /star/starAgentScan 预览源配置 → 勾选子服务 → POST /star/starAgentMigrate
+   服务端：停 C# 子服务（UDP RPC）→ 停/禁用 C# 星尘服务 → 导入配置（相对路径绝对化）→ 启动 */
+let _mgData=null;        // 最近一次扫描结果
+let _mgHint=null;        // 自动检测到的可迁移源（子服务页横幅）
+let _mgDetectDone=false; // 自动检测每次登录只做一次（避免每次轮询都扫盘）
+
+async function mgDetectOnce(){
+ if(_mgDetectDone||!canView('services'))return;
+ _mgDetectDone=true;
+ try{
+  const j=await api('/star/starAgentScan');
+  const d=(j&&j.data)||{};
+  if(d.found&&(d.apps||[]).length){_mgHint=d;renderServices()}
+ }catch(e){}
+}
+
+function showMigrateForm(dir){
+ _mgData=null;
+ const html=`<div class="form-group"><label>C# 星尘安装目录</label>
+  <div style="display:flex;gap:8px">
+   <input type="text" id="mg-dir" value="${escAttr(dir||'')}" placeholder="留空自动探测（如 C:\\StarAgent）">
+   <button class="btn btn-secondary btn-sm" type="button" onclick="mgScan()" style="white-space:nowrap">扫描</button>
+  </div>
+  <div class="text-muted" style="font-size:11px;margin-top:4px">只读解析 C# 的 <code>Config/StarAgent.config</code>；不会修改原配置，应用文件也留在原目录（迁移只改“谁来守护”）</div></div>
+ <div id="mg-body" class="text-muted" style="font-size:12px">正在扫描…</div>`;
+ showModal('从 C# 版星尘迁移',html,'开始迁移',()=>mgRun(),true);
+ mgScan();
+}
+
+async function mgScan(){
+ const dir=($('mg-dir')?.value||'').trim();
+ const body=$('mg-body');
+ if(body)body.textContent='正在扫描…';
+ try{
+  const j=await api('/star/starAgentScan?dir='+encodeURIComponent(dir));
+  const d=(j&&j.data)||{};
+  if(!d.found){
+   _mgData=null;
+   if(body)body.innerHTML=`<div style="color:var(--red)">${esc(j.message||'未找到 C# 星尘')}</div>`+
+    ((d.candidates&&d.candidates.length)?`<div class="text-muted" style="font-size:11px;margin-top:6px">常见路径：${d.candidates.map(esc).join('、')}</div>`:'');
+   return;
+  }
+  _mgData=d;
+  const svc=d.serviceInstalled?(d.serviceRunning?'运行中':'已停止'):'未安装';
+  let html=`<div class="text-muted" style="font-size:12px;margin-bottom:8px">源：<code>${esc(d.configPath)}</code><br>服务 <b>${esc(d.serviceName)}</b>（${svc}）· 本地端口 ${d.localPort}</div>`;
+  const apps=d.apps||[];
+  if(!apps.length){
+   html+='<div style="color:var(--orange)">该配置里没有子服务——可直接用「📦 上传应用包」安装</div>';
+   if(body)body.innerHTML=html;return;
+  }
+  html+=`<table class="svc-table"><thead><tr><th style="width:36px"><input type="checkbox" id="mg-all" checked onchange="mgAll(this.checked)"></th><th>名称</th><th>文件 / 参数</th><th>模式</th><th>启用</th></tr></thead><tbody>`;
+  apps.forEach(a=>{
+   html+=`<tr><td><input type="checkbox" class="mg-pick" data-name="${escAttr(a.name)}" checked></td>`;
+   html+=`<td><div class="svc-name">${esc(a.name)}</div></td>`;
+   html+=`<td><div class="svc-file">${esc(a.fileName||'')}${a.arguments?' '+esc(a.arguments):''}</div></td>`;
+   html+=`<td style="font-size:12px">${esc(a.mode||'shadow')}</td>`;
+   html+=`<td>${a.enable?'<span class="badge badge-green">启用</span>':'<span class="badge badge-gray">禁用</span>'}</td></tr>`;
+  });
+  html+='</tbody></table>';
+  html+=`<div class="form-row" style="margin-top:10px">
+   <div class="form-group"><label class="toggle"><input type="checkbox" id="mg-stop-service" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">停止并禁用 C# 星尘服务（防重启/守护再拉起）</div></div>
+   <div class="form-group"><label class="toggle"><input type="checkbox" id="mg-start" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">迁移后启动（仅启用状态的子服务）</div></div>
+  </div>`;
+  if((d.warnings||[]).length)html+=`<div class="text-muted" style="font-size:11px;margin-top:6px;line-height:1.6">${d.warnings.map(esc).join('<br>')}</div>`;
+  if(body)body.innerHTML=html;
+ }catch(e){if(body)body.innerHTML='<span style="color:var(--red)">扫描失败</span>'}
+}
+
+function mgAll(on){document.querySelectorAll('.mg-pick').forEach(c=>c.checked=!!on)}
+
+function mgRun(){
+ if(!_mgData){showToast('请先扫描确认要迁移的子服务','error');return}
+ const picks=[...document.querySelectorAll('.mg-pick')].filter(c=>c.checked).map(c=>c.dataset.name);
+ if(!picks.length){showToast('请至少勾选一个子服务','error');return}
+ const dir=($('mg-dir')?.value||_mgData.dir||'').trim();
+ const stopSvc=($('mg-stop-service')?.checked)?1:0;
+ const startApps=($('mg-start')?.checked)?1:0;
+ const qs=`dir=${encodeURIComponent(dir)}&names=${encodeURIComponent(picks.join(','))}`
+  +`&stopApps=1&stopService=${stopSvc}&disableService=${stopSvc}&startApps=${startApps}`;
+ showToast('正在迁移（停 C# 子服务 → 停 C# 星尘 → 导入并启动）…','info');
+ api('/star/starAgentMigrate?'+qs,{method:'POST'}).then(j=>{
+  if(j.code!==0){showToast(j.message||'迁移失败','error');return}
+  showToast(j.message||'迁移完成','success');
+  _mgHint=null;_mgData=null;
+  setTimeout(loadServices,800);
+ }).catch(e=>showToast('迁移失败：网络错误','error'));
 }
 
 function showServiceForm(svc,title){
