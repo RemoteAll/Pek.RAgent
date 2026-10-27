@@ -111,17 +111,36 @@ pub fn start(manager: Arc<AppManager>) {
     let _ = std::thread::Builder::new()
         .name("ragent-panel-ws".to_string())
         .spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => {
-                    util::log_error(&format!("平台实时通道运行时创建失败：{e}"));
-                    return;
+            // 关键后台线程：任何 panic 都不能让整个平台通道静默消失。
+            // 外层循环重建运行时并重启通道；panic 本身由全局 panic hook 记录线程/位置。
+            loop {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        util::log_error(&format!(
+                            "平台实时通道运行时创建失败：{e}（10 秒后重试）"
+                        ));
+                        std::thread::sleep(Duration::from_secs(10));
+                        continue;
+                    }
+                };
+                let mgr = manager.clone();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    rt.block_on(run(mgr));
+                }));
+                match result {
+                    Ok(()) => util::log_error(
+                        "平台实时通道任务意外结束（0 退出；5 秒后重启）",
+                    ),
+                    Err(_) => util::log_error(
+                        "平台实时通道任务 panic（5 秒后重建运行时并重启，详见上一条 panic 日志）",
+                    ),
                 }
-            };
-            rt.block_on(run(manager));
+                std::thread::sleep(Duration::from_secs(5));
+            }
         });
 }
 
@@ -160,14 +179,34 @@ async fn run(manager: Arc<AppManager>) {
         hb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut chk = tokio::time::interval(Duration::from_secs(30));
         chk.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // 连接状态看门狗：WsClient 内部会自动重连，但若其监督任务 panic 或卡死，
+        // 仅靠会话循环会永远停在“未连接”。超过 3 分钟未恢复则重建客户端。
+        let mut link = tokio::time::interval(Duration::from_secs(30));
+        link.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut down_since: Option<Instant> = None;
         // 消费首 tick（避免建连即发心跳；配置检查首 tick 保留）
         hb.tick().await;
+        link.tick().await;
         loop {
             tokio::select! {
                 _ = hb.tick() => {
                     // 配对（待批准）期间不发心跳：平台此时不接收任何上报，省带宽也省日志
                     if client.is_connected() && !PAIR_PENDING.load(Ordering::Relaxed) {
                         let _ = client.send_text(build_heartbeat(&manager));
+                    }
+                }
+                _ = link.tick() => {
+                    if client.is_connected() {
+                        down_since = None;
+                    } else {
+                        let since = *down_since.get_or_insert_with(Instant::now);
+                        if since.elapsed() >= Duration::from_secs(180) {
+                            util::log_error(
+                                "平台实时通道 180 秒未恢复，重建客户端（避免监督任务卡死导致永久离线）",
+                            );
+                            client.close();
+                            break;
+                        }
                     }
                 }
                 _ = chk.tick() => {

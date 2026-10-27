@@ -76,12 +76,39 @@ fn main() {
     // 日志：控制台 + 文件（Log/，行格式与文件头对齐 DH.NCore）；级别取 RUST_LOG
     let level = dhrust::logs::level_from_env();
     util::init_logging(&base, true, level);
+    install_panic_logging();
 
     let code = cli::run(&args, &base);
     // 异步文件日志同步落盘后再退出（否则最后若干条日志可能在队列中丢失，
     // 例如：重启助手进程的"服务已拉起"结论、CLI 升级的最终提示）
     dhrust::logs::flush();
     std::process::exit(code);
+}
+
+/// 全局 panic 钩子：任何线程 panic 都写入日志（线程名/位置/消息）。
+///
+/// Rust 默认只在 stderr 打印；服务模式下 stderr 可能无人接收，后台线程 panic 会变成
+/// “进程还活着但某个功能永久消失”（例如平台实时通道离线）。记录下来才能定位。
+fn install_panic_logging() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread = std::thread::current();
+        let name = thread.name().unwrap_or("unnamed");
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "未知位置".to_string());
+        let payload = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            (*s).to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "非字符串 panic".to_string()
+        };
+        let line = format!("未捕获 panic（线程 {name}，{location}）：{payload}");
+        util::log_error(&line);
+        // 控制台也输出一份（前台/调试模式可见；日志失败时仍有兜底）
+        eprintln!("{line}");
+    }));
 }
 
 /// 把 zip 参数绝对化（相对路径优先按调用目录，其次保持原样由部署层兜底）。
