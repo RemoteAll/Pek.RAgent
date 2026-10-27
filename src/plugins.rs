@@ -179,10 +179,11 @@ pub struct HttpFetcher;
 
 /// 阻塞下载（**运行时内安全**：库内独立线程 + join，见 `blocking_request_offthread`）。
 fn fetch_blocking(url: &str) -> Result<dhrust::net::http_client::HttpResponse, String> {
+    let ua = util::user_agent();
     dhrust::net::http_client::blocking_request_offthread(
         "GET",
         url,
-        &[],
+        &[("User-Agent", ua.as_str())],
         None,
         Vec::new(),
         std::time::Duration::from_secs(30),

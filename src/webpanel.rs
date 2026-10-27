@@ -404,6 +404,18 @@ impl WebPanel {
         self.principal(ctx).is_some()
     }
 
+    /// 当前请求的真实客户端 IP（含反代口径，见 [`effective_client_ip`]）。
+    pub(crate) fn client_ip(&self, ctx: &Ctx) -> String {
+        effective_client_ip(self.manager.config().trust_forwarded_for, ctx).0
+    }
+
+    /// 当前请求是否可按“本机”对待（`LocalOnly` 免登录、契约接口放行）。
+    fn is_local_request(&self, ctx: &Ctx) -> bool {
+        let trust = self.manager.config().trust_forwarded_for;
+        let (ip, proxied) = effective_client_ip(trust, ctx);
+        is_loopback(&ip) && !(proxied && !trust)
+    }
+
     /// 解析请求主体（已认证身份；`None` = 未认证）。
     ///
     /// Bearer 令牌有效 → 会话绑定的用户与权限；无令牌时按鉴权级别兜底
@@ -435,13 +447,13 @@ impl WebPanel {
         }
         match self.auth_level() {
             AuthLevel::None => {
-                if !is_loopback(&client_ip(ctx)) {
+                if !self.is_local_request(ctx) {
                     admin.name = "anon".to_string();
                 }
                 Some(admin)
             }
             AuthLevel::LocalOnly => {
-                if is_loopback(&client_ip(ctx)) {
+                if self.is_local_request(ctx) {
                     Some(admin)
                 } else {
                     None
@@ -598,7 +610,7 @@ fn record_audit(
         &audit::AuditEntry {
             category: None,
             user: principal.name.clone(),
-            ip: client_ip(ctx),
+            ip: panel.client_ip(ctx),
             action: action.to_string(),
             title: action_title(action),
             method: ctx.req.method.clone(),
@@ -714,6 +726,68 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("userResetPassword", "重置用户密码"),
     ("auditLogs", "查看操作日志"),
 ];
+
+/// 解析真实客户端 IP：返回（IP，是否经过反代）。
+///
+/// - 默认（`trust=false`）：对端是回环又带 `X-Real-IP` / `X-Forwarded-For` 时，按**反代来的远程请求**
+///   处理（不享受本机免登录），防止 nginx 后 `LocalOnly` 整体免鉴权；
+/// - `trust=true`：仅当对端是回环才采纳转发头（优先 `X-Real-IP`，否则取 XFF 最后一段——反代追加时
+///   最后一段才是真实客户端；客户端可伪造左侧字段）。
+pub(crate) fn effective_client_ip(trust: bool, ctx: &Ctx) -> (String, bool) {
+    resolve_client_ip(
+        &client_ip(ctx),
+        ctx.header("x-real-ip"),
+        ctx.header("x-forwarded-for"),
+        trust,
+    )
+}
+
+/// [`effective_client_ip`] 的纯函数版本（便于单测）。
+fn resolve_client_ip(
+    peer: &str,
+    real: Option<&str>,
+    xff: Option<&str>,
+    trust: bool,
+) -> (String, bool) {
+    let peer = peer.trim().to_string();
+    if !is_loopback(&peer) {
+        return (peer, false);
+    }
+    let real = real.map(str::trim).filter(|s| !s.is_empty());
+    let xff = xff.map(str::trim).filter(|s| !s.is_empty());
+    if real.is_none() && xff.is_none() {
+        return (peer, false);
+    }
+    if !trust {
+        return (peer, true);
+    }
+    let ip = real
+        .map(|s| s.to_string())
+        .or_else(|| {
+            xff.and_then(|s| s.rsplit(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or(peer);
+    (strip_ip_port(&ip), true)
+}
+
+/// 去掉 IP 串可能带的端口（`1.2.3.4:56`、`[::1]:56`）。
+fn strip_ip_port(raw: &str) -> String {
+    let s = raw.trim().trim_matches('"');
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host.to_string();
+    }
+    if s.matches(':').count() == 1
+        && let Some((host, port)) = s.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return host.to_string();
+    }
+    s.to_string()
+}
 
 /// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。
 ///
@@ -1141,7 +1215,7 @@ fn logout_all(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
 /// 登录：签发令牌（成功/失败均写入操作审计）。
 fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    let ip = client_ip(ctx);
+    let ip = panel.client_ip(ctx);
 
     if panel.logins.is_blocked(&ip) {
         return json_error(429, "Too many failed attempts. Try again later.");
@@ -1225,7 +1299,7 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 &audit::AuditEntry {
                     category: None,
                     user: principal.name,
-                    ip: client_ip(ctx),
+                    ip: panel.client_ip(ctx),
                     action: "logout".to_string(),
                     title: action_title("logout"),
                     method: ctx.req.method.clone(),
@@ -1935,7 +2009,7 @@ fn sync_time(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(400, "时间戳超出允许范围（2000~2100 年）");
     }
 
-    let ip = client_ip(ctx);
+    let ip = panel.client_ip(ctx);
     match sys::set_system_time(epoch_ms) {
         Ok(()) => {
             let local = Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
@@ -1962,6 +2036,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.manager.config();
     let items = vec![
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
+        config_item("TrustForwardedFor", "信任反代转发头", "Boolean", cfg.trust_forwarded_for.to_string(), "默认 false。面板前有可信 nginx/TLS 反代时开启，按 X-Real-IP / X-Forwarded-For 判定真实 IP（本机免登录、审计、登录限流）；直连部署保持 false；反代须覆盖而非追加 X-Forwarded-For。修改后自动生效"),
         // 面板 HTTPS：自签叶子证书（SAN 含本机全部 IP）；修改后需重启服务生效
         config_item("Tls", "面板HTTPS", "Boolean", cfg.tls.to_string(), "为真时面板同端口改用 HTTPS（自签证书，浏览器首次访问前需导入 Config/keys/panel.pem 信任）；修改需重启服务后生效"),
         config_item("WebSessionHours", "登录保持时长（小时）", "Int32", cfg.web_session_hours.to_string(), "面板登录会话保持时长（滑动续期：期间用过面板就不掉线，重启/升级不用重新登录），默认 12；0=关闭持久化（仅进程内 24 小时）。修改需重启服务后生效（会话已落盘，重启不会掉登录）"),
@@ -1978,7 +2053,7 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         config_item("TerminalEnabled", "在线终端", "Boolean", cfg.terminal_enabled.to_string(), "启用后可在「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）。修改后自动生效"),
         config_item("TerminalCommandAudit", "终端命令审计", "Boolean", cfg.terminal_command_audit.to_string(), "记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）。关闭后只保留开关会话记录，不推荐。修改后生效"),
         config_item("TerminalDangerPolicy", "终端危险命令策略", "String", cfg.terminal_danger_policy.clone(), "confirm=管理员需二次确认且子用户禁止（默认）；block=所有人禁止；allow=只审计不拦截。修改后生效"),
-        config_item("TerminalAllowedCommands", "子用户命令白名单", "String", cfg.terminal_allowed_commands.clone(), "留空=不限制；非空时子用户只能执行这些前缀（分号或换行分隔，如 systemctl restart;docker ps）；内置管理员不受限。修改后生效"),
+        config_item("TerminalAllowedCommands", "子用户命令白名单", "String", cfg.terminal_allowed_commands.clone(), "留空=禁止子用户使用终端（终端本质是 root 级 shell）；非空时子用户只能执行这些前缀（分号或换行分隔，如 systemctl status;df -h）；内置管理员不受限。修改后生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兜底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -2369,10 +2444,11 @@ fn dhdeploy_service_text(service: &str) -> &'static str {
 ///
 /// 阻塞 HTTP 经库内包装（独立线程 + join）——运行时线程内直接 `block_on` 会 panic（历史踩坑）。
 fn dhdeploy_probe() -> Result<(String, String), String> {
+    let ua = util::user_agent();
     let resp = dhrust::net::http_client::blocking_request_offthread(
         "GET",
         DHDEPLOY_PANEL_API,
-        &[],
+        &[("User-Agent", ua.as_str())],
         None,
         Vec::new(),
         std::time::Duration::from_millis(2000),
@@ -2410,10 +2486,11 @@ fn dhdeploy_probe() -> Result<(String, String), String> {
 /// 调用 DHDeploy 控制接口（POST JSON；阻塞 HTTP 经库内包装，运行时内安全）。
 fn dhdeploy_post(payload: &Json) -> Result<String, String> {
     let body = payload.to_string().into_bytes();
+    let ua = util::user_agent();
     let resp = dhrust::net::http_client::blocking_request_offthread(
         "POST",
         DHDEPLOY_PANEL_API,
-        &[],
+        &[("User-Agent", ua.as_str())],
         Some("application/json"),
         body,
         std::time::Duration::from_millis(3000),
@@ -3949,6 +4026,7 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "webusername" => set_string(value, |s| cfg.web_user_name = s),
         "webauthlevel" => set_string(value, |s| cfg.web_auth_level = s),
+        "trustforwardedfor" => set_bool(value, |b| cfg.trust_forwarded_for = b),
         // 面板 HTTPS：写入配置后需重启服务才切换监听协议
         "tls" => set_bool(value, |b| cfg.tls = b),
         "websessionhours" => match value_u64(value) {
@@ -5330,5 +5408,36 @@ mod tests {
         let text = summarize_request(&ctx);
         assert!(text.contains("\"AiApiKey\":\"***\""), "{text}");
         assert!(!text.contains("sk-verysecret"), "{text}");
+    }
+
+    #[test]
+    fn forwarded_for_is_never_trusted_by_default() {
+        // 直连：回环就是本机
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, None, false),
+            ("127.0.0.1".to_string(), false)
+        );
+        // 反代（对端回环 + 转发头）但未开启信任：按远程处理（proxied=true，不能免登录）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, Some("203.0.113.9"), false),
+            ("127.0.0.1".to_string(), true)
+        );
+        // 信任后取 X-Real-IP（优先）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", Some("203.0.113.9"), Some("10.0.0.1"), true).0,
+            "203.0.113.9"
+        );
+        // 没有 X-Real-IP 时取 XFF 最后一段（防客户端伪造左侧字段）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, Some("127.0.0.1, 203.0.113.9"), true).0,
+            "203.0.113.9"
+        );
+        // 非回环对端不采纳任何转发头（防直连伪造）
+        assert_eq!(
+            resolve_client_ip("198.51.100.5", Some("127.0.0.1"), Some("127.0.0.1"), true),
+            ("198.51.100.5".to_string(), false)
+        );
+        assert_eq!(strip_ip_port("[::1]:5501"), "::1");
+        assert_eq!(strip_ip_port("203.0.113.9:1234"), "203.0.113.9");
     }
 }

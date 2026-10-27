@@ -27,7 +27,6 @@ use std::time::{Duration, Instant};
 
 use dhrust::net::controller::{arg, json_body, json_error, json_result, ActionResult};
 use dhrust::net::http::{json_escape, HttpOutcome, HttpResponse};
-use dhrust::net::panel_auth::client_ip;
 use dhrust::net::router::Ctx;
 use dhrust::net::ws::{WsServerConn, WsServerHooks, WsServerMessage};
 use dhrust::term::{valid_sid, TermOptions, Terminal};
@@ -202,6 +201,13 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
             "在线终端未启用（「配置」页 →「在线终端」开关）",
         ));
     }
+    // 子用户终端本质上是 root 级 shell，默认不允许：必须显式配置白名单才开放
+    if !principal.is_admin && cfg.terminal_allowed_commands.trim().is_empty() {
+        return HttpOutcome::Response(json_err(
+            403,
+            "子用户使用在线终端需先配置 TerminalAllowedCommands 白名单（留空 = 禁止子用户，避免授予 root 级 shell）",
+        ));
+    }
     if !ctx.req.is_websocket_upgrade() {
         return HttpOutcome::Response(json_err(400, "该地址仅用于 WebSocket 连接"));
     }
@@ -222,6 +228,10 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
     if let Err(e) = term.ensure(&sid, &principal.name, cols, rows) {
         return HttpOutcome::Response(json_err(ensure_error_status(&e), &e));
     }
+    session_owners()
+        .lock()
+        .unwrap()
+        .insert(sid.clone(), principal.name.clone());
     if !existed {
         util::log_format(
             "在线终端已连接（{}，{}x{}）",
@@ -237,7 +247,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
         &audit::AuditEntry {
             category: None,
             user: principal.name.clone(),
-            ip: client_ip(ctx),
+            ip: panel.client_ip(ctx),
             action: "termWs".to_string(),
             title: "打开在线终端".to_string(),
             method: "GET".to_string(),
@@ -287,7 +297,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
     let manager_msg = panel.manager.clone();
     let user_msg = principal.name.clone();
     let admin_msg = principal.is_admin;
-    let ip_msg = client_ip(ctx);
+    let ip_msg = panel.client_ip(ctx);
     let on_message = Arc::new(move |msg: WsServerMessage| {
         let Ok(v) = serde_json::from_str::<Json>(&msg.text) else {
             return;
@@ -342,7 +352,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
                             path: "/star/termWs".to_string(),
                             detail: format!(
                                 "sid={sid_msg} 危险={reason} 命令={}",
-                                dhrust::text::truncate_chars(&cmd, 500)
+                                dhrust::text::truncate_chars(&redact_command(&cmd), 500)
                             ),
                             success: true,
                             code: 0,
@@ -363,7 +373,7 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
 
     let base_close = panel.base().to_path_buf();
     let user_close = principal.name.clone();
-    let ip_close = client_ip(ctx);
+    let ip_close = panel.client_ip(ctx);
     let on_close = Arc::new(move |_conn: WsServerConn, reason: String| {
         let reason = dhrust::text::truncate_chars(&reason, 120);
         util::log_format(
@@ -399,8 +409,11 @@ pub fn term_ws(panel: &WebPanel, ctx: &Ctx) -> HttpOutcome {
 
 /// `POST /star/termReset {"sid"}`：重置会话（杀 shell + 断开当前 WS；前端自动重连出新会话）。
 pub fn term_reset(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    if !panel.check_auth(ctx) {
+    let Some(principal) = panel.principal(ctx) else {
         return json_error(401, "Unauthorized");
+    };
+    if !principal.allowed(PERM_TERMINAL) {
+        return json_error(403, "没有权限执行该操作");
     }
     let sid = json_body(ctx)
         .and_then(|b| {
@@ -412,7 +425,15 @@ pub fn term_reset(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !valid_sid(&sid) {
         return json_error(400, "会话标识无效");
     }
+    // 会话归属校验：子用户只能重置自己会话；管理员可重置任意会话
+    if !principal.is_admin {
+        let owner = session_owners().lock().unwrap().get(&sid).cloned();
+        if owner.as_deref() != Some(principal.name.as_str()) {
+            return json_error(403, "会话归属校验失败（只能重置自己的终端会话）");
+        }
+    }
     engine(panel.base()).reset(&sid);
+    session_owners().lock().unwrap().remove(&sid);
     util::log_format("在线终端会话已重置：{}", &[&sid]);
     json_result(0, "会话已重置", None)
 }
@@ -439,6 +460,12 @@ struct PendingCommand {
 
 fn guard_map() -> &'static Mutex<HashMap<String, GuardState>> {
     static MAP: OnceLock<Mutex<HashMap<String, GuardState>>> = OnceLock::new();
+    MAP.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 终端会话归属（`sid → 用户名`）：重置时校验，防止子用户重置他人会话。
+fn session_owners() -> &'static Mutex<HashMap<String, String>> {
+    static MAP: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
     MAP.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -655,16 +682,44 @@ fn take_confirmed(sid: &str, user: &str, token: &str) -> Option<(String, String)
     Some((p.command, p.reason))
 }
 
-/// 命令策略判定：危险命令（先判，防止命令外形的注入绕过）→ 白名单（仅子用户）。
+/// 命令策略判定。
+///
+/// - 子用户：必须配置白名单，且只允许**单条、无 shell 元字符、非解释器/逃逸类程序**的命令；
+/// - 管理员：保留完整 shell（危险命令按策略二次确认/禁止）；
+/// - 所有用户：危险特征先判（fork 炸弹等不以普通命令开头的内容也要拦）。
 fn decide_line(cfg: &AgentConfig, is_admin: bool, line: &str) -> LineVerdict {
-    // 危险特征优先：fork 炸弹等不以普通命令开头的内容也要拦
+    if !is_admin {
+        let list = cfg.terminal_allowed_commands.trim();
+        if list.is_empty() {
+            return LineVerdict::Blocked(
+                "子用户未配置终端白名单（TerminalAllowedCommands 为空 = 禁止子用户）".to_string(),
+            );
+        }
+        if let Some(meta) = shell_meta_reason(line) {
+            return LineVerdict::Blocked(format!(
+                "子用户终端不允许 {meta}（只允许单条白名单命令，不支持管道/重定向/变量/引号/通配符）"
+            ));
+        }
+        if let Some(prog) = forbidden_program(line) {
+            return LineVerdict::Blocked(format!(
+                "子用户禁止执行 {prog}（解释器/逃逸类程序可绕过白名单；如确需请改用管理员账号）"
+            ));
+        }
+        if !is_command_like(line) {
+            return LineVerdict::Blocked("子用户只允许执行白名单中的单条命令".to_string());
+        }
+        if !whitelist_allows(line, list) {
+            return LineVerdict::Blocked("不在允许的命令白名单内".to_string());
+        }
+    }
+
     if let Some(reason) = danger_reason(line) {
         return match cfg.terminal_danger_policy.as_str() {
             "allow" => LineVerdict::Run {
                 danger: Some(reason),
             },
             "block" => LineVerdict::Blocked(reason.to_string()),
-            // confirm：管理员二次确认，子用户直接禁止（子用户通常不承担系统级操作）
+            // confirm：管理员二次确认；子用户直接禁止
             _ => {
                 if is_admin {
                     LineVerdict::Confirm(reason)
@@ -677,12 +732,73 @@ fn decide_line(cfg: &AgentConfig, is_admin: bool, line: &str) -> LineVerdict {
     if !is_command_like(line) {
         return LineVerdict::Run { danger: None };
     }
-    let list = cfg.terminal_allowed_commands.trim();
-    if !is_admin && !list.is_empty() && !whitelist_allows(line, list) {
-        return LineVerdict::Blocked("不在允许的命令白名单内".to_string());
-    }
     LineVerdict::Run { danger: None }
 }
+
+/// 子用户不允许的 shell 元字符（任一命中即拒绝，避免命令拼接/替换/重定向）。
+fn shell_meta_reason(line: &str) -> Option<&'static str> {
+    for (ch, reason) in [
+        (';', "分号"),
+        ('&', "&"),
+        ('|', "管道符"),
+        ('$', "变量/命令替换"),
+        ('`', "反引号"),
+        ('(', "括号"),
+        (')', "括号"),
+        ('<', "输入重定向"),
+        ('>', "输出重定向"),
+        ('\\', "反斜杠转义"),
+        ('"', "双引号"),
+        ('\'', "单引号"),
+        ('*', "通配符"),
+        ('?', "通配符"),
+        ('[', "通配符"),
+        (']', "通配符"),
+        ('{', "花括号"),
+        ('}', "花括号"),
+        ('\n', "换行"),
+        ('\r', "回车"),
+    ] {
+        if line.contains(ch) {
+            return Some(reason);
+        }
+    }
+    None
+}
+
+/// 子用户禁止的程序（解释器、shell 逃逸、可执行外部命令的工具）。
+fn forbidden_program(line: &str) -> Option<String> {
+    const FORBIDDEN: &[&str] = &[
+        "sh", "bash", "zsh", "dash", "ksh", "csh", "tcsh", "fish", "pwsh", "powershell", "cmd",
+        "python", "python3", "perl", "ruby", "node", "nodejs", "php", "lua", "deno", "bun",
+        "awk", "gawk", "mawk", "sed", "vi", "vim", "nano", "emacs", "ed", "less", "more",
+        "find", "xargs", "env", "eval", "exec", "source", ".", "sudo", "su", "doas", "newgrp",
+        "docker", "podman", "nerdctl", "kubectl", "ctr", "nsenter", "unshare", "chroot",
+        "setpriv", "capsh", "setcap", "systemd-run", "curl", "wget", "nc", "ncat", "socat",
+        "telnet", "ssh", "scp", "sftp", "rsync", "git", "tar", "zip", "unzip", "mount",
+        "umount", "crontab", "at", "chmod", "chown", "chattr", "setfacl", "useradd", "usermod",
+        "userdel", "passwd", "chpasswd", "iptables", "nft", "ufw", "firewall-cmd", "reboot",
+        "shutdown", "halt", "poweroff", "kill", "pkill", "killall", "apt", "apt-get", "yum",
+        "dnf", "apk", "pacman", "make", "cargo", "rustc", "gcc", "g++", "clang", "go", "java",
+        "dotnet",
+    ];
+    let mut tokens = line.split_whitespace();
+    let mut token = tokens.next()?;
+    while token.contains('=') && !token.starts_with('-') {
+        token = tokens.next()?;
+    }
+    let base = token
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(token)
+        .trim_end_matches(':')
+        .to_ascii_lowercase();
+    FORBIDDEN
+        .iter()
+        .find(|p| **p == base)
+        .map(|p| (*p).to_string())
+}
+
 
 /// 命令审计上下文（字段较多，收敛为结构体避免参数过长）。
 struct CommandAudit<'a> {
@@ -722,7 +838,7 @@ impl CommandAudit<'_> {
                 path: "/star/termWs".to_string(),
                 detail: format!(
                     "sid={sid} 命令={}",
-                    dhrust::text::truncate_chars(cmd.trim(), 500)
+                    dhrust::text::truncate_chars(&redact_command(cmd.trim()), 500)
                 ),
                 success,
                 code: if success { 0 } else { 403 },
@@ -731,6 +847,94 @@ impl CommandAudit<'_> {
             },
         );
     }
+}
+
+/// 命令审计脱敏：口令/令牌等常见传参形式替换为 `***`（终端输出本身不受影响）。
+fn redact_command(cmd: &str) -> String {
+    const SECRET_KEYS: &[&str] = &[
+        "--password",
+        "--passwd",
+        "--token",
+        "--secret",
+        "--api-key",
+        "--apikey",
+        "--auth",
+        "password=",
+        "passwd=",
+        "pwd=",
+        "token=",
+        "secret=",
+        "apikey=",
+        "api_key=",
+        "access_token=",
+        "refresh_token=",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    let mut program = String::new();
+    let mut mask_next = false;
+    let mut skip_auth = false;
+    for (i, tok) in cmd.split_whitespace().enumerate() {
+        let lower = tok.to_ascii_lowercase();
+        if i == 0 {
+            program = lower.clone();
+        }
+        if skip_auth {
+            if tok.ends_with('\'') || tok.ends_with('"') {
+                skip_auth = false;
+            }
+            continue;
+        }
+        let masked = if mask_next {
+            mask_next = false;
+            "***".to_string()
+        } else if lower
+            .trim_start_matches(['\'', '"'])
+            .starts_with("authorization:")
+        {
+            let quote = if tok.starts_with('\'') || tok.starts_with('"') {
+                &tok[..1]
+            } else {
+                ""
+            };
+            if !(tok.ends_with('\'') || tok.ends_with('"')) {
+                skip_auth = true;
+            }
+            format!("{quote}Authorization:***{quote}")
+        } else if SECRET_KEYS.iter().any(|k| lower.starts_with(k)) {
+            if let Some((key, _)) = tok.split_once('=') {
+                format!("{key}=***")
+            } else {
+                mask_next = true;
+                tok.to_string()
+            }
+        } else if let Some(k) = SECRET_KEYS.iter().find(|k| lower.contains(*k)) {
+            // URL/连接串里的 `?token=xxx`、`password=xxx`：从该键的 `=` 起全部掩掉
+            let quote = if tok.ends_with('\'') || tok.ends_with('"') {
+                &tok[tok.len() - 1..]
+            } else {
+                ""
+            };
+            match lower
+                .find(k)
+                .and_then(|rel| tok[rel..].find('=').map(|eq| rel + eq + 1))
+            {
+                Some(cut) => format!("{}***{quote}", &tok[..cut]),
+                None => tok.to_string(),
+            }
+        } else if program.contains("mysql")
+            && lower.starts_with("-p")
+            && lower.len() > 2
+        {
+            "-p***".to_string()
+        } else if program.contains("redis-cli") && lower == "-a" {
+            mask_next = true;
+            tok.to_string()
+        } else {
+            tok.to_string()
+        };
+        out.push(masked);
+    }
+    out.join(" ")
 }
 
 /// 终端内的受控提示（不带控制帧；前端弹窗另行下发）。
@@ -1080,7 +1284,80 @@ mod tests {
     }
 
     #[test]
-    fn policy_branches() {        let cfg = AgentConfig::default();
+    fn sub_user_requires_whitelist_and_rejects_shell_escapes() {
+        let cfg = AgentConfig::default();
+        // 未配置白名单：子用户一律阻止
+        assert!(matches!(
+            decide_line(&cfg, false, "systemctl status nginx"),
+            LineVerdict::Blocked(_)
+        ));
+        let wl = AgentConfig {
+            terminal_allowed_commands: "systemctl status;df -h".to_string(),
+            ..AgentConfig::default()
+        };
+        assert!(matches!(
+            decide_line(&wl, false, "systemctl status nginx"),
+            LineVerdict::Run { danger: None }
+        ));
+        // 命令拼接/替换/重定向
+        for line in [
+            "systemctl status nginx; rm -rf /etc",
+            "systemctl status nginx | sh",
+            "systemctl status $(id)",
+            "systemctl status > /tmp/x",
+            "systemctl status `id`",
+        ] {
+            assert!(
+                matches!(decide_line(&wl, false, line), LineVerdict::Blocked(_)),
+                "应阻止：{line}"
+            );
+        }
+        // 解释器/逃逸类程序即使写进白名单也禁止
+        let wl_bash = AgentConfig {
+            terminal_allowed_commands: "bash;python3;docker".to_string(),
+            ..AgentConfig::default()
+        };
+        for line in ["bash -c id", "python3 -c 'print(1)'", "docker ps"] {
+            assert!(
+                matches!(decide_line(&wl_bash, false, line), LineVerdict::Blocked(_)),
+                "应阻止：{line}"
+            );
+        }
+        // 管理员不受白名单/元字符限制（仍走危险命令策略）
+        assert!(matches!(
+            decide_line(&cfg, true, "ls -l | head"),
+            LineVerdict::Run { danger: None }
+        ));
+    }
+
+    #[test]
+    fn audit_redacts_common_secrets() {
+        assert_eq!(
+            redact_command("mysql -uroot -pMySecret db"),
+            "mysql -uroot -p*** db"
+        );
+        assert_eq!(
+            redact_command("curl -H 'Authorization: Bearer abc' https://x"),
+            "curl -H 'Authorization:***' https://x"
+        );
+        assert_eq!(
+            redact_command("app --token=abc --password secret"),
+            "app --token=*** --password ***"
+        );
+        assert_eq!(
+            redact_command("wget 'https://x/api?token=abc&a=1'"),
+            "wget 'https://x/api?token=***'"
+        );
+        assert_eq!(
+            redact_command("redis-cli -a abc ping"),
+            "redis-cli -a *** ping"
+        );
+        assert_eq!(redact_command("ls -l"), "ls -l");
+    }
+
+    #[test]
+    fn policy_branches() {
+        let cfg = AgentConfig::default();
         assert!(matches!(
             decide_line(&cfg, true, "rm -rf /etc"),
             LineVerdict::Confirm(_)
@@ -1095,7 +1372,7 @@ mod tests {
             ..AgentConfig::default()
         };
         assert!(matches!(
-            decide_line(&allow, false, "reboot"),
+            decide_line(&allow, true, "reboot"),
             LineVerdict::Run { danger: Some(_) }
         ));
         // block：连管理员也拦
@@ -1109,20 +1386,20 @@ mod tests {
         ));
         // 子用户白名单：未命中直接阻止（即使命令本身无害）
         let wl = AgentConfig {
-            terminal_allowed_commands: "docker ps".to_string(),
+            terminal_allowed_commands: "systemctl status".to_string(),
             ..AgentConfig::default()
         };
         assert!(matches!(
-            decide_line(&wl, false, "ls -l"),
+            decide_line(&wl, false, "df -h"),
             LineVerdict::Blocked(_)
         ));
         assert!(matches!(
-            decide_line(&wl, false, "docker ps"),
+            decide_line(&wl, false, "systemctl status nginx"),
             LineVerdict::Run { danger: None }
         ));
         // 内置管理员不受白名单限制
         assert!(matches!(
-            decide_line(&wl, true, "ls -l"),
+            decide_line(&wl, true, "df -h"),
             LineVerdict::Run { danger: None }
         ));
     }

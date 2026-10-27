@@ -1119,10 +1119,11 @@ fn health_check(spec: &str) -> Result<(), String> {
         // 必须用 offthread 版本：本函数也会在 tokio 连接线程内被调用（HTTP 控制接口
         // /StartService 的启动尾段健康检查），直接 blocking_get_text 会因"运行时内
         // block_on"panic → 连接无响应关闭（客户端只见 Empty reply）。
+        let ua = util::user_agent();
         return dhrust::net::http_client::blocking_request_offthread(
             "GET",
             spec,
-            &[],
+            &[("User-Agent", ua.as_str())],
             None,
             Vec::new(),
             Duration::from_millis(5_000),

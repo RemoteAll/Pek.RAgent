@@ -70,6 +70,11 @@ pub struct AgentConfig {
     pub web_user_password: String,
     /// Web 面板鉴权级别。None 不鉴权；LocalOnly 本地免鉴权、远程需鉴权（默认）；Full 全部鉴权
     pub web_auth_level: String,
+    /// 信任反向代理转发头（`X-Real-IP` / `X-Forwarded-For`）。**仅在面板前面有可信反代时开启**。
+    ///
+    /// 开启后，对端为回环且带转发头时按真实 IP 判定“是否本机”、写入审计与登录限流；
+    /// 默认 false：只要对端是回环又带转发头，就按“反代来的远程请求”要求登录（防 nginx 后整体免登录）。
+    pub trust_forwarded_for: bool,
     /// 面板登录会话保持时长（小时，滑动续期：期间用过面板就不掉线；重启/升级不掉登录）。
     /// 默认 12；0 = 关闭持久化（仅进程内 24 小时，重启即失效）
     pub web_session_hours: u32,
@@ -136,7 +141,8 @@ pub struct AgentConfig {
     pub terminal_command_audit: bool,
     /// 在线终端：危险命令策略。`confirm`=管理员需二次确认、子用户禁止（默认）；`block`=所有人禁止；`allow`=只审计不拦截
     pub terminal_danger_policy: String,
-    /// 在线终端：子用户命令白名单（`;` 或换行分隔的前缀，如 `systemctl restart;docker ps`）。留空 = 不限制；内置管理员不受限
+    /// 在线终端：子用户命令白名单（`;` 或换行分隔的前缀，如 `systemctl restart;df -h`）。
+    /// **留空 = 禁止子用户使用终端**（终端本质是 root 级 shell）；管理员不受限制
     pub terminal_allowed_commands: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
@@ -164,6 +170,7 @@ impl Default for AgentConfig {
             web_user_name: "admin".to_string(),
             web_user_password: "admin".to_string(),
             web_auth_level: "LocalOnly".to_string(),
+            trust_forwarded_for: false,
             // 登录会话：默认保持 12 小时（滑动续期），避免重启后/隔天反复输入密码
             web_session_hours: 12,
             sample_interval: 1000,
@@ -881,6 +888,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebUserName", cfg.web_user_name.clone());
         push("WebPassword", cfg.web_user_password.clone());
         push("WebAuthLevel", cfg.web_auth_level.clone());
+        push("TrustForwardedFor", bool_text(cfg.trust_forwarded_for));
         push("WebSessionHours", cfg.web_session_hours.to_string());
         push("SampleInterval", cfg.sample_interval.to_string());
         push("WebTraffic", bool_text(cfg.web_traffic));

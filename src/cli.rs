@@ -966,6 +966,7 @@ fn zip_deploy(base: &Path, args: &[String]) -> i32 {
 /// 本机回环自签证书，校验无意义（对端就是自己），这样菜单/`-ListServices` 不受开关影响。
 fn api_get(base: &Path, action: &str, timeout: Duration) -> Result<String, String> {
     let cfg = AgentConfig::load(base);
+    let ua = crate::util::user_agent();
     if cfg.tls {
         let url = format!("https://127.0.0.1:{}/{}", cfg.local_port, action);
         let options = dhrust::net::http_client::HttpClientOptions {
@@ -973,12 +974,28 @@ fn api_get(base: &Path, action: &str, timeout: Duration) -> Result<String, Strin
             insecure_tls: true,
             ..Default::default()
         };
-        dhrust::net::http_client::blocking_request_with("GET", &url, &[], None, Vec::new(), &options)
-            .map(|r| r.body_text())
-            .map_err(|e| e.to_string())
+        dhrust::net::http_client::blocking_request_with(
+            "GET",
+            &url,
+            &[("User-Agent", ua.as_str())],
+            None,
+            Vec::new(),
+            &options,
+        )
+        .map(|r| r.body_text())
+        .map_err(|e| e.to_string())
     } else {
         let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
-        dhrust::net::http_client::blocking_get_text(&url, timeout).map_err(|e| e.to_string())
+        dhrust::net::http_client::blocking_request_offthread(
+            "GET",
+            &url,
+            &[("User-Agent", ua.as_str())],
+            None,
+            Vec::new(),
+            timeout,
+        )
+        .map(|r| r.body_text())
+        .map_err(|e| e.to_string())
     }
 }
 

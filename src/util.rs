@@ -10,6 +10,14 @@ use std::path::{Path, PathBuf};
 
 use dhrust::logs::LogLevel;
 
+/// 出站 HTTP 的 User-Agent（机器调用标识）。
+///
+/// WAF 开启「拦截空 UA」（`block_empty_ua`）时，空 UA 的内部调用会被当成机器人拦成 403；
+/// 统一带上可识别的 UA，避免升级/健康检查/插件下载等机器链路自锁。
+pub fn user_agent() -> String {
+    format!("pek-ragent/{}", env!("CARGO_PKG_VERSION"))
+}
+
 /// 基础目录：环境变量 `PEK_RAGENT_BASE` 优先（便于开发调试），其次可执行文件目录，最后当前目录。
 pub fn base_dir() -> PathBuf {
     dhrust::io::base_dir(&["PEK_RAGENT_BASE"])

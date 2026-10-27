@@ -144,6 +144,9 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         "/KillAndStart".to_string(),
     ];
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
+    // 反代后对端恒为回环：信任转发头（仅对端回环时采纳），否则 WAF 会整体放行且 IP 黑名单/Top IP 失真。
+    // 反代必须用 X-Real-IP 或**覆盖**（而非追加）X-Forwarded-For，否则客户端可伪造首段。
+    waf.set_trust_forwarded_for(true);
     // 强制豁免走内存态（不受 Config/Waf.toml 在线修改影响）：面板与机器接口（DHDeploy 的
     // RestSharp / HttpClient UA）不应被判为扫描器。
     waf.set_forced_skip_bot_prefixes(vec!["/api".to_string(), "/star".to_string()]);
@@ -200,7 +203,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| {
             let m = m.clone();
             async move {
-                if let Some(denied) = deny_remote(&ctx) {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
                     return denied;
                 }
                 HttpOutcome::Response(HttpResponse::json(200, services_json(&m)))
@@ -215,7 +218,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| {
             let m = m.clone();
             async move {
-                if let Some(denied) = deny_remote(&ctx) {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
                     return denied;
                 }
                 HttpOutcome::Response(HttpResponse::json(200, info_json(&m, port)))
@@ -224,13 +227,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     );
 
     // 本机信息
+    let m = manager.clone();
     router.map_get(
         "/ShowMachineInfo",
-        route(|ctx| async move {
-            if let Some(denied) = deny_remote(&ctx) {
-                return denied;
+        route(move |ctx| {
+            let m = m.clone();
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::text(200, crate::sys::machine_info()))
             }
-            HttpOutcome::Response(HttpResponse::text(200, crate::sys::machine_info()))
         }),
     );
 
@@ -241,7 +248,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| {
             let m = m.clone();
             async move {
-                if let Some(denied) = deny_remote(&ctx) {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
                     return denied;
                 }
                 m.reload_config();
@@ -273,13 +280,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     );
 
     // 杀死并启动进程（应用自重启辅助）
+    let m = manager.clone();
     router.map_post(
         "/KillAndStart",
-        route(move |ctx| async move {
-            if let Some(denied) = deny_remote(&ctx) {
-                return denied;
+        route(move |ctx| {
+            let m = m.clone();
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                kill_and_start(ctx)
             }
-            kill_and_start(ctx)
         }),
     );
 
@@ -361,9 +372,12 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
 /// 这批接口原本无任何校验（服务清单会泄露安装路径/启动参数，启停/杀进程可直接被利用），
 /// 星尘监听 `0.0.0.0` 时会对公网暴露。DHDeploy Agent 与运维脚本均从本机调用，不受影响。
 /// 返回 `Some(响应)` 表示调用方应直接返回该响应。
-fn deny_remote(ctx: &Ctx) -> Option<HttpOutcome> {
-    let ip = dhrust::net::panel_auth::client_ip(ctx);
-    if dhrust::net::panel_auth::is_loopback(&ip) {
+fn deny_remote(manager: &crate::manager::AppManager, ctx: &Ctx) -> Option<HttpOutcome> {
+    let trust = manager.config().trust_forwarded_for;
+    let (ip, proxied) = crate::webpanel::effective_client_ip(trust, ctx);
+    // 未开启信任时，回环对端带转发头 = 反代来的远程请求（不能当本机）
+    let local = dhrust::net::panel_auth::is_loopback(&ip) && !(proxied && !trust);
+    if local {
         return None;
     }
     util::log_error(&format!(
@@ -388,7 +402,7 @@ pub(crate) enum OpKind {
 /// 应用级操作统一处理。
 fn app_operation(manager: Arc<AppManager>, ctx: Ctx, kind: OpKind) -> HttpOutcome {
     // 契约接口仅本机可用（防公网任意启停子服务）
-    if let Some(denied) = deny_remote(&ctx) {
+    if let Some(denied) = deny_remote(manager.as_ref(), &ctx) {
         return denied;
     }
     let name = param(&ctx, "serviceName")

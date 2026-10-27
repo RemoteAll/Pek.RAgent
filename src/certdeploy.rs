@@ -214,10 +214,11 @@ fn fetch_material(url: &str) -> Result<serde_json::Value, String> {
             "拒绝拉取：仅允许 https 或回环 http 地址（当前：{url}）"
         ));
     }
+    let ua = crate::util::user_agent();
     let resp = dhrust::net::http_client::blocking_request_offthread(
         "GET",
         url,
-        &[],
+        &[("User-Agent", ua.as_str())],
         None,
         Vec::new(),
         std::time::Duration::from_secs(30),
