@@ -22,6 +22,10 @@ use crate::util;
 
 /// 上传包大小上限（与程序升级一致）。
 pub const MAX_PACKAGE_SIZE: usize = 64 * 1024 * 1024;
+/// 解压后总大小上限（防 zip bomb 把节点磁盘写满）。
+const MAX_UNPACKED_SIZE: u64 = 512 * 1024 * 1024;
+/// 解压条目数上限（防海量小文件拖垮磁盘/文件句柄）。
+const MAX_ENTRY_COUNT: usize = 20_000;
 
 /// 部署结果（面板回显）。
 #[derive(Debug, Clone)]
@@ -132,7 +136,14 @@ fn deploy_staged(
         PackageKind::Zip => {
             let pkg = staging.join("package.zip");
             fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
-            dhrust::zip::extract_zip(&pkg, &unpack)?;
+            check_zip_limits(&pkg)?;
+            // 双重防护：先按中央目录快速拒绝，解压时再按**实际写入字节**限制（声明 size 不可信）
+            dhrust::zip::extract_zip_limited(
+                &pkg,
+                &unpack,
+                MAX_UNPACKED_SIZE,
+                MAX_ENTRY_COUNT,
+            )?;
         }
         PackageKind::TarGz => {
             let pkg = staging.join("package.tar.gz");
@@ -242,13 +253,16 @@ fn deploy_staged(
     })
 }
 
-/// 解压 tar.gz（防路径穿越；Unix 下保留可执行位）。
+/// 解压 tar.gz（防路径穿越/链接逃逸/zip bomb；Unix 下保留可执行位）。
 fn extract_tar_gz(pkg: &Path, target: &Path) -> Result<usize, String> {
     let file = fs::File::open(pkg).map_err(|e| format!("打开压缩包失败：{e}"))?;
     let reader = flate2::read::GzDecoder::new(std::io::BufReader::new(file));
-    let mut archive = tar::Archive::new(reader);
+    // 限制解压流读取量（防极端 gzip 炸弹；正常包远小于此值）
+    let limited = std::io::Read::take(reader, MAX_UNPACKED_SIZE.saturating_add(64 * 1024));
+    let mut archive = tar::Archive::new(limited);
 
     let mut count = 0usize;
+    let mut total: u64 = 0;
     let entries = archive
         .entries()
         .map_err(|e| format!("读取 tar 失败：{e}"))?;
@@ -261,15 +275,68 @@ fn extract_tar_gz(pkg: &Path, target: &Path) -> Result<usize, String> {
         if is_unsafe_tar_path(&path) {
             return Err(format!("包内路径非法（路径穿越）：{}", path.display()));
         }
+        let kind = entry.header().entry_type();
+        if kind.is_symlink() || kind.is_hard_link() {
+            return Err(format!(
+                "包内包含符号链接/硬链接（拒绝，防链接逃逸）：{}",
+                path.display()
+            ));
+        }
+        if !kind.is_file() && !kind.is_dir() {
+            return Err(format!("包内包含不支持的条目类型：{}", path.display()));
+        }
+        count += 1;
+        if count > MAX_ENTRY_COUNT {
+            return Err(format!("压缩包条目过多（上限 {MAX_ENTRY_COUNT}）"));
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_UNPACKED_SIZE {
+            return Err(format!(
+                "解压后总大小超过上限（{} MB）",
+                MAX_UNPACKED_SIZE / 1024 / 1024
+            ));
+        }
         entry
             .unpack_in(target)
             .map_err(|e| format!("解压条目失败 {}：{e}", path.display()))?;
-        count += 1;
     }
     if count == 0 {
         return Err("压缩包为空".to_string());
     }
     Ok(count)
+}
+
+/// 预扫描 zip 条目数与解压后总大小（防 zip bomb；不读文件内容，只读中央目录）。
+fn check_zip_limits(pkg: &Path) -> Result<(), String> {
+    let file = fs::File::open(pkg).map_err(|e| format!("打开压缩包失败：{e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("读取压缩包失败：{e}"))?;
+    if archive.len() > MAX_ENTRY_COUNT {
+        return Err(format!(
+            "压缩包条目过多（{}，上限 {MAX_ENTRY_COUNT}）",
+            archive.len()
+        ));
+    }
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let entry = archive
+            .by_index(i)
+            .map_err(|e| format!("读取压缩包条目失败：{e}"))?;
+        // 符号链接条目直接拒绝（解压器不会创建链接，但避免后续误用）
+        if entry.unix_mode().map(|m| m & 0o170000 == 0o120000).unwrap_or(false) {
+            return Err(format!(
+                "压缩包包含符号链接（拒绝）：{}",
+                entry.name()
+            ));
+        }
+        total = total.saturating_add(entry.size());
+        if total > MAX_UNPACKED_SIZE {
+            return Err(format!(
+                "解压后总大小超过上限（{} MB）",
+                MAX_UNPACKED_SIZE / 1024 / 1024
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// tar 条目路径是否危险（绝对路径、盘符前缀、或含 `..` 上跳）。

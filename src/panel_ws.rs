@@ -1,8 +1,9 @@
 //! 平台实时通道（Pek.RAgent → Pek.RPanlServer WebSocket）。
 //!
 //! 配置「平台接入令牌」（`AutoUpgradeToken`）后启用：
-//! - 上行：`register`（节点信息）/ `heartbeat`（机器数据，60 秒）——平台「服务器节点」页可见；
-//! - 下行：`checkUpgrade`（平台下发"立即检查升级"→ 触发一次强制自升级检查）。
+//! - 上行：`register`（节点信息 + 子应用清单）/ `heartbeat`（机器数据，60 秒；子应用清单变化才带）
+//!   / `appUpgradeResult`（远程应用升级回执）——平台「服务器节点」页可见；
+//! - 下行：`checkUpgrade`（立即检查代理自升级）/ `appUpgrade`（下载并部署**已有**子应用包）。
 //!
 //! 连接地址从自动升级源（`AutoUpgradeUrl`）推导：`scheme://host[:port]` + `/store/agents/ws`
 //! （http → ws、https → wss）；断线由 dhrust `WsClient` 会话层自动重连（指数退避），
@@ -36,6 +37,12 @@ pub fn connected() -> bool {
 
 /// 证书部署串行锁（同一时刻只允许一个任务改配置）。
 static DEPLOY_BUSY: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// 应用升级串行锁（同一时刻只允许一个应用包部署，避免两个任务同时改同一应用目录）。
+static APP_UPGRADE_BUSY: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
+
+/// 上次上报的子应用清单签名（心跳仅在变化时携带 `apps`，平台侧 `null` = 保留旧值）。
+static APPS_SIGNATURE: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
 
 /// 是否启用（升级源地址非空，且「有令牌」或「开配对」）。
 pub fn enabled(cfg: &AgentConfig) -> bool {
@@ -390,6 +397,12 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
             }
+            // 平台下发子应用升级（`appUpgrade`）：下载 → SHA-256 校验 → 部署 → 重启 → 回执
+            "appUpgrade" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_app_upgrade(&mgr, &cmd));
+            }
             // ————— 平台统一管控面板子用户（平台权威；内置管理员不接管） —————
             "panelUserList" => {
                 let base = crate::util::base_dir();
@@ -512,6 +525,266 @@ fn regenerate_agent_id(manager: &AppManager) {
     }
 }
 
+/// 平台下发子应用升级（`appUpgrade`）：
+/// 下载（平台相对路径 + 一次性票据）→ SHA-256 校验 → 调用 `apppkg::deploy_bytes` 部署并重启 → 回执。
+///
+/// 安全边界：只允许升级**本机已存在**的子应用；下载地址只能来自 `AutoUpgradeUrl` 的 origin
+/// （平台给的是 `/store/apps/{id}?ticket=...` 相对路径），避免被冒充平台诱导去任意地址下载。
+fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let app_name = cmd
+        .get("appName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let version = cmd
+        .get("version")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let reply = |ok: bool, message: String| {
+        send_event(
+            &agent_id,
+            json!({
+                "type": "appUpgradeResult",
+                "appName": app_name,
+                "version": version,
+                "ok": ok,
+                "message": message,
+            }),
+        );
+    };
+
+    if app_name.is_empty() || version.is_empty() {
+        reply(false, "缺少 appName 或 version".to_string());
+        return;
+    }
+    // 串行化：避免两个升级任务同时改同一应用目录
+    {
+        let mut busy = APP_UPGRADE_BUSY.lock().unwrap_or_else(|e| e.into_inner());
+        if *busy {
+            reply(false, "节点正在执行另一个应用升级，请稍后重试".to_string());
+            return;
+        }
+        *busy = true;
+    }
+    // RAII：即使后续逻辑 panic，也会释放串行锁，不会让节点永久拒绝后续升级
+    struct BusyGuard;
+    impl Drop for BusyGuard {
+        fn drop(&mut self) {
+            if let Ok(mut busy) = APP_UPGRADE_BUSY.lock() {
+                *busy = false;
+            }
+        }
+    }
+    let _guard = BusyGuard;
+    let result = run_app_upgrade(manager, cmd, &app_name, &version);
+    match &result {
+        Ok(msg) => {
+            util::log_format(
+                "平台应用升级完成：{} v{}——{}",
+                &[&app_name, &version, msg],
+            );
+            reply(true, msg.clone());
+            crate::audit::record(
+                manager.base(),
+                &crate::audit::AuditEntry {
+                    category: None,
+                    user: "platform".to_string(),
+                    ip: "platform".to_string(),
+                    action: "appUpgrade".to_string(),
+                    title: format!("平台下发应用升级：{app_name} v{version}"),
+                    method: "WS".to_string(),
+                    path: "/store/agents/ws".to_string(),
+                    detail: msg.clone(),
+                    success: true,
+                    code: 0,
+                    message: String::new(),
+                    elapsed_ms: 0,
+                },
+            );
+        }
+        Err(e) => {
+            util::log_error(&format!(
+                "平台应用升级失败：{} v{}——{}",
+                app_name, version, e
+            ));
+            reply(false, e.clone());
+            crate::audit::record(
+                manager.base(),
+                &crate::audit::AuditEntry {
+                    category: None,
+                    user: "platform".to_string(),
+                    ip: "platform".to_string(),
+                    action: "appUpgrade".to_string(),
+                    title: format!("平台下发应用升级：{app_name} v{version}"),
+                    method: "WS".to_string(),
+                    path: "/store/agents/ws".to_string(),
+                    detail: e.clone(),
+                    success: false,
+                    code: 0,
+                    message: e.clone(),
+                    elapsed_ms: 0,
+                },
+            );
+        }
+    }
+}
+
+/// 执行一次应用升级（失败返回可读原因；调用方负责回执与审计）。
+fn run_app_upgrade(
+    manager: &Arc<AppManager>,
+    cmd: &Json,
+    app_name: &str,
+    version: &str,
+) -> Result<String, String> {
+    // 只允许升级已有应用：远程新建任意应用会扩大攻击面，也不符合「升级」语义
+    // （大小写不敏感匹配，避免平台包名大小写与配置不一致时误判为「不存在」）
+    let actual_name = manager
+        .config()
+        .apps
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(app_name))
+        .map(|a| a.name.clone())
+        .ok_or_else(|| format!("节点上没有应用「{app_name}」（远程升级只允许升级已有应用）"))?;
+    let path = cmd
+        .get("path")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if path.len() > 2048
+        || !path.starts_with('/')
+        || path.starts_with("//")
+        || path.contains("..")
+        || path.contains('\\')
+        || path.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err("平台下发的下载路径非法（只接受平台相对路径）".to_string());
+    }
+    let origin = platform_origin(&manager.config())?;
+    let url = format!("{origin}{path}");
+    let expected_sha = cmd
+        .get("sha256")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if expected_sha.len() != 64 || !expected_sha.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("平台下发的 SHA-256 无效".to_string());
+    }
+    util::log_format(
+        "开始下载应用升级包：{} v{} ← {}",
+        &[app_name, version, &redact_url_ticket(&url)],
+    );
+    let ua = crate::util::user_agent();
+    let resp = dhrust::net::http_client::blocking_request_offthread(
+        "GET",
+        &url,
+        &[("User-Agent", ua.as_str())],
+        None,
+        Vec::new(),
+        Duration::from_secs(180),
+    )
+    .map_err(|e| format!("下载应用包失败（{}）：{e}", redact_url_ticket(&url)))?;
+    if resp.status != 200 {
+        let body = String::from_utf8_lossy(&resp.body);
+        return Err(format!(
+            "下载应用包失败：HTTP {}（{}）",
+            resp.status,
+            body.chars().take(200).collect::<String>()
+        ));
+    }
+    if resp.body.is_empty() {
+        return Err("下载应用包失败：响应为空".to_string());
+    }
+    if resp.body.len() > crate::apppkg::MAX_PACKAGE_SIZE {
+        return Err(format!(
+            "应用包过大（{} MB，上限 {} MB）",
+            resp.body.len() / 1024 / 1024,
+            crate::apppkg::MAX_PACKAGE_SIZE / 1024 / 1024
+        ));
+    }
+    let actual = dhrust::sign::sha256_hex(&resp.body);
+    if !actual.eq_ignore_ascii_case(&expected_sha) {
+        return Err(format!(
+            "应用包校验失败：SHA-256 不一致（期望 {}，实际 {}）",
+            &expected_sha[..12],
+            &actual[..12]
+        ));
+    }
+    let file_name = cmd
+        .get("fileName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let file_name = if file_name.is_empty() {
+        format!("{app_name}-{version}.zip")
+    } else {
+        file_name
+    };
+    let deployed = crate::apppkg::deploy_bytes(
+        manager,
+        &file_name,
+        &resp.body,
+        Some(&actual_name),
+        None,
+        true,
+    )?;
+    if !deployed.started {
+        return Err(format!(
+            "应用包已写入，但应用未成功启动（{}）；请查看节点日志与应用日志",
+            deployed.program.display()
+        ));
+    }
+    Ok(format!(
+        "已部署并启动（{} 个文件，程序 {}）",
+        deployed.files,
+        deployed.program.display()
+    ))
+}
+
+/// 日志/回执里隐藏一次性下载票据（`ticket=...`），避免凭据落进日志。
+fn redact_url_ticket(url: &str) -> String {
+    match url.find("ticket=") {
+        Some(pos) => format!("{}ticket=***", &url[..pos]),
+        None => url.to_string(),
+    }
+}
+
+/// 平台 origin（只认 `AutoUpgradeUrl` 的 scheme + authority；https，回环例外允许 http）。
+fn platform_origin(cfg: &AgentConfig) -> Result<String, String> {
+    let raw = cfg.auto_upgrade_url.trim();
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return Err("未配置 AutoUpgradeUrl，无法解析应用包下载地址".to_string());
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("").trim();
+    if authority.is_empty() {
+        return Err("AutoUpgradeUrl 缺少主机名".to_string());
+    }
+    let host = dhrust::web::url_host(raw).unwrap_or_default();
+    let loopback = host == "localhost"
+        || host == "[::1]"
+        || host.starts_with("127.")
+        || host == "::1";
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "https" && !(scheme == "http" && loopback) {
+        return Err(format!(
+            "AutoUpgradeUrl 必须是 https（当前 {scheme}://{authority}；仅回环地址允许 http）"
+        ));
+    }
+    if authority.contains('@') {
+        return Err("AutoUpgradeUrl 不能包含用户名/口令".to_string());
+    }
+    Ok(format!("{scheme}://{authority}"))
+}
+
 /// 平台下发节点专用令牌（`tokenIssue`）：校验格式 → 写配置 → 立即断开重连（用新令牌）。
 ///
 /// 这样管理员在平台侧签发即可，无需逐台手抄令牌（与分发源配置自动下发同一思路）。
@@ -629,6 +902,7 @@ fn apply_store_config(manager: &AppManager, v: &Json) {
 
 /// `register` 报文（连接建立后发送）。
 fn build_register(manager: &AppManager) -> String {
+    let services = manager.list();
     with_panel_meta(
         manager,
         json!({
@@ -639,7 +913,59 @@ fn build_register(manager: &AppManager) -> String {
             "platform": crate::self_upgrade::current_platform(),
             "os": dhrust::sys::machine::os_description(),
             "hostname": dhrust::sys::machine::hostname(),
+            // 子应用清单：每次接入都全量上报（平台据此远程升级指定应用）
+            "apps": apps_payload(&services, true),
         }),
+    )
+}
+
+/// 子应用清单（平台「服务器节点」展示与远程应用升级选择用）。
+///
+/// 只上报**无敏感信息**的字段：名称/程序/模式/启用/运行状态；不传启动参数与环境变量
+/// （可能含口令/令牌）。`version` 由平台在远程部署后记录，Agent 不额外读盘探测。
+fn apps_payload(
+    services: &[(crate::config::AppConfig, crate::app::AppStatus)],
+    force: bool,
+) -> Json {
+    // 先用轻量签名判断变化（心跳 60 秒一次；无变化时**不构造 JSON**，省带宽也省分配）
+    let mut sig = String::new();
+    for (cfg, st) in services {
+        sig.push_str(&cfg.name);
+        sig.push('|');
+        sig.push_str(&cfg.file_name);
+        sig.push('|');
+        sig.push_str(&cfg.mode_text());
+        sig.push('|');
+        sig.push_str(if cfg.enable { "1" } else { "0" });
+        sig.push(if st.running { '1' } else { '0' });
+        sig.push('|');
+        sig.push_str(&st.pid.to_string());
+        sig.push('|');
+        sig.push_str(&st.health_fails.to_string());
+        sig.push(';');
+    }
+    let cache = APPS_SIGNATURE.get_or_init(|| std::sync::Mutex::new(String::new()));
+    let mut last = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if !force && *last == sig {
+        return Json::Null;
+    }
+    *last = sig;
+    drop(last);
+    Json::Array(
+        services
+            .iter()
+            .map(|(cfg, st)| {
+                json!({
+                    "name": cfg.name,
+                    "file": cfg.file_name,
+                    "mode": cfg.mode_text(),
+                    "enable": cfg.enable,
+                    "running": st.running,
+                    "pid": st.pid,
+                    "healthFails": st.health_fails,
+                })
+            })
+            .collect(),
     )
 }
 
@@ -687,6 +1013,8 @@ fn build_heartbeat(manager: &AppManager) -> String {
     }
     let services = manager.list();
     let running = services.iter().filter(|(_, s)| s.running).count();
+    // 子应用清单：仅名称/启用/运行状态/pid 变化时携带（平台侧 null = 保留旧值）
+    let apps = apps_payload(&services, false);
     let uptime = STARTED.get().map(|t| t.elapsed().as_secs()).unwrap_or(0);
     let pid = std::process::id();
     let (site_summary, sites_changed) = {
@@ -709,6 +1037,7 @@ fn build_heartbeat(manager: &AppManager) -> String {
             "processMemoryMB": crate::sys::memory_mb(pid).unwrap_or(0),
             "servicesRunning": running,
             "servicesTotal": services.len(),
+            "apps": apps,
             // 仅在站点/白名单变化时携带清单（平台侧 null = 保留旧值），省带宽
             "sites": if sites_changed { site_summary } else { serde_json::Value::Null },
         }),
