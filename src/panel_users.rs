@@ -287,8 +287,7 @@ mod tests {
     #[test]
     fn upsert_list_delete_and_digest() {
         let base = temp_base("upsert");
-        let mut cfg = AgentConfig::default();
-        cfg.web_user_name = "admin".to_string();
+        let cfg = AgentConfig::default();
 
         let salt = "aabbccdd";
         let v = json!({

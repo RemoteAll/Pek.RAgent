@@ -132,6 +132,12 @@ pub struct AgentConfig {
     pub ai_api_key: String,
     /// 在线终端。启用后可在面板「在线终端」页执行服务器命令（免 SSH；命令以本程序/服务账户权限运行，全部记入审计）
     pub terminal_enabled: bool,
+    /// 在线终端：记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）
+    pub terminal_command_audit: bool,
+    /// 在线终端：危险命令策略。`confirm`=管理员需二次确认、子用户禁止（默认）；`block`=所有人禁止；`allow`=只审计不拦截
+    pub terminal_danger_policy: String,
+    /// 在线终端：子用户命令白名单（`;` 或换行分隔的前缀，如 `systemctl restart;docker ps`）。留空 = 不限制；内置管理员不受限
+    pub terminal_allowed_commands: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -190,6 +196,9 @@ impl Default for AgentConfig {
             ai_model: "deepseek-chat".to_string(),
             ai_api_key: String::new(),
             terminal_enabled: true,
+            terminal_command_audit: true,
+            terminal_danger_policy: "confirm".to_string(),
+            terminal_allowed_commands: String::new(),
             apps: sample_apps(),
         }
     }
@@ -434,6 +443,15 @@ impl AgentConfig {
         self.plugin_store_pubkey = self.plugin_store_pubkey.trim().to_string();
         self.auto_upgrade_url = self.auto_upgrade_url.trim().to_string();
         self.auto_upgrade_token = self.auto_upgrade_token.trim().to_string();
+        // 终端危险命令策略：只认三档，非法值回落 confirm（最安全的默认口径）
+        self.terminal_danger_policy = self.terminal_danger_policy.trim().to_ascii_lowercase();
+        if !matches!(
+            self.terminal_danger_policy.as_str(),
+            "confirm" | "block" | "allow"
+        ) {
+            self.terminal_danger_policy = "confirm".to_string();
+        }
+        self.terminal_allowed_commands = self.terminal_allowed_commands.trim().to_string();
         if self.auto_upgrade_interval_minutes == 0 {
             self.auto_upgrade_interval_minutes = 60;
         } else {
@@ -733,6 +751,15 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = bool_of(obj, "TerminalEnabled") {
         cfg.terminal_enabled = v;
     }
+    if let Some(v) = bool_of(obj, "TerminalCommandAudit") {
+        cfg.terminal_command_audit = v;
+    }
+    if let Some(v) = text_of(obj, "TerminalDangerPolicy") {
+        cfg.terminal_danger_policy = v;
+    }
+    if let Some(v) = text_of(obj, "TerminalAllowedCommands") {
+        cfg.terminal_allowed_commands = v;
+    }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
     let services = obj.get("Services").and_then(|s| s.get("ServiceInfo"));
@@ -880,6 +907,9 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("AiModel", cfg.ai_model.clone());
         push("AiApiKey", cfg.ai_api_key.clone());
         push("TerminalEnabled", bool_text(cfg.terminal_enabled));
+        push("TerminalCommandAudit", bool_text(cfg.terminal_command_audit));
+        push("TerminalDangerPolicy", cfg.terminal_danger_policy.clone());
+        push("TerminalAllowedCommands", cfg.terminal_allowed_commands.clone());
         // 文件承载键（C# 特有标量）：当前文件有值则原样带入（缺省保持模板默认，防重建丢 C# 数据）
         for key in [
             "Code",
@@ -1319,6 +1349,30 @@ mod tests {
         assert!(AgentConfig::default().terminal_enabled);
         let text = render_xml(&AgentConfig::default(), None).unwrap();
         assert!(text.contains("<TerminalEnabled>true</TerminalEnabled>"), "{text}");
+    }
+
+    #[test]
+    fn terminal_control_read_render() {
+        let json: Json = serde_json::from_str(
+            r#"{ "TerminalCommandAudit": "false", "TerminalDangerPolicy": "BLOCK", "TerminalAllowedCommands": " docker ps;systemctl restart " }"#,
+        )
+        .unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert!(!cfg.terminal_command_audit);
+        assert_eq!(cfg.terminal_danger_policy, "block");
+        assert_eq!(cfg.terminal_allowed_commands, "docker ps;systemctl restart");
+
+        // 非法策略回落 confirm（最安全默认）
+        let bad: Json = serde_json::from_str(r#"{ "TerminalDangerPolicy": "whatever" }"#).unwrap();
+        let mut cfg = config_from_json(&bad);
+        cfg.normalize();
+        assert_eq!(cfg.terminal_danger_policy, "confirm");
+
+        let text = render_xml(&AgentConfig::default(), None).unwrap();
+        assert!(text.contains("<TerminalCommandAudit>true</TerminalCommandAudit>"), "{text}");
+        assert!(text.contains("<TerminalDangerPolicy>confirm</TerminalDangerPolicy>"), "{text}");
+        assert!(text.contains("<TerminalAllowedCommands></TerminalAllowedCommands>"), "{text}");
     }
 
     #[test]

@@ -105,6 +105,12 @@
   <AiApiKey></AiApiKey>
   <!--在线终端。启用后可在面板「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）-->
   <TerminalEnabled>true</TerminalEnabled>
+  <!--在线终端·命令审计。true=记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）-->
+  <TerminalCommandAudit>true</TerminalCommandAudit>
+  <!--在线终端·危险命令策略。confirm=管理员需二次确认且子用户禁止（默认）；block=所有人禁止；allow=只审计不拦截-->
+  <TerminalDangerPolicy>confirm</TerminalDangerPolicy>
+  <!--在线终端·子用户命令白名单。留空=不限制；非空时子用户只能执行这些前缀（分号或换行分隔，如 systemctl restart;docker ps）；内置管理员不受限-->
+  <TerminalAllowedCommands></TerminalAllowedCommands>
 
   <!--应用服务集合-->
   <Services></Services>

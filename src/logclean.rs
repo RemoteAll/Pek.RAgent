@@ -313,6 +313,58 @@ fn glob_logs(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// 目录下日志文件（**含轮转**：`access.log`、`access.log.1`、`access.log-20261025.gz`）。
+///
+/// 只匹配文件名中出现 `.log` 的文件，不会误收 `nginx.pid`、`*.conf` 等。
+#[cfg_attr(windows, allow(dead_code))]
+fn glob_rotated_logs(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let Ok(rd) = fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name.contains(".log") {
+            let p = entry.path();
+            if p.is_file() {
+                out.push(p);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// 收集某目录下指定基线名的日志及其轮转文件（`name` / `name-20261025` / `name.1.gz`）。
+///
+/// `messages`、`secure`、`cron` 这类日志没有 `.log` 后缀，必须按前缀匹配才能找到轮转件。
+#[cfg_attr(windows, allow(dead_code))]
+fn collect_log_variants(
+    targets: &mut Vec<Target>,
+    seen: &mut HashSet<PathBuf>,
+    dir: &Path,
+    base: &str,
+) {
+    let Ok(rd) = fs::read_dir(dir) else {
+        return;
+    };
+    let base = base.to_ascii_lowercase();
+    let dash = format!("{base}-");
+    let dot = format!("{base}.");
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_ascii_lowercase();
+        if name != base && !name.starts_with(&dash) && !name.starts_with(&dot) {
+            continue;
+        }
+        let p = entry.path();
+        if !p.is_file() {
+            continue;
+        }
+        let text = p.to_string_lossy().to_string();
+        push_file(targets, seen, &text);
+    }
+}
+
 /// 按平台构建分类清单（仅保留含实际目标的分类）。
 fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
     let mut cats: Vec<Category> = Vec::new();
@@ -322,7 +374,7 @@ fn build_categories(base: &Path, cfg: &AgentConfig) -> Vec<Category> {
         cats.push(Category {
             key: "system",
             name: "系统日志",
-            description: "系统运行日志（syslog/messages/journald 等；未开启 audit 审计时可放心清理）",
+            description: "系统运行日志（syslog/messages/secure/cron/audit 含轮转件、journald 等；未开启 audit 审计时可放心清理）",
             targets: linux_system_targets(),
         });
         cats.push(Category {
@@ -514,33 +566,42 @@ fn custom_category(text: &str) -> Option<Category> {
 fn linux_system_targets() -> Vec<Target> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
-    // 常见系统日志文件
+    // 常见系统日志基线名（**含轮转件**：messages-20261025 / secure-* / cron.1 等）
     const KNOWN: &[&str] = &[
-        "/var/log/syslog",
-        "/var/log/messages",
-        "/var/log/secure",
-        "/var/log/auth.log",
-        "/var/log/kern.log",
-        "/var/log/daemon.log",
-        "/var/log/cron",
-        "/var/log/maillog",
-        "/var/log/mail.log",
-        "/var/log/mail.err",
-        "/var/log/boot.log",
-        "/var/log/dmesg",
-        "/var/log/yum.log",
-        "/var/log/dnf.log",
-        "/var/log/firewalld",
-        "/var/log/sshd.log",
+        "syslog",
+        "messages",
+        "secure",
+        "auth.log",
+        "kern.log",
+        "daemon.log",
+        "cron",
+        "maillog",
+        "mail.log",
+        "mail.err",
+        "boot.log",
+        "dmesg",
+        "yum.log",
+        "dnf.log",
+        "hawkey.log",
+        "firewalld",
+        "sshd.log",
+        "spooler",
+        "ufw.log",
     ];
-    for p in KNOWN {
-        push_file(&mut targets, &mut seen, p);
+    let log_dir = Path::new("/var/log");
+    for base in KNOWN {
+        collect_log_variants(&mut targets, &mut seen, log_dir, base);
     }
-    // /var/log 顶层 *.log
-    for p in glob_logs(Path::new("/var/log")) {
+    // /var/log 顶层所有 `*.log*`（dpkg.log / alternatives.log / cloud-init.log / *.log.1.gz …）
+    for p in glob_rotated_logs(log_dir) {
         let text = p.to_string_lossy().to_string();
         push_file(&mut targets, &mut seen, &text);
     }
+    // auditd 审计日志目录（宝塔同样纳入系统日志；未开 audit 可放心清理）
+    push_dir(&mut targets, &mut seen, "/var/log/audit");
+    // 安装器 / 调优工具日志目录（内容为日志，清空后按需重建）
+    push_dir(&mut targets, &mut seen, "/var/log/anaconda");
+    push_dir(&mut targets, &mut seen, "/var/log/tuned");
     // journald（目录存在才显示；清理走 journalctl 真空）
     let journal = PathBuf::from("/var/log/journal");
     if journal.is_dir() {
@@ -566,7 +627,7 @@ fn linux_website_targets() -> Vec<Target> {
         "/www/server/nginx/logs",
     ];
     for dir in DIRS {
-        for p in glob_logs(Path::new(dir)) {
+        for p in glob_rotated_logs(Path::new(dir)) {
             let text = p.to_string_lossy().to_string();
             push_file(&mut targets, &mut seen, &text);
         }
@@ -594,7 +655,7 @@ fn linux_nginx_cache_targets() -> Vec<Target> {
 fn linux_redis_targets() -> Vec<Target> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
-    for p in glob_logs(Path::new("/var/log/redis")) {
+    for p in glob_rotated_logs(Path::new("/var/log/redis")) {
         let text = p.to_string_lossy().to_string();
         push_file(&mut targets, &mut seen, &text);
     }
@@ -609,7 +670,7 @@ fn linux_mysql_targets() -> Vec<Target> {
     let mut targets = Vec::new();
     let mut seen = HashSet::new();
     for dir in ["/var/log/mysql", "/var/log/mariadb", "/www/server/data"] {
-        for p in glob_logs(Path::new(dir)) {
+        for p in glob_rotated_logs(Path::new(dir)) {
             let text = p.to_string_lossy().to_string();
             push_file(&mut targets, &mut seen, &text);
         }
@@ -1337,9 +1398,58 @@ mod tests {
         dir
     }
 
+    /// 轮转日志匹配：`messages-20261025`、`secure-*`、`cron.1`、`hawkey.log-*` 都要命中，
+    /// 无关文件不得命中（宝塔能看到而此前我们漏掉的正是这些轮转件）。
     #[test]
-    fn truncates_log_file() {
-        let dir = temp_dir("truncate");
+    fn rotated_logs_match_variants() {
+        let dir = temp_dir("rotated");
+        for name in [
+            "messages",
+            "messages-20261025",
+            "messages.1.gz",
+            "secure",
+            "secure-20261025",
+            "cron",
+            "cron.1",
+            "cron-20261025",
+            "hawkey.log",
+            "hawkey.log-20261025",
+            "unrelated.txt",
+            "messages-backup.tmp",
+        ] {
+            fs::write(dir.join(name), b"x").unwrap();
+        }
+        let mut targets = Vec::new();
+        let mut seen = HashSet::new();
+        for base in ["messages", "secure", "cron", "hawkey.log"] {
+            collect_log_variants(&mut targets, &mut seen, &dir, base);
+        }
+        let names: Vec<String> = targets
+            .iter()
+            .map(|t| t.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        for expect in [
+            "messages",
+            "messages-20261025",
+            "messages.1.gz",
+            "secure",
+            "secure-20261025",
+            "cron",
+            "cron.1",
+            "cron-20261025",
+            "hawkey.log",
+            "hawkey.log-20261025",
+        ] {
+            assert!(names.iter().any(|n| n == expect), "应命中 {expect}：{names:?}");
+        }
+        assert!(!names.iter().any(|n| n == "unrelated.txt"), "{names:?}");
+        // `messages` 前缀不应吞掉 `messages-backup.tmp` 之外的无关文件（前缀匹配会命中它，
+        // 但那也是 messages 的轮转/备份件，属于日志语义，保留）
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn truncates_log_file() {        let dir = temp_dir("truncate");
         let file = dir.join("app.log");
         fs::write(&file, b"0123456789").unwrap();
         let target = Target {

@@ -28,7 +28,7 @@
 | 流量统计 | **网站流量**（解析 nginx/Apache/Caddy/IIS 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled`、IIS `applicationHost.config` 与 `W3SVC*` 日志目录等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布（IIS 需在日志字段中启用 `sc-bytes` 才能统计流量；IIS 全部站点都会列出，暂无日志/日志关闭/格式不支持的会标注原因）；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 SQLite：`Data/traffic.db`，由 **Pek.RCode** 按 XCode 规范模型 `Entity/Model.xml` 管理；网站按站点、端口按天；旧版 JSON 归档首次运行自动迁移），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 | **AI 助手** | 服务器问题分析助手（面板「🤖 AI 助手」页）：对话式分析，自动附带服务器实况快照（主机/代理/子服务/看门狗/最近日志）；**支持自定义模型**——OpenAI 兼容接口（默认接入 DeepSeek `deepseek-chat`，可改 `deepseek-reasoner` 或任何兼容服务/本地 Ollama），配置项 `AiEnabled`/`AiBaseUrl`/`AiModel`/`AiApiKey`（面板配置页可改）；接口 `/star/aiStatus`、`/star/aiChat`；菜单权限 `ai` 可授予子用户 |
-| **在线终端** | 免 SSH 的真终端（「🖥 在线终端」页，xterm.js + WebSocket + PTY）：单区域流式、光标闪烁、命令回显，**支持 vim/top 等交互式程序与 Ctrl+C 中断、pause 等待等完整键盘交互**；会话内 `cd`/环境变量保持、刷新自动重连并回放最近输出、空闲 30 分钟回收；命令以服务账户权限运行（Linux 通常 root、Windows LocalSystem）；**会话打开/关闭记入操作审计**（有意不采集击键——可能含密码）；配置项 `TerminalEnabled` 可整体关闭；菜单权限 `terminal`；接口 `GET /star/termWs`（WebSocket）、`POST /star/termReset` |
+| **在线终端** | 免 SSH 的真终端（「🖥 在线终端」页，xterm.js + WebSocket + PTY）：单区域流式、光标闪烁、命令回显，**支持 vim/top 等交互式程序与 Ctrl+C 中断、pause 等待等完整键盘交互**；会话内 `cd`/环境变量保持、刷新自动重连并回放最近输出、空闲 30 分钟回收；命令以服务账户权限运行（Linux 通常 root、Windows LocalSystem）；**每条完整命令写入操作审计**（只记命令行、不记逐键，疑似口令输入不记）；**危险命令默认二次确认**（管理员弹窗确认后执行，子用户直接禁止），子用户还可用 `TerminalAllowedCommands` 限定命令白名单（此时方向键/补全被屏蔽，防历史记录绕过）；配置项 `TerminalEnabled` / `TerminalCommandAudit` / `TerminalDangerPolicy` / `TerminalAllowedCommands`；菜单权限 `terminal`；接口 `GET /star/termWs`（WebSocket）、`POST /star/termReset` |
 
 ---
 
@@ -155,15 +155,19 @@ sudo /www/Agent/pek-ragent -update /tmp/pek-ragent-new    # 升级 + 重启服�
 
 ### 3.3 把应用安装进星尘
 
-**主路径：Web 面板（无需 SSH）**——「子服务」页「📦 上传应用包」或直接把 `.zip` / `.tar.gz` 拖进页面，
+**主路径：Web 面板**——「子服务」页「📦 上传应用包」或直接把 `.zip` / `.tar.gz` 拖进页面，
 服务端自动解压、识别主程序、落工作目录并按影子模式注册启动；**包内不需要任何安装脚本**，
 升级=重复上传同名包。C# 框架依赖包请用自包含单文件发布，或装完把该服务模式改为 `Standard`。
+
+**权限分工**：管理员可自行 SSH 安装（`install-app.sh`），也可用面板；**其他使用者只给 Web 面板**
+（不提供 SSH）。Web 在线终端对这些人同样受控：每条完整命令写入审计，危险命令默认二次确认
+（子用户直接禁止），并可给子用户限定命令白名单（`TerminalAllowedCommands`）。
 
 **C# 版星尘迁移**——「子服务」页「🔄 迁移 C# 星尘」：扫描源配置 → 勾选子服务 → 一键导入；
 同时经 C# 本机 UDP RPC 停掉其子服务，并停止/禁用 C# 星尘服务（防重启再拉起）。
 相对路径按 C# 安装目录绝对化，程序与数据不搬家。
 
-**兜底脚本**：`packaging/install-app.sh`（仅 Linux 无面板/批量自动化场景，C# 版不再自动注册）：
+**管理员/批量脚本**：`packaging/install-app.sh`（仅 Linux SSH/批量场景，C# 版不再自动注册）：
 
 ```bash
 sudo sh install-app.sh --name dhdeploy-agent-rust --bin ./dhdeploy-agent-rust \
@@ -309,6 +313,9 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `AiModel` | `deepseek-chat` | 模型名（如 `deepseek-chat` / `deepseek-reasoner`） |
 | `AiApiKey` | 空 | API Key（Bearer 令牌）；留空时 AI 页提示先到配置页填写 |
 | `TerminalEnabled` | `true` | 在线终端开关（面板「🖥 在线终端」页）；关闭后接口直接拒绝 |
+| `TerminalCommandAudit` | `true` | 记录每条完整命令（只记命令行、不记逐键，疑似口令不记）；关闭只保留会话开关记录，不推荐 |
+| `TerminalDangerPolicy` | `confirm` | 危险命令策略：`confirm`=管理员二次确认、子用户禁止；`block`=所有人禁止；`allow`=只审计不拦截 |
+| `TerminalAllowedCommands` | 空 | 子用户命令白名单（`;`/换行分隔前缀，如 `systemctl restart;docker ps`）；留空=不限制；内置管理员不受限 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）

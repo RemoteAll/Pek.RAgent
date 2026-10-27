@@ -3211,7 +3211,7 @@ function loadTerminal(){
    </div>
   </div>
   <div id="term-box" class="term-box"></div>
-  <div class="text-muted" style="margin-top:8px;font-size:12px">真终端（PTY）：支持 vim/top 等交互式程序与完整键盘操作；命令以服务账户权限运行（Linux 通常 root）；会话在标签页内保持、空闲 30 分钟自动回收；刷新页面自动重连并回放最近输出。</div>
+  <div class="text-muted" style="margin-top:8px;font-size:12px">真终端（PTY）：支持 vim/top 等交互式程序与完整键盘操作；命令以服务账户权限运行（Linux 通常 root）；<b>每条完整命令写入审计</b>（不记逐键输入、疑似口令不记）；危险命令默认需二次确认（子用户直接禁止，可按「Sub 用户白名单」限制可用命令）；会话在标签页内保持、空闲 30 分钟自动回收；刷新页面自动重连并回放最近输出。</div>
  </div>`;
  termEnsureAssets(()=>termInit());
 }
@@ -3244,11 +3244,27 @@ function termConnect(){
  let ws;try{ws=new WebSocket(url)}catch(e){termSetState('连接失败','err');return}
  termWs=ws;
  ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');termBannerShown=false;try{termFit&&termFit.fit()}catch(e){}termScheduleBanner(700)};
- ws.onmessage=ev=>{if(termInst&&typeof ev.data==='string'){termInst.write(ev.data);if(!termBannerShown)termScheduleBanner(450)}};
+ ws.onmessage=ev=>{
+  if(!termInst||typeof ev.data!=='string')return;
+  // 控制帧（U+0001 开头）：危险命令二次确认请求
+  if(ev.data.charCodeAt(0)===1){
+   try{const info=JSON.parse(ev.data.slice(1));if(info&&info.t==='askConfirm')termAskConfirm(ws,info)}catch(e){}
+   return;
+  }
+  termInst.write(ev.data);if(!termBannerShown)termScheduleBanner(450);
+ };
  ws.onclose=()=>{if(termWs!==ws)return;termWs=null;termSetState('已断开（3 秒后自动重连）','err');termReconnectTimer=setTimeout(()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active'))termConnect()},3000)};
  ws.onerror=()=>{};
 }
 function termSetState(text,kind){const el=$('term-state');if(el){el.textContent=text;el.className='term-state '+(kind||'')}}
+/* 危险命令二次确认：服务端已清掉当前行，确认后回发一次性令牌才真正执行 */
+function termAskConfirm(ws,info){
+ const cmd=String(info&&info.cmd||''),reason=String(info&&info.reason||'');
+ showModal('⚠ 危险命令确认',
+  `<div class="text-muted" style="font-size:12px;margin-bottom:8px">该命令可能影响系统可用性（${esc(reason)}）。确认后将立即以服务账户权限执行，并记入审计；取消则命令不执行。</div>`+
+  `<pre style="white-space:pre-wrap;word-break:break-all;background:#0b1220;color:#fca5a5;padding:10px;border-radius:8px;font-size:12px;margin:0">${esc(cmd)}</pre>`,
+  '确认执行',()=>{if(termWs===ws&&ws.readyState===1)ws.send(JSON.stringify({t:'cf',token:info.token}))},true);
+}
 /* 服务器概况在「PTY 初始输出静默」后写入：ConPTY 启动会发清屏序列，早写会被擦掉 */
 function termScheduleBanner(ms){
  clearTimeout(termBannerTimer);
