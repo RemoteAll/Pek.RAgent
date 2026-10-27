@@ -403,6 +403,20 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 let cmd = v.clone();
                 std::thread::spawn(move || handle_app_upgrade(&mgr, &cmd));
             }
+            // 平台请求**立即**上报子应用清单（面板「同步应用」：不必等 60 秒心跳）
+            "appsQuery" => {
+                let mgr = msg_mgr.clone();
+                // 独立线程：清单构造在大配置下也绝不阻塞实时通道
+                std::thread::spawn(move || {
+                    let services = mgr.list();
+                    // force=true：同时刷新签名缓存，避免下一次心跳把同一份清单再发一遍
+                    let apps = apps_payload(&services, true);
+                    let count = apps.as_array().map(|a| a.len()).unwrap_or(0);
+                    let agent_id = mgr.config().agent_id;
+                    util::log_format("平台请求同步子应用清单（{} 个）", &[&count.to_string()]);
+                    send_event(&agent_id, json!({ "type": "appsSync", "apps": apps }));
+                });
+            }
             // ————— 平台统一管控面板子用户（平台权威；内置管理员不接管） —————
             "panelUserList" => {
                 let base = crate::util::base_dir();

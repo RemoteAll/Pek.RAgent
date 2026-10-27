@@ -30,6 +30,9 @@ pub const CAP: &str = "panelUsers";
 /// 能力标识（平台据此判断节点是否支持远程子应用升级）。
 pub const CAP_APP_UPGRADE: &str = "appUpgrade";
 
+/// 能力标识（平台可下发 `appsQuery` 让节点**立即**上报子应用清单，不等 60 秒心跳）。
+pub const CAP_APPS_SYNC: &str = "appsSync";
+
 /// 摘要缓存（5 秒）：register 与首次心跳间隔很短，避免重复读库。
 static SUMMARY: OnceLock<Mutex<(Instant, String, usize)>> = OnceLock::new();
 
@@ -67,7 +70,8 @@ pub fn merge_summary(base: &Path, v: &mut Json) {
     let (digest, count) = summary(base);
     if let Some(obj) = v.as_object_mut() {
         // `appUpgrade`：支持平台下发子应用升级包（下载 → SHA-256 校验 → 部署 → 回执）
-        obj.insert("caps".to_string(), json!([CAP, CAP_APP_UPGRADE]));
+        // `appsSync`：支持平台请求立即上报子应用清单（`appsQuery` → `appsSync`）
+        obj.insert("caps".to_string(), json!([CAP, CAP_APP_UPGRADE, CAP_APPS_SYNC]));
         obj.insert("panelUsersVersion".to_string(), Json::String(digest));
         obj.insert("panelUsersCount".to_string(), json!(count));
     }
