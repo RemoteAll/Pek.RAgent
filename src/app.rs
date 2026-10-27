@@ -491,6 +491,17 @@ impl AppRuntime {
             &[&self.name, &pid.to_string(), reason],
         );
 
+        // 僵尸进程只能由父进程 waitpid 回收；RAgent 重启后可能丢失 Child 句柄但仍是父进程。
+        if handle.is_none() && pid > 0 && !sys::is_alive(pid) {
+            let reaped = sys::reap_child(pid);
+            if reaped {
+                util::log_info(&format!(
+                    "应用[{}]已退出，已回收僵尸进程 PID={pid}",
+                    self.name
+                ));
+            }
+        }
+
         // systemd 托管的应用：直接 kill PID 会被 systemd 立刻拉起，永远停不掉。
         // 仅当目标进程属于**另一个** systemd 单元时才走 systemctl stop；
         // 与代理同单元（普通子进程继承 cgroup）时仍按 PID 停止，绝不能停掉 StarAgentRust 自己。
