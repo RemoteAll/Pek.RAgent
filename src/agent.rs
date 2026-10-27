@@ -440,9 +440,25 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 /// `skip_list`：同一批次未被采用的其他候选（升级目录里的其余文件）——处置后统一
 /// 标记 `.skipped`，保证无论目录里有多少文件都只发生一轮升级（一次重启）。
 fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager: &Arc<AppManager>) {
+    // 防降级：带版本元数据（自动升级下载的）且不高于当前版本 → 丢弃（旧包残留/放错文件）。
+    // 手工上传/`Update/` 目录的文件没有元数据，保持既有行为（由格式 + 影子冒烟把关）。
+    if let Some(meta) = crate::self_upgrade::read_staged_meta(new_path)
+        .filter(|m| !dhrust::version::is_newer(&m.version, env!("CARGO_PKG_VERSION")))
+    {
+        util::log_error(&format!(
+            "自升级跳过：待应用文件版本 {} 不高于当前 {}（旧包或放错文件），已丢弃",
+            meta.version,
+            env!("CARGO_PKG_VERSION")
+        ));
+        let _ = std::fs::remove_file(new_path);
+        let _ = std::fs::remove_file(format!("{}.meta", new_path.display()));
+        return;
+    }
     match apply_upgrade(new_path, exe, 10) {
         Ok(()) => {
             util::log_info("检测到新版本：影子自检通过，程序文件已替换");
+            // 升级成功：清掉历史失败记录（否则同名版本回滚时会误入退避）
+            crate::self_upgrade::clear_apply_failure(exe);
             // 其余候选跳过（避免重启后逐个升级造成多轮重启）
             skip_candidates(skip_list);
             // 移交新版本（Unix 原地接管 / Windows 服务由 SCM 拉起 / 其余助手兜底）
@@ -466,6 +482,8 @@ fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager:
             } else {
                 util::log_error(&format!("自升级失败（当前程序不受影响）：{e}"));
             }
+            // 记录失败：同一目标版本退避期内不再重复下载完整包
+            crate::self_upgrade::record_apply_failure(exe, &e);
             // 其余候选同样跳过：避免失败后逐个重试造成多轮“尝试→重启”
             skip_candidates(skip_list);
         }
