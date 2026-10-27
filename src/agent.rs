@@ -243,7 +243,8 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
 
 /// 获取代理单实例锁（`Data/agent.lock`）。
 ///
-/// 锁文件只记录 PID：已存在且对应进程仍存活则拒绝启动；进程已退出视为残留锁并清理。
+/// 锁文件记录 PID：已存在且对应进程**确实是星尘代理**才拒绝启动；进程已退出、
+/// 或 PID 已被系统复用给其它程序（重启后常见）→ 视为残留锁并清理。
 /// 用 `create_new` 保证并发启动时只有一个能创建成功。
 fn acquire_instance_lock(base: &Path) -> Result<(), String> {
     use std::io::Write;
@@ -261,20 +262,40 @@ fn acquire_instance_lock(base: &Path) -> Result<(), String> {
             .open(&path)
         {
             Ok(mut f) => {
-                let _ = write!(f, "{self_pid}");
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let _ = write!(f, "{self_pid}\n{exe}");
                 let _ = f.flush();
                 return Ok(());
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                if let Ok(text) = std::fs::read_to_string(&path)
-                    && let Ok(pid) = text.trim().parse::<u32>()
-                        && pid != self_pid && sys::is_alive(pid) {
-                            return Err(format!(
-                                "已有星尘代理实例运行（PID={pid}），本实例退出：{}",
-                                path.display()
-                            ));
-                        }
-                // 进程已不在（上次异常退出/升级移交）→ 清理残留锁后重试
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let pid = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<u32>()
+                    .ok();
+                if let Some(pid) = pid
+                    && pid != self_pid
+                    && sys::is_alive(pid)
+                    && pid_is_agent(pid)
+                {
+                    let name = sys::process_name(pid).unwrap_or_else(|| "?".to_string());
+                    let cmd = sys::command_line(pid).unwrap_or_else(|| "?".to_string());
+                    return Err(format!(
+                        "已有星尘代理实例运行（PID={pid}，进程={name}，命令行={cmd}），本实例退出：{}。\n\
+                         如确认该进程已不是本代理（残留/僵死），先停止它再删除该文件后重启；不要直接删除正在运行实例的锁",
+                        path.display()
+                    ));
+                }
+                // 进程已不在 / PID 被系统复用给其它程序 → 清理残留锁后重试
+                util::log_format(
+                    "清理残留实例锁：{}（PID {} 不是星尘代理或已退出）",
+                    &[&path.display().to_string(), &pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string())],
+                );
                 let _ = std::fs::remove_file(&path);
             }
             Err(e) => return Err(format!("创建实例锁失败 {}：{e}", path.display())),
@@ -283,13 +304,30 @@ fn acquire_instance_lock(base: &Path) -> Result<(), String> {
     Err(format!("获取实例锁失败（并发冲突）：{}", path.display()))
 }
 
+/// PID 对应的进程名是否像星尘代理（`pek-ragent` / `staragent`，兼容下划线与 `.exe`）。
+///
+/// 用于识别 PID 复用：锁文件里的 924 在重启后可能已是 nginx/sshd，此时必须清锁。
+/// 查不到进程名时按“可能是代理”保守处理（宁可拒绝启动，也不双实例守护）。
+fn pid_is_agent(pid: u32) -> bool {
+    match sys::process_name(pid) {
+        Some(name) => looks_like_agent_name(&name),
+        None => true,
+    }
+}
+
+fn looks_like_agent_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('_', "-");
+    n.contains("pek-ragent") || n.contains("staragent")
+}
+
 /// 释放本进程持有的代理实例锁。
 fn release_instance_lock(base: &Path) {
     let path = base.join("Data").join("agent.lock");
     if let Ok(text) = std::fs::read_to_string(&path)
-        && text.trim() == std::process::id().to_string() {
-            let _ = std::fs::remove_file(path);
-        }
+        && text.lines().next().unwrap_or("").trim() == std::process::id().to_string()
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并移交新版本——Unix 由旧进程
@@ -825,6 +863,26 @@ unsafe extern "system" fn on_console_ctrl(_ctrl_type: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_lock_pid_reuse_is_recognized_by_process_name() {
+        assert!(looks_like_agent_name("pek-ragent"));
+        assert!(looks_like_agent_name("pek_ragent-72e8d2cf.exe"));
+        assert!(looks_like_agent_name("StarAgent.exe"));
+        assert!(!looks_like_agent_name("nginx"));
+        assert!(!looks_like_agent_name("sshd"));
+        // 当前测试进程名就是 pek_ragent-*，必须能被识别为代理（锁写入后用自身 PID 校验）
+        let self_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        if !self_name.is_empty() {
+            assert!(
+                looks_like_agent_name(&self_name),
+                "测试二进制名应被识别：{self_name}"
+            );
+        }
+    }
 
     #[test]
     fn upgrade_from_validates_and_replaces() {
