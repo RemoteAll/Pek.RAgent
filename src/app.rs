@@ -436,7 +436,7 @@ impl AppRuntime {
 
     /// 停止应用（优雅 → 强制）。返回是否已退出。
     pub fn stop(&self, reason: &str) -> bool {
-        let (pid, handle, work_dir, was_running, hosted) = {
+        let (pid, handle, work_dir, was_running, hosted, process_name) = {
             let mut st = self.state.lock().unwrap();
             let was_running = st.running;
             st.running = false;
@@ -446,8 +446,9 @@ impl AppRuntime {
             let pid = st.pid;
             let work_dir = st.work_dir.clone();
             let hosted = st.hosted;
+            let process_name = st.process_name.clone();
             st.hosted = false;
-            (pid, handle, work_dir, was_running, hosted)
+            (pid, handle, work_dir, was_running, hosted, process_name)
         };
 
         if !was_running && handle.is_none() {
@@ -456,6 +457,23 @@ impl AppRuntime {
 
         if hosted || (pid == 0 && handle.is_none()) {
             util::log_format("应用[{}]停止（托管模式无进程），原因：{}", &[&self.name, reason]);
+            return true;
+        }
+
+        // PID 复用保护：记录的是 A 进程，但 PID 已被系统复用给 B 进程时，绝不能对 B 发信号。
+        // （停止失败后旧状态可能残留；重启后 PID 复用尤其常见）
+        if handle.is_none() && pid > 0 && !process_name.is_empty()
+            && let Some(actual) = sys::process_name(pid)
+            && !actual.eq_ignore_ascii_case(&process_name)
+        {
+            util::log_error(&format!(
+                "应用[{}]停止：PID={pid} 已被复用为 {actual}（原进程 {process_name} 已退出），不再发送信号；按已停止处理",
+                self.name
+            ));
+            let mut st = self.state.lock().unwrap();
+            st.pid = 0;
+            st.running = false;
+            st.handle = None;
             return true;
         }
 
@@ -482,7 +500,13 @@ impl AppRuntime {
         {
             let mut st = self.state.lock().unwrap();
             st.handle = None;
-            st.pid = 0;
+            if ok {
+                st.pid = 0;
+            } else {
+                // 停止失败必须保留 PID（否则面板/菜单再也无法定位并重试）
+                st.pid = pid;
+                st.running = sys::is_alive(pid);
+            }
         }
 
         // 停稳后清理占用期产生的临时文件（*.del 等）
@@ -493,7 +517,11 @@ impl AppRuntime {
         if ok {
             util::log_format("应用[{}]已退出", &[&self.name]);
         } else {
-            util::log_format("应用[{}]停止超时，进程仍可能存在", &[&self.name]);
+            let actual = sys::process_name(pid).unwrap_or_else(|| "?".to_string());
+            util::log_error(&format!(
+                "应用[{}]停止超时：PID={pid} 仍在运行（进程名={actual}，原进程名={process_name}）；已保留 PID 供重试，必要时请手动 kill -9 {pid}",
+                self.name
+            ));
         }
 
         ok
