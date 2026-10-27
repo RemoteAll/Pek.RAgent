@@ -132,6 +132,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     // - 保留 **IP 黑白名单 + CC 限流（默认 600 次/分钟/IP）**——面板 3 秒轮询约 40 次/分钟，余量充足。
     let mut waf_cfg = pek_rwaf::WafConfig::admin_api();
     waf_cfg.skip_attack_prefixes = vec!["/api".to_string(), "/star".to_string()];
+    // DHDeploy 契约接口属敏感路径（服务清单拿安装路径/启停能力）：该前缀下禁一切机器人
+    waf_cfg.sensitive_prefixes = vec![
+        "/GetServices".to_string(),
+        "/Info".to_string(),
+        "/ShowMachineInfo".to_string(),
+        "/ReloadConfig".to_string(),
+        "/RestartService".to_string(),
+        "/StartService".to_string(),
+        "/StopService".to_string(),
+        "/KillAndStart".to_string(),
+    ];
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
     // 强制豁免走内存态（不受 Config/Waf.toml 在线修改影响）：面板与机器接口（DHDeploy 的
     // RestSharp / HttpClient UA）不应被判为扫描器。
@@ -186,9 +197,14 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/GetServices",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
-            async move { HttpOutcome::Response(HttpResponse::json(200, services_json(&m))) }
+            async move {
+                if let Some(denied) = deny_remote(&ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::json(200, services_json(&m)))
+            }
         }),
     );
 
@@ -196,16 +212,24 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/Info",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
-            async move { HttpOutcome::Response(HttpResponse::json(200, info_json(&m, port))) }
+            async move {
+                if let Some(denied) = deny_remote(&ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::json(200, info_json(&m, port)))
+            }
         }),
     );
 
     // 本机信息
     router.map_get(
         "/ShowMachineInfo",
-        route(|_ctx| async move {
+        route(|ctx| async move {
+            if let Some(denied) = deny_remote(&ctx) {
+                return denied;
+            }
             HttpOutcome::Response(HttpResponse::text(200, crate::sys::machine_info()))
         }),
     );
@@ -214,9 +238,12 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/ReloadConfig",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
             async move {
+                if let Some(denied) = deny_remote(&ctx) {
+                    return denied;
+                }
                 m.reload_config();
                 HttpOutcome::Response(HttpResponse::json(
                     200,
@@ -248,7 +275,12 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     // 杀死并启动进程（应用自重启辅助）
     router.map_post(
         "/KillAndStart",
-        route(move |ctx| async move { kill_and_start(ctx) }),
+        route(move |ctx| async move {
+            if let Some(denied) = deny_remote(&ctx) {
+                return denied;
+            }
+            kill_and_start(ctx)
+        }),
     );
 
     // 静态资源：优先嵌入的面板首页（单文件部署稳定），其次 wwwroot 目录。
@@ -324,6 +356,27 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     router
 }
 
+/// DHDeploy 契约接口的本机限制：非回环来源一律拒绝。
+///
+/// 这批接口原本无任何校验（服务清单会泄露安装路径/启动参数，启停/杀进程可直接被利用），
+/// 星尘监听 `0.0.0.0` 时会对公网暴露。DHDeploy Agent 与运维脚本均从本机调用，不受影响。
+/// 返回 `Some(响应)` 表示调用方应直接返回该响应。
+fn deny_remote(ctx: &Ctx) -> Option<HttpOutcome> {
+    let ip = dhrust::net::panel_auth::client_ip(ctx);
+    if dhrust::net::panel_auth::is_loopback(&ip) {
+        return None;
+    }
+    util::log_error(&format!(
+        "拒绝非本机访问星尘契约接口：path={} ip={ip}",
+        ctx.req.path
+    ));
+    Some(HttpOutcome::Response(HttpResponse::json(
+        403,
+        "{\"Success\":false,\"Message\":\"该接口仅允许本机访问（请在服务器本机执行，或用面板/在线终端）\"}"
+            .to_string(),
+    )))
+}
+
 /// 操作类型。
 #[derive(Clone, Copy)]
 pub(crate) enum OpKind {
@@ -334,6 +387,10 @@ pub(crate) enum OpKind {
 
 /// 应用级操作统一处理。
 fn app_operation(manager: Arc<AppManager>, ctx: Ctx, kind: OpKind) -> HttpOutcome {
+    // 契约接口仅本机可用（防公网任意启停子服务）
+    if let Some(denied) = deny_remote(&ctx) {
+        return denied;
+    }
     let name = param(&ctx, "serviceName")
         .or_else(|| param(&ctx, "name"))
         .unwrap_or_default();
