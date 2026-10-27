@@ -460,6 +460,15 @@ impl AppRuntime {
             return true;
         }
 
+        // 防呆：配置/状态错误把代理自身当成子服务时，绝不能停止自己
+        if pid == std::process::id() {
+            util::log_error(&format!(
+                "应用[{}]停止被拒绝：PID={pid} 是星尘代理自身（请检查子服务配置）",
+                self.name
+            ));
+            return false;
+        }
+
         // PID 复用保护：记录的是 A 进程，但 PID 已被系统复用给 B 进程时，绝不能对 B 发信号。
         // （停止失败后旧状态可能残留；重启后 PID 复用尤其常见）
         if handle.is_none() && pid > 0 && !process_name.is_empty()
@@ -482,19 +491,59 @@ impl AppRuntime {
             &[&self.name, &pid.to_string(), reason],
         );
 
+        // systemd 托管的应用：直接 kill PID 会被 systemd 立刻拉起，永远停不掉。
+        // 仅当目标进程属于**另一个** systemd 单元时才走 systemctl stop；
+        // 与代理同单元（普通子进程继承 cgroup）时仍按 PID 停止，绝不能停掉 StarAgentRust 自己。
+        #[cfg(not(target_os = "linux"))]
+        let systemd_result: Option<bool> = None;
+        #[cfg(target_os = "linux")]
+        let mut systemd_result: Option<bool> = None;
+        #[cfg(target_os = "linux")]
+        if handle.is_none() && pid > 0
+            && let Some(unit) = systemd_unit_of(pid)
+            && current_systemd_unit().as_deref() != Some(unit.as_str())
+        {
+            util::log_info(&format!(
+                "应用[{}]由 systemd 单元 {unit} 托管，改用 systemctl stop（直接 kill 会被 systemd 拉起）",
+                self.name
+            ));
+            let stopped = std::process::Command::new("systemctl")
+                .args(["stop", &unit])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while sys::is_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let gone = !sys::is_alive(pid);
+            if !(stopped && gone) {
+                util::log_error(&format!(
+                    "应用[{}]停止 systemd 单元 {unit} 失败（systemctl={stopped}，进程仍存活={}）；请检查 `systemctl status {unit}` 与 journalctl",
+                    self.name,
+                    !gone
+                ));
+            }
+            systemd_result = Some(stopped && gone);
+        }
+
         // 自有子进程用 Child::try_wait 回收（避免僵尸导致 is_alive 误判）；
         // 接管进程按 pid 停止
-        let ok = match handle {
-            Some(Handle::Owned(mut child)) => {
-                sys::signal_graceful(pid);
-                let mut exited = wait_child(&mut child, 3_000);
-                if !exited {
-                    sys::signal_force(pid);
-                    exited = wait_child(&mut child, 2_000);
+        let ok = match systemd_result {
+            #[cfg(target_os = "linux")]
+            Some(ok) => ok,
+            _ => match handle {
+                Some(Handle::Owned(mut child)) => {
+                    sys::signal_graceful(pid);
+                    let mut exited = wait_child(&mut child, 3_000);
+                    if !exited {
+                        sys::signal_force(pid);
+                        exited = wait_child(&mut child, 2_000);
+                    }
+                    exited
                 }
-                exited
-            }
-            _ => sys::stop_process(pid, 3_000),
+                _ => sys::stop_process(pid, 3_000),
+            },
         };
 
         {
@@ -1172,6 +1221,32 @@ fn health_check(spec: &str) -> Result<(), String> {
     Err(format!("不支持的健康检查地址：{}", spec))
 }
 
+/// 目标 PID 所属的 systemd 单元（Linux；普通子进程通常继承代理自己的单元）。
+#[cfg(target_os = "linux")]
+fn systemd_unit_of(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    systemd_unit_from_cgroup(&text)
+}
+
+/// 当前代理进程自己的 systemd 单元（手动运行时通常为 None）。
+#[cfg(target_os = "linux")]
+fn current_systemd_unit() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    systemd_unit_from_cgroup(&text)
+}
+
+/// 从 `/proc/<pid>/cgroup` 文本中提取单元名（只认 `.service`；scope/session 不算）。
+#[cfg(target_os = "linux")]
+fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let path = line.rsplit(':').next().unwrap_or("");
+        if let Some(unit) = path.split('/').find(|s| s.ends_with(".service")) {
+            return Some(unit.to_string());
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1288,6 +1363,24 @@ mod tests {
         runtime.mark_heartbeat();
         assert!(runtime.probe_heartbeat(60).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn systemd_unit_parsing_from_cgroup() {
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/system.slice/dhdeploy-agent.service\n"),
+            Some("dhdeploy-agent.service".to_string())
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/system.slice/StarAgentRust.service/child\n"),
+            Some("StarAgentRust.service".to_string())
+        );
+        // scope/session 不是 systemd 服务，回退按 PID 停止
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/user.slice/user-0.slice/session-1.scope\n"),
+            None
+        );
     }
 }
 
