@@ -1,90 +1,60 @@
-//! 面板 HTTPS 证书（`Config/keys/panel.pem` + `panel.key`）。
+//! 面板 HTTPS 证书 —— **实现已下沉到 `dhrust::net::panel_cert`**（与 HlktechIoT 等面板共用一份）。
 //!
-//! 设计取舍：
-//! - **自签叶子证书 `CA:FALSE`**：私钥泄露也只能冒充本机 IP，不能冒充其他站点
-//!   （远优于「每台机器各建 CA 再让运维全部信任」）；
-//! - SAN 由 dhrust 自动写入 `localhost` / 回环 + **本机全部网卡 IPv4**，
-//!   因此浏览器可直接用 `https://内网IP:端口` 打开（只需导入一次证书信任）；
-//! - 有效期 10 年、**不做自动续签**（面板显示剩余天数 + 一键重签），
-//!   避免运行中重建 TLS 监听带来的故障面；
-//! - 私钥 Unix 权限 `0600`，不进配置项、不落日志。
+//! 本文件只保留原有调用签名（`ensure_pem` / `renew` / `status` / `cert_paths`），
+//! 内部全部转调公共库，**不再重复实现**证书路径约定、状态 JSON 与重签逻辑。
+//!
+//! 口径（由公共库统一保证，不要在此处另行实现）：
+//! - 证书落 `Config/keys/panel.pem` + `panel.key`；
+//! - **自签叶子证书 `CA:FALSE`**，私钥泄露也只能冒充本机 IP；
+//! - SAN 自动含 `localhost` / 回环 + **本机全部网卡 IPv4**，有效期 ≈10 年；
+//! - **不做自动续签**（面板显示剩余天数 + 一键重签）；
+//! - 私钥不进配置项、不落日志。
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-/// 证书与私钥路径（`{base}/Config/keys/panel.{pem,key}`）。
-pub fn cert_paths(base: &Path) -> (PathBuf, PathBuf) {
-    let dir = base.join("Config").join("keys");
-    (dir.join("panel.pem"), dir.join("panel.key"))
-}
+pub use dhrust::net::panel_cert::cert_paths;
 
 /// 确保证书存在（缺失自动生成）并返回 PEM 字节；供启动时 `bind_tls` 使用。
+///
+/// # 参数
+/// - `base`：部署根目录。
+///
+/// # 返回值
+/// `(cert_pem, key_pem)`。
 pub fn ensure_pem(base: &Path) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let (cert, key) = cert_paths(base);
-    match dhrust::net::tls::ensure_self_signed_cert(&cert, &key, &[]) {
-        Ok(generated) => {
-            if generated {
-                // 提示运维“下一步要导入信任”，避免直接打开看到红屏后以为是程序故障
-                crate::util::log_format(
-                    "已生成面板自签证书：{}（浏览器首次访问 https://… 前请导入该证书信任）",
-                    &[&cert.display().to_string()],
-                );
-            }
-        }
-        Err(e) => return Err(format!("生成面板证书失败：{e}")),
+    let cert = dhrust::net::panel_cert::ensure_pem(base)?;
+    if cert.generated {
+        // 提示运维「下一步要导入信任」，避免直接打开看到红屏后以为是程序故障
+        crate::util::log_format(
+            "已生成面板自签证书：{}（浏览器首次访问 https://… 前请导入该证书信任）",
+            &[&cert.cert_path.display().to_string()],
+        );
     }
-    dhrust::net::tls::load_pem(&cert, &key).map_err(|e| format!("加载面板证书失败：{e}"))
+    Ok((cert.cert_pem, cert.key_pem))
 }
 
 /// 重新签发（删除旧证书后重建）；调用方需提示「重启服务后生效」。
+///
+/// # 参数
+/// - `base`：部署根目录。
+///
+/// # 返回值
+/// 成功/失败。
 pub fn renew(base: &Path) -> Result<(), String> {
-    let (cert, key) = cert_paths(base);
-    dhrust::net::tls::reset_cert(&cert, &key).map_err(|e| format!("删除旧证书失败：{e}"))?;
-    ensure_pem(base).map(|_| ())
+    dhrust::net::panel_cert::renew(base).map(|_| ())
 }
 
-/// 证书状态（面板展示用 JSON）。
+/// 证书状态（面板展示用 JSON）。字段见 [`dhrust::net::panel_cert::status`]。
 ///
-/// 字段：`exists` / `path` / `notAfter` / `daysLeft` / `sans` / `sha256`；
-/// 证书缺失或损坏时 `exists=false` 且其余为空，不报错（面板照常可用）。
+/// # 参数
+/// - `base`：部署根目录。
+/// - `enabled`：配置里是否启用 TLS（本项目的「实际生效」与配置同值，故一并传入）。
+/// - `port`：面板端口。
+///
+/// # 返回值
+/// 状态 JSON。
 pub fn status(base: &Path, enabled: bool, port: u16) -> serde_json::Value {
-    let (cert_path, _) = cert_paths(base);
-    let mut out = serde_json::json!({
-        "enabled": enabled,
-        "exists": false,
-        "path": cert_path.display().to_string(),
-        "notAfter": "",
-        "daysLeft": 0,
-        "sans": Vec::<String>::new(),
-        "sha256": "",
-        // 建议访问地址（启用以 https，否则 http）
-        "panelUrl": format!(
-            "{}://127.0.0.1:{}",
-            if enabled { "https" } else { "http" },
-            port
-        ),
-        "expiringSoon": false,
-    });
-
-    let Ok(text) = std::fs::read_to_string(&cert_path) else {
-        return out;
-    };
-    let Some(info) = dhrust::cert::parse_certificate_pem(&text) else {
-        return out;
-    };
-
-    let mut sans = info.dns_names.clone();
-    sans.extend(info.ip_addresses.iter().cloned());
-    let now = chrono::Utc::now().timestamp();
-    let days = info.days_left(now);
-
-    out["exists"] = serde_json::json!(true);
-    out["notAfter"] = serde_json::json!(dhrust::cert::format_unix_utc(info.not_after));
-    out["daysLeft"] = serde_json::json!(days);
-    out["sans"] = serde_json::json!(sans);
-    out["sha256"] = serde_json::json!(info.sha256_hex.to_uppercase());
-    // 到期前 30 天提示重签（与“无自动续签”的口径配套）
-    out["expiringSoon"] = serde_json::json!(days <= 30);
-    out
+    dhrust::net::panel_cert::status(base, enabled, enabled, &format!("0.0.0.0:{port}"))
 }
 
 #[cfg(test)]
