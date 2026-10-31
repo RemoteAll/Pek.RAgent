@@ -626,6 +626,8 @@ async function loadMachineDetail(){
    html+=infoRow('已用',s.totalMB>0?s.usedText:'—',warn);
    html+=infoRow('使用率',s.totalMB>0?s.usedPercent:'—',warn);
    if(s.swappiness!=null)html+=infoRow('swappiness',String(s.swappiness));
+   // 分区类型：swapon 报 Invalid argument 时，这一行是判断「环境不支持」还是「文件创建方式不对」的关键
+   if(s.fsType)html+=infoRow('分区文件系统',s.fsType+(s.container?' · 容器':''));
    html+=`</table>`;
    if(s.entries&&s.entries.length>0){
     html+=`<table class="info-table" style="margin-top:8px"><tr><td style="${TH};font-size:11px">交换文件</td><td style="${TH};font-size:11px">大小</td><td style="${TH};font-size:11px">已用</td><td style="${TH};font-size:11px">优先级</td><td></td></tr>`;

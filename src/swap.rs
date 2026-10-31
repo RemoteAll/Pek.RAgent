@@ -51,10 +51,19 @@ pub(crate) fn status_json() -> Json {
 
     let supported = cfg!(target_os = "linux");
     let root = is_root();
+    // 分区文件系统与容器环境：用户遇到 swapon 失败时最需要看的两条信息
+    #[cfg(target_os = "linux")]
+    let (fs_type, container) = (fs_type_of("/swapfile"), in_container());
+    #[cfg(not(target_os = "linux"))]
+    let (fs_type, container) = (String::new(), false);
     let hint = if !supported {
         "Windows 的页面文件需在「系统属性 → 高级 → 性能 → 虚拟内存」中设置并重启生效，面板仅展示用量"
     } else if !root {
         "是否需要 root 才能创建：当前代理不是以 root 运行，创建/关闭按钮会被拒绝"
+    } else if !fs_type.is_empty() && unsupported_fs_reason(&fs_type).is_some() {
+        "当前分区不支持 swap 文件（详见「分区文件系统」一行）"
+    } else if container {
+        "检测到容器环境：容器内通常禁止 swapon，需在宿主机层面创建交换区"
     } else {
         ""
     };
@@ -74,6 +83,8 @@ pub(crate) fn status_json() -> Json {
         "supported": supported,
         "configurable": info.configurable,
         "root": root,
+        "fsType": fs_type,
+        "container": container,
         "totalMB": info.total_bytes / 1024 / 1024,
         "usedMB": info.used_bytes / 1024 / 1024,
         "totalText": dhrust::web::format_bytes(info.total_bytes),
@@ -131,35 +142,88 @@ pub(crate) fn create(path: &str, size_mb: u64, persist: bool) -> Result<String, 
         &[&path, &size_mb.to_string(), &persist.to_string()],
     );
 
-    // ① 分配文件：fallocate 最快；文件系统不支持时回退 dd
-    let mut r = run(&format!("fallocate -l {size_mb}M {path}"), 180);
-    if r.exit_code != 0 {
-        let _ = run(&format!("rm -f {path}"), 30);
-        r = run(
-            &format!("dd if=/dev/zero of={path} bs=1M count={size_mb} status=none"),
-            600,
-        );
+    // ① 分区预检：overlayfs / tmpfs / 网络盘不可能启用 swap 文件
+    // （提前拒绝，不要等 swapon 只回报一个 Invalid argument）
+    let fstype = fs_type_of(&path);
+    if let Some(reason) = unsupported_fs_reason(&fstype) {
+        return Err(format!("{reason}（当前分区文件系统：{fstype}）"));
     }
-    if r.exit_code != 0 {
+    let size_bytes = size_mb * 1024 * 1024;
+
+    // ② 分配文件：
+    //   - btrfs 上 swap 文件必须**非 COW**（`chattr +C`，且必须在文件为空时设置），
+    //     否则 `swapon` 只报 `Invalid argument`（最常见的踩坑点）；
+    //   - fallocate 在某些文件系统会产出**稀疏文件**，swap 同样不接受 → 回退 dd 全量写零。
+    let mut allocated;
+    if fstype == "btrfs" {
+        let _ = std::fs::File::create(&path);
+        let c = run(&format!("chattr +C {path}"), 60);
+        if c.exit_code != 0 {
+            crate::util::log_format(
+                "虚拟内存：btrfs 关闭 COW 失败（chattr +C）：{}（继续尝试，失败时看内核提示）",
+                &[&err_text(&c)],
+            );
+        }
+        allocated = run(&format!("fallocate -l {size_mb}M {path}"), 300).exit_code == 0;
+    } else {
+        allocated = run(&format!("fallocate -l {size_mb}M {path}"), 300).exit_code == 0;
+        if allocated && is_sparse_file(&path, size_bytes) {
+            crate::util::log_format(
+                "虚拟内存：fallocate 产物是稀疏文件（swap 不接受），改用 dd 全量写入 {} MB",
+                &[&size_mb.to_string()],
+            );
+            allocated = false;
+        }
+    }
+    if !allocated {
         let _ = run(&format!("rm -f {path}"), 30);
-        return Err(format!("创建交换文件失败：{}", err_text(&r)));
+        let r = run(
+            &format!("dd if=/dev/zero of={path} bs=1M count={size_mb} status=none"),
+            900,
+        );
+        if r.exit_code != 0 {
+            let _ = run(&format!("rm -f {path}"), 30);
+            return Err(format!("创建交换文件失败：{}", err_text(&r)));
+        }
     }
 
-    // ② 权限 / 格式化 / 启用（任一步失败都回收半成品）
+    // ③ 权限 / 格式化（失败即回收半成品）
     for (cmd, title) in [
         (format!("chmod 600 {path}"), "设置文件权限"),
         (format!("mkswap {path}"), "格式化交换文件"),
-        (format!("swapon {path}"), "启用交换区"),
     ] {
         let r = run(&cmd, 180);
         if r.exit_code != 0 {
-            let _ = run(&format!("swapoff {path}"), 120);
             let _ = run(&format!("rm -f {path}"), 30);
             return Err(format!("{title}失败：{}", err_text(&r)));
         }
     }
 
-    // ③ 持久化（失败不影响本次已生效）
+    // ④ 启用：失败时把「分区文件系统 / 内核提示 / 容器」一并回报，
+    // 否则用户只看到 `Invalid argument`，根本无从下手
+    let r = run(&format!("swapon {path}"), 180);
+    if r.exit_code != 0 {
+        let _ = run(&format!("swapoff {path}"), 120);
+        let _ = run(&format!("rm -f {path}"), 30);
+        let mut diag = vec![format!(
+            "分区文件系统：{}",
+            if fstype.is_empty() { "未知" } else { fstype.as_str() }
+        )];
+        if in_container() {
+            diag.push("检测到容器环境（容器内默认禁止 swapon）".to_string());
+        }
+        let k = dmesg_tail(3);
+        if !k.is_empty() {
+            diag.push(format!("内核提示：{k}"));
+        }
+        return Err(format!(
+            "启用交换区失败：{}（{}）",
+            err_text(&r),
+            diag.join("；")
+        ));
+    }
+
+    // ⑤ 持久化（失败不影响本次已生效）
     let mut note = String::new();
     if persist {
         match append_fstab(&path) {
@@ -292,6 +356,78 @@ fn err_text(r: &dhrust::sys::process::ShellResult) -> String {
     } else {
         text.lines().take(3).collect::<Vec<_>>().join("; ")
     }
+}
+
+/// 明确不支持 swap 文件的分区类型（提前给出可执行建议，而不是等 `swapon` 只报一个错误码）。
+///
+/// 纯字符串判定，任何平台可编译、可单测。
+pub(crate) fn unsupported_fs_reason(fstype: &str) -> Option<&'static str> {
+    match fstype {
+        "overlay" | "overlayfs" | "aufs" => Some(
+            "当前分区是容器叠层（overlayfs），内核不允许在其上启用 swap 文件：请在宿主机真实分区创建",
+        ),
+        "tmpfs" | "ramfs" => Some(
+            "当前分区是内存盘（tmpfs/ramfs），在其上创建 swap 文件没有意义且不被内核支持：请改到磁盘分区",
+        ),
+        "nfs" | "nfs4" | "cifs" | "smbfs" | "fuse.sshfs" => {
+            Some("当前分区是网络文件系统，不支持 swap 文件：请改到本地磁盘分区")
+        }
+        _ => None,
+    }
+}
+
+/// 分区文件系统类型（`stat -f -c %T`；取不到返回空串）。
+#[cfg(target_os = "linux")]
+fn fs_type_of(path: &str) -> String {
+    let dir = std::path::Path::new(path)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| "/".to_string());
+    let out = dhrust::sys::process::run("stat", &["-f", "-c", "%T", &dir]);
+    if out.0 == 0 {
+        out.1.trim().to_string()
+    } else {
+        String::new()
+    }
+}
+
+/// 是否处于容器内（容器默认没有 CAP_SYS_ADMIN，`swapon` 会被拒）。
+#[cfg(target_os = "linux")]
+fn in_container() -> bool {
+    if std::path::Path::new("/.dockerenv").exists() {
+        return true;
+    }
+    std::fs::read_to_string("/proc/1/cgroup")
+        .map(|text| text.contains("docker") || text.contains("lxc") || text.contains("kubepods"))
+        .unwrap_or(false)
+}
+
+/// 文件是否稀疏（swap 要求文件已完整分配；稀疏/带洞文件 `swapon` 报 `Invalid argument`）。
+#[cfg(target_os = "linux")]
+fn is_sparse_file(path: &str, expected: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match std::fs::metadata(path) {
+        // 已分配块数 × 512 明显小于文件大小 → 有洞
+        Ok(md) => md.blocks().saturating_mul(512) < expected.saturating_mul(9) / 10,
+        Err(_) => false,
+    }
+}
+
+/// 内核最近几条消息（`dmesg` 需要权限；拿不到返回空串，不因此报错）。
+#[cfg(target_os = "linux")]
+fn dmesg_tail(lines: usize) -> String {
+    let out = dhrust::sys::process::run("dmesg", &[]);
+    if out.0 != 0 {
+        return String::new();
+    }
+    let all: Vec<&str> = out
+        .1
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
+    let start = all.len().saturating_sub(lines);
+    all[start..].join(" / ")
 }
 
 /// 路径校验：绝对路径 + 字符白名单 + 父目录白名单 + 禁 `..`。
@@ -472,6 +608,21 @@ mod recommend_tests {
         assert_eq!(recommended_swap_mb(65536), 8192);
         // 读不到物理内存时的兜底
         assert_eq!(recommended_swap_mb(0), 2048);
+    }
+
+    #[test]
+    fn rejects_filesystems_that_cannot_host_swap_files() {
+        // 容器叠层 / 内存盘 / 网络盘：提前拒绝并给出建议
+        assert!(unsupported_fs_reason("overlay").is_some());
+        assert!(unsupported_fs_reason("overlayfs").is_some());
+        assert!(unsupported_fs_reason("tmpfs").is_some());
+        assert!(unsupported_fs_reason("nfs4").is_some());
+        assert!(unsupported_fs_reason("cifs").is_some());
+        // 常规磁盘文件系统必须放行（btrfs 支持 swap 文件，但要求先关 COW——由 create 处理）
+        assert!(unsupported_fs_reason("ext4").is_none());
+        assert!(unsupported_fs_reason("xfs").is_none());
+        assert!(unsupported_fs_reason("btrfs").is_none());
+        assert!(unsupported_fs_reason("").is_none());
     }
 }
 
