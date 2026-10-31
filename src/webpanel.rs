@@ -703,6 +703,9 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("fileMove", "移动文件"),
     ("fileCopy", "复制文件"),
     ("fileUpload", "上传文件"),
+    ("fileUploadChunk", "分片上传"),
+    ("fileUploadAbort", "放弃上传"),
+    ("fileCheck", "检查同名文件"),
     ("fileDownload", "下载文件"),
     ("fileCompress", "压缩文件"),
     ("fileExtract", "解压文件"),
@@ -1035,6 +1038,22 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "fileUpload",
         guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload),
+    );
+    controller = controller.post(
+        "fileCheck",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_check),
+    );
+    controller = controller.post(
+        "fileUploadChunk",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_chunk),
+    );
+    controller = controller.get(
+        "fileUploadStatus",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_status),
+    );
+    controller = controller.post(
+        "fileUploadAbort",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_abort),
     );
     controller = controller.get(
         "fileDownload",

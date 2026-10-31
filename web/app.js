@@ -2501,7 +2501,7 @@ function renderFileman(){
    <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传/编辑上限 64MB/10MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传单文件上限 2GB（>8MB 自动分片）/ 在线编辑 10MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
 }
@@ -2542,32 +2542,94 @@ function fmPrompt(title,labelHtml,value,okText,cb){
  setTimeout(()=>{const el=$('fm-prompt-input');if(el){el.focus();el.select()}},50);
 }
 
+// 分片上传片大小（服务端按片收，内存不随文件大小增长）
+const FM_CHUNK=8*1024*1024;
+
 function fmUpload(input){
  const files=[...input.files];input.value='';
  if(!files.length)return;
  if(!fmReady())return;
- const dir=fmData.path;let i=0,ok=0,fail=0;
+ const dir=fmData.path;
+ // 先查同名：有冲突必须由用户确认；取消则一个字节都不发
+ api('/star/fileCheck',{method:'POST',body:JSON.stringify({dir,names:files.map(f=>f.name)})})
+  .then(j=>{
+   const existing=(j&&j.data&&j.data.existing)||[];
+   if(!existing.length){fmUploadRun(files,dir,false);return}
+   showModal('文件已存在',
+    `以下 <b>${existing.length}</b> 个文件已存在，继续将<b>覆盖</b>：<br><span class="text-muted" style="word-break:break-all">${existing.map(n=>esc(n)).join('、')}</span>`,
+    '确认覆盖',()=>fmUploadRun(files,dir,true));
+  })
+  .catch(()=>fmUploadRun(files,dir,false));
+}
+
+function fmUploadRun(files,dir,overwrite){
+ let i=0,ok=0,fail=0;
  const next=()=>{
   if(i>=files.length){
    showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个`:''}`,fail?'error':'success');
    loadFileman();return;
   }
   const f=files[i++];
-  showToast(`正在上传 ${i}/${files.length}：${f.name}`,'info');
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name));
-  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
-  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${i}/${files.length}：${f.name} ${Math.round(e.loaded/e.total*100)}%`,'info')};
-  xhr.onload=()=>{
-   let msg='';
-   try{const j=JSON.parse(xhr.responseText);if(j.code===0)ok++;else{fail++;msg=j.message||''}}catch(e){fail++}
-   if(msg)console.warn('上传失败 '+f.name+'：'+msg);
-   next();
-  };
-  xhr.onerror=()=>{fail++;next()};
-  xhr.send(f);
+  const label=`${i}/${files.length}：${f.name}`;
+  const done=v=>{v?ok++:fail++;next()};
+  if(f.size>FM_CHUNK){
+   fmUploadChunked(f,dir,overwrite,label).then(done).catch(e=>{console.warn('上传失败 '+f.name+'：'+((e&&e.message)||e));done(false)});
+  }else{
+   fmUploadSmall(f,dir,overwrite,label).then(done);
+  }
  };
  next();
+}
+
+// 小文件整块上传（带上传进度）
+function fmUploadSmall(f,dir,overwrite,label){
+ return new Promise(res=>{
+  showToast(`正在上传 ${label}`,'info');
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name)+'&overwrite='+(overwrite?1:0));
+  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${label} ${Math.round(e.loaded/e.total*100)}%`,'info')};
+  xhr.onload=()=>{
+   let ok=false,msg='';
+   try{const j=JSON.parse(xhr.responseText);ok=j.code===0;if(!ok)msg=j.message||''}catch(e){msg='响应解析失败'}
+   if(!ok)console.warn('上传失败 '+f.name+'：'+msg);
+   res(ok);
+  };
+  xhr.onerror=()=>{console.warn('上传失败 '+f.name+'：网络错误');res(false)};
+  xhr.send(f);
+ });
+}
+
+// 大文件分片上传（每片 8MB）
+function fmUploadChunked(f,dir,overwrite,label){
+ const id='u'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+ const q=`path=${encodeURIComponent(dir)}&name=${encodeURIComponent(f.name)}&id=${encodeURIComponent(id)}&total=${f.size}&overwrite=${overwrite?1:0}`;
+ const chunks=Math.ceil(f.size/FM_CHUNK);
+ return (async()=>{
+  let offset=0;
+  while(offset<f.size){
+   const end=Math.min(offset+FM_CHUNK,f.size);
+   showToast(`正在上传 ${label} ${Math.round(end/f.size*100)}%（分片 ${Math.floor(offset/FM_CHUNK)+1}/${chunks}）`,'info');
+   const j=await fmPostBinary('/star/fileUploadChunk?'+q+'&offset='+offset,f.slice(offset,end));
+   if(!j||j.code!==0){
+    console.warn('上传失败 '+f.name+'（offset='+offset+'）：'+((j&&j.message)||'未知错误'));
+    try{await api('/star/fileUploadAbort?path='+encodeURIComponent(dir)+'&id='+encodeURIComponent(id),{method:'POST'})}catch(e){}
+    return false;
+   }
+   offset=end;
+  }
+  return true;
+ })();
+}
+
+// 二进制 POST（不走 api()：它会强制 JSON Content-Type）
+async function fmPostBinary(url,body){
+ const h={'Content-Type':'application/octet-stream'};
+ if(token)h['Authorization']='Bearer '+token;
+ const r=await fetch(url,{method:'POST',body,headers:h});
+ let j=null;try{j=await r.json()}catch(e){}
+ if(r.status===401||(j&&j.code===401)){logout();throw new Error('登录已过期')}
+ return j;
 }
 
 async function fmDownload(path){
@@ -2639,13 +2701,53 @@ function fmCompress(){
  });
 }
 
+function fmArchiveLabel(name){
+ const l=(name||'').toLowerCase();
+ if(l.endsWith('.tar.gz')||l.endsWith('.tgz'))return 'TAR.GZ';
+ if(l.endsWith('.tar.bz2')||l.endsWith('.tbz2')||l.endsWith('.tbz'))return 'TAR.BZ2';
+ if(l.endsWith('.tar.xz')||l.endsWith('.txz'))return 'TAR.XZ';
+ if(l.endsWith('.tar.zst')||l.endsWith('.tzst')||l.endsWith('.tar.zstd'))return 'TAR.ZST';
+ if(l.endsWith('.tar'))return 'TAR';
+ if(l.endsWith('.zip'))return 'ZIP';
+ if(l.endsWith('.7z'))return '7Z';
+ if(l.endsWith('.gz'))return 'GZ';
+ if(l.endsWith('.bz2'))return 'BZ2';
+ if(l.endsWith('.xz'))return 'XZ';
+ if(l.endsWith('.zst')||l.endsWith('.zstd'))return 'ZST';
+ if(l.endsWith('.rar'))return 'RAR';
+ return '';
+}
+function fmArchiveStem(name){
+ return (name||'').replace(/\.(tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.zstd|tgz|tbz2|tbz|txz|tzst|tar|zip|7z|gz|bz2|xz|zst|zstd)$/i,'');
+}
+
 function fmExtract(){
  const names=[...fmSelected];if(names.length!==1||!fmReady())return;
  const name=names[0];
- showModal('解压 ZIP',`将 <b>${esc(name)}</b> 解压到所在目录（保留内部目录结构）？`,'解压',async()=>{
-  const j=await api('/star/fileExtract',{method:'POST',body:JSON.stringify({path:fmJoin(name)})});
+ const label=fmArchiveLabel(name);
+ if(label==='RAR'){showToast('RAR 暂不支持（无纯 Rust 解压实现），请先转换为 ZIP 或 7Z','error');return}
+ // 默认解压到「同级同名子目录」（a.zip → a/），可改
+ const def=fmJoin(fmArchiveStem(name));
+ const canPwd=(label==='ZIP'||label==='7Z');
+ showModal('解压'+(label?` · ${esc(label)}`:''),`
+  <div class="text-muted" style="margin-bottom:10px">压缩包：<b>${esc(name)}</b></div>
+  <label class="text-muted" style="font-size:12px">目标目录（不存在会自动创建；默认同名子目录）</label>
+  <input type="text" id="fm-ex-target" value="${escAttr(def)}" spellcheck="false" style="width:100%;margin:6px 0 12px">
+  <label class="text-muted" style="font-size:12px">密码${canPwd?'（加密包才需要）':'（该格式不支持密码）'}</label>
+  <input type="password" id="fm-ex-pass" placeholder="${canPwd?'加密的 ZIP/7Z 请填密码':'—'}" ${canPwd?'':'disabled'} style="width:100%;margin-top:6px">
+ `,'解压',async()=>{
+  const tEl=$('fm-ex-target'),pEl=$('fm-ex-pass');
+  const target=tEl?tEl.value.trim():'';
+  const password=pEl?pEl.value.trim():'';
+  showToast('正在解压…','info');
+  const j=await api('/star/fileExtract',{method:'POST',body:JSON.stringify({path:fmJoin(name),target,password})});
   if(j.code!==0){showToast(j.message||'解压失败','error');return}
-  showToast(`解压完成：${j.data.fileCount} 个文件`,'success');loadFileman();
+  const d=j.data||{};
+  let msg=`解压完成（${d.formatLabel||label||'压缩包'}）：${d.fileCount} 个文件，${fmtBytes(d.bytes||0)}`;
+  if(d.overridden)msg+=`；覆盖 ${d.overridden} 个同名文件`;
+  if(d.skipped)msg+=`；跳过 ${d.skipped} 个可疑条目`;
+  showToast(msg,(d.overridden||d.skipped)?'info':'success');
+  loadFileman();
  });
 }
 

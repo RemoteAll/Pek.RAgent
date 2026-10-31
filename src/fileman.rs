@@ -28,8 +28,8 @@ use crate::webpanel::WebPanel;
 
 pub(crate) use dhrust::fileman::{
     MAX_BATCH, MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, chmod, compress_zip, copy_recursive,
-    dir_or_file_stats, ensure_modifiable, extract_zip_file, file_label, list_dir, percent_encode,
-    quick_roots, remove_path, resolve_path, search_dir, size_recursive, validate_name,
+    dir_or_file_stats, ensure_modifiable, file_label, list_dir, percent_encode, quick_roots,
+    remove_path, resolve_path, search_dir, size_recursive, validate_name,
 };
 
 // ————— 动作：浏览 / 读写 —————
@@ -486,6 +486,10 @@ pub fn file_upload(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if dst.is_dir() {
         return json_error(400, "目标是目录，无法覆盖");
     }
+    // 覆盖须由前端确认：`overwrite=0/false` 时同名直接拒绝（缺省 true 保持旧客户端行为）
+    if !overwrite_flag(ctx) && dst.exists() {
+        return json_error(400, &format!("目标已存在：{}（确认覆盖后重试）", dst.display()));
+    }
     // 先写临时文件再替换（覆盖已存在文件；Windows 占用时安全让位）
     let nonce = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -511,6 +515,151 @@ pub fn file_upload(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             let _ = fs::remove_file(&tmp);
             json_error(500, &format!("保存失败：{}", e))
         }
+    }
+}
+
+/// 是否允许覆盖（`overwrite=0/false/no` 拒绝，其余缺省允许——保持旧客户端行为）。
+fn overwrite_flag(ctx: &Ctx) -> bool {
+    match arg(ctx, "overwrite") {
+        Some(v) => {
+            let v = v.trim().to_ascii_lowercase();
+            !(v == "0" || v == "false" || v == "no")
+        }
+        None => true,
+    }
+}
+
+fn arg_u64(ctx: &Ctx, key: &str) -> Result<u64, String> {
+    let raw = arg(ctx, key).unwrap_or_default();
+    raw.trim()
+        .parse::<u64>()
+        .map_err(|_| format!("参数 {key} 必须是非负整数"))
+}
+
+/// `POST /star/fileCheck`：上传前查同名（body `{dir, names: []}` → `{existing: []}`）。
+///
+/// 前端据此弹覆盖确认；确认后才带 `overwrite=1` 继续上传，取消则不发数据。
+pub fn file_check(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let dir_text = body
+        .get("dir")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let dir = match resolve_path(panel.base(), &dir_text) {
+        Ok(p) => p,
+        Err(e) => return json_error(400, &e),
+    };
+    if !dir.is_dir() {
+        return json_error(404, &format!("目录不存在：{}", dir.display()));
+    }
+    let mut existing: Vec<String> = Vec::new();
+    if let Some(list) = body.get("names").and_then(|v| v.as_array()) {
+        for item in list {
+            let Some(name) = item.as_str() else { continue };
+            let name = name.trim();
+            if validate_name(name).is_ok() && dir.join(name).exists() {
+                existing.push(name.to_string());
+            }
+        }
+    }
+    json_result(0, "", Some(json!({ "existing": existing })))
+}
+
+/// `POST /star/fileUploadChunk?path=目录&name=文件名&id=会话&offset=&total=&overwrite=`
+/// 请求体 = 本片字节（建议 ≤ 8MB）。
+///
+/// 分片上传把「整文件进内存」降为「单片进内存」：2GB 文件也只有几 MB 驻留。
+/// 返回 `{received,total,done,path?}`；`done=true` 时文件已原子落盘。
+pub fn file_upload_chunk(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let dir = match resolve_path(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
+        Ok(p) => p,
+        Err(e) => return json_error(400, &e),
+    };
+    let name = arg(ctx, "name").unwrap_or_default();
+    let id = arg(ctx, "id").unwrap_or_default();
+    let offset = match arg_u64(ctx, "offset") {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &e),
+    };
+    let total = match arg_u64(ctx, "total") {
+        Ok(v) => v,
+        Err(e) => return json_error(400, &e),
+    };
+    match dhrust::fileman::upload_chunk(
+        &dir,
+        &name,
+        &id,
+        offset,
+        total,
+        &ctx.req.body,
+        overwrite_flag(ctx),
+    ) {
+        Ok(p) => {
+            if p.done {
+                util::log_format(
+                    "文件管理：上传 {}（{} 字节，分片）",
+                    &[
+                        &p.path
+                            .as_ref()
+                            .map(|x| x.display().to_string())
+                            .unwrap_or_default(),
+                        &p.total.to_string(),
+                    ],
+                );
+            }
+            json_result(
+                0,
+                if p.done { "上传完成" } else { "分片已接收" },
+                Some(json!({
+                    "received": p.received,
+                    "total": p.total,
+                    "done": p.done,
+                    "path": p.path.map(|x| x.display().to_string()),
+                })),
+            )
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// `GET /star/fileUploadStatus?path=目录&id=会话` → `{received}`（断点续传起点）。
+pub fn file_upload_status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let dir = match resolve_path(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
+        Ok(p) => p,
+        Err(e) => return json_error(400, &e),
+    };
+    let id = arg(ctx, "id").unwrap_or_default();
+    match dhrust::fileman::upload_received(&dir, &id) {
+        Ok(received) => json_result(0, "", Some(json!({ "received": received }))),
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// `POST /star/fileUploadAbort?path=目录&id=会话`：放弃未完成的分片上传。
+pub fn file_upload_abort(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let dir = match resolve_path(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
+        Ok(p) => p,
+        Err(e) => return json_error(400, &e),
+    };
+    let id = arg(ctx, "id").unwrap_or_default();
+    match dhrust::fileman::upload_abort(&dir, &id) {
+        Ok(()) => json_result(0, "已放弃上传", None),
+        Err(e) => json_error(400, &e),
     }
 }
 
@@ -625,7 +774,10 @@ pub fn file_compress(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// `POST /star/fileExtract`：解压 zip（`{path, target?}`，默认解压到所在目录）。
+/// `POST /star/fileExtract`：解压（`{path, target?, password?}`）。
+///
+/// 支持 zip / 7z / tar / tar.gz / tar.bz2 / tar.xz / tar.zst / gz / bz2 / xz / zst；
+/// zip 与 7z 支持密码（AES-256）。`target` 缺省 = 压缩包同级同名子目录（`a.zip` → `a/`）。
 pub fn file_extract(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -635,10 +787,10 @@ pub fn file_extract(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         Ok(p) => p,
         Err(e) => return json_error(400, &e),
     };
-    let Ok(md) = fs::metadata(&path) else {
+    if fs::symlink_metadata(&path).is_err() {
         return json_error(404, &format!("文件不存在：{}", path.display()));
-    };
-    if md.is_dir() {
+    }
+    if path.is_dir() {
         return json_error(400, "目标是目录，无法解压");
     }
     let target = match arg(ctx, "target") {
@@ -646,37 +798,39 @@ pub fn file_extract(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             Ok(p) => p,
             Err(e) => return json_error(400, &e),
         },
-        _ => path
-            .parent()
-            .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from(".")),
+        _ => dhrust::fileman::default_extract_target(&path),
     };
-    if !target.is_dir()
-        && let Err(e) = fs::create_dir_all(&target)
-    {
-        return json_error(500, &format!("创建目标目录失败：{}", e));
-    }
-    match extract_zip_file(&path, &target) {
-        Ok((files, bytes)) => {
+    let password = arg(ctx, "password");
+    match dhrust::fileman::extract_archive(&path, &target, password.as_deref()) {
+        Ok(report) => {
+            let label = report.format.map(|f| f.label()).unwrap_or("");
             util::log_format(
-                "文件管理：解压 {} → {}（{} 个文件）",
+                "文件管理：解压 {}（{}）→ {}（{} 个文件，{} 字节，跳过 {}，覆盖 {}）",
                 &[
                     &path.display().to_string(),
+                    label,
                     &target.display().to_string(),
-                    &files.to_string(),
+                    &report.files.to_string(),
+                    &report.bytes.to_string(),
+                    &report.skipped.to_string(),
+                    &report.overridden.to_string(),
                 ],
             );
             json_result(
                 0,
-                "解压完成",
+                &format!("解压完成（{label}）"),
                 Some(json!({
                     "target": target.display().to_string(),
-                    "fileCount": files,
-                    "bytes": bytes,
+                    "fileCount": report.files,
+                    "bytes": report.bytes,
+                    "format": report.format.map(|f| f.code()).unwrap_or(""),
+                    "formatLabel": label,
+                    "skipped": report.skipped,
+                    "overridden": report.overridden,
                 })),
             )
         }
-        Err(e) => json_error(500, &e),
+        Err(e) => json_error(400, &e),
     }
 }
 
@@ -915,7 +1069,7 @@ mod tests {
 
         let out = dir.join("extract");
         fs::create_dir(&out).unwrap();
-        let (efiles, _) = extract_zip_file(&zip_path, &out).unwrap();
+        let (efiles, _) = dhrust::fileman::extract_zip_file(&zip_path, &out).unwrap();
         assert_eq!(efiles, 2);
         assert_eq!(fs::read(out.join("a.txt")).unwrap(), b"AAAA");
         assert_eq!(fs::read(out.join("sub/b.txt")).unwrap(), b"BBBBBB");
