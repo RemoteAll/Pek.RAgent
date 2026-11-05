@@ -3128,9 +3128,9 @@ function fmDelete(names){
  if(!(names&&names.length))return;
  showModal('删除确认',`确定删除选中的 <b>${names.length}</b> 项？<br><span class="text-muted">文件夹将连同内容递归删除，此操作不可恢复</span>`,'删除',async()=>{
   const paths=names.map(n=>fmJoin(n));
-  const j=await api('/star/fileDelete',{method:'POST',body:JSON.stringify({paths})});
-  if(j.code!==0){showToast(j.message||'删除失败','error');return}
-  showToast(`已删除 ${j.data.deleted} 项（释放 ${fmtBytes(j.data.freedBytes)}）`,'success');
+  const r=await fmPostPathsChunked('/star/fileDelete',paths);
+  if(r.code!==0){showToast(r.message||'删除失败','error');return}
+  showToast(`已删除 ${r.data.deleted} 项（释放 ${fmtBytes(r.data.freedBytes)}）`,'success');
   loadFileman();
  });
 }
@@ -3251,14 +3251,34 @@ function fmClipClear(){
  if(fmData&&fmData.path)renderFileman();
 }
 /** 粘贴到当前目录（剪贴板为 cut 时走移动） */
+/** 分批提交 paths：单批 500（服务端面板层放宽到 5000，前端再兜一层，超大选择也不会被拒） */
+async function fmPostPathsChunked(url,paths,target,chunk){
+ const step=chunk||500;
+ const total={files:0,bytes:0,deleted:0,freedBytes:0};
+ for(let i=0;i<paths.length;i+=step){
+  const part=paths.slice(i,i+step);
+  const body=target?{paths:part,target}:{paths:part};
+  const j=await api(url,{method:'POST',body:JSON.stringify(body)});
+  if(j.code!==0)return {code:j.code,message:j.message,data:total,partial:true};
+  const d=j.data||{};
+  total.files+=d.files||0;total.bytes+=d.bytes||0;
+  total.deleted+=d.deleted||0;total.freedBytes+=d.freedBytes||0;
+ }
+ return {code:0,data:total};
+}
+
 async function fmPaste(){
  if(!fmReady())return;
  if(!fmClip||!fmClip.paths.length){showToast('剪贴板为空','error');return}
  const isCut=fmClip.mode==='cut';
- const j=await api(isCut?'/star/fileMove':'/star/fileCopy',{method:'POST',body:JSON.stringify({paths:fmClip.paths,target:fmData.path})});
- if(j.code!==0){showToast(j.message||'粘贴失败','error');return}
- const d=j.data||{};
- showToast('已'+(isCut?'移动':'粘贴')+'：'+(d.files||fmClip.paths.length)+' 个文件（'+fmtBytes(d.bytes||0)+'）','success');
+ const r=await fmPostPathsChunked(isCut?'/star/fileMove':'/star/fileCopy',fmClip.paths,fmData.path);
+ if(r.code!==0){
+  const done=r.data&&(r.data.files||r.data.deleted);
+  showToast((r.message||'粘贴失败')+(r.partial&&done?`（已完成 ${done} 个文件）`:''),'error');
+  return;
+ }
+ const d=r.data||{};
+ showToast('已'+(isCut?'移动':'粘贴')+'：'+d.files+' 个文件（'+fmtBytes(d.bytes)+'）','success');
  if(isCut)fmClipClear();
  loadFileman();
 }

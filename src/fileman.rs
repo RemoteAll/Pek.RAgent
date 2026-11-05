@@ -27,10 +27,16 @@ use crate::webpanel::WebPanel;
 // ————— 业务实现（下沉 dhrust::fileman；本模块只保留面板 HTTP 适配层） —————
 
 pub(crate) use dhrust::fileman::{
-    MAX_BATCH, MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, chmod, compress_zip, copy_recursive,
-    dir_or_file_stats, ensure_modifiable, file_label, list_dir, percent_encode, quick_roots,
-    remove_path, resolve_path, search_dir, size_recursive, validate_name,
+    MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, chmod, compress_zip, copy_recursive, dir_or_file_stats,
+    ensure_modifiable, file_label, list_dir, percent_encode, quick_roots, remove_path,
+    resolve_path, search_dir, size_recursive, validate_name,
 };
+
+/// 面板批量文件操作（复制/移动/删除/压缩）单次上限。
+///
+/// dhrust 的 `MAX_BATCH`（100）是库层保守值，面板批量勾选动辄上百项，
+/// 故面板层放宽到 5000（前端还会按 500 分批提交，超大选择也不会被拒）。
+const MAX_PANEL_BATCH: usize = 5_000;
 
 /// 批量建目录单次上限（拖拽整棵文件夹树时一次补齐）。
 const MAX_FOLDER_DIRS: usize = 2_000;
@@ -328,8 +334,8 @@ fn body_paths(panel: &WebPanel, ctx: &Ctx) -> Result<Vec<PathBuf>, String> {
     if list.is_empty() {
         return Err("未选择任何项目".to_string());
     }
-    if list.len() > MAX_BATCH {
-        return Err(format!("单次最多操作 {} 项", MAX_BATCH));
+    if list.len() > MAX_PANEL_BATCH {
+        return Err(format!("单次最多操作 {MAX_PANEL_BATCH} 项"));
     }
     let mut paths = Vec::new();
     for item in list {

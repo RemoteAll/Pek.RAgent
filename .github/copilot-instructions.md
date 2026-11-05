@@ -27,4 +27,4 @@
 ## 流程
 - 每轮收尾三件套：① 决策/台账新增节（**含用户原话**）② `tools/continuity/sync-memory.ps1` 回灌 `docs/项目记忆.md` ③ 回归验证如实汇报（贴实际输出）。
 - `docs/` 台账随仓库走（已入 git）；`docs/项目接续指南.md` 为开工先读。
-- GitHub 推送走 IP 直连（本机 hosts 劫持）：`git -c http.curloptResolve=github.com:443:<IP> push origin main`（IP 用 `Resolve-DnsName github.com -Server 223.5.5.5` 获取）。
+- GitHub 推送走 IP 直连（本机 hosts 劫持）：`git -c http.version=HTTP/1.1 -c http.curloptResolve=github.com:443:<IP> push main main`（IP 用 `Resolve-DnsName github.com -Server 223.5.5.5` 获取；**2026-11-05 起该 DNS 返回的 20.205.243.166 已不可达**，改用 `140.82.112.3` / `140.82.113.3` / `20.27.177.113`；HTTP/2 协商会被重置，必须带 `http.version=HTTP/1.1`）。
