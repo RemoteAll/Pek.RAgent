@@ -106,12 +106,14 @@ async function doLogin(){
    e.classList.add('show');return
   }
   setToken(j.data.token,remember);showApp();
+  if(j.data&&j.data.mustChangePassword)forcePwdShow();
  }catch(ex){e.textContent='网络错误，请检查服务是否正常运行';e.classList.add('show')}
 }
 
 async function logout(){
  // 幂等：已经在登录页时不再重复清理/抢焦点。
  // （否则多个并发的 3 秒轮询同时 401 会反复调 logout → 把光标从密码框拽回用户名框）
+ const fp=$('force-pwd');if(fp)fp.classList.add('hidden');
  if($('login').style.display!=='none'){
   clearToken();
   return;
@@ -185,6 +187,8 @@ async function api(url,opt={}){
   if(!onLoginPage)showToast('登录已过期，请重新登录','error');
   throw new Error('Unauthorized')
  }
+ // 428：首次登录仍是默认口令 → 服务端已挡住动作，这里把改密框顶上来
+ if(j.code===428)forcePwdShow();
  return j;
 }
 
@@ -1915,6 +1919,33 @@ async function syncServerTime(btn){
   else showToast('❌ '+(j.message||'同步失败（需管理员/root 权限）'),'error');
  }catch(e){showToast('❌ 同步失败','error')}
  finally{_syncingTime=false;if(btn)btn.disabled=false}
+}
+
+/* ── 首次登录强制改密（服务端 guarded 已拦截，这里只负责给出不可绕过的入口） ── */
+function forcePwdShow(){
+ const el=$('force-pwd');if(!el)return;
+ if(!el.classList.contains('hidden'))return;
+ el.classList.remove('hidden');
+ setTimeout(()=>{const f=$('fp-new');if(f)f.focus()},60);
+}
+function forcePwdHide(){const el=$('force-pwd');if(el)el.classList.add('hidden')}
+async function forceChangePassword(){
+ const oldP=($('fp-old').value||'').trim()||'admin';
+ const newP=$('fp-new').value||'';
+ const confirmP=$('fp-confirm').value||'';
+ const msg=$('fp-msg');
+ const fail=t=>{msg.textContent=t;msg.style.color='var(--red)'};
+ if(newP.length<8)return fail('新密码至少 8 位');
+ if(newP!==confirmP)return fail('两次输入的新密码不一致');
+ msg.textContent='保存中…';msg.style.color='var(--text-muted)';
+ try{
+  const j=await api('/api/changePassword',{method:'POST',body:JSON.stringify({oldPassword:oldP,newPassword:newP})});
+  if(j.code!==0)return fail('❌ '+(j.message||'修改失败'));
+  msg.textContent='✅ 密码已修改';msg.style.color='var(--green)';
+  $('fp-old').value='';$('fp-new').value='';$('fp-confirm').value='';
+  showToast('默认密码已修改，正在进入面板…','success');
+  setTimeout(()=>location.reload(),700);
+ }catch(e){fail('❌ 网络错误')}
 }
 
 async function changePassword(){

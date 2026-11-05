@@ -563,6 +563,15 @@ where
             return json_error(401, "Unauthorized");
         };
         let action_name = action_name_of(&ctx.req.path);
+        // 首次登录强制改密：出厂默认口令 + 真实登录会话（带令牌）时，除改密/注销外一律挡住。
+        // 免登录的本机访问（LocalOnly 回环）不拦，避免把无人值守节点的本地运维一起锁死。
+        if force_password_change(&panel, ctx, &principal)
+            && !matches!(action_name.as_str(), "changePassword" | "logout")
+        {
+            let result = json_error(428, "首次登录必须先修改默认密码（admin/admin）");
+            record_audit(&panel, ctx, &principal, &action_name, started, false, &result);
+            return result;
+        }
         if !perm.is_empty() && !principal.allowed(perm) {
             let result = json_error(403, "没有权限执行该操作");
             record_audit(&panel, ctx, &principal, &action_name, started, true, &result);
@@ -574,6 +583,16 @@ where
         }
         result
     }
+}
+
+/// 首次登录强制改密判定：仍是出厂默认口令，且**本次请求带令牌**（真实登录会话）。
+///
+/// 免登录的本机访问（`LocalOnly` 回环）刻意不拦：避免升级后把无人值守节点的本地运维
+/// 一并锁死，该场景继续由面板顶部横幅提示。
+fn force_password_change(panel: &WebPanel, ctx: &Ctx, principal: &Principal) -> bool {
+    principal.is_admin
+        && bearer_token(ctx).is_some()
+        && uses_default_credentials(&panel.manager.config())
 }
 
 /// 是否需要审计（写操作与敏感读）。
@@ -1287,7 +1306,16 @@ fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                     elapsed_ms: 0,
                 },
             );
-            json_result(0, "", Some(json!({ "token": token })))
+            json_result(
+                0,
+                "",
+                Some(json!({
+                    "token": token,
+                    // 首次登录强制改密：前端据此直接弹不可关闭的改密框（服务端 guarded 也会拦）
+                    "mustChangePassword": principal.is_admin
+                        && uses_default_credentials(&panel.manager.config()),
+                })),
+            )
         }
         None => {
             panel.logins.record_failure(&ip);
@@ -5367,8 +5395,11 @@ mod tests {
         let denied = audit::query_logs(&dir, 1, 50, "op1", "dbQuery", Some(false)).unwrap();
         assert_eq!(denied["total"], 1);
 
-        // 内置管理员全放行
-        let admin_token = panel.issue_token("admin", "admin").unwrap();
+        // 内置管理员全放行（先改掉出厂默认口令：首登强制改密会拦下其它动作）
+        panel
+            .manager
+            .update_config(|cfg| cfg.web_user_password = "admin-new".to_string());
+        let admin_token = panel.issue_token("admin", "admin-new").unwrap();
         let r = body_json(db_act(&context("POST", "/star/dbQuery", "", Some(&admin_token))));
         assert_eq!(r["code"], 0);
 
@@ -5382,6 +5413,36 @@ mod tests {
             .as_u64()
             .unwrap();
         assert_eq!(before, after, "未认证请求不写审计");
+
+        crate::history::drop_storage_for_test(&dir);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn first_login_with_default_password_must_change_it() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+        let file_act = guarded(panel.clone(), PERM_FILEMAN, |_, _| json_result(0, "ok", None));
+
+        // 默认口令 + 登录令牌：动作被 428 挡住（面板顶部横幅之外再加服务端闸门）
+        let r = body_json(file_act(&context("GET", "/star/fileList", "", Some(&token))));
+        assert_eq!(r["code"], 428, "{r}");
+        let logged = audit::query_logs(&dir, 1, 50, "admin", "fileList", Some(false)).unwrap();
+        assert_eq!(logged["total"], 1, "被拦下的动作也要留痕");
+
+        // 改密动作本身放行
+        let pwd_act = guarded(panel.clone(), "", change_password);
+        let r = body_json(pwd_act(&context(
+            "POST",
+            "/api/changePassword",
+            r#"{"oldPassword":"admin","newPassword":"newpass123"}"#,
+            Some(&token),
+        )));
+        assert_eq!(r["code"], 0, "{r}");
+
+        // 改完立即恢复
+        let r = body_json(file_act(&context("GET", "/star/fileList", "", Some(&token))));
+        assert_eq!(r["code"], 0, "{r}");
 
         crate::history::drop_storage_for_test(&dir);
         let _ = std::fs::remove_dir_all(&dir);
