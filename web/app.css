@@ -269,6 +269,21 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .fm-editor{width:100%;height:320px;font-family:var(--font-mono);font-size:12px;line-height:1.5;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px;resize:vertical;outline:none;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;overflow:auto}
 /* 关闭自动换行：长行不折行、改横向滚动（查看宽表格/对齐文本时用） */
 .fm-editor.fm-nowrap{white-space:pre;word-break:normal;overflow-wrap:normal}
+/* 文件管理：拖拽落点高亮（整卡 = 当前目录；行 = 该文件夹） */
+.card.fm-drop-active{outline:2px dashed var(--brand-500);outline-offset:2px;background:rgba(91,91,255,.06)}
+tr.fm-drop-row{outline:2px dashed var(--brand-500);outline-offset:-2px;background:rgba(91,91,255,.08)}
+/* 文件管理：传输任务面板（上传/下载进度、取消/续传） */
+.fm-jobs{position:fixed;right:18px;bottom:18px;width:320px;max-height:52vh;overflow:auto;background:var(--surface-2);border:1px solid var(--border-default);border-radius:var(--radius-lg);box-shadow:var(--shadow-modal);z-index:900;font-size:12px}
+.fm-jobs-head{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:8px 10px;border-bottom:1px solid var(--border-subtle);font-weight:600;position:sticky;top:0;background:var(--surface-2)}
+.fm-job{padding:8px 10px;border-bottom:1px solid var(--border-subtle)}
+.fm-job:last-child{border-bottom:none}
+.fm-job-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;margin-bottom:5px;color:var(--text-primary)}
+.fm-job-bar{height:5px;border-radius:3px;background:var(--surface-3);overflow:hidden}
+.fm-job-bar i{display:block;height:100%;background:var(--brand-500);transition:width .2s linear}
+.fm-job-meta{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-top:5px;color:var(--text-muted);font-size:11px}
+.fm-job-meta>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.fm-link-btn{border:none;background:transparent;color:var(--brand-300);cursor:pointer;font-size:11px;padding:0 4px}
+.fm-link-btn:hover{text-decoration:underline}
 /* ── 日志清理 ── */
 .clean-summary{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 20px;border-radius:var(--radius-md);background:var(--gradient-brand-soft);border:1px solid var(--border-subtle);margin-bottom:16px;flex-wrap:wrap}
 .clean-summary-text{display:flex;align-items:center;gap:12px;font-size:14px;color:var(--text-secondary)}

@@ -8,7 +8,7 @@
 //!   updateStarConfig / machine / webTraffic / portTraffic /
 //!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
 //!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup /
-//!   fileList / fileRead / fileWrite / fileMkdir / fileNewFile / fileDelete / fileRename /
+//!   fileList / fileRead / fileWrite / fileMkdir / fileMkdirs / fileNewFile / fileDelete / fileRename /
 //!   fileMove / fileCopy / fileUpload / fileDownload / fileCompress / fileExtract /
 //!   fileChmod / fileSearch（文件管理）/ logCleanScan / logCleanRun（日志清理）
 //! - 统一 JSON 信封 `{code, message?, data?}`；Bearer Token 鉴权（`Authorization` 头）
@@ -697,6 +697,7 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("fileRead", "读取文件"),
     ("fileWrite", "保存文件"),
     ("fileMkdir", "新建文件夹"),
+    ("fileMkdirs", "批量新建文件夹"),
     ("fileNewFile", "新建文件"),
     ("fileDelete", "删除文件"),
     ("fileRename", "重命名"),
@@ -1018,6 +1019,10 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "fileNewFile",
         guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_new_file),
+    );
+    controller = controller.post(
+        "fileMkdirs",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_mkdirs),
     );
     controller = controller.post(
         "fileDelete",

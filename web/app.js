@@ -2397,6 +2397,7 @@ let fmData=null;
 // 其次 localStorage（下次打开面板回到上次访问的目录；服务端拒绝时自动回退根目录）
 let fmPath=fmPathFromHash() || (()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
 let fmSelected=new Set();
+let fmLastIdx=-1; // Shift 连选锚点（上次点选的行号）
 let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
 function fmJoin(name){
@@ -2452,21 +2453,24 @@ function fmPathGo(){
 
 function renderFileman(){
  const d=fmData||{items:[]};
+ const items=d.items||[];
  const isRoot=!d.path;
  let rows='';
- if(!(d.items||[]).length){rows=`<tr><td colspan="6" class="fm-empty">${isRoot?'':'此目录为空'}</td></tr>`}
- else{(d.items||[]).forEach(it=>{
+ if(!items.length){rows=`<tr><td colspan="6" class="fm-empty">${isRoot?'':'此目录为空'}</td></tr>`}
+ else{items.forEach((it,idx)=>{
   const name=it.name;
   const checked=fmSelected.has(name)?'checked':'';
   const icon=it.isDir?(it.isLink?'🔗':'📁'):'📄';
-  rows+=`<tr>
-   <td style="width:34px"><input type="checkbox" ${checked} onchange="fmToggle('${escAttr(name)}',this.checked)"></td>
+  // 文件夹行本身是拖放目标：把文件/文件夹拖到它上面 = 上传进该目录
+  const drop=(!isRoot&&it.isDir)?' ondragover="fmRowOver(event,this)" ondragleave="fmRowLeave(event,this)" ondrop="fmRowDrop(event,this)"':'';
+  rows+=`<tr data-idx="${idx}"${drop}>
+   <td style="width:34px"><input type="checkbox" class="fm-cb" data-idx="${idx}" ${checked}></td>
    <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0},${it.isDir?0:(it.size||0)})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
    <td style="width:92px" class="text-secondary">${it.isDir?fmSizeCell(name):fmtBytes(it.size)}</td>
    <td style="width:152px" class="text-muted">${esc(it.mtime||'')}</td>
    <td style="width:72px" class="text-muted">${esc(it.perm||'—')}</td>
    <td class="fm-row-actions" style="width:118px">${isRoot?'':`
-    ${it.isDir?'':`<button class="fm-icon-btn" title="下载" onclick="fmDownload(fmJoin('${escAttr(name)}'))">⬇</button>`}
+    ${it.isDir?'':`<button class="fm-icon-btn" title="下载" onclick="fmDownload('${escAttr(name)}')">⬇</button>`}
     <button class="fm-icon-btn" title="重命名" onclick="fmRename('${escAttr(name)}')">✏️</button>
     <button class="fm-icon-btn" title="删除" onclick="fmDelete(['${escAttr(name)}'])">🗑️</button>`}
    </td>
@@ -2474,12 +2478,15 @@ function renderFileman(){
  });}
  const sel=fmSelected.size;
  const canUp=!!(fmParentText()||d.path);
- let html=`<div class="glass-card card">
+ let html=`<div class="glass-card card" data-fm-drop="1" ondragover="fmDragOver(event,this)" ondragleave="fmDragLeave(event,this)" ondrop="fmDrop(event,this)">
   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
    <h2>🗂 文件管理</h2>
    <div style="display:flex;gap:8px;flex-wrap:wrap">
-    <button class="btn btn-secondary btn-sm" onclick="$('fm-upload-input').click()">⬆ 上传</button>
+    <button class="btn btn-secondary btn-sm" onclick="$('fm-upload-input').click()">⬆ 上传文件</button>
     <input type="file" id="fm-upload-input" multiple style="display:none" onchange="fmUpload(this)">
+    <button class="btn btn-secondary btn-sm" onclick="$('fm-upload-dir-input').click()" title="选择整个文件夹（保留目录结构；空目录仅在「拖拽文件夹」时保留，浏览器选择器不提供空目录）">📂 上传文件夹</button>
+    <input type="file" id="fm-upload-dir-input" webkitdirectory directory multiple style="display:none" onchange="fmUploadDir(this)">
+    <button class="btn btn-secondary btn-sm" ${items.length?'':'disabled'} onclick="fmToggleAll(fmSelected.size!==${items.length})" title="全选 / 取消全选（勾选框处可按 Shift 连选）">☑ 全选</button>
     <button class="btn btn-secondary btn-sm" onclick="fmMkdir()">📁 新建文件夹</button>
     <button class="btn btn-secondary btn-sm" onclick="fmNewFile()">📄 新建文件</button>
     <button class="btn btn-secondary btn-sm" onclick="fmSearchPrompt()">🔍 搜索</button>
@@ -2500,15 +2507,55 @@ function renderFileman(){
    <button class="btn btn-danger btn-sm" ${sel?'':'disabled'} onclick="fmDelete([...fmSelected])">🗑 删除</button>
   </div>
   <div style="overflow-x:auto"><table class="svc-table">
-   <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
-   <tbody>${rows}</tbody>
+   <thead><tr>
+    <th style="width:34px"><input type="checkbox" id="fm-sel-all" title="全选 / 取消全选" onchange="fmToggleAll(this.checked)"></th>
+    <th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th>
+   </tr></thead>
+   <tbody id="fm-tbody">${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传单文件上限 2GB（>8MB 自动分片）/ 在线编辑 10MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${items.length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 勾选框可按 Shift 连选 · <b>支持把文件/文件夹直接拖到本页上传</b>（拖到文件夹行 = 传进该文件夹）· 上传 >8MB 自动分片并支持断点续传 · 下载 >32MB 自动分片续传 · 在线编辑 10MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
+ const tbody=$('fm-tbody');
+ if(tbody)tbody.addEventListener('click',e=>{
+  const cb=e.target.closest?e.target.closest('.fm-cb'):null;
+  if(!cb)return;
+  // 用 click 而不是 change：只有 MouseEvent 才带 shiftKey（Shift 连选）
+  fmToggleIdx(+cb.dataset.idx,cb.checked,e.shiftKey);
+ });
+ const sa=$('fm-sel-all');
+ if(sa){
+  sa.checked=items.length>0&&fmSelected.size>=items.length;
+  sa.indeterminate=fmSelected.size>0&&fmSelected.size<items.length;
+ }
 }
 
+/** 勾选/取消（支持 Shift 连选：从上次点击的行到当前行整段同选） */
+function fmToggleIdx(idx,checked,shift){
+ const items=(fmData&&fmData.items)||[];
+ const it=items[idx];
+ if(!it)return;
+ if(shift&&fmLastIdx>=0&&fmLastIdx!==idx&&fmLastIdx<items.length){
+  const [a,b]=fmLastIdx<idx?[fmLastIdx,idx]:[idx,fmLastIdx];
+  for(let i=a;i<=b;i++){
+   const n=items[i]&&items[i].name;
+   if(n==null)continue;
+   checked?fmSelected.add(n):fmSelected.delete(n);
+  }
+ }else{
+  checked?fmSelected.add(it.name):fmSelected.delete(it.name);
+ }
+ fmLastIdx=idx;
+ renderFileman();
+}
+/** 同名兼容：按名称勾选（旧入口保留） */
 function fmToggle(name,checked){checked?fmSelected.add(name):fmSelected.delete(name);renderFileman()}
+/** 全选 / 取消全选（表头勾选框与工具栏按钮共用） */
+function fmToggleAll(checked){
+ const items=(fmData&&fmData.items)||[];
+ fmSelected=new Set(checked?items.map(i=>i.name):[]);
+ renderFileman();
+}
 function fmOpen(name,isDir,size){
  if(isDir){fmNavigate(fmJoin(name));return}
  fmEdit(fmJoin(name),size);
@@ -2546,109 +2593,494 @@ function fmPrompt(title,labelHtml,value,okText,cb){
 
 // 分片上传片大小（服务端按片收，内存不随文件大小增长）
 const FM_CHUNK=8*1024*1024;
+// 分片下载片大小；≥32MB 的文件走 Range 分片，可断点续传
+const FM_DL_CHUNK=8*1024*1024;
+const FM_DL_RESUME_MIN=32*1024*1024;
+const fmDlParts=new Map(); // 无「另存为」能力时的内存兜底：路径 → Blob[]
+const fmDlMeta=new Map();  // 下载断点元信息：路径 → {size}
 
+/* ── 传输任务面板（上传/下载进度、取消、续传） ── */
+let fmJobs=[];
+function fmJobAdd(title){
+ const job={title,pct:0,status:'准备中',onAction:null,onCancel:null};
+ fmJobs.push(job);
+ if(fmJobs.length>40)fmJobs=fmJobs.slice(-40);
+ fmJobRender();
+ return job;
+}
+function fmJobUpdate(job,patch){if(!job)return;Object.assign(job,patch||{});fmJobRender()}
+function fmJobAct(i){const j=fmJobs[i];if(j&&j.onAction)j.onAction()}
+function fmJobCancel(i){const j=fmJobs[i];if(j&&j.onCancel)j.onCancel()}
+function fmJobsClear(){fmJobs=[];fmJobRender()}
+function fmJobRender(){
+ let box=$('fm-jobs');
+ if(!fmJobs.length){if(box)box.remove();return}
+ if(!box){
+  box=document.createElement('div');box.id='fm-jobs';box.className='fm-jobs';
+  document.body.appendChild(box);
+ }
+ const running=fmJobs.filter(j=>!(j.pct>=100)).length;
+ box.innerHTML=`<div class="fm-jobs-head"><span>传输任务${running?`（${running} 进行中）`:''}</span><button class="fm-icon-btn" title="清空列表" onclick="fmJobsClear()">✕</button></div>`
+  +fmJobs.map((j,i)=>`<div class="fm-job">
+   <div class="fm-job-title" title="${escAttr(j.title)}">${esc(j.title)}</div>
+   <div class="fm-job-bar"><i style="width:${Math.max(0,Math.min(100,j.pct||0)).toFixed(1)}%"></i></div>
+   <div class="fm-job-meta"><span title="${escAttr(j.status||'')}">${esc(j.status||'')}</span><span style="white-space:nowrap">${j.onAction?`<button class="fm-link-btn" onclick="fmJobAct(${i})">续传</button>`:''}${j.onCancel?`<button class="fm-link-btn" onclick="fmJobCancel(${i})">取消</button>`:''}</span></div>
+  </div>`).join('');
+}
+
+/* ── 路径拼接（Windows 反斜杠 / Unix 斜杠自适应） ── */
+function fmSep(p){const s=String(p||'');return (s.includes('\\')&&!s.includes('/'))?'\\':'/'}
+function fmJoinRel(dir,rel){
+ const sep=fmSep(dir);
+ let p=String(dir||'').replace(/[\\/]+$/,'');
+ if(rel)p+=(p?sep:'')+String(rel).split('/').join(sep);
+ return p;
+}
+function fmJoinName(dir,name){
+ const sep=fmSep(dir);
+ const p=String(dir||'').replace(/[\\/]+$/,'');
+ return p?p+sep+name:String(name||'');
+}
+
+/* ── 上传：选择文件 / 选择文件夹 / 拖拽（文件夹递归、保留目录结构） ── */
 function fmUpload(input){
  const files=[...input.files];input.value='';
  if(!files.length)return;
  if(!fmReady())return;
- const dir=fmData.path;
- // 先查同名：有冲突必须由用户确认；取消则一个字节都不发
- api('/star/fileCheck',{method:'POST',body:JSON.stringify({dir,names:files.map(f=>f.name)})})
-  .then(j=>{
-   const existing=(j&&j.data&&j.data.existing)||[];
-   if(!existing.length){fmUploadRun(files,dir,false);return}
-   showModal('文件已存在',
-    `以下 <b>${existing.length}</b> 个文件已存在，继续将<b>覆盖</b>：<br><span class="text-muted" style="word-break:break-all">${existing.map(n=>esc(n)).join('、')}</span>`,
-    '确认覆盖',()=>fmUploadRun(files,dir,true));
-  })
-  .catch(()=>fmUploadRun(files,dir,false));
+ fmStartUpload(files.map(f=>({file:f,rel:''})),new Set(),fmData.path);
 }
 
-function fmUploadRun(files,dir,overwrite){
- let i=0,ok=0,fail=0;
- const next=()=>{
-  if(i>=files.length){
-   showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个`:''}`,fail?'error':'success');
-   loadFileman();return;
-  }
-  const f=files[i++];
-  const label=`${i}/${files.length}：${f.name}`;
-  const done=v=>{v?ok++:fail++;next()};
-  if(f.size>FM_CHUNK){
-   fmUploadChunked(f,dir,overwrite,label).then(done).catch(e=>{console.warn('上传失败 '+f.name+'：'+((e&&e.message)||e));done(false)});
-  }else{
-   fmUploadSmall(f,dir,overwrite,label).then(done);
-  }
- };
- next();
+function fmUploadDir(input){
+ const files=[...input.files];input.value='';
+ if(!files.length)return;
+ if(!fmReady())return;
+ const dirs=new Set();
+ const list=files.map(f=>{
+  const rel=(f.webkitRelativePath||f.name).replace(/\\/g,'/');
+  const parts=rel.split('/');parts.pop();
+  for(let i=1;i<=parts.length;i++)dirs.add(parts.slice(0,i).join('/'));
+  return {file:f,rel:parts.join('/')};
+ });
+ fmStartUpload(list,dirs,fmData.path);
 }
 
-// 小文件整块上传（带上传进度）
-function fmUploadSmall(f,dir,overwrite,label){
- return new Promise(res=>{
-  showToast(`正在上传 ${label}`,'info');
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name)+'&overwrite='+(overwrite?1:0));
-  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
-  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${label} ${Math.round(e.loaded/e.total*100)}%`,'info')};
-  xhr.onload=()=>{
-   let ok=false,msg='';
-   try{const j=JSON.parse(xhr.responseText);ok=j.code===0;if(!ok)msg=j.message||''}catch(e){msg='响应解析失败'}
-   if(!ok)console.warn('上传失败 '+f.name+'：'+msg);
-   res(ok);
-  };
-  xhr.onerror=()=>{console.warn('上传失败 '+f.name+'：网络错误');res(false)};
-  xhr.send(f);
+function fmHasFiles(e){return !!(e&&e.dataTransfer&&Array.from(e.dataTransfer.types||[]).includes('Files'))}
+function fmDragOver(e,card){
+ if(!fmHasFiles(e))return;
+ e.preventDefault();e.stopPropagation();
+ if(e.dataTransfer)e.dataTransfer.dropEffect='copy';
+ card.classList.add('fm-drop-active');
+}
+function fmDragLeave(e,card){
+ if(e.relatedTarget&&card.contains(e.relatedTarget))return;
+ card.classList.remove('fm-drop-active');
+}
+function fmDrop(e,card){
+ if(!fmHasFiles(e))return;
+ e.preventDefault();e.stopPropagation();
+ card.classList.remove('fm-drop-active');
+ if(!fmReady())return;
+ fmDropHandle(e,fmData.path);
+}
+function fmRowOver(e,tr){if(!fmHasFiles(e))return;e.preventDefault();e.stopPropagation();tr.classList.add('fm-drop-row')}
+function fmRowLeave(e,tr){tr.classList.remove('fm-drop-row')}
+function fmRowDrop(e,tr){
+ if(!fmHasFiles(e))return;
+ e.preventDefault();e.stopPropagation();
+ tr.classList.remove('fm-drop-row');
+ const it=((fmData&&fmData.items)||[])[+tr.dataset.idx];
+ if(!it||!it.isDir)return;
+ fmDropHandle(e,fmJoin(it.name));
+}
+async function fmDropHandle(e,dir){
+ const dt=e.dataTransfer;
+ const entries=[];
+ for(const item of (dt&&dt.items?[...dt.items]:[])){
+  if(item.kind!=='file')continue;
+  const en=item.webkitGetAsEntry?item.webkitGetAsEntry():null;
+  if(en)entries.push(en);
+ }
+ if(!entries.length){
+  const files=dt&&dt.files?[...dt.files]:[];
+  if(!files.length){showToast('没有可上传的文件','error');return}
+  fmStartUpload(files.map(f=>({file:f,rel:''})),new Set(),dir);
+  return;
+ }
+ showToast('正在读取拖入的文件…','info');
+ const files=[],dirs=new Set();
+ for(const en of entries)await fmWalkEntry(en,'',files,dirs);
+ fmStartUpload(files,dirs,dir);
+}
+/** readEntries 每次最多返回 100 条，必须循环读到空数组 */
+function fmReadAllEntries(reader){
+ return new Promise((resolve,reject)=>{
+  const all=[];
+  const step=()=>reader.readEntries(batch=>{
+   if(!batch||!batch.length){resolve(all);return}
+   for(const b of batch)all.push(b);
+   step();
+  },reject);
+  step();
  });
 }
-
-// 大文件分片上传（每片 8MB）
-function fmUploadChunked(f,dir,overwrite,label){
- const id='u'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
- const q=`path=${encodeURIComponent(dir)}&name=${encodeURIComponent(f.name)}&id=${encodeURIComponent(id)}&total=${f.size}&overwrite=${overwrite?1:0}`;
- const chunks=Math.ceil(f.size/FM_CHUNK);
- return (async()=>{
-  let offset=0;
-  while(offset<f.size){
-   const end=Math.min(offset+FM_CHUNK,f.size);
-   showToast(`正在上传 ${label} ${Math.round(end/f.size*100)}%（分片 ${Math.floor(offset/FM_CHUNK)+1}/${chunks}）`,'info');
-   const j=await fmPostBinary('/star/fileUploadChunk?'+q+'&offset='+offset,f.slice(offset,end));
-   if(!j||j.code!==0){
-    console.warn('上传失败 '+f.name+'（offset='+offset+'）：'+((j&&j.message)||'未知错误'));
-    try{await api('/star/fileUploadAbort?path='+encodeURIComponent(dir)+'&id='+encodeURIComponent(id),{method:'POST'})}catch(e){}
-    return false;
-   }
-   offset=end;
-  }
-  return true;
- })();
+async function fmWalkEntry(entry,prefix,files,dirs){
+ if(!entry)return;
+ if(entry.isFile){
+  try{
+   const file=await new Promise((res,rej)=>entry.file(res,rej));
+   files.push({file,rel:prefix});
+  }catch(e){}
+  return;
+ }
+ if(!entry.isDirectory)return;
+ const rel=prefix?prefix+'/'+entry.name:entry.name;
+ dirs.add(rel);
+ let kids=[];
+ try{kids=await fmReadAllEntries(entry.createReader())}catch(e){}
+ for(const k of kids)await fmWalkEntry(k,rel,files,dirs);
 }
 
-// 二进制 POST（不走 api()：它会强制 JSON Content-Type）
-async function fmPostBinary(url,body){
- const h={'Content-Type':'application/octet-stream'};
- if(token)h['Authorization']='Bearer '+token;
- const r=await fetch(url,{method:'POST',body,headers:h});
- let j=null;try{j=await r.json()}catch(e){}
- if(r.status===401||(j&&j.code===401)){logout();throw new Error('登录已过期')}
- return j;
-}
-
-async function fmDownload(path){
+async function fmStartUpload(entries,dirs,dir){
+ entries=(entries||[]).filter(x=>x&&x.file);
+ dirs=dirs||new Set();
+ if(!dir){showToast('请先进入具体目录','error');return}
+ if(!entries.length&&!dirs.size){showToast('没有可上传的内容','error');return}
+ // 1) 先补齐目录树（保留空目录；已存在视为成功）
+ if(dirs.size){
+  try{
+   const r=await api('/star/fileMkdirs',{method:'POST',body:JSON.stringify({path:dir,dirs:[...dirs]})});
+   if(r.code!==0){showToast(r.message||'创建目录失败','error');return}
+  }catch(e){showToast('创建目录失败','error');return}
+ }
+ if(!entries.length){showToast(`已创建 ${dirs.size} 个文件夹`,'success');loadFileman();return}
+ const targets=entries.map(e=>{
+  const sub=fmJoinRel(dir,e.rel);
+  return {file:e.file,rel:e.rel,dir:sub,name:e.file.name,path:fmJoinName(sub,e.file.name)};
+ });
+ // 2) 同名预检：有冲突必须由用户确认；取消则一个字节都不发
+ let existing=[];
  try{
-  const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:token?{'Authorization':'Bearer '+token}:{}});
-  const ct=r.headers.get('content-type')||'';
-  if(!r.ok||ct.includes('application/json')){
-   let msg='下载失败';
-   try{const j=await r.json();msg=j.message||msg}catch(e){}
-   showToast(msg,'error');return;
+  const r=await api('/star/fileCheck',{method:'POST',body:JSON.stringify({paths:targets.map(t=>t.path)})});
+  existing=(r&&r.data&&r.data.existingPaths)||[];
+ }catch(e){}
+ if(!existing.length){fmUploadRun(targets,false);return}
+ const preview=existing.slice(0,10).map(p=>esc(p)).join('<br>')+(existing.length>10?`<br>…共 ${existing.length} 个`:'');
+ showModal('文件已存在',
+  `以下 <b>${existing.length}</b> 个文件已存在，继续将<b>覆盖</b>：<div class="text-muted" style="margin-top:8px;max-height:200px;overflow:auto;word-break:break-all">${preview}</div>`,
+  '确认覆盖',()=>fmUploadRun(targets,true));
+}
+
+async function fmUploadRun(targets,overwrite){
+ let ok=0,fail=0,firstErr='';
+ for(let i=0;i<targets.length;i++){
+  const t=targets[i];
+  const job=fmJobAdd('⬆ '+(t.rel?t.rel+'/':'')+t.name);
+  fmJobUpdate(job,{pct:0,status:`${i+1}/${targets.length} · 准备中`});
+  let r;
+  try{r=await fmUploadOne(t,overwrite,job)}
+  catch(e){r={ok:false,message:(e&&e.message)||'上传失败'}}
+  if(r&&r.ok){ok++;fmJobUpdate(job,{pct:100,status:'完成',onAction:null})}
+  else{
+   fail++;
+   firstErr=firstErr||((r&&r.message)||'上传失败');
+   fmJobUpdate(job,{status:'失败：'+((r&&r.message)||'上传失败'),onAction:()=>fmUploadRetry(t,overwrite,job)});
   }
-  const blob=await r.blob();
-  const name=path.split(/[\\/]/).pop()||'download';
-  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
-  document.body.appendChild(a);a.click();
-  setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
- }catch(e){showToast('下载失败','error')}
+ }
+ if(ok)showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个（可在任务面板续传）`:''}`,fail?'error':'success');
+ else if(fail)showToast(`上传失败 ${fail} 个：${firstErr}`,'error');
+ loadFileman();
+}
+async function fmUploadRetry(t,overwrite,job){
+ fmJobUpdate(job,{status:'重试中…',onAction:null});
+ let r;
+ try{r=await fmUploadOne(t,overwrite,job)}
+ catch(e){r={ok:false,message:(e&&e.message)||'上传失败'}}
+ if(r&&r.ok){fmJobUpdate(job,{pct:100,status:'完成（断点续传）'});loadFileman()}
+ else fmJobUpdate(job,{status:'失败：'+((r&&r.message)||'上传失败'),onAction:()=>fmUploadRetry(t,overwrite,job)});
+}
+async function fmUploadOne(t,overwrite,job){
+ const f=t.file;
+ if(!f.size)return await fmUploadEmpty(t);
+ if(f.size<=FM_CHUNK)return await fmUploadWhole(t,overwrite,job);
+ return await fmUploadChunked(t,overwrite,job);
+}
+// 0 字节文件：服务端拒收空请求体/空分片，改用在线写空内容
+async function fmUploadEmpty(t){
+ try{
+  const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path:t.path,content:''})});
+  return r.code===0?{ok:true}:{ok:false,message:r.message||'写入失败'};
+ }catch(e){return{ok:false,message:'网络错误'}}
+}
+// 小文件整块上传（带进度）
+function fmUploadWhole(t,overwrite,job){
+ return new Promise(resolve=>{
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(t.dir)+'&name='+encodeURIComponent(t.name)+'&overwrite='+(overwrite?1:0));
+  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+  const started=Date.now();
+  xhr.upload.onprogress=e=>{
+   if(!e.lengthComputable)return;
+   const pct=e.loaded/e.total*100;
+   fmJobUpdate(job,{pct,status:`${pct.toFixed(0)}% · ${fmtBytes(e.loaded)} / ${fmtBytes(e.total)} · ${fmRate(e.loaded,Date.now()-started)}`});
+  };
+  xhr.onload=()=>{
+   let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}
+   if(xhr.status===401||(j&&j.code===401)){logout();return resolve({ok:false,message:'登录已过期'})}
+   if(j&&j.code===0)return resolve({ok:true});
+   resolve({ok:false,message:(j&&j.message)||('HTTP '+xhr.status)});
+  };
+  xhr.onerror=()=>resolve({ok:false,message:'网络错误'});
+  xhr.onabort=()=>resolve({ok:false,message:'已取消'});
+  xhr.send(t.file);
+ });
+}
+/** 上传会话 ID：由「目录+文件名+大小+修改时间」定死 → 刷新/重试/重开页面都能接着传 */
+function fmUploadId(dir,name,size,mtime){
+ const s=dir+'|'+name+'|'+size+'|'+(mtime||0);
+ let h=2166136261>>>0,h2=5381;
+ for(let i=0;i<s.length;i++){
+  const c=s.charCodeAt(i);
+  h^=c;h=Math.imul(h,16777619)>>>0;
+  h2=((h2*33)^c)>>>0;
+ }
+ let id='u'+h.toString(36)+h2.toString(36);
+ if(id.length<8)id=(id+'00000000').slice(0,8);
+ return id.slice(0,64);
+}
+// 大文件分片上传（每片 8MB，断点续传：先查服务端已收字节，从断点继续）
+async function fmUploadChunked(t,overwrite,job){
+ const f=t.file;
+ const id=fmUploadId(t.dir,t.name,f.size,f.lastModified);
+ const q='path='+encodeURIComponent(t.dir)+'&name='+encodeURIComponent(t.name)+'&id='+encodeURIComponent(id);
+ const chunks=Math.max(1,Math.ceil(f.size/FM_CHUNK));
+ let offset=0;
+ try{
+  const st=await api('/star/fileUploadStatus?'+q);
+  if(st&&st.code===0)offset=st.data.received||0;
+ }catch(e){}
+ if(offset>f.size){
+  try{await api('/star/fileUploadAbort?'+q,{method:'POST'})}catch(e){}
+  offset=0;
+ }
+ if(offset>0)fmJobUpdate(job,{pct:offset/f.size*100,status:`断点续传：已有 ${fmtBytes(offset)} / ${fmtBytes(f.size)}`});
+ outer:
+ while(offset<f.size){
+  const start=offset;
+  const end=Math.min(start+FM_CHUNK,f.size);
+  const chunk=f.slice(start,end);
+  let lastErr='网络错误';
+  for(let attempt=1;attempt<=3;attempt++){
+   const started=Date.now();
+   const r=await fmPostBinaryProgress(
+    '/star/fileUploadChunk?'+q+'&offset='+start+'&total='+f.size+'&overwrite='+(overwrite?1:0),
+    chunk,
+    loaded=>{
+     const done=start+loaded;
+     const pct=done/f.size*100;
+     fmJobUpdate(job,{pct,status:`${pct.toFixed(0)}% · ${fmtBytes(done)} / ${fmtBytes(f.size)} · ${fmRate(done-start,Date.now()-started)}（分片 ${Math.floor(start/FM_CHUNK)+1}/${chunks}）`});
+    });
+   if(r&&r.code===0){offset=end;continue outer}
+   lastErr=(r&&r.message)||'网络错误';
+   if(/已存在/.test(lastErr))return{ok:false,message:lastErr};
+   // 响应丢失但服务端其实已收下：对齐已收字节后继续（真续传）
+   try{
+    const st=await api('/star/fileUploadStatus?'+q);
+    const got=st&&st.code===0?(st.data.received||0):start;
+    if(got>start){offset=Math.min(got,f.size);continue outer}
+   }catch(e){}
+   if(attempt<3)await fmSleep(500*attempt);
+  }
+  return{ok:false,message:lastErr};
+ }
+ return{ok:true};
+}
+// 二进制 POST（不走 api()：它会强制 JSON Content-Type），带上传进度
+function fmPostBinaryProgress(url,body,onProgress){
+ return new Promise(resolve=>{
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST',url);
+  xhr.setRequestHeader('Content-Type','application/octet-stream');
+  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+  if(onProgress&&xhr.upload)xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)};
+  xhr.onload=()=>{let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}resolve(j)};
+  xhr.onerror=()=>resolve(null);
+  xhr.onabort=()=>resolve(null);
+  xhr.send(body);
+ });
+}
+function fmSleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function fmRate(bytes,ms){if(!ms||ms<300)return '…';return fmtRate(bytes*1000/ms)}
+
+async function fmDownload(name){
+ const path=fmJoin(name);
+ const it=((fmData&&fmData.items)||[]).find(x=>x.name===name)||{};
+ try{
+  if(!(it.size>=FM_DL_RESUME_MIN)){await fmDownloadDirect(path,name);return}
+  await fmDownloadResume(path,name,it);
+ }catch(e){showToast((e&&e.message)||'下载失败','error')}
+}
+
+// 小文件：整块取回直接存盘（保持原有体验）
+async function fmDownloadDirect(path,name){
+ const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:token?{'Authorization':'Bearer '+token}:{}});
+ if(r.status===401){logout();return}
+ const ct=r.headers.get('content-type')||'';
+ if(!r.ok||ct.includes('application/json')){
+  let msg='下载失败';
+  try{const j=await r.json();msg=j.message||msg}catch(e){}
+  showToast(msg,'error');return;
+ }
+ fmSaveBlob(await r.blob(),name);
+}
+function fmSaveBlob(blob,name){
+ const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
+ document.body.appendChild(a);a.click();
+ setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
+}
+
+/** 大文件断点续传下载：Range 分片取回；有「另存为」句柄就直接落盘并支持跨次续传，否则内存兜底 */
+async function fmDownloadResume(path,name,it){
+ let handle=null;
+ if(window.showSaveFilePicker){
+  // 必须在用户手势内调用（此处尚未 await，仍在点击的激活期内）
+  try{handle=await window.showSaveFilePicker({suggestedName:name})}
+  catch(e){if(e&&e.name==='AbortError')return;handle=null}
+ }
+ const job=fmJobAdd('⬇ '+name);
+ const ctrl={cancelled:false};
+ fmJobUpdate(job,{status:'准备中',onCancel:()=>{ctrl.cancelled=true;fmJobUpdate(job,{status:'正在停止…'})}});
+ try{
+  if(handle)await fmDownloadToFile(handle,path,name,it,job,ctrl);
+  else await fmDownloadToMemory(path,name,it,job,ctrl);
+ }catch(e){
+  fmJobUpdate(job,{status:'失败：'+((e&&e.message)||e),onCancel:null,onAction:()=>fmDownloadResume(path,name,it)});
+  throw e;
+ }
+}
+/** 上次下载记录的源文件 ETag（判断续传目标是否还是同一个版本） */
+function fmDlEtagGet(path){try{return localStorage.getItem('fm_dl_etag:'+path)||''}catch(e){return ''}}
+function fmDlEtagSet(path,v){try{v?localStorage.setItem('fm_dl_etag:'+path,v):localStorage.removeItem('fm_dl_etag:'+path)}catch(e){}}
+
+async function fmDownloadToFile(handle,path,name,it,job,ctrl){
+ let offset=0;
+ try{offset=(await handle.getFile()).size}catch(e){offset=0}
+ const probe=await fmFetchRange(path,0,0,'',1);
+ let total=probe.total||it.size||0;
+ if(!total||offset>total)offset=0;
+ // 目标文件是上一次的残留，但源文件已换版本 → 不能续接
+ const stored=fmDlEtagGet(path);
+ if(offset>0&&stored&&probe.etag&&stored!==probe.etag)offset=0;
+ let etag=probe.etag||'';
+ const w=await handle.createWritable({keepExistingData:offset>0});
+ let done=offset;
+ try{
+  if(done>0)fmJobUpdate(job,{pct:done/total*100,status:`断点续传：已有 ${fmtBytes(done)} / ${fmtBytes(total)}`});
+  while(done<total){
+   if(ctrl.cancelled){
+    await w.close();
+    fmJobUpdate(job,{status:`已暂停（${fmtBytes(done)} / ${fmtBytes(total)}），重新点击下载可续传`,onCancel:null});
+    return;
+   }
+   const start=done;
+   const r=await fmFetchRange(path,start,Math.min(start+FM_DL_CHUNK,total)-1,etag,3);
+   if(r.total)total=r.total;
+   if(r.status===412){
+    await w.truncate(0);done=0;etag=r.etag||etag;fmDlEtagSet(path,etag);
+    fmJobUpdate(job,{pct:0,status:'源文件已更新，从头下载'});
+    continue;
+   }
+   if(r.status===200&&start>0){
+    // 服务端忽略了 Range（不应发生）：整文件已返回，直接整体重写
+    await w.truncate(0);
+    await w.write({type:'write',position:0,data:r.buf});
+    done=r.buf.length;total=r.buf.length;
+   }else{
+    await w.write({type:'write',position:start,data:r.buf});
+    done=start+r.buf.length;
+   }
+   if(etag)fmDlEtagSet(path,etag);
+   fmJobUpdate(job,{pct:total?done/total*100:0,status:`${fmtBytes(done)} / ${fmtBytes(total)}`});
+   if(!r.buf.length)break;
+  }
+  await w.close();
+  fmDlEtagSet(path,'');
+  fmJobUpdate(job,{pct:100,status:'完成',onCancel:null,onAction:null});
+  showToast('已保存：'+name,'success');
+ }catch(e){
+  try{await w.close()}catch(_){}
+  throw e;
+ }
+}
+
+async function fmDownloadToMemory(path,name,it,job,ctrl){
+ const probe=await fmFetchRange(path,0,0,'',1);
+ let total=probe.total||it.size||0;
+ let etag=probe.etag||'';
+ let parts=fmDlParts.get(path)||[];
+ let done=parts.reduce((a,b)=>a+b.size,0);
+ const meta=fmDlMeta.get(path);
+ if(!meta||meta.size!==total||done>total){parts=[];done=0}
+ fmDlParts.set(path,parts);
+ fmDlMeta.set(path,{size:total});
+ if(done>0)fmJobUpdate(job,{pct:done/total*100,status:`断点续传：已有 ${fmtBytes(done)} / ${fmtBytes(total)}`});
+ while(done<total){
+  if(ctrl.cancelled){
+   fmJobUpdate(job,{status:`已暂停（${fmtBytes(done)} / ${fmtBytes(total)}），重新点击下载可续传`,onCancel:null});
+   return;
+  }
+  const start=done;
+  const r=await fmFetchRange(path,start,Math.min(start+FM_DL_CHUNK,total)-1,etag,3);
+  if(r.total)total=r.total;
+  if(r.status===412){
+   parts=[];done=0;etag=r.etag||etag;
+   fmDlParts.set(path,parts);fmDlMeta.set(path,{size:total});
+   continue;
+  }
+  if(r.status===200&&start>0){parts=[];done=0;continue}
+  if(r.buf.length)parts.push(new Blob([r.buf]));
+  done=start+r.buf.length;
+  fmJobUpdate(job,{pct:total?done/total*100:0,status:`${fmtBytes(done)} / ${fmtBytes(total)}`});
+  if(!r.buf.length)break;
+ }
+ fmDlParts.delete(path);fmDlMeta.delete(path);
+ fmSaveBlob(new Blob(parts),name);
+ fmJobUpdate(job,{pct:100,status:'完成',onCancel:null,onAction:null});
+ showToast('已保存：'+name,'success');
+}
+
+/** Range 取一片；412 = 源文件已变（调用方负责从头重下）；网络/5xx 自动重试 */
+async function fmFetchRange(path,start,end,etag,retries){
+ const tries=retries||3;
+ let last=null;
+ for(let attempt=1;attempt<=tries;attempt++){
+  try{
+   const h={'Range':'bytes='+start+'-'+end};
+   if(etag)h['If-Range']=etag;
+   if(token)h['Authorization']='Bearer '+token;
+   const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:h});
+   if(r.status===401){logout();throw new Error('登录已过期')}
+   const ct=r.headers.get('content-type')||'';
+   const m=/\/(\d+)\s*$/.exec(r.headers.get('content-range')||'');
+   const out={status:r.status,total:m?+m[1]:0,etag:r.headers.get('etag')||'',buf:new Uint8Array(0)};
+   // 防呆：错误响应是 JSON，绝不能当文件内容写盘
+   if(ct.includes('application/json')){
+    if(r.status===412)return out;
+    let msg='下载失败';
+    try{const j=await r.json();msg=j.message||msg}catch(e){}
+    last=new Error(msg);
+    if(r.status<500)break;
+   }else if(r.status===200||r.status===206){
+    out.buf=new Uint8Array(await r.arrayBuffer());
+    if(r.status===200)out.total=out.buf.length;
+    return out;
+   }else{
+    last=new Error('下载失败（HTTP '+r.status+'）');
+    if(r.status<500)break;
+   }
+  }catch(e){last=e}
+  if(attempt<tries)await fmSleep(500*attempt);
+ }
+ throw last||new Error('下载失败');
 }
 
 function fmDelete(names){
@@ -3619,7 +4051,7 @@ window.matchMedia('(prefers-color-scheme:dark)').addEventListener('change',()=>{
 function installDropUpload(){
  if(document._dropUploadInstalled) return;
  document._dropUploadInstalled = true;
- const cards = () => Array.from(document.querySelectorAll('.card, .card2')).filter(c => c.querySelector('input[type=file]'));
+ const cards = () => Array.from(document.querySelectorAll('.card, .card2')).filter(c => !c.dataset.fmDrop && c.querySelector('input[type=file]'));
  const cardOf = e => (e.target && e.target.closest) ? e.target.closest('.card, .card2') : null;
  const inputOf = c => c ? c.querySelector('input[type=file]') : null;
  const clearCandidates = () => document.querySelectorAll('.drop-candidate').forEach(c => c.classList.remove('drop-candidate'));
@@ -3635,16 +4067,16 @@ function installDropUpload(){
  document.addEventListener('dragenter', e => {
   const hasFile = !!(e.dataTransfer && Array.from(e.dataTransfer.types || []).includes('Files'));
   if(hasFile){ ensureHints(); cards().forEach(c => c.classList.add('drop-candidate')); }
-  const c = cardOf(e); if(c && inputOf(c)) c.classList.add('drop-active');
+  const c = cardOf(e); if(c && !c.dataset.fmDrop && inputOf(c)) c.classList.add('drop-active');
  }, true);
- document.addEventListener('dragover', e => { const c = cardOf(e); if(c && inputOf(c)){ e.preventDefault(); e.stopPropagation(); if(e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; } }, true);
+ document.addEventListener('dragover', e => { const c = cardOf(e); if(c && !c.dataset.fmDrop && inputOf(c)){ e.preventDefault(); e.stopPropagation(); if(e.dataTransfer) e.dataTransfer.dropEffect = 'copy'; } }, true);
  document.addEventListener('dragleave', e => {
   if(e.relatedTarget === null){ clearCandidates(); return; }
   const c = cardOf(e); if(c && !c.contains(e.relatedTarget)) c.classList.remove('drop-active');
  }, true);
  document.addEventListener('drop', e => {
   clearCandidates();
-  const c = cardOf(e); if(!c) return;
+  const c = cardOf(e); if(!c || c.dataset.fmDrop) return;
   const input = inputOf(c); if(!input) return;
   e.preventDefault(); e.stopPropagation();
   c.classList.remove('drop-active');
