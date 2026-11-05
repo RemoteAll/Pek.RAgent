@@ -315,6 +315,13 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             include_bytes!("../web/app.js"),
             "application/javascript; charset=utf-8",
         )
+        // 文件管理传输内核：与 Pek.RPanlServer 共用 dhrust 里的同一份实现
+        // （分片断点上传 / Range 断点续传下载 / 传输任务面板 / 分批提交 / 剪贴板模型）
+        .embed(
+            "/assets/fm-transport.js",
+            dhrust::assets::FM_TRANSPORT_JS.as_bytes(),
+            "application/javascript; charset=utf-8",
+        )
         .embed(
             "/assets/xterm.js",
             include_bytes!("../res/web/xterm.js"),

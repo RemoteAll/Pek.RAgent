@@ -11,7 +11,6 @@
 //! - 在线编辑上限 10MB（二进制拒读），大文件请用下载或 SFTP。
 
 use std::fs;
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use dhrust::net::controller::{ActionResult, arg, json_body, json_error, json_result};
@@ -27,19 +26,11 @@ use crate::webpanel::WebPanel;
 // ————— 业务实现（下沉 dhrust::fileman；本模块只保留面板 HTTP 适配层） —————
 
 pub(crate) use dhrust::fileman::{
-    MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, chmod, compress_zip, copy_recursive, dir_or_file_stats,
-    ensure_modifiable, file_label, list_dir, percent_encode, quick_roots, remove_path,
-    resolve_path, search_dir, size_recursive, validate_name,
+    ByteRange, MAX_DOWNLOAD_SIZE, MAX_EDIT_SIZE, MAX_FOLDER_DIRS, MAX_PANEL_BATCH, chmod,
+    compress_zip, create_dirs, ensure_modifiable, file_etag, file_label, if_range_matches, list_dir,
+    parse_byte_range, quick_roots, read_range, remove_path, resolve_path, search_dir,
+    size_recursive, transfer_many, validate_name,
 };
-
-/// 面板批量文件操作（复制/移动/删除/压缩）单次上限。
-///
-/// dhrust 的 `MAX_BATCH`（100）是库层保守值，面板批量勾选动辄上百项，
-/// 故面板层放宽到 5000（前端还会按 500 分批提交，超大选择也不会被拒）。
-const MAX_PANEL_BATCH: usize = 5_000;
-
-/// 批量建目录单次上限（拖拽整棵文件夹树时一次补齐）。
-const MAX_FOLDER_DIRS: usize = 2_000;
 
 // ————— 动作：浏览 / 读写 —————
 
@@ -286,34 +277,14 @@ pub fn file_mkdirs(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if list.len() > MAX_FOLDER_DIRS {
         return json_error(400, &format!("单次最多创建 {MAX_FOLDER_DIRS} 个目录"));
     }
-    let mut created = 0u64;
+    let mut rels: Vec<String> = Vec::with_capacity(list.len());
     for item in list {
-        let rel = item.as_str().unwrap_or_default();
-        let mut dst = root.clone();
-        let mut has_segment = false;
-        for seg in rel.split(['/', '\\']) {
-            let seg = seg.trim();
-            if seg.is_empty() {
-                continue;
-            }
-            // 盘符/ADS（`C:`、`a:stream`）会让 push 跳出根目录，必须先拦
-            if seg.contains(':') {
-                return json_error(400, "目录名不能包含冒号");
-            }
-            if let Err(e) = validate_name(seg) {
-                return json_error(400, &e);
-            }
-            dst.push(seg);
-            has_segment = true;
-        }
-        if !has_segment {
-            continue;
-        }
-        if let Err(e) = fs::create_dir_all(&dst) {
-            return json_error(500, &format!("创建目录失败（{}）：{e}", dst.display()));
-        }
-        created += 1;
+        rels.push(item.as_str().unwrap_or_default().to_string());
     }
+    let created = match create_dirs(&root, &rels) {
+        Ok(n) => n,
+        Err(e) => return json_error(400, &e),
+    };
     util::log_format(
         "文件管理：批量建目录 {} 项（根：{}）",
         &[&created.to_string(), &root.display().to_string()],
@@ -455,84 +426,35 @@ fn transfer(panel: &WebPanel, ctx: &Ctx, copy: bool) -> ActionResult {
         Ok(p) => p,
         Err(e) => return json_error(400, &e),
     };
-    if !target.is_dir() {
-        return json_error(404, &format!("目标目录不存在：{}", target.display()));
-    }
-    // 预检
     for p in &paths {
         if let Err(e) = ensure_modifiable(p, &base) {
             return json_error(400, &e);
         }
-        if !p.exists() && fs::symlink_metadata(p).is_err() {
-            return json_error(404, &format!("不存在：{}", p.display()));
-        }
-        let dst = target.join(file_label(p));
-        // 先判“同一目录”（粘贴到源目录本身）：此前用 `p.starts_with(&target)` 会把
-        // “复制到上一级/同目录”统统误报成“目标在选中项内部”。
-        if dst == *p {
-            return json_error(400, "目标目录与源目录相同，无需粘贴");
-        }
-        if target.starts_with(p) {
-            return json_error(
-                400,
-                if copy {
-                    "目标目录在选中项内部，无法复制"
-                } else {
-                    "目标目录在选中项内部，无法移动"
-                },
+    }
+    // 预检（同目录/自嵌套/同名）与跨卷退化都在 dhrust::fileman::transfer_many 里，
+    // 与 Pek.RPanlServer 共用同一份规则。
+    match transfer_many(&paths, &target, copy) {
+        Ok((files, bytes)) => {
+            util::log_format(
+                "文件管理：{} {} 项到 {}",
+                &[
+                    if copy { "复制" } else { "移动" },
+                    &paths.len().to_string(),
+                    &target.display().to_string(),
+                ],
             );
+            json_result(
+                0,
+                &format!(
+                    "已{} {} 项",
+                    if copy { "复制" } else { "移动" },
+                    paths.len()
+                ),
+                Some(json!({ "files": files, "bytes": bytes })),
+            )
         }
-        if dst.exists() {
-            return json_error(400, &format!("目标已存在：{}", dst.display()));
-        }
+        Err(e) => json_error(400, &e),
     }
-    let mut files = 0u64;
-    let mut bytes = 0u64;
-    for p in &paths {
-        let dst = target.join(file_label(p));
-        // 统计须在移动前取（rename 后源路径已不存在）
-        let stats = dir_or_file_stats(p);
-        if copy {
-            match copy_recursive(p, &dst) {
-                Ok((f, b)) => {
-                    files += f;
-                    bytes += b;
-                }
-                Err(e) => return json_error(500, &e),
-            }
-        } else {
-            // 先尝试原子改名；跨卷失败退化为复制 + 删除
-            if fs::rename(p, &dst).is_err() {
-                match copy_recursive(p, &dst).and_then(|(f, b)| remove_path(p).map(|_| (f, b))) {
-                    Ok((f, b)) => {
-                        files += f;
-                        bytes += b;
-                    }
-                    Err(e) => return json_error(500, &e),
-                }
-            } else {
-                files += stats.0;
-                bytes += stats.1;
-            }
-        }
-    }
-    util::log_format(
-        "文件管理：{} {} 项到 {}",
-        &[
-            if copy { "复制" } else { "移动" },
-            &paths.len().to_string(),
-            &target.display().to_string(),
-        ],
-    );
-    json_result(
-        0,
-        &format!(
-            "已{} {} 项",
-            if copy { "复制" } else { "移动" },
-            paths.len()
-        ),
-        Some(json!({ "files": files, "bytes": bytes })),
-    )
 }
 
 // ————— 动作：上传 / 下载 / 压缩 / 解压 / 权限 / 搜索 —————
@@ -630,18 +552,16 @@ pub fn file_check(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         .and_then(|v| v.as_str())
         .unwrap_or_default()
         .to_string();
-    let mut existing: Vec<String> = Vec::new();
-    let mut existing_paths: Vec<String> = Vec::new();
+    let mut hits: Vec<String> = Vec::new();
+    let mut hit_paths: Vec<String> = Vec::new();
     // `paths` 模式：文件夹上传时前端把每个目标文件的绝对路径一并送来
     if let Some(list) = body.get("paths").and_then(|v| v.as_array()) {
-        for item in list.iter().take(MAX_FOLDER_DIRS * 5) {
-            let Some(text) = item.as_str() else { continue };
-            if let Ok(p) = resolve_path(panel.base(), text)
-                && p.exists()
-            {
-                existing_paths.push(text.to_string());
-            }
-        }
+        let raw: Vec<String> = list
+            .iter()
+            .take(MAX_FOLDER_DIRS * 5)
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        hit_paths = dhrust::fileman::existing_paths(&panel.base(), &raw);
     }
     if !dir_text.trim().is_empty() || body.get("names").is_some() {
         let dir = match resolve_path(panel.base(), &dir_text) {
@@ -652,19 +572,17 @@ pub fn file_check(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             return json_error(404, &format!("目录不存在：{}", dir.display()));
         }
         if let Some(list) = body.get("names").and_then(|v| v.as_array()) {
-            for item in list {
-                let Some(name) = item.as_str() else { continue };
-                let name = name.trim();
-                if validate_name(name).is_ok() && dir.join(name).exists() {
-                    existing.push(name.to_string());
-                }
-            }
+            let raw: Vec<String> = list
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect();
+            hits = dhrust::fileman::existing_in(&dir, &raw);
         }
     }
     json_result(
         0,
         "",
-        Some(json!({ "existing": existing, "existingPaths": existing_paths })),
+        Some(json!({ "existing": hits, "existingPaths": hit_paths })),
     )
 }
 
@@ -781,17 +699,14 @@ pub fn file_download(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return download_error(400, "目标是目录，无法下载（可先压缩）");
     }
     let total = md.len();
-    let etag = download_etag(&md);
+    let etag = file_etag(&md);
     // 断点续传时前端会带 If-Range；文件已被改动则拒绝续传（412 → 前端从 0 重下）
-    if let Some(sent) = ctx.req.header("if-range").map(str::trim)
-        && sent.starts_with('"')
-        && sent != etag
-    {
+    if !if_range_matches(ctx.req.header("if-range"), &etag) {
         return download_error(412, "源文件已更新，请重新下载");
     }
     let (status, start, end) = match parse_byte_range(ctx.req.header("range"), total) {
-        RangeSpec::Valid(s, e) => (206u16, s, e),
-        RangeSpec::Unsatisfiable => {
+        ByteRange::Valid(s, e) => (206u16, s, e),
+        ByteRange::Unsatisfiable => {
             let body = json!({ "code": 416, "message": "请求的区间超出文件大小" }).to_string();
             return ActionResult::Response(
                 HttpResponse::bytes(416, "application/json; charset=utf-8", body)
@@ -799,7 +714,7 @@ pub fn file_download(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                     .with_header("Accept-Ranges", "bytes"),
             );
         }
-        RangeSpec::None => {
+        ByteRange::None => {
             if total > MAX_DOWNLOAD_SIZE {
                 return download_error(
                     400,
@@ -818,21 +733,7 @@ pub fn file_download(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         Err(e) => return download_error(500, &format!("读取文件失败：{e}")),
     };
     let name = file_label(&path);
-    let ascii: String = name
-        .chars()
-        .map(|c| {
-            if c.is_ascii() && c != '"' && c != '\\' {
-                c
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let disposition = format!(
-        "attachment; filename=\"{}\"; filename*=UTF-8''{}",
-        ascii,
-        percent_encode(&name)
-    );
+    let disposition = dhrust::fileman::content_disposition(&name);
     // 分片下载只在最后一片记一条日志，避免大文件续传刷屏
     if status == 200 || end + 1 >= total {
         util::log_format(
@@ -855,69 +756,6 @@ pub fn file_download(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     ActionResult::Response(resp)
 }
 
-/// `Range` 头解析结果。
-enum RangeSpec {
-    /// 没有 `Range`（或不支持的多区间，按整文件处理）
-    None,
-    /// 有效区间（含首尾字节）
-    Valid(u64, u64),
-    /// 区间越界 → 416
-    Unsatisfiable,
-}
-
-/// 解析单区间 `Range: bytes=start-end | start- | -suffix`。
-///
-/// 多区间（含 `,`）、未知单位一律按「无 Range」处理（返回整文件），
-/// 这样下载器/浏览器都能正常工作，只是不享受分段收益。
-fn parse_byte_range(header: Option<&str>, total: u64) -> RangeSpec {
-    let Some(raw) = header else {
-        return RangeSpec::None;
-    };
-    let raw = raw.trim();
-    let Some((unit, spec)) = raw.split_once('=') else {
-        return RangeSpec::None;
-    };
-    if !unit.trim().eq_ignore_ascii_case("bytes") {
-        return RangeSpec::None;
-    }
-    let spec = spec.trim();
-    if spec.contains(',') {
-        return RangeSpec::None;
-    }
-    let Some((head, tail)) = spec.split_once('-') else {
-        return RangeSpec::None;
-    };
-    let (head, tail) = (head.trim(), tail.trim());
-    if head.is_empty() {
-        // `-N`：最后 N 字节
-        let Ok(n) = tail.parse::<u64>() else {
-            return RangeSpec::None;
-        };
-        if n == 0 || total == 0 {
-            return RangeSpec::Unsatisfiable;
-        }
-        return RangeSpec::Valid(total.saturating_sub(n), total - 1);
-    }
-    let Ok(start) = head.parse::<u64>() else {
-        return RangeSpec::None;
-    };
-    if start >= total {
-        return RangeSpec::Unsatisfiable;
-    }
-    let end = if tail.is_empty() {
-        total - 1
-    } else {
-        match tail.parse::<u64>() {
-            Ok(v) => v.min(total - 1),
-            Err(_) => return RangeSpec::None,
-        }
-    };
-    if end < start {
-        return RangeSpec::Unsatisfiable;
-    }
-    RangeSpec::Valid(start, end)
-}
-
 /// 下载接口的错误响应：**真正的 HTTP 状态码** + JSON 体。
 ///
 /// 与其它动作（HTTP 200 + body 内 `code`）不同——下载是二进制通道，
@@ -925,29 +763,6 @@ fn parse_byte_range(header: Option<&str>, total: u64) -> RangeSpec {
 fn download_error(status: u16, message: &str) -> ActionResult {
     let body = json!({ "code": status, "message": message }).to_string();
     ActionResult::Response(HttpResponse::json(status, body))
-}
-
-/// 下载用的强校验标识（长度 + 修改时间纳秒）。
-fn download_etag(md: &fs::Metadata) -> String {
-    let mtime = md
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    format!("\"{:x}-{:x}\"", md.len(), mtime)
-}
-
-/// 只读取指定区间（不整文件进内存；`len` 已由调用方限制在 256MB 内）。
-fn read_range(path: &Path, start: u64, len: u64) -> std::io::Result<Vec<u8>> {
-    if len == 0 {
-        return Ok(Vec::new());
-    }
-    let mut file = fs::File::open(path)?;
-    file.seek(SeekFrom::Start(start))?;
-    let mut buf = vec![0u8; len as usize];
-    file.read_exact(&mut buf)?;
-    Ok(buf)
 }
 
 /// `POST /star/fileCompress`：压缩（`{paths: [], target: 目标目录, name: 压缩包名}`）。
@@ -1179,22 +994,7 @@ pub fn file_dir_size(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 mod tests {
     use super::*;
     // 仅测试使用的下沉能力（面板 handler 不直接调用）
-    use dhrust::fileman::{dir_stats, is_protected};
-
-    impl RangeSpec {
-        fn range(&self) -> Option<(u64, u64)> {
-            match self {
-                RangeSpec::Valid(a, b) => Some((*a, *b)),
-                _ => None,
-            }
-        }
-        fn is_full(&self) -> bool {
-            matches!(self, RangeSpec::None)
-        }
-        fn unsatisfiable(&self) -> bool {
-            matches!(self, RangeSpec::Unsatisfiable)
-        }
-    }
+    use dhrust::fileman::{copy_recursive, dir_stats, is_protected, percent_encode};
 
     /// 独立临时目录。
     fn temp_dir(tag: &str) -> PathBuf {
@@ -1226,33 +1026,30 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// Range 解析/区间读取已下沉 `dhrust::fileman`（库内已有完整用例），
+    /// 这里只核对面板下载分支依赖的几种取值。
     #[test]
-    fn parses_single_byte_ranges() {
-        assert!(parse_byte_range(None, 100).is_full());
-        assert_eq!(parse_byte_range(Some("bytes=10-19"), 100).range(), Some((10, 19)));
-        // 结尾越界自动夹到文件尾
-        assert_eq!(parse_byte_range(Some("bytes=90-999"), 100).range(), Some((90, 99)));
-        // 开放尾区间
-        assert_eq!(parse_byte_range(Some("bytes=50-"), 100).range(), Some((50, 99)));
-        // 后缀区间
-        assert_eq!(parse_byte_range(Some("bytes=-10"), 100).range(), Some((90, 99)));
-        // 起点越界 → 416
-        assert_eq!(parse_byte_range(Some("bytes=100-"), 100).range(), None);
-        assert!(parse_byte_range(Some("bytes=100-"), 100).unsatisfiable());
-        // 多区间/未知单位 → 整文件
-        assert_eq!(parse_byte_range(Some("bytes=0-1,5-9"), 100).range(), None);
-        assert!(parse_byte_range(Some("items=0-1"), 100).is_full());
-        // 空文件任何区间都不满足
-        assert!(parse_byte_range(Some("bytes=0-"), 0).unsatisfiable());
-    }
-
-    #[test]
-    fn reads_only_requested_range() {
+    fn byte_range_variants_cover_download_branches() {
+        assert_eq!(parse_byte_range(None, 100), ByteRange::None);
+        assert_eq!(
+            parse_byte_range(Some("bytes=10-19"), 100),
+            ByteRange::Valid(10, 19)
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=100-"), 100),
+            ByteRange::Unsatisfiable
+        );
+        assert_eq!(
+            parse_byte_range(Some("bytes=0-1,5-9"), 100),
+            ByteRange::None
+        );
+        assert!(if_range_matches(Some("\"stale\""), "\"fresh\"") == false);
+        assert!(if_range_matches(None, "\"fresh\""));
         let dir = temp_dir("range");
         let file = dir.join("a.bin");
         fs::write(&file, b"0123456789").unwrap();
         assert_eq!(read_range(&file, 3, 4).unwrap(), b"3456");
-        assert_eq!(read_range(&file, 10, 0).unwrap(), Vec::<u8>::new());
+        assert!(read_range(&file, 10, 0).unwrap().is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -2632,42 +2632,31 @@ function fmPrompt(title,labelHtml,value,okText,cb){
  setTimeout(()=>{const el=$('fm-prompt-input');if(el){el.focus();el.select()}},50);
 }
 
-// 分片上传片大小（服务端按片收，内存不随文件大小增长）
-const FM_CHUNK=8*1024*1024;
-// 分片下载片大小；≥32MB 的文件走 Range 分片，可断点续传
-const FM_DL_CHUNK=8*1024*1024;
-const FM_DL_RESUME_MIN=32*1024*1024;
-const fmDlParts=new Map(); // 无「另存为」能力时的内存兜底：路径 → Blob[]
-const fmDlMeta=new Map();  // 下载断点元信息：路径 → {size}
+// 片大小 / 断点阈值 / 内存兜底缓存都由 FmClient.constants 统一提供（见 fm-transport.js）
 
-/* ── 传输任务面板（上传/下载进度、取消、续传） ── */
-let fmJobs=[];
-function fmJobAdd(title){
- const job={title,pct:0,status:'准备中',onAction:null,onCancel:null};
- fmJobs.push(job);
- if(fmJobs.length>40)fmJobs=fmJobs.slice(-40);
- fmJobRender();
- return job;
-}
-function fmJobUpdate(job,patch){if(!job)return;Object.assign(job,patch||{});fmJobRender()}
-function fmJobAct(i){const j=fmJobs[i];if(j&&j.onAction)j.onAction()}
-function fmJobCancel(i){const j=fmJobs[i];if(j&&j.onCancel)j.onCancel()}
-function fmJobsClear(){fmJobs=[];fmJobRender()}
-function fmJobRender(){
- let box=$('fm-jobs');
- if(!fmJobs.length){if(box)box.remove();return}
- if(!box){
-  box=document.createElement('div');box.id='fm-jobs';box.className='fm-jobs';
-  document.body.appendChild(box);
- }
- const running=fmJobs.filter(j=>!(j.pct>=100)).length;
- box.innerHTML=`<div class="fm-jobs-head"><span>传输任务${running?`（${running} 进行中）`:''}</span><button class="fm-icon-btn" title="清空列表" onclick="fmJobsClear()">✕</button></div>`
-  +fmJobs.map((j,i)=>`<div class="fm-job">
-   <div class="fm-job-title" title="${escAttr(j.title)}">${esc(j.title)}</div>
-   <div class="fm-job-bar"><i style="width:${Math.max(0,Math.min(100,j.pct||0)).toFixed(1)}%"></i></div>
-   <div class="fm-job-meta"><span title="${escAttr(j.status||'')}">${esc(j.status||'')}</span><span style="white-space:nowrap">${j.onAction?`<button class="fm-link-btn" onclick="fmJobAct(${i})">续传</button>`:''}${j.onCancel?`<button class="fm-link-btn" onclick="fmJobCancel(${i})">取消</button>`:''}</span></div>
-  </div>`).join('');
-}
+/* ── 传输任务面板（上传/下载进度、取消、续传） ──
+ * 实现下沉 dhrust 共享资产 web/fm-transport.js（与 Pek.RPanlServer 同一份） */
+const fmJobApi = FmClient.jobs;
+function fmJobAdd(title){return fmJobApi.add(title)}
+function fmJobUpdate(job,patch){fmJobApi.update(job,patch)}
+function fmJobAct(i){fmJobApi.act(i)}
+function fmJobCancel(i){fmJobApi.cancel(i)}
+function fmJobsClear(){fmJobApi.clear()}
+function fmJobRender(){fmJobApi.render()}
+
+/* ── 文件管理传输内核接线（分片断点上传 / Range 断点下载 / 分批提交 / 剪贴板模型） ── */
+FmClient.configure({
+ api: (path,opt)=>api(path,opt),
+ token: ()=>token,
+ onAuthFail: ()=>logout(),
+ join: (dir,name)=>fmJoinName(dir,name),
+ joinRel: (dir,rel)=>fmJoinRel(dir,rel),
+ bytes: fmtBytes,
+ toast: (msg,err)=>showToast(msg, err?'error':'success'),
+ esc: escAttr,
+ onUploadDone: ()=>loadFileman(),
+ storagePrefix: 'fm',
+});
 
 /* ── 路径拼接（Windows 反斜杠 / Unix 斜杠自适应） ── */
 function fmSep(p){const s=String(p||'');return (s.includes('\\')&&!s.includes('/'))?'\\':'/'}
@@ -2752,34 +2741,9 @@ async function fmDropHandle(e,dir){
  for(const en of entries)await fmWalkEntry(en,'',files,dirs);
  fmStartUpload(files,dirs,dir);
 }
-/** readEntries 每次最多返回 100 条，必须循环读到空数组 */
-function fmReadAllEntries(reader){
- return new Promise((resolve,reject)=>{
-  const all=[];
-  const step=()=>reader.readEntries(batch=>{
-   if(!batch||!batch.length){resolve(all);return}
-   for(const b of batch)all.push(b);
-   step();
-  },reject);
-  step();
- });
-}
-async function fmWalkEntry(entry,prefix,files,dirs){
- if(!entry)return;
- if(entry.isFile){
-  try{
-   const file=await new Promise((res,rej)=>entry.file(res,rej));
-   files.push({file,rel:prefix});
-  }catch(e){}
-  return;
- }
- if(!entry.isDirectory)return;
- const rel=prefix?prefix+'/'+entry.name:entry.name;
- dirs.add(rel);
- let kids=[];
- try{kids=await fmReadAllEntries(entry.createReader())}catch(e){}
- for(const k of kids)await fmWalkEntry(k,rel,files,dirs);
-}
+/* readEntries 每次最多返回 100 条，必须循环读到空数组（实现见 fm-transport.js） */
+function fmReadAllEntries(reader){return FmClient.readAllEntries(reader)}
+async function fmWalkEntry(entry,prefix,files,dirs){return FmClient.walkEntry(entry,prefix,files,dirs)}
 
 async function fmStartUpload(entries,dirs,dir){
  entries=(entries||[]).filter(x=>x&&x.file);
@@ -2812,317 +2776,26 @@ async function fmStartUpload(entries,dirs,dir){
 }
 
 async function fmUploadRun(targets,overwrite){
- let ok=0,fail=0,firstErr='';
- for(let i=0;i<targets.length;i++){
-  const t=targets[i];
-  const job=fmJobAdd('⬆ '+(t.rel?t.rel+'/':'')+t.name);
-  fmJobUpdate(job,{pct:0,status:`${i+1}/${targets.length} · 准备中`});
-  let r;
-  try{r=await fmUploadOne(t,overwrite,job)}
-  catch(e){r={ok:false,message:(e&&e.message)||'上传失败'}}
-  if(r&&r.ok){ok++;fmJobUpdate(job,{pct:100,status:'完成',onAction:null})}
-  else{
-   fail++;
-   firstErr=firstErr||((r&&r.message)||'上传失败');
-   fmJobUpdate(job,{status:'失败：'+((r&&r.message)||'上传失败'),onAction:()=>fmUploadRetry(t,overwrite,job)});
-  }
- }
- if(ok)showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个（可在任务面板续传）`:''}`,fail?'error':'success');
- else if(fail)showToast(`上传失败 ${fail} 个：${firstErr}`,'error');
- loadFileman();
+ // 目录树与同名覆盖确认已在 fmStartUpload 完成，这里交给共享内核逐文件传（分片/续传/重试全在里面）
+ targets.forEach(t=>{t.overwrite=overwrite});
+ return FmClient.uploadAll(targets,[],(fmData&&fmData.path)||'');
 }
-async function fmUploadRetry(t,overwrite,job){
- fmJobUpdate(job,{status:'重试中…',onAction:null});
- let r;
- try{r=await fmUploadOne(t,overwrite,job)}
- catch(e){r={ok:false,message:(e&&e.message)||'上传失败'}}
- if(r&&r.ok){fmJobUpdate(job,{pct:100,status:'完成（断点续传）'});loadFileman()}
- else fmJobUpdate(job,{status:'失败：'+((r&&r.message)||'上传失败'),onAction:()=>fmUploadRetry(t,overwrite,job)});
-}
-async function fmUploadOne(t,overwrite,job){
- const f=t.file;
- if(!f.size)return await fmUploadEmpty(t);
- if(f.size<=FM_CHUNK)return await fmUploadWhole(t,overwrite,job);
- return await fmUploadChunked(t,overwrite,job);
-}
-// 0 字节文件：服务端拒收空请求体/空分片，改用在线写空内容
-async function fmUploadEmpty(t){
- try{
-  const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path:t.path,content:''})});
-  return r.code===0?{ok:true}:{ok:false,message:r.message||'写入失败'};
- }catch(e){return{ok:false,message:'网络错误'}}
-}
-// 小文件整块上传（带进度）
-function fmUploadWhole(t,overwrite,job){
- return new Promise(resolve=>{
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(t.dir)+'&name='+encodeURIComponent(t.name)+'&overwrite='+(overwrite?1:0));
-  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
-  const started=Date.now();
-  xhr.upload.onprogress=e=>{
-   if(!e.lengthComputable)return;
-   const pct=e.loaded/e.total*100;
-   fmJobUpdate(job,{pct,status:`${pct.toFixed(0)}% · ${fmtBytes(e.loaded)} / ${fmtBytes(e.total)} · ${fmRate(e.loaded,Date.now()-started)}`});
-  };
-  xhr.onload=()=>{
-   let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}
-   if(xhr.status===401||(j&&j.code===401)){logout();return resolve({ok:false,message:'登录已过期'})}
-   if(j&&j.code===0)return resolve({ok:true});
-   resolve({ok:false,message:(j&&j.message)||('HTTP '+xhr.status)});
-  };
-  xhr.onerror=()=>resolve({ok:false,message:'网络错误'});
-  xhr.onabort=()=>resolve({ok:false,message:'已取消'});
-  xhr.send(t.file);
- });
-}
-/** 上传会话 ID：由「目录+文件名+大小+修改时间」定死 → 刷新/重试/重开页面都能接着传 */
-function fmUploadId(dir,name,size,mtime){
- const s=dir+'|'+name+'|'+size+'|'+(mtime||0);
- let h=2166136261>>>0,h2=5381;
- for(let i=0;i<s.length;i++){
-  const c=s.charCodeAt(i);
-  h^=c;h=Math.imul(h,16777619)>>>0;
-  h2=((h2*33)^c)>>>0;
- }
- let id='u'+h.toString(36)+h2.toString(36);
- if(id.length<8)id=(id+'00000000').slice(0,8);
- return id.slice(0,64);
-}
-// 大文件分片上传（每片 8MB，断点续传：先查服务端已收字节，从断点继续）
-async function fmUploadChunked(t,overwrite,job){
- const f=t.file;
- const id=fmUploadId(t.dir,t.name,f.size,f.lastModified);
- const q='path='+encodeURIComponent(t.dir)+'&name='+encodeURIComponent(t.name)+'&id='+encodeURIComponent(id);
- const chunks=Math.max(1,Math.ceil(f.size/FM_CHUNK));
- let offset=0;
- try{
-  const st=await api('/star/fileUploadStatus?'+q);
-  if(st&&st.code===0)offset=st.data.received||0;
- }catch(e){}
- if(offset>f.size){
-  try{await api('/star/fileUploadAbort?'+q,{method:'POST'})}catch(e){}
-  offset=0;
- }
- if(offset>0)fmJobUpdate(job,{pct:offset/f.size*100,status:`断点续传：已有 ${fmtBytes(offset)} / ${fmtBytes(f.size)}`});
- outer:
- while(offset<f.size){
-  const start=offset;
-  const end=Math.min(start+FM_CHUNK,f.size);
-  const chunk=f.slice(start,end);
-  let lastErr='网络错误';
-  for(let attempt=1;attempt<=3;attempt++){
-   const started=Date.now();
-   const r=await fmPostBinaryProgress(
-    '/star/fileUploadChunk?'+q+'&offset='+start+'&total='+f.size+'&overwrite='+(overwrite?1:0),
-    chunk,
-    loaded=>{
-     const done=start+loaded;
-     const pct=done/f.size*100;
-     fmJobUpdate(job,{pct,status:`${pct.toFixed(0)}% · ${fmtBytes(done)} / ${fmtBytes(f.size)} · ${fmRate(done-start,Date.now()-started)}（分片 ${Math.floor(start/FM_CHUNK)+1}/${chunks}）`});
-    });
-   if(r&&r.code===0){offset=end;continue outer}
-   lastErr=(r&&r.message)||'网络错误';
-   if(/已存在/.test(lastErr))return{ok:false,message:lastErr};
-   // 响应丢失但服务端其实已收下：对齐已收字节后继续（真续传）
-   try{
-    const st=await api('/star/fileUploadStatus?'+q);
-    const got=st&&st.code===0?(st.data.received||0):start;
-    if(got>start){offset=Math.min(got,f.size);continue outer}
-   }catch(e){}
-   if(attempt<3)await fmSleep(500*attempt);
-  }
-  return{ok:false,message:lastErr};
- }
- return{ok:true};
-}
-// 二进制 POST（不走 api()：它会强制 JSON Content-Type），带上传进度
-function fmPostBinaryProgress(url,body,onProgress){
- return new Promise(resolve=>{
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST',url);
-  xhr.setRequestHeader('Content-Type','application/octet-stream');
-  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
-  if(onProgress&&xhr.upload)xhr.upload.onprogress=e=>{if(e.lengthComputable)onProgress(e.loaded)};
-  xhr.onload=()=>{let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}resolve(j)};
-  xhr.onerror=()=>resolve(null);
-  xhr.onabort=()=>resolve(null);
-  xhr.send(body);
- });
-}
-function fmSleep(ms){return new Promise(r=>setTimeout(r,ms))}
-function fmRate(bytes,ms){if(!ms||ms<300)return '…';return fmtRate(bytes*1000/ms)}
+function fmUploadOne(t,overwrite,job){return FmClient.uploadFile(t,overwrite,job)}
+function fmUploadId(dir,name,size,mtime){return FmClient.uploadId(dir,name,size,mtime)}
+function fmPostBinaryProgress(url,body,onProgress){return FmClient.postBinary(url,body,onProgress)}
+function fmSleep(ms){return FmClient.sleep(ms)}
+function fmRate(bytes,ms){return FmClient.rate(bytes,ms)}
 
+/* ── 下载：小文件整块，≥32MB 走 Range 断点续传（实现见 fm-transport.js） ── */
 async function fmDownload(name){
  const path=fmJoin(name);
  const it=((fmData&&fmData.items)||[]).find(x=>x.name===name)||{};
- try{
-  if(!(it.size>=FM_DL_RESUME_MIN)){await fmDownloadDirect(path,name);return}
-  await fmDownloadResume(path,name,it);
- }catch(e){showToast((e&&e.message)||'下载失败','error')}
+ try{ await FmClient.download(path,name,it) }
+ catch(e){ showToast((e&&e.message)||'下载失败','error') }
 }
-
-// 小文件：整块取回直接存盘（保持原有体验）
-async function fmDownloadDirect(path,name){
- const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:token?{'Authorization':'Bearer '+token}:{}});
- if(r.status===401){logout();return}
- const ct=r.headers.get('content-type')||'';
- if(!r.ok||ct.includes('application/json')){
-  let msg='下载失败';
-  try{const j=await r.json();msg=j.message||msg}catch(e){}
-  showToast(msg,'error');return;
- }
- fmSaveBlob(await r.blob(),name);
-}
-function fmSaveBlob(blob,name){
- const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;
- document.body.appendChild(a);a.click();
- setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove()},1000);
-}
-
-/** 大文件断点续传下载：Range 分片取回；有「另存为」句柄就直接落盘并支持跨次续传，否则内存兜底 */
-async function fmDownloadResume(path,name,it){
- let handle=null;
- if(window.showSaveFilePicker){
-  // 必须在用户手势内调用（此处尚未 await，仍在点击的激活期内）
-  try{handle=await window.showSaveFilePicker({suggestedName:name})}
-  catch(e){if(e&&e.name==='AbortError')return;handle=null}
- }
- const job=fmJobAdd('⬇ '+name);
- const ctrl={cancelled:false};
- fmJobUpdate(job,{status:'准备中',onCancel:()=>{ctrl.cancelled=true;fmJobUpdate(job,{status:'正在停止…'})}});
- try{
-  if(handle)await fmDownloadToFile(handle,path,name,it,job,ctrl);
-  else await fmDownloadToMemory(path,name,it,job,ctrl);
- }catch(e){
-  fmJobUpdate(job,{status:'失败：'+((e&&e.message)||e),onCancel:null,onAction:()=>fmDownloadResume(path,name,it)});
-  throw e;
- }
-}
-/** 上次下载记录的源文件 ETag（判断续传目标是否还是同一个版本） */
-function fmDlEtagGet(path){try{return localStorage.getItem('fm_dl_etag:'+path)||''}catch(e){return ''}}
-function fmDlEtagSet(path,v){try{v?localStorage.setItem('fm_dl_etag:'+path,v):localStorage.removeItem('fm_dl_etag:'+path)}catch(e){}}
-
-async function fmDownloadToFile(handle,path,name,it,job,ctrl){
- let offset=0;
- try{offset=(await handle.getFile()).size}catch(e){offset=0}
- const probe=await fmFetchRange(path,0,0,'',1);
- let total=probe.total||it.size||0;
- if(!total||offset>total)offset=0;
- // 目标文件是上一次的残留，但源文件已换版本 → 不能续接
- const stored=fmDlEtagGet(path);
- if(offset>0&&stored&&probe.etag&&stored!==probe.etag)offset=0;
- let etag=probe.etag||'';
- const w=await handle.createWritable({keepExistingData:offset>0});
- let done=offset;
- try{
-  if(done>0)fmJobUpdate(job,{pct:done/total*100,status:`断点续传：已有 ${fmtBytes(done)} / ${fmtBytes(total)}`});
-  while(done<total){
-   if(ctrl.cancelled){
-    await w.close();
-    fmJobUpdate(job,{status:`已暂停（${fmtBytes(done)} / ${fmtBytes(total)}），重新点击下载可续传`,onCancel:null});
-    return;
-   }
-   const start=done;
-   const r=await fmFetchRange(path,start,Math.min(start+FM_DL_CHUNK,total)-1,etag,3);
-   if(r.total)total=r.total;
-   if(r.status===412){
-    await w.truncate(0);done=0;etag=r.etag||etag;fmDlEtagSet(path,etag);
-    fmJobUpdate(job,{pct:0,status:'源文件已更新，从头下载'});
-    continue;
-   }
-   if(r.status===200&&start>0){
-    // 服务端忽略了 Range（不应发生）：整文件已返回，直接整体重写
-    await w.truncate(0);
-    await w.write({type:'write',position:0,data:r.buf});
-    done=r.buf.length;total=r.buf.length;
-   }else{
-    await w.write({type:'write',position:start,data:r.buf});
-    done=start+r.buf.length;
-   }
-   if(etag)fmDlEtagSet(path,etag);
-   fmJobUpdate(job,{pct:total?done/total*100:0,status:`${fmtBytes(done)} / ${fmtBytes(total)}`});
-   if(!r.buf.length)break;
-  }
-  await w.close();
-  fmDlEtagSet(path,'');
-  fmJobUpdate(job,{pct:100,status:'完成',onCancel:null,onAction:null});
-  showToast('已保存：'+name,'success');
- }catch(e){
-  try{await w.close()}catch(_){}
-  throw e;
- }
-}
-
-async function fmDownloadToMemory(path,name,it,job,ctrl){
- const probe=await fmFetchRange(path,0,0,'',1);
- let total=probe.total||it.size||0;
- let etag=probe.etag||'';
- let parts=fmDlParts.get(path)||[];
- let done=parts.reduce((a,b)=>a+b.size,0);
- const meta=fmDlMeta.get(path);
- if(!meta||meta.size!==total||done>total){parts=[];done=0}
- fmDlParts.set(path,parts);
- fmDlMeta.set(path,{size:total});
- if(done>0)fmJobUpdate(job,{pct:done/total*100,status:`断点续传：已有 ${fmtBytes(done)} / ${fmtBytes(total)}`});
- while(done<total){
-  if(ctrl.cancelled){
-   fmJobUpdate(job,{status:`已暂停（${fmtBytes(done)} / ${fmtBytes(total)}），重新点击下载可续传`,onCancel:null});
-   return;
-  }
-  const start=done;
-  const r=await fmFetchRange(path,start,Math.min(start+FM_DL_CHUNK,total)-1,etag,3);
-  if(r.total)total=r.total;
-  if(r.status===412){
-   parts=[];done=0;etag=r.etag||etag;
-   fmDlParts.set(path,parts);fmDlMeta.set(path,{size:total});
-   continue;
-  }
-  if(r.status===200&&start>0){parts=[];done=0;continue}
-  if(r.buf.length)parts.push(new Blob([r.buf]));
-  done=start+r.buf.length;
-  fmJobUpdate(job,{pct:total?done/total*100:0,status:`${fmtBytes(done)} / ${fmtBytes(total)}`});
-  if(!r.buf.length)break;
- }
- fmDlParts.delete(path);fmDlMeta.delete(path);
- fmSaveBlob(new Blob(parts),name);
- fmJobUpdate(job,{pct:100,status:'完成',onCancel:null,onAction:null});
- showToast('已保存：'+name,'success');
-}
-
-/** Range 取一片；412 = 源文件已变（调用方负责从头重下）；网络/5xx 自动重试 */
-async function fmFetchRange(path,start,end,etag,retries){
- const tries=retries||3;
- let last=null;
- for(let attempt=1;attempt<=tries;attempt++){
-  try{
-   const h={'Range':'bytes='+start+'-'+end};
-   if(etag)h['If-Range']=etag;
-   if(token)h['Authorization']='Bearer '+token;
-   const r=await fetch('/star/fileDownload?path='+encodeURIComponent(path),{headers:h});
-   if(r.status===401){logout();throw new Error('登录已过期')}
-   const ct=r.headers.get('content-type')||'';
-   const m=/\/(\d+)\s*$/.exec(r.headers.get('content-range')||'');
-   const out={status:r.status,total:m?+m[1]:0,etag:r.headers.get('etag')||'',buf:new Uint8Array(0)};
-   // 防呆：错误响应是 JSON，绝不能当文件内容写盘
-   if(ct.includes('application/json')){
-    if(r.status===412)return out;
-    let msg='下载失败';
-    try{const j=await r.json();msg=j.message||msg}catch(e){}
-    last=new Error(msg);
-    if(r.status<500)break;
-   }else if(r.status===200||r.status===206){
-    out.buf=new Uint8Array(await r.arrayBuffer());
-    if(r.status===200)out.total=out.buf.length;
-    return out;
-   }else{
-    last=new Error('下载失败（HTTP '+r.status+'）');
-    if(r.status<500)break;
-   }
-  }catch(e){last=e}
-  if(attempt<tries)await fmSleep(500*attempt);
- }
- throw last||new Error('下载失败');
-}
+function fmDownloadDirect(path,name){return FmClient.downloadDirect(path,name)}
+function fmSaveBlob(blob,name){return FmClient.saveBlob(blob,name)}
+function fmFetchRange(path,start,end,etag,retries){return FmClient.fetchRange(path,start,end,etag,retries)}
 
 function fmDelete(names){
  if(!(names&&names.length))return;
@@ -3227,16 +2900,9 @@ function fmExtract(){
 }
 
 /* ── 剪贴板式复制 / 剪切 / 粘贴（对齐宝塔/资源管理器：先复制，进目标目录再粘贴） ── */
-function fmClipLoad(){
- try{
-  const raw=localStorage.getItem('fm_clip');if(!raw)return null;
-  const c=JSON.parse(raw);
-  return (c&&Array.isArray(c.paths)&&c.paths.length&&(c.mode==='cut'||c.mode==='copy'))?c:null;
- }catch(e){return null}
-}
-function fmClipSave(c){
- try{c?localStorage.setItem('fm_clip',JSON.stringify(c)):localStorage.removeItem('fm_clip')}catch(e){}
-}
+function fmClipLoad(){return FmClient.clip.load()}
+function fmClipSave(c){FmClient.clip.save(c)}
+
 function fmClipSet(mode){
  if(!fmReady())return;
  const paths=[...fmSelected].map(n=>fmJoin(n));
@@ -3252,20 +2918,7 @@ function fmClipClear(){
 }
 /** 粘贴到当前目录（剪贴板为 cut 时走移动） */
 /** 分批提交 paths：单批 500（服务端面板层放宽到 5000，前端再兜一层，超大选择也不会被拒） */
-async function fmPostPathsChunked(url,paths,target,chunk){
- const step=chunk||500;
- const total={files:0,bytes:0,deleted:0,freedBytes:0};
- for(let i=0;i<paths.length;i+=step){
-  const part=paths.slice(i,i+step);
-  const body=target?{paths:part,target}:{paths:part};
-  const j=await api(url,{method:'POST',body:JSON.stringify(body)});
-  if(j.code!==0)return {code:j.code,message:j.message,data:total,partial:true};
-  const d=j.data||{};
-  total.files+=d.files||0;total.bytes+=d.bytes||0;
-  total.deleted+=d.deleted||0;total.freedBytes+=d.freedBytes||0;
- }
- return {code:0,data:total};
-}
+async function fmPostPathsChunked(url,paths,target,chunk){return FmClient.postPathsChunked(url,paths,target,chunk)}
 
 async function fmPaste(){
  if(!fmReady())return;
