@@ -33,7 +33,15 @@ struct ServiceOperationResult {
 }
 
 /// 启动 HTTP 控制服务。返回线程句柄（进程退出时自然结束）。
-pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thread::JoinHandle<()> {
+///
+/// `tls` 非空时同端口改用 **HTTPS**（自签叶子证书；证书/私钥 PEM 字节），
+/// 否则保持原有明文 HTTP 行为（默认）。UDP RPC 不受影响（UDP/TCP 分属不同协议）。
+pub fn start(
+    manager: Arc<AppManager>,
+    port: u16,
+    local_only: bool,
+    tls: Option<(Vec<u8>, Vec<u8>)>,
+) -> std::thread::JoinHandle<()> {
     // 资源采样器：按配置间隔（默认 1 秒）采样整机指标，面板接口读快照
     // （多客户端读数一致、请求零采集；SampleInterval=0 时关闭，改由请求时现采）
     crate::sampler::start(manager.config().sample_interval);
@@ -48,6 +56,12 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
     } else {
         format!("0.0.0.0:{}", port)
     };
+
+    // 允许远程访问时自动放行本机防火墙端口；关闭时撤销规则（幂等，失败只记日志）
+    match dhrust::sys::firewall::ensure("Pek.RAgent", !local_only, port) {
+        Ok(msg) => dhrust::info!("{msg}"),
+        Err(e) => dhrust::warn!("防火墙自动放行失败（不影响运行）：{e}"),
+    }
 
     std::thread::Builder::new()
         .name("ragent-http".to_string())
@@ -64,7 +78,12 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
             };
 
             runtime.block_on(async move {
-                let server = match HttpServer::bind(addr.as_str()).await {
+                let https = tls.is_some();
+                let bind_result = match &tls {
+                    Some((cert, key)) => HttpServer::bind_tls(addr.as_str(), cert, key).await,
+                    None => HttpServer::bind(addr.as_str()).await,
+                };
+                let server = match bind_result {
                     Ok(s) => s,
                     Err(e) => {
                         util::log_error(&format!("本地控制接口绑定失败 {}：{}", addr, e));
@@ -72,12 +91,18 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
                     }
                 };
 
-                util::log_format("本地控制接口已启动：http://{}", &[&addr]);
+                util::log_format(
+                    "本地控制接口已启动：{}://{}",
+                    &[if https { "https" } else { "http" }, &addr],
+                );
 
                 let router = build_router(manager, port);
                 let options = HttpServerOptions {
                     // 每连接独立线程：管理操作可能阻塞（停止/启动应用），避免拖慢其他请求
                     thread_per_connection: true,
+                    // 单端口 HTTPS：明文 HTTP 请求（旧书签 http://ip:端口）由连接层识别后
+                    // 自动 301 到 https://同端口——不需要额外端口，也不会“连不上/协议错误”
+                    https_redirect_port: if https { Some(port) } else { None },
                     // WebSocket（在线终端）30 秒服务端 Ping：穿透反向代理的空闲断开
                     ws: dhrust::net::ws::WsServerOptions {
                         server_ping: Some(std::time::Duration::from_secs(30)),
@@ -98,11 +123,34 @@ pub fn start(manager: Arc<AppManager>, port: u16, local_only: bool) -> std::thre
 fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let mut router = Router::new();
 
-    // 〇 WAF（管理端预设：拦恶意爬虫与扫描器 + 路径探测/CC；在线 SQL/文件管理/AI 端点跳过攻击检测，由业务护栏负责）
+    // 〇 WAF（管理端预设：拦恶意爬虫与扫描器 + 路径探测/CC）
+    //
+    // 面板自己的接口（`/api/*`、`/star/*`）**不做攻击检测与机器人判定**：
+    // - 这些路径固定、全部要求 Bearer 鉴权，攻击面由业务护栏（参数化 SQL、fileman 路径白名单、
+    //   login_guard 限流、CSRF）负责；WAF 的正则反而会误伤正常操作（SQL 含关键字、文件名带引号、
+    //   AI 对话内容），历史上已多次为此逐个加白名单；
+    // - 保留 **IP 黑白名单 + CC 限流（默认 600 次/分钟/IP）**——面板 3 秒轮询约 40 次/分钟，余量充足。
     let mut waf_cfg = pek_rwaf::WafConfig::admin_api();
-    waf_cfg.skip_attack_prefixes =
-        vec!["/star/db".to_string(), "/star/file".to_string(), "/star/ai".to_string()];
+    waf_cfg.skip_attack_prefixes = vec!["/api".to_string(), "/star".to_string()];
+    // DHDeploy 契约接口属敏感路径（服务清单拿安装路径/启停能力）：该前缀下禁一切机器人
+    waf_cfg.sensitive_prefixes = vec![
+        "/GetServices".to_string(),
+        "/Info".to_string(),
+        "/ShowMachineInfo".to_string(),
+        "/ReloadConfig".to_string(),
+        "/RestartService".to_string(),
+        "/StartService".to_string(),
+        "/StopService".to_string(),
+        "/KillAndStart".to_string(),
+    ];
     let waf = pek_rwaf::Waf::load_with_default(manager.base(), waf_cfg);
+    // 反代后对端恒为回环：信任转发头（仅对端回环时采纳），否则 WAF 会整体放行且 IP 黑名单/Top IP 失真。
+    // 反代必须用 X-Real-IP 或**覆盖**（而非追加）X-Forwarded-For，否则客户端可伪造首段。
+    waf.set_trust_forwarded_for(true);
+    // 强制豁免走内存态（不受 Config/Waf.toml 在线修改影响）：面板与机器接口（DHDeploy 的
+    // RestSharp / HttpClient UA）不应被判为扫描器。
+    waf.set_forced_skip_bot_prefixes(vec!["/api".to_string(), "/star".to_string()]);
+    waf.set_forced_skip_attack_prefixes(vec!["/api".to_string(), "/star".to_string()]);
     router.use_middleware(waf.middleware());
 
     // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板；WAF 用于「安全」页在线管理）
@@ -152,9 +200,14 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/GetServices",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
-            async move { HttpOutcome::Response(HttpResponse::json(200, services_json(&m))) }
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::json(200, services_json(&m)))
+            }
         }),
     );
 
@@ -162,17 +215,29 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/Info",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
-            async move { HttpOutcome::Response(HttpResponse::json(200, info_json(&m, port))) }
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::json(200, info_json(&m, port)))
+            }
         }),
     );
 
     // 本机信息
+    let m = manager.clone();
     router.map_get(
         "/ShowMachineInfo",
-        route(|_ctx| async move {
-            HttpOutcome::Response(HttpResponse::text(200, crate::sys::machine_info()))
+        route(move |ctx| {
+            let m = m.clone();
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                HttpOutcome::Response(HttpResponse::text(200, crate::sys::machine_info()))
+            }
         }),
     );
 
@@ -180,9 +245,12 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     let m = manager.clone();
     router.map_get(
         "/ReloadConfig",
-        route(move |_ctx| {
+        route(move |ctx| {
             let m = m.clone();
             async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
                 m.reload_config();
                 HttpOutcome::Response(HttpResponse::json(
                     200,
@@ -212,9 +280,18 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     );
 
     // 杀死并启动进程（应用自重启辅助）
+    let m = manager.clone();
     router.map_post(
         "/KillAndStart",
-        route(move |ctx| async move { kill_and_start(ctx) }),
+        route(move |ctx| {
+            let m = m.clone();
+            async move {
+                if let Some(denied) = deny_remote(m.as_ref(), &ctx) {
+                    return denied;
+                }
+                kill_and_start(ctx)
+            }
+        }),
     );
 
     // 静态资源：优先嵌入的面板首页（单文件部署稳定），其次 wwwroot 目录。
@@ -290,6 +367,30 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     router
 }
 
+/// DHDeploy 契约接口的本机限制：非回环来源一律拒绝。
+///
+/// 这批接口原本无任何校验（服务清单会泄露安装路径/启动参数，启停/杀进程可直接被利用），
+/// 星尘监听 `0.0.0.0` 时会对公网暴露。DHDeploy Agent 与运维脚本均从本机调用，不受影响。
+/// 返回 `Some(响应)` 表示调用方应直接返回该响应。
+fn deny_remote(manager: &crate::manager::AppManager, ctx: &Ctx) -> Option<HttpOutcome> {
+    let trust = manager.config().trust_forwarded_for;
+    let (ip, proxied) = crate::webpanel::effective_client_ip(trust, ctx);
+    // 未开启信任时，回环对端带转发头 = 反代来的远程请求（不能当本机）
+    let local = dhrust::net::panel_auth::is_loopback(&ip) && !(proxied && !trust);
+    if local {
+        return None;
+    }
+    util::log_error(&format!(
+        "拒绝非本机访问星尘契约接口：path={} ip={ip}",
+        ctx.req.path
+    ));
+    Some(HttpOutcome::Response(HttpResponse::json(
+        403,
+        "{\"Success\":false,\"Message\":\"该接口仅允许本机访问（请在服务器本机执行，或用面板/在线终端）\"}"
+            .to_string(),
+    )))
+}
+
 /// 操作类型。
 #[derive(Clone, Copy)]
 pub(crate) enum OpKind {
@@ -300,6 +401,10 @@ pub(crate) enum OpKind {
 
 /// 应用级操作统一处理。
 fn app_operation(manager: Arc<AppManager>, ctx: Ctx, kind: OpKind) -> HttpOutcome {
+    // 契约接口仅本机可用（防公网任意启停子服务）
+    if let Some(denied) = deny_remote(manager.as_ref(), &ctx) {
+        return denied;
+    }
     let name = param(&ctx, "serviceName")
         .or_else(|| param(&ctx, "name"))
         .unwrap_or_default();
@@ -353,11 +458,10 @@ fn result(success: bool, message: String, name: &str) -> HttpOutcome {
 fn param(ctx: &Ctx, name: &str) -> Option<String> {
     let lower = name.to_ascii_lowercase();
     for (k, v) in ctx.query.iter().chain(ctx.form.iter()) {
-        if k.eq_ignore_ascii_case(name) || k.to_ascii_lowercase() == lower {
-            if !v.is_empty() {
+        if (k.eq_ignore_ascii_case(name) || k.to_ascii_lowercase() == lower)
+            && !v.is_empty() {
                 return Some(v.clone());
             }
-        }
     }
     None
 }

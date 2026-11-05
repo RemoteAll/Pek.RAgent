@@ -10,6 +10,7 @@ use dhrust::threading::Timer;
 use crate::config::AgentConfig;
 use crate::manager::AppManager;
 use crate::service::ServiceManager;
+use crate::sys;
 use crate::util;
 
 /// 全局停止标志（信号 / 服务控制 / 回车退出 共用）。
@@ -142,6 +143,14 @@ impl Agent {
 
 /// 核心运行：拉起应用、启动控制接口、守护循环、等待退出。
 fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period: u64) {
+    // 0) 单实例锁：同一基础目录只允许一个 RAgent 运行。
+    //    防止 Windows 服务与手动 `-run`/菜单实例同时守护同一批应用，
+    //    造成重复拉起、端口冲突与重启循环。
+    if let Err(e) = acquire_instance_lock(manager.base()) {
+        util::log_error(&e);
+        return;
+    }
+
     // 1) 拉起已启用应用（配置“加载即补齐”由 AgentConfig::load 内部自动完成）
     manager.start_all();
 
@@ -156,7 +165,21 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
             );
         }
     }
-    let _http = crate::server::start(manager.clone(), port, local_only);
+    // 2) 本地控制接口（线程持有；进程退出即结束）
+    //    面板 HTTPS：配置 `Tls=true` 时同端口改用 TLS（自签叶子证书，SAN 含本机全部 IP）。
+    //    证书生成/加载失败一律回退明文 HTTP 并告警——安全增强不得把管理员挡在面板外。
+    let tls = if manager.config().tls {
+        match crate::tlscfg::ensure_pem(manager.base()) {
+            Ok(pem) => Some(pem),
+            Err(e) => {
+                util::log_error(&format!("{e}；已回退为明文 HTTP"));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let _http = crate::server::start(manager.clone(), port, local_only, tls);
 
     // 2.1) 本地 UDP RPC 服务端（NewLife ApiClient 协议；DHDeploy 重启/拉起链路依赖）
     let _udp = crate::udp_rpc::start(manager.clone(), port);
@@ -214,7 +237,97 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     drop(up_timer);
     drop(hb_timer);
     drop(au_timer);
+    release_instance_lock(manager.base());
     util::log_info("星尘代理已退出");
+}
+
+/// 获取代理单实例锁（`Data/agent.lock`）。
+///
+/// 锁文件记录 PID：已存在且对应进程**确实是星尘代理**才拒绝启动；进程已退出、
+/// 或 PID 已被系统复用给其它程序（重启后常见）→ 视为残留锁并清理。
+/// 用 `create_new` 保证并发启动时只有一个能创建成功。
+fn acquire_instance_lock(base: &Path) -> Result<(), String> {
+    use std::io::Write;
+
+    let dir = base.join("Data");
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建数据目录失败 {}：{e}", dir.display()))?;
+    let path = dir.join("agent.lock");
+    let self_pid = std::process::id();
+
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(mut f) => {
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "?".to_string());
+                let _ = write!(f, "{self_pid}\n{exe}");
+                let _ = f.flush();
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let text = std::fs::read_to_string(&path).unwrap_or_default();
+                let pid = text
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .parse::<u32>()
+                    .ok();
+                if let Some(pid) = pid
+                    && pid != self_pid
+                    && sys::is_alive(pid)
+                    && pid_is_agent(pid)
+                {
+                    let name = sys::process_name(pid).unwrap_or_else(|| "?".to_string());
+                    let cmd = sys::command_line(pid).unwrap_or_else(|| "?".to_string());
+                    return Err(format!(
+                        "已有星尘代理实例运行（PID={pid}，进程={name}，命令行={cmd}），本实例退出：{}。\n\
+                         如确认该进程已不是本代理（残留/僵死），先停止它再删除该文件后重启；不要直接删除正在运行实例的锁",
+                        path.display()
+                    ));
+                }
+                // 进程已不在 / PID 被系统复用给其它程序 → 清理残留锁后重试
+                util::log_format(
+                    "清理残留实例锁：{}（PID {} 不是星尘代理或已退出）",
+                    &[&path.display().to_string(), &pid.map(|p| p.to_string()).unwrap_or_else(|| "?".to_string())],
+                );
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(e) => return Err(format!("创建实例锁失败 {}：{e}", path.display())),
+        }
+    }
+    Err(format!("获取实例锁失败（并发冲突）：{}", path.display()))
+}
+
+/// PID 对应的进程名是否像星尘代理（`pek-ragent` / `staragent`，兼容下划线与 `.exe`）。
+///
+/// 用于识别 PID 复用：锁文件里的 924 在重启后可能已是 nginx/sshd，此时必须清锁。
+/// 查不到进程名时按“可能是代理”保守处理（宁可拒绝启动，也不双实例守护）。
+fn pid_is_agent(pid: u32) -> bool {
+    match sys::process_name(pid) {
+        Some(name) => looks_like_agent_name(&name),
+        None => true,
+    }
+}
+
+fn looks_like_agent_name(name: &str) -> bool {
+    let n = name.to_ascii_lowercase().replace('_', "-");
+    n.contains("pek-ragent") || n.contains("staragent")
+}
+
+/// 释放本进程持有的代理实例锁。
+fn release_instance_lock(base: &Path) {
+    let path = base.join("Data").join("agent.lock");
+    if let Ok(text) = std::fs::read_to_string(&path)
+        && text.lines().next().unwrap_or("").trim() == std::process::id().to_string()
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 /// 自升级检查（守护周期调用）：发现候选升级文件时自动替换并移交新版本——Unix 由旧进程
@@ -262,48 +375,8 @@ pub(crate) fn check_self_upgrade(manager: &Arc<AppManager>) {
     }
 }
 
-/// exe 文件身份指纹（外部替换检测用）。
-///
-/// - Unix：设备号 + inode（最强信号，`touch`/属性变更不影响）；
-/// - Windows：大小 + 创建时间（运行中的 exe 无法被覆盖写；改名替换会刷新创建时间）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct ExeIdentity {
-    len: u64,
-    #[cfg(unix)]
-    dev: u64,
-    #[cfg(unix)]
-    ino: u64,
-    #[cfg(windows)]
-    created: Option<SystemTime>,
-}
-
-/// 读取文件身份指纹（失败返回 None）。
-fn exe_identity(path: &Path) -> Option<ExeIdentity> {
-    let meta = std::fs::metadata(path).ok()?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        Some(ExeIdentity {
-            len: meta.len(),
-            dev: meta.dev(),
-            ino: meta.ino(),
-        })
-    }
-    #[cfg(windows)]
-    {
-        Some(ExeIdentity {
-            len: meta.len(),
-            created: meta.created().ok(),
-        })
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        Some(ExeIdentity { len: meta.len() })
-    }
-}
-
 /// 进程启动时的 exe 身份基线（启动即记录；`check_external_replace` 懒初始化兜底）。
-static EXE_IDENTITY: Mutex<Option<ExeIdentity>> = Mutex::new(None);
+static EXE_IDENTITY: Mutex<Option<dhrust::upgrade::FileIdentity>> = Mutex::new(None);
 /// 已校验失败的外部替换文件指纹（len, mtime 秒），避免周期性重复处理。
 static EXTERNAL_REJECTED: Mutex<Option<(u64, u64)>> = Mutex::new(None);
 /// 自升级检查累计次数（心跳日志展示，便于确认周期任务存活）。
@@ -329,7 +402,7 @@ fn heartbeat(manager: &AppManager) {
 fn record_exe_identity_baseline() {
     if let Ok(exe) = std::env::current_exe() {
         let exe = util::lexical_normalize(&exe);
-        if let Some(id) = exe_identity(&exe) {
+        if let Some(id) = dhrust::upgrade::identity_of(&exe) {
             *EXE_IDENTITY.lock().unwrap() = Some(id);
         }
     }
@@ -342,7 +415,7 @@ fn record_exe_identity_baseline() {
 /// 部分 FTP/SFTP/同步工具采用"临时文件 + 重命名"实现上传，或用户手动先删再传——
 /// 本检测在这些场景下补齐"替换后自动生效重启"的最后一环。
 fn check_external_replace(exe: &Path, manager: &Arc<AppManager>) {
-    let Some(identity) = exe_identity(exe) else {
+    let Some(identity) = dhrust::upgrade::identity_of(exe) else {
         return;
     };
     {
@@ -352,7 +425,7 @@ fn check_external_replace(exe: &Path, manager: &Arc<AppManager>) {
                 *slot = Some(identity);
                 return;
             }
-            Some(baseline) if baseline == identity => return,
+            Some(baseline) if !baseline.changed(&identity) => return,
             Some(_) => {}
         }
     }
@@ -405,9 +478,25 @@ fn mtime_secs(meta: &std::fs::Metadata) -> u64 {
 /// `skip_list`：同一批次未被采用的其他候选（升级目录里的其余文件）——处置后统一
 /// 标记 `.skipped`，保证无论目录里有多少文件都只发生一轮升级（一次重启）。
 fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager: &Arc<AppManager>) {
+    // 防降级：带版本元数据（自动升级下载的）且不高于当前版本 → 丢弃（旧包残留/放错文件）。
+    // 手工上传/`Update/` 目录的文件没有元数据，保持既有行为（由格式 + 影子冒烟把关）。
+    if let Some(meta) = crate::self_upgrade::read_staged_meta(new_path)
+        .filter(|m| !dhrust::version::is_newer(&m.version, env!("CARGO_PKG_VERSION")))
+    {
+        util::log_error(&format!(
+            "自升级跳过：待应用文件版本 {} 不高于当前 {}（旧包或放错文件），已丢弃",
+            meta.version,
+            env!("CARGO_PKG_VERSION")
+        ));
+        let _ = std::fs::remove_file(new_path);
+        let _ = std::fs::remove_file(format!("{}.meta", new_path.display()));
+        return;
+    }
     match apply_upgrade(new_path, exe, 10) {
         Ok(()) => {
             util::log_info("检测到新版本：影子自检通过，程序文件已替换");
+            // 升级成功：清掉历史失败记录（否则同名版本回滚时会误入退避）
+            crate::self_upgrade::clear_apply_failure(exe);
             // 其余候选跳过（避免重启后逐个升级造成多轮重启）
             skip_candidates(skip_list);
             // 移交新版本（Unix 原地接管 / Windows 服务由 SCM 拉起 / 其余助手兜底）
@@ -431,6 +520,8 @@ fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager:
             } else {
                 util::log_error(&format!("自升级失败（当前程序不受影响）：{e}"));
             }
+            // 记录失败：同一目标版本退避期内不再重复下载完整包
+            crate::self_upgrade::record_apply_failure(exe, &e);
             // 其余候选同样跳过：避免失败后逐个重试造成多轮“尝试→重启”
             skip_candidates(skip_list);
         }
@@ -439,11 +530,7 @@ fn try_auto_upgrade(new_path: &Path, exe: &Path, skip_list: &[PathBuf], manager:
 
 /// 把未被采用的候选文件标记为 `*.skipped`（保留现场、不再参与自动升级）。
 fn skip_candidates(paths: &[PathBuf]) {
-    for p in paths {
-        let skipped = PathBuf::from(format!("{}.skipped", p.display()));
-        let _ = std::fs::remove_file(&skipped);
-        let _ = std::fs::rename(p, &skipped);
-    }
+    dhrust::upgrade::skip_candidates(paths);
 }
 
 /// 升级收尾（各升级路径共用）：把运行权交给新版本——启动次数最少、停顿最短、日志完整。
@@ -664,18 +751,17 @@ pub(crate) fn collect_update_files(exe_dir: &Path) -> Vec<PathBuf> {
                 continue;
             }
             // 排除留证文件（`*.failed`）与已跳过文件（`*.skipped`）
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("failed") || ext.eq_ignore_ascii_case("skipped") {
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && (ext.eq_ignore_ascii_case("failed") || ext.eq_ignore_ascii_case("skipped")) {
                     continue;
                 }
-            }
             let Ok(modified) = meta.modified() else {
                 continue;
             };
             all.push((modified, path));
         }
     }
-    all.sort_by(|a, b| b.0.cmp(&a.0));
+    all.sort_by_key(|item| std::cmp::Reverse(item.0));
     all.into_iter().map(|(_, p)| p).collect()
 }
 
@@ -696,15 +782,13 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
         return Err("升级文件为空".to_string());
     }
 
-    // 上传中保护：文件需静置一段时间（大小/mtime 稳定）
-    if min_age_secs > 0 {
-        if let Ok(modified) = meta.modified() {
-            if let Ok(age) = SystemTime::now().duration_since(modified) {
-                if age.as_secs() < min_age_secs {
-                    return Err(format!("升级文件上传中（静置 {min_age_secs} 秒后自动替换）"));
-                }
-            }
-        }
+    // 上传中保护：文件需静置一段时间（大小/mtime 稳定）——dhrust::upgrade 统一口径
+    if min_age_secs > 0
+        && !dhrust::upgrade::is_stable(new_path, std::time::Duration::from_secs(min_age_secs))
+    {
+        return Err(format!(
+            "升级文件上传中（静置 {min_age_secs} 秒后自动替换）"
+        ));
     }
 
     // 形态校验：ELF（Linux/macOS）或 PE（Windows），避免把半截/错误文件换上
@@ -714,9 +798,7 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
         let mut f = std::fs::File::open(new_path).map_err(|e| format!("升级文件不可读：{e}"))?;
         let _ = f.read(&mut head).map_err(|e| format!("升级文件读取失败：{e}"))?;
     }
-    let is_elf = head == [0x7F, b'E', b'L', b'F'];
-    let is_pe = head[0] == b'M' && head[1] == b'Z';
-    if !is_elf && !is_pe {
+    if !dhrust::upgrade::is_executable(&head) {
         return Err("升级文件格式校验失败（非可执行文件，请确认上传完整）".to_string());
     }
 
@@ -735,34 +817,19 @@ fn validate_upgrade_file(new_path: &Path, min_age_secs: u64) -> Result<(), Strin
 /// 注意：通过 `PEK_RAGENT_BASE` 显式指定真实基础目录——影子文件可能位于 `Update/` 等
 /// 子目录，否则自检进程会把影子位置当作程序目录，在其下生成 Log/Config 污染目录。
 fn smoke_test(new_path: &Path, official_exe: &Path) -> Result<(), String> {
-    let mut cmd = std::process::Command::new(new_path);
-    cmd.arg("-selftest");
+    let mut spec = dhrust::upgrade::SelftestSpec::new("-selftest");
     if let Some(dir) = official_exe.parent() {
-        cmd.env("PEK_RAGENT_BASE", dir);
+        spec = spec.with_env("PEK_RAGENT_BASE", dir.to_string_lossy().to_string());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        // CREATE_NO_WINDOW：避免服务会话中出现控制台窗口
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    match cmd.output() {
-        Ok(out) if out.status.success() => Ok(()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-            let detail = if !stderr.is_empty() { stderr } else { stdout };
-            let code = out.status.code();
-            if detail.is_empty() {
-                Err(format!("影子自检未通过（退出码 {code:?}）"))
-            } else {
-                Err(format!("影子自检未通过（退出码 {code:?}）：{detail}"))
-            }
+    // 公共实现返回「自检未通过（退出码 …）」/「自检启动失败…」/「自检超时…」/「自检程序不存在…」，
+    // 这里统一加「影子」前缀，保持原有运维文案口径（升级失败日志可读性不变）。
+    dhrust::upgrade::selftest(new_path, &spec).map_err(|e| {
+        if e.contains("未通过") {
+            format!("影子{e}")
+        } else {
+            format!("影子自检无法通过：{e}")
         }
-        Err(e) => Err(format!("影子自检无法启动：{e}")),
-    }
+    })
 }
 
 /// 自升级替换核心（校验 + 原子替换，不含影子冒烟；纯逻辑便于单测）。
@@ -796,6 +863,26 @@ unsafe extern "system" fn on_console_ctrl(_ctrl_type: u32) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_lock_pid_reuse_is_recognized_by_process_name() {
+        assert!(looks_like_agent_name("pek-ragent"));
+        assert!(looks_like_agent_name("pek_ragent-72e8d2cf.exe"));
+        assert!(looks_like_agent_name("StarAgent.exe"));
+        assert!(!looks_like_agent_name("nginx"));
+        assert!(!looks_like_agent_name("sshd"));
+        // 当前测试进程名就是 pek_ragent-*，必须能被识别为代理（锁写入后用自身 PID 校验）
+        let self_name = std::env::current_exe()
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+            .unwrap_or_default();
+        if !self_name.is_empty() {
+            assert!(
+                looks_like_agent_name(&self_name),
+                "测试二进制名应被识别：{self_name}"
+            );
+        }
+    }
 
     #[test]
     fn upgrade_from_validates_and_replaces() {
@@ -962,12 +1049,18 @@ mod tests {
 
         let exe = dir.join("app");
         std::fs::write(&exe, b"v1").unwrap();
-        let first = exe_identity(&exe).unwrap();
-        assert_eq!(first, exe_identity(&exe).unwrap(), "同一文件身份应稳定");
+        let first = dhrust::upgrade::identity_of(&exe).unwrap();
+        assert!(
+            !first.changed(&dhrust::upgrade::identity_of(&exe).unwrap()),
+            "同一文件身份应稳定"
+        );
 
         std::fs::remove_file(&exe).unwrap();
         std::fs::write(&exe, b"v2-longer").unwrap();
-        assert_ne!(first, exe_identity(&exe).unwrap(), "替换后身份应变化");
+        assert!(
+            first.changed(&dhrust::upgrade::identity_of(&exe).unwrap()),
+            "替换后身份应变化"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

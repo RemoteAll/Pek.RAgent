@@ -52,6 +52,10 @@
   <WebPassword>admin</WebPassword>
   <!--Web 面板鉴权级别。None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录-->
   <WebAuthLevel>LocalOnly</WebAuthLevel>
+  <!--信任反代转发头（X-Real-IP / X-Forwarded-For，默认 false）。面板前有可信 nginx/TLS 反代时开启，按真实客户端 IP 判定本机免登录、审计与登录限流；反代须用 X-Real-IP 或覆盖（而非追加）X-Forwarded-For。直连部署保持 false-->
+  <TrustForwardedFor>false</TrustForwardedFor>
+  <!--面板登录会话保持时长（小时，滑动续期：期间用过面板就不掉线，重启/升级不用重新登录）。默认 12；0 = 关闭持久化（仅进程内 24 小时）-->
+  <WebSessionHours>12</WebSessionHours>
   <!--后台资源采样间隔（毫秒）。默认 1000（与任务管理器/宝塔同粒度）；0 = 关闭后台采样（改为面板请求时现采）-->
   <SampleInterval>1000</SampleInterval>
   <!--网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + 下方手动补充），默认 true-->
@@ -62,18 +66,33 @@
   <PortTraffic>true</PortTraffic>
   <!--端口流量统计端口（高级选项，面板配置页不展示；一般无需填写）。形如 `22,80,443,3306`；留空 = 自动取系统监听端口（上限 64 个）-->
   <PortTrafficPorts></PortTrafficPorts>
+  <!--面板 HTTPS。默认 true（同端口切换，不额外占端口）：浏览器用 https://内网IP:端口 访问，旧书签 http:// 会自动 301 到 https（不会连不上）；自签叶子证书 CA:FALSE，SAN 自动含本机全部网卡 IP，有效期 10 年，证书落 Config/keys/panel.pem，首次访问前下载并导入该证书信任即可绿锁直开。修改需重启服务后生效-->
+  <Tls>true</Tls>
   <!--流量历史保留天数。每日归档落 SQLite（Data/traffic.db，Pek.RCode 按 Entity/Model.xml 模型管理）；默认 90（7~3650），0 = 永久保留-->
   <TrafficHistoryDays>90</TrafficHistoryDays>
   <!--日志清理自定义路径（高级选项，面板配置页不展示；仅直接编辑本文件时使用）。“日志清理”页额外扫描的路径，分号分隔；目录=清空内容、文件=截断清空-->
   <LogCleanupPaths></LogCleanupPaths>
-  <!--在线插件源（catalog.json）地址。仅允许 https（127.0.0.1 例外）；留空 = 关闭在线插件-->
+  <!--证书托管白名单（高级选项）。**留空 = 全部站点只读**：平台只能盘点与生成计划，不能写入任何文件。
+      需要平台自动部署证书时，把允许管理的站点填进来（逗号/分号分隔）：站点 key（如 nginx:/www/server/panel/vhost/nginx/a.conf#1、iis:站点名）、
+      nginx 配置文件路径，或域名/域名通配符（如 *.example.com）。建议先只加试验站点，确认无误再逐步扩大-->
+  <CertManagedSites></CertManagedSites>
+  <!--nginx 站点配置目录（高级选项，逗号分隔；追加在自动发现目录之后，如 /data/nginx/vhost）-->
+  <CertNginxDirs></CertNginxDirs>
+  <!--nginx 可执行文件（高级选项；留空 = PATH 中的 nginx。宝塔常为 /www/server/nginx/sbin/nginx）-->
+  <CertNginxBin></CertNginxBin>
+  <!--在线插件源（catalog.json）地址。一般**留空即可**：接入平台后由平台自动下发（含签名公钥）；留空且未接入平台 = 关闭在线插件-->
   <PluginStoreUrl></PluginStoreUrl>
-  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。非空时强制校验 catalog.json.sig，防源被篡改；留空 = 仅 HTTPS+SHA-256。自动升级发行源验签复用本公钥-->
+  <!--在线插件源 Ed25519 公钥（hex，32 字节裸公钥或 SPKI DER）。一般**留空即可**：接入平台后由平台自动下发；非空时强制校验 catalog.json.sig（防源被篡改）。自动升级发行源验签复用本公钥-->
   <PluginStorePubKey></PluginStorePubKey>
-  <!--代理自动升级源（星尘代理发行源 catalog.json）地址，默认官方平台。仅允许 https（127.0.0.1 例外）；留空 = 关闭自动升级（仍可用「上传即升级」手工通道）-->
+  <!--代理自动升级源（星尘代理发行源 catalog.json）地址，默认官方平台。仅允许 https（127.0.0.1 例外）；留空 = 关闭自动升级（仍可用「上传即升级」手工通道）。
+      平台实时通道的连接地址由本项推导（scheme://host[:port] + /store/agents/ws）-->
   <AutoUpgradeUrl>https://p.sc8.fun/store/agents/catalog.json</AutoUpgradeUrl>
-  <!--平台接入令牌（Pek.RPanlServer「服务器节点」页生成）。配置后启用 WebSocket 实时通道：向平台实时上报机器数据（CPU/内存/磁盘/子服务），并接收平台下发的「立即检查升级」指令；留空 = 不接入平台-->
+  <!--平台接入令牌。**可以留空**：留空且 <PairingEnabled>true</PairingEnabled> 时以「配对模式」接入——
+      节点只需能连上平台，平台「服务器节点」页会出现「待批准」条目，管理员点一下批准即自动下发本节点专用令牌（无需手抄）。
+      也可以由平台「服务器节点」页生成后填到这里（全局令牌），接上后平台会自动换成节专用令牌并写回本文件-->
   <AutoUpgradeToken></AutoUpgradeToken>
+  <!--免令牌配对接入。默认 true：令牌留空时也能接入平台，等待管理员批准；false = 必须填令牌（令牌空则不连接）-->
+  <PairingEnabled>true</PairingEnabled>
   <!--自动升级检查间隔（分钟），默认 60（5~1440）-->
   <AutoUpgradeIntervalMinutes>60</AutoUpgradeIntervalMinutes>
   <!--节点标识。平台「服务器节点」用于识别本机的唯一 ID：首次运行自动生成（32 位十六进制）并写入本文件、此后保持不变；克隆镜像/整机复制的服务器之间不会撞号。一般无需修改-->
@@ -88,6 +107,12 @@
   <AiApiKey></AiApiKey>
   <!--在线终端。启用后可在面板「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）-->
   <TerminalEnabled>true</TerminalEnabled>
+  <!--在线终端·命令审计。true=记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）-->
+  <TerminalCommandAudit>true</TerminalCommandAudit>
+  <!--在线终端·危险命令策略。confirm=管理员需二次确认且子用户禁止（默认）；block=所有人禁止；allow=只审计不拦截-->
+  <TerminalDangerPolicy>confirm</TerminalDangerPolicy>
+  <!--在线终端·子用户命令白名单。留空=禁止子用户使用终端（终端本质是 root 级 shell）；非空时子用户只能执行这些前缀（分号或换行分隔，如 systemctl restart;df -h）；内置管理员不受限-->
+  <TerminalAllowedCommands></TerminalAllowedCommands>
 
   <!--应用服务集合-->
   <Services></Services>

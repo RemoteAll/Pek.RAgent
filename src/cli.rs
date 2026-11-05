@@ -378,14 +378,12 @@ fn cmd_update(base: &Path, args: &[String]) -> i32 {
         .find(|a| !a.is_empty() && !a.starts_with('-') && !a.eq_ignore_ascii_case("update"))
         .map(PathBuf::from);
 
-    if let Some(src) = &src {
-        if *src != staged {
-            if let Err(e) = std::fs::copy(src, &staged) {
+    if let Some(src) = &src
+        && *src != staged
+            && let Err(e) = std::fs::copy(src, &staged) {
                 eprintln!("读取升级文件失败：{}（{e}）", src.display());
                 return 1;
             }
-        }
-    }
 
     if !staged.is_file() {
         eprintln!(
@@ -525,8 +523,8 @@ fn cmd_list_apps(base: &Path) -> i32 {
 
     println!("所有子服务列表：");
     println!(
-        "{:<5} {:<20} {:<6} {:<8} {:<8} {:<16} {}",
-        "序号", "服务名称", "启用", "状态", "进程Id", "进程名称", "启动时间"
+        "{:<5} {:<20} {:<6} {:<8} {:<8} {:<16} 启动时间",
+        "序号", "服务名称", "启用", "状态", "进程Id", "进程名称"
     );
     for (i, (name, enable, running, pid, pname, start_time)) in list.iter().enumerate() {
         println!(
@@ -963,10 +961,42 @@ fn zip_deploy(base: &Path, args: &[String]) -> i32 {
 // ————— 辅助 —————
 
 /// 调用本地控制接口。
+///
+/// 面板启用 HTTPS（`Tls=true`）时自动改用 `https://` 并跳过证书校验——
+/// 本机回环自签证书，校验无意义（对端就是自己），这样菜单/`-ListServices` 不受开关影响。
 fn api_get(base: &Path, action: &str, timeout: Duration) -> Result<String, String> {
     let cfg = AgentConfig::load(base);
-    let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
-    dhrust::net::http_client::blocking_get_text(&url, timeout).map_err(|e| e.to_string())
+    let ua = crate::util::user_agent();
+    if cfg.tls {
+        let url = format!("https://127.0.0.1:{}/{}", cfg.local_port, action);
+        let options = dhrust::net::http_client::HttpClientOptions {
+            timeout,
+            insecure_tls: true,
+            ..Default::default()
+        };
+        dhrust::net::http_client::blocking_request_with(
+            "GET",
+            &url,
+            &[("User-Agent", ua.as_str())],
+            None,
+            Vec::new(),
+            &options,
+        )
+        .map(|r| r.body_text())
+        .map_err(|e| e.to_string())
+    } else {
+        let url = format!("http://127.0.0.1:{}/{}", cfg.local_port, action);
+        dhrust::net::http_client::blocking_request_offthread(
+            "GET",
+            &url,
+            &[("User-Agent", ua.as_str())],
+            None,
+            Vec::new(),
+            timeout,
+        )
+        .map(|r| r.body_text())
+        .map_err(|e| e.to_string())
+    }
 }
 
 /// 拉取子服务列表：`(名称, 启用, 运行中, 进程Id, 进程名称, 启动时间)`。
@@ -1025,19 +1055,17 @@ fn save_server_args(base: &Path, args: &[String]) {
     let mut cfg = AgentConfig::load(base);
     let mut changed = false;
 
-    if let Some(s) = server {
-        if !s.is_empty() && cfg.server != s {
+    if let Some(s) = server
+        && !s.is_empty() && cfg.server != s {
             cfg.server = s;
             changed = true;
             println!("服务端地址已保存：{}（当前版本暂不对接）", cfg.server);
         }
-    }
-    if let Some(p) = project {
-        if !p.is_empty() && cfg.project != p {
+    if let Some(p) = project
+        && !p.is_empty() && cfg.project != p {
             cfg.project = p;
             changed = true;
         }
-    }
 
     if changed {
         let _ = cfg.save(base);

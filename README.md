@@ -1,4 +1,4 @@
-# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
+﻿# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
 
 部署在每台应用服务器 / 边缘节点上的节点守护代理，以系统服务方式运行，负责**多应用进程守护、影子目录部署、运行中文件替换与本地控制接口**。
 
@@ -17,7 +17,7 @@
 | 安全文件替换 | 目标文件被占用时先改名为 `*.del` 再写入新文件（Windows 允许重命名运行中的文件），应用停止后自动清理 |
 | 内存限制 | `MaxMemory` 超限自动重启应用（Windows 读私有内存、Linux 读 `/proc`） |
 | 文件变动重启 | `ReloadOnChange=true`（默认）时按 5 秒周期监视**配置的程序文件本身**（含无扩展名的 Linux 可执行文件），变更后停止应用，稳定 `Delay` 毫秒后重启 |
-| 健康检查 | 启动后按 `HealthCheck`（http/https/tcp 地址）探测，失败仅记录日志（对齐 C# 行为；https 含 TLS） |
+| 健康检查 | **假死自愈**（**最多每 10 秒探一次**——守护循环 1 秒一跳但探活有节流，避免代理自己成为负担；连续 3 次失败即约 30 秒判定 → 重启）：`HealthCheck` 留空时**自动探测该进程（含子进程）的监听端口**；也可配 `http(s)://`、`tcp://`、`file:<日志/输出文件>`（窗口内无变化即判假死）、`heartbeat`（应用调 `POST /star/appHeartbeat?name=<应用名>`；**从未上报过不判定**，应用不支持看门狗则不探不误杀），`off` 关闭 |
 | 看门狗 | 应用通过 `GET /Ping?processId=&watchdogTimeout=` 喂狗，超时未喂自动重启对应应用 |
 | 进程接管 | 代理重启后接管仍存活的子进程（`data/state.json`），**不会重复拉起** |
 | 本地 HTTP 控制接口 | 默认 `0.0.0.0:5501`（`LocalOnly=true` 时仅 `127.0.0.1`；与 C# 版 StarAgent 的 5500 错开可并存），兼容 DHDeploy 的调用契约 |
@@ -25,10 +25,10 @@
 | 配置热更新 | `Config/StarAgent.config` 被外部修改后自动重新加载并应用 |
 | Web 管理面板 | 内置浏览器管理界面（对齐 C# 面板契约）：状态/子服务/流量/控制/配置/星尘设置/日志（含操作日志子页）/看门狗/数据库/文件管理/日志清理/插件/AI 助手/在线终端/用户管理/服务器校时；**多用户与菜单权限**（面板用户存 SQLite；登录后仅显示被授权菜单，服务端逐接口强制校验）；默认管理员 `admin`/`admin`（配置文件凭据，超级权限，在用户列表首行显示）；鉴权级别 `WebAuthLevel`（None/LocalOnly/Full，默认 LocalOnly：本机免登录、远程需令牌）；**操作审计**（登录与全部变更类操作自动落库 `Agent_OperationLog`，密码等敏感字段脱敏）；前端页编译期内嵌。**「控制」页含「DHDeploy 访问控制」卡片**（探测本机 `127.0.0.1:8282` 控制接口）：**① 服务远程访问**（整个节点监听 `0.0.0.0` ⇄ `127.0.0.1` 热重绑——仅本机时外部完全无法连接，适合平台走 WS 中继的节点）**② 管理面板访问**（仅本机/允许远程/关闭面板）；一键切换、变更入审计 |
 | 资源采样器 | 后台线程按 `SampleInterval`（默认 1 秒）采样整机 CPU/网络/磁盘/TCP/线程句柄并缓存；面板请求读快照（多客户端读数一致、请求零采集；CPU 与任务管理器/宝塔同粒度）；`SampleInterval=0` 可关闭改由请求时现采 |
-| 流量统计 | **网站流量**（解析 nginx/Apache/Caddy 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled` 等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 SQLite：`Data/traffic.db`，由 **Pek.RCode** 按 XCode 规范模型 `Entity/Model.xml` 管理；网站按站点、端口按天；旧版 JSON 归档首次运行自动迁移），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
+| 流量统计 | **网站流量**（解析 nginx/Apache/Caddy/IIS 访问日志，零侵入）：自动发现站点（宝塔 `/www/server/panel/vhost/nginx`、`/etc/nginx/sites-enabled`、IIS `applicationHost.config` 与 `W3SVC*` 日志目录等）+ `WebLogs` 手动补充，按站点聚合今日/累计流量、请求数、UV 与状态码分布（IIS 需在日志字段中启用 `sc-bytes` 才能统计流量；IIS 全部站点都会列出，暂无日志/日志关闭/格式不支持的会标注原因）；**端口流量**（Linux：`nftables` 独立计数表 `inet pek_stats`，需 root）：各端口 TCP/UDP 收发字节与实时速率，nft 不可用时自动降级连接视图（Windows 仅连接视图）；面板“📈 流量”页实时查看（接口 `/star/webTraffic`、`/star/portTraffic`）；**历史数据**：每日归档（跨天自动保存到 SQLite：`Data/traffic.db`，由 **Pek.RCode** 按 XCode 规范模型 `Entity/Model.xml` 管理；网站按站点、端口按天；旧版 JSON 归档首次运行自动迁移），面板按最近 7/30/90 天查看趋势图与每日明细（接口 `/star/trafficHistory`） |
 | 日志 | 控制台 + `Log/` 目录按天文件；行格式与文件头全量对齐 DH.NCore（`HH:mm:ss.fff 线程ID 类型 名称 正文`）；`RUST_LOG=debug` 调整级别 |
 | **AI 助手** | 服务器问题分析助手（面板「🤖 AI 助手」页）：对话式分析，自动附带服务器实况快照（主机/代理/子服务/看门狗/最近日志）；**支持自定义模型**——OpenAI 兼容接口（默认接入 DeepSeek `deepseek-chat`，可改 `deepseek-reasoner` 或任何兼容服务/本地 Ollama），配置项 `AiEnabled`/`AiBaseUrl`/`AiModel`/`AiApiKey`（面板配置页可改）；接口 `/star/aiStatus`、`/star/aiChat`；菜单权限 `ai` 可授予子用户 |
-| **在线终端** | 免 SSH 的真终端（「🖥 在线终端」页，xterm.js + WebSocket + PTY）：单区域流式、光标闪烁、命令回显，**支持 vim/top 等交互式程序与 Ctrl+C 中断、pause 等待等完整键盘交互**；会话内 `cd`/环境变量保持、刷新自动重连并回放最近输出、空闲 30 分钟回收；命令以服务账户权限运行（Linux 通常 root、Windows LocalSystem）；**会话打开/关闭记入操作审计**（有意不采集击键——可能含密码）；配置项 `TerminalEnabled` 可整体关闭；菜单权限 `terminal`；接口 `GET /star/termWs`（WebSocket）、`POST /star/termReset` |
+| **在线终端** | 免 SSH 的真终端（「🖥 在线终端」页，xterm.js + WebSocket + PTY）：单区域流式、光标闪烁、命令回显，**支持 vim/top 等交互式程序与 Ctrl+C 中断、pause 等待等完整键盘交互**；会话内 `cd`/环境变量保持、刷新自动重连并回放最近输出、空闲 30 分钟回收；命令以服务账户权限运行（Linux 通常 root、Windows LocalSystem）；**每条完整命令写入操作审计**（只记命令行、不记逐键；口令/令牌参数自动脱敏）；**危险命令默认二次确认**（管理员弹窗确认后执行，子用户直接禁止）；**子用户必须配置 `TerminalAllowedCommands` 白名单才可使用（留空=禁止）**，白名单模式屏蔽方向键/补全并拒绝 shell 元字符、解释器/逃逸类程序（防拼接与 root 逃逸）；这是运维护栏，不是安全沙箱；配置项 `TerminalEnabled` / `TerminalCommandAudit` / `TerminalDangerPolicy` / `TerminalAllowedCommands`；菜单权限 `terminal`；接口 `GET /star/termWs`（WebSocket）、`POST /star/termReset` |
 
 ---
 
@@ -153,9 +153,30 @@ sudo /www/Agent/pek-ragent -update /tmp/pek-ragent-new    # 升级 + 重启服�
   请使用上述三种上传方式之一；
 - 前台 `-run` 模式：Unix 同样原地接管（无需手动重启）；Windows 需手动重启（日志有提示）。
 
-### 3.3 把应用安装进星尘（通用脚本）
+### 3.3 把应用安装进星尘
 
-`packaging/install-app.sh`：把任意应用安装到本机星尘（Pek.RAgent / C# StarAgent）中的通用安装脚本——应用打包时随包携带（或部署方直接调用），自动完成文件就位、停止旧实例、注册子服务（`-AddService`，注册即启用并由星尘拉起）与就绪检查：
+**主路径：Web 面板**——「子服务」页「📦 上传应用包」或直接把 `.zip` / `.tar.gz` 拖进页面，
+服务端自动解压、识别主程序、落工作目录并按影子模式注册启动；**包内不需要任何安装脚本**，
+升级=重复上传同名包。C# 框架依赖包请用自包含单文件发布，或装完把该服务模式改为 `Standard`。
+
+**权限分工**：管理员可自行 SSH 安装（`install-app.sh`），也可用面板；**其他使用者只给 Web 面板**
+（不提供 SSH）。Web 在线终端对这些人同样受控：每条完整命令写入审计，危险命令默认二次确认
+（子用户直接禁止），并可给子用户限定命令白名单（`TerminalAllowedCommands`）。
+
+**平台远程升级已有应用（0.1.94+）**：Pek.RPanlServer「服务器节点」页会展示每个节点上报的子应用
+（名称/运行状态/pid），管理员先选节点、再选该节点已有应用的升级包下发即可（工具栏「🚀 应用升级」）。
+上传升级包时应用名/平台可从包内主程序自动识别、版本可从文件名自动识别（平台 0.1.66+）。
+节点从平台按一次性票据下载包、校验 SHA-256 后调用同一套 `apppkg::deploy_bytes` 覆盖并重启；
+**只能升级已存在的应用，不能远程新建应用**。应用清单仅在变化时随心跳上报，不增加周期流量
+（要立刻看到最新清单可点节点页「🔄 同步应用」/ 子服务展开内「🔄 立即同步」，Agent 0.1.95+，
+平台下发 `appsQuery` → 节点回 `appsSync`，只刷新清单不动心跳指标）。
+详见 `docs/审计报告-2026-10-27-远程应用升级与安全.md`。
+
+**C# 版星尘迁移**——「子服务」页「🔄 迁移 C# 星尘」：扫描源配置 → 勾选子服务 → 一键导入；
+同时经 C# 本机 UDP RPC 停掉其子服务，并停止/禁用 C# 星尘服务（防重启再拉起）。
+相对路径按 C# 安装目录绝对化，程序与数据不搬家。
+
+**管理员/批量脚本**：`packaging/install-app.sh`（仅 Linux SSH/批量场景，C# 版不再自动注册）：
 
 ```bash
 sudo sh install-app.sh --name dhdeploy-agent-rust --bin ./dhdeploy-agent-rust \
@@ -164,7 +185,7 @@ sudo sh install-app.sh --name dhdeploy-agent-rust --bin ./dhdeploy-agent-rust \
 sudo sh install-app.sh --name dhdeploy-agent-rust --unregister   # 从星尘注销
 ```
 
-详见 `packaging/README-应用安装.md`（选项、星尘探测顺序、C# 版兼容说明）。
+详见 `packaging/README-应用安装.md`（Web 上传与迁移步骤、脚本选项、星尘探测顺序）。
 
 ---
 
@@ -284,20 +305,27 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `WatchDog` | 空 | 看门狗：逗号分隔的进程名，每分钟检查存活（面板 `/api/watchdog`） |
 | `WebUserName` / `WebPassword` | `admin` | Web 面板登录凭据（面板「用户」页管理：内置管理员行可改用户名/密码） |
 | `WebAuthLevel` | `LocalOnly` | 面板鉴权级别：None 不鉴权 / LocalOnly 本机（回环地址）免登录、远程需 Token / Full 全部需 Token；修改后自动生效（无需重启） |
+| `TrustForwardedFor` | `false` | 面板前有可信反代时开启：仅对端回环才采纳 `X-Real-IP` / `X-Forwarded-For`（优先 X-Real-IP，否则 XFF 最后一段），用于本机判定、审计与登录限流。默认 false：回环 + 转发头一律按远程处理（防 nginx 后整体免登录）；反代须覆盖而非追加 XFF |
+| `WebSessionHours` | `12` | 登录会话保持时长（**小时**，**滑动续期**：期间用过面板就不掉线，重启/升级服务不用重新登录）；会话落盘 `Data/panel-sessions.json`（Unix 0600）；`0` = 关闭持久化（仅进程内 24 小时）；上限 8760（365 天）；修改需重启服务后生效（会话已落盘，重启不会掉登录） |
 | `SampleInterval` | `1000` | 后台资源采样间隔（毫秒）：面板 CPU/网络/磁盘速率按此窗口差分；`0`=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效 |
 | `WebTraffic` | `true` | 网站流量统计开关：后台解析站点访问日志（自动发现常见目录 + `WebLogs` 手动补充），零侵入只读；关闭后停止读取；统计口径默认响应体字节（`$body_bytes_sent`），日志行尾追加 `$bytes_sent` 时自动改用实际发送字节（响应头+响应体，推荐配置见 8. 面板“流量”节） |
 | `WebLogs` | 空 | 网站日志手动补充（高级选项，面板配置页不展示，一般无需填写）：`名称=路径;名称2=路径2`（绝对路径；自动发现不到时补充，如 Caddy 自定义日志） |
-| `PortTraffic` | `true` | 端口流量统计开关（默认开启）：Linux 在独立 nftables 表 `inet pek_stats` 中按端口计数收发字节（需 root 与 `nft` 命令；**只计数不改转发**，关闭/卸载时自动删表）；无 nft 或权限不足、Windows/其它平台自动降级为连接视图（无字节数） |
+| `PortTraffic` | `true` | 端口流量统计开关（默认开启）：Linux 在独立 nftables 表 `inet pek_stats` 中按端口计数收发字节（需 root 与 `nft` 命令；**只计数不改转发**，关闭/卸载时自动删表）；无 nft 或权限不足自动降级为连接视图（无字节数）；**Windows 无按端口字节计数接口，仅显示连接数（接收/发送/速率显示 `—`）**——HTTP/HTTPS 流量请用「网站流量」（IIS 日志），其他端口需 Linux/ETW 采集 |
 | `PortTrafficPorts` | 空 | 端口流量统计端口列表（高级选项，面板配置页不展示，一般无需填写）：`22,80,443`（逗号分隔）；留空自动取系统监听端口（上限 64 个） |
 | `TrafficHistoryDays` | `90` | 流量历史保留天数：每日归档落 SQLite `Data/traffic.db`（Pek.RCode + XCode 模型 `Entity/Model.xml`；网站按站点、端口按天；跨天自动保存、进程重启续算不重复）；`7~3650`，`0`=永久保留 |
 | `LogCleanupPaths` | 空 | 日志清理自定义路径（高级选项，面板配置页不展示，直接编辑配置文件，修改后自动生效）：分号分隔（绝对路径；目录=清空内容、文件=截断清空），在面板“🧹 日志清理”页以“自定义路径”分类显示与清理 |
-| `PluginStoreUrl` | 空 | 在线插件源地址（`catalog.json` 的 URL）：仅允许 https（127.0.0.1 例外便于本地调试）；面板「🧩 插件」页据此展示在线插件并可一键安装/更新；留空 = 关闭在线插件。修改后自动生效 |
-| `PluginStorePubKey` | 空 | 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）：非空时对 `catalog.json` 强制验签（需发布同名 `.sig`），防插件源被篡改；留空 = 仅 HTTPS + SHA-256 校验 |
+| `PluginStoreUrl` | 空 | 在线插件源地址（`catalog.json` 的 URL）：仅允许 https（127.0.0.1 例外便于本地调试）；面板「🧩 插件」页据此展示 在线插件并可一键安装/更新；留空 = 关闭在线插件。**安全项：面板配置页不展示，仅编辑配置文件** |
+| `PluginStorePubKey` | 空 | 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）：非空时对 `catalog.json` 强制验签（需发布同名 `.sig`），防插件源被篡改；留空 = 仅 HTTPS + SHA-256 校验。**安全项：面板配置页不展示，仅编辑配置文件** |
+
+> **安全项仅配置文件修改**：`PluginStoreUrl` / `PluginStorePubKey` / `AutoUpgradeUrl` / `AutoUpgradeIntervalMinutes` / `AutoUpgradeToken` 不在面板配置页展示，`/api/updateConfig` 也不接受在线修改；请直接编辑服务器 `Config/StarAgent.config`（防误改/被改乱）。
 | `AiEnabled` | `true` | AI 助手开关（面板「🤖 AI 助手」页）；关闭后接口直接拒绝 |
 | `AiBaseUrl` | `https://api.deepseek.com/v1` | AI 接口地址：OpenAI 兼容 Base（自动补 `/chat/completions`），也可直接填完整地址；接入其他厂商/本地模型时修改（如 `http://127.0.0.1:11434/v1`） |
 | `AiModel` | `deepseek-chat` | 模型名（如 `deepseek-chat` / `deepseek-reasoner`） |
 | `AiApiKey` | 空 | API Key（Bearer 令牌）；留空时 AI 页提示先到配置页填写 |
 | `TerminalEnabled` | `true` | 在线终端开关（面板「🖥 在线终端」页）；关闭后接口直接拒绝 |
+| `TerminalCommandAudit` | `true` | 记录每条完整命令（只记命令行、不记逐键，疑似口令不记）；关闭只保留会话开关记录，不推荐 |
+| `TerminalDangerPolicy` | `confirm` | 危险命令策略：`confirm`=管理员二次确认、子用户禁止；`block`=所有人禁止；`allow`=只审计不拦截 |
+| `TerminalAllowedCommands` | 空 | 子用户命令白名单（`;`/换行分隔前缀，如 `systemctl status;df -h`）；**留空 = 禁止子用户使用终端**（终端是 root 级 shell）；内置管理员不受限 |
 | `Services` | 示例 | 应用列表（`<ServiceInfo>` 元素，属性形式） |
 
 ### 5.2 应用字段（`<ServiceInfo>` 属性）
@@ -317,7 +345,7 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `ReloadOnChange` | `true` | 文件变动自动重启（5 秒周期监视程序文件本身） |
 | `MaxMemory` | `0` | 最大内存（MB），超限重启；0 不限制 |
 | `OomScoreAdjust` | `0` | OOM 分值（仅 Linux） |
-| `HealthCheck` | 空 | 健康检查：`http://…`、`https://…`（含 TLS）或 `tcp://host:port` |
+| `HealthCheck` | 空 | 健康探针：留空 = 自动探测该进程（含子进程）的 TCP 监听端口；`http(s)://…`、`tcp://host:port`、`file:<日志/输出文件>[?within=秒]`（文件活性）、`heartbeat[?within=秒]`（应用调 `POST /star/appHeartbeat?name=<应用名>`，从未上报不判定）、`off`（关闭）。连续 3 次失败判定假死并重启 |
 | `Overwrite` | 空 | 部署包内需拷贝覆盖到工作目录的文件/子目录，`;` 分隔，支持 `*` |
 | `Debug` | `false` | 应用输出重定向到 `Log/app-{Name}.log` |
 
@@ -428,22 +456,23 @@ curl 'http://127.0.0.1:5501/RestartService?serviceName=webapp'
 
 内置管理面板，浏览器访问 `http://127.0.0.1:5501/`（`LocalOnly=false` 时允许远程）：
 
-- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；Bearer Token 24 小时有效；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；
-- **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/Top 进程）；
-- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；
+- **登录**：默认 `admin` / `admin`（配置项 `WebUserName` / `WebPassword`，面板「用户」页可在线管理内置管理员用户名与密码）；鉴权级别 `WebAuthLevel`（默认 `LocalOnly`：本机免登录、远程需登录；`Full` 全部需登录；`None` 不鉴权）；**登录会话默认保持 12 小时（`WebSessionHours`，滑动续期）且落盘，重启/升级不掉登录**；**密码不明文上网络**（`GET /api/loginChallenge` 下发一次性 nonce + 盐，前端本地算 `SHA-256(nonce:SHA-256(salt:password))` 提交，nonce 用完即废、2 分钟过期；旧版明文口令仍兼容）；登录爆破防护：每 IP 5 次失败封禁 5 分钟（窗口 15 分钟）；改密码或「退出所有设备」立即注销其它会话；
+- **状态**：服务运行时长/进程信息（PID、端口、进程内存）；资源监控（**整机视角**，口径与宝塔一致，顺序：负载 → CPU → 内存 → 磁盘）：负载（**仅 Linux**：1/5/15 分钟，Windows 不显示；百分比 = 1 分钟均值 /（核数 × 2），对齐宝塔）、CPU 使用率+核数（`busy/(busy+idle+iowait)`，按请求间隔差分采样，不阻塞请求）、内存已用/总量（**已用 = 总 − MemFree − Buffers − Cached − SReclaimable**，缓存不计入已用，同 psutil/宝塔）、磁盘（**全部磁盘各自用量**；过滤 /boot、/boot/efi 与 tmpfs/overlay/squashfs/snap 等虚拟文件系统，对齐 DHDeploy `IsTemporaryVolume`）；**流量与磁盘 IO 趋势图**（对齐宝塔：双页签 + 统计块 + 平滑双曲线，近 3 分钟每 3 秒采样；流量=上行/下行/总发送/总接收，磁盘=读取/写入/每秒读写/IO 延迟）；TCP 连接数；机器 GUID、主机运行时长、本机详情（CPU 型号/内存/磁盘分区/网卡/**进程 Top 20**）/；
+- **子服务**：列表（含运行状态）、启动/停止/重启、添加/编辑/删除（写回 `Config/StarAgent.config`）；**一键部署应用包**——「📦 上传应用包」按钮或**直接把发布包拖进页面**（`.zip` / `.tar.gz` / `.tgz`），服务端自动解压（兼容根级与顶层目录两种包布局）、识别主程序（命名匹配 / 唯一 exe / runtimeconfig 配套 dll / jar / 可执行位）、按名称推导服务名（可用包内主程序名，如 `dhdeploy-agent-rust`），落盘到 `../apps/{名称}` 并按**影子模式**注册与启动；升级=重复上传新包（同名自动更新并重启，旧影子目录自动清理）；跨平台包会被识别拒绝（Windows 传了 Linux 包等）；**🔄 迁移 C# 星尘**——扫描 C# 版配置并一键导入子服务（同时经 C# 本机 UDP RPC 停其子服务、停/禁用 C# 星尘服务，相对路径按 C# 安装目录绝对化）；手动填写文件名/参数/工作目录的方式仍保留（「➕ 添加服务」）；
 - **控制**：启停重启代理服务自身（分离进程延迟 2 秒执行 `sc stop/start` 或 `systemctl restart`）、释放内存（Windows 回收工作集）；
-- **配置**：面板与守护参数在线更新（部分需重启服务后生效）；
-- **星尘设置**：`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护；
+- **配置**：页内三个**子页签**（URL hash `#config` / `#config.star` / `#config.security`，兼容旧 `#starconfig`、`#security` 书签）——**⚙ Agent 配置**（面板与守护参数在线更新，部分需重启服务后生效；插件源/自动升级/平台接入令牌等安全项仅支持配置文件修改）、**🌐 星尘设置**（`Server` / `LocalPort` / `Project` / `StartupHook` / `Delay` 分组维护）、**🛡 安全**（Web 应用防火墙 WAF 在线开关与参考配置；权限跟随 `control`，保存后立即生效）；子页标签按权限显隐；
 - **日志**：页内两个**子页签**（交互对齐流量页）——**📋 系统日志**（`Log/` 目录文件列表与尾部内容查看，支持行数/文件/级别过滤）与 **📜 操作日志**（审计查询，见下）；子页标签按权限显隐（URL hash `#logs` / `#logs.audit`，兼容旧 `#audit` 书签）；
 - **看门狗**：`WatchDog` 配置的进程名存活状态检查。
-- **文件管理**（对齐宝塔）：全盘浏览（根=盘符/`/`，符号链接可进入）、上传（多文件、带进度，≤64MB）/下载（≤256MB）、新建文件与文件夹、批量重命名/复制/移动/删除、ZIP 压缩/解压、在线编辑文本（≤2MB，UTF-8，二进制拒读）、Linux 权限修改（chmod）与递归搜索；删除/改名/移动对根、一级目录（`/etc`、`C:\Windows` 等）与程序目录本身设保护（目录内部照常可操作）；
-- **日志清理**（对齐宝塔）：一键扫描并清理 系统日志（syslog/messages/journald）、网站日志（宝塔/nginx/apache）、Nginx 缓存目录、代理自身日志（`Log/`）、Redis/MySQL 日志（额外目录可通过配置文件高级项 `LogCleanupPaths` 追加，面板不提供编辑）；日志文件**截断清空**（保留文件、持句柄进程不受影响）、缓存目录清空（内含 `*.log` 同样截断保留）、journald 走 `journalctl --vacuum`；逐分类显示条数与大小、可展开文件明细。
+- **文件管理**（对齐宝塔）：全盘浏览（根=盘符/`/`，符号链接可进入）、上传（多文件、带进度；**单文件 ≤2GB，>8MB 自动分片**（内存恒定）、**同名先弹覆盖确认**）/下载（≤256MB）、新建文件与文件夹、批量重命名/复制/移动/删除、压缩（ZIP）、**多格式解压**（`zip` / `7z` / `tar` / `tar.gz` / `tar.bz2` / `tar.xz` / `tar.zst` / `gz` / `bz2` / `xz` / `zst`；**zip 与 7z 支持 AES-256 密码**；rar 无纯 Rust 实现，选中时明确提示转格式；默认解压到**同级同名子目录**、目标目录可改，覆盖/跳过条目数会回报）、在线编辑文本（≤10MB，UTF-8，二进制拒读）、Linux 权限修改（chmod）与递归搜索；删除/改名/移动对根、一级目录（`/etc`、`C:\Windows` 等）与程序目录本身设保护（目录内部照常可操作）；
+- **日志清理**（对齐宝塔）：一键扫描并清理——**Linux**：系统日志（syslog/messages/journald）、网站日志（宝塔/nginx/apache）、Nginx 缓存目录、Redis/MySQL 日志、**系统缓存**（`/var/cache/{apt,yum,dnf,zypper,PackageKit,man}`、`/var/crash`、`/var/lib/systemd/coredump`、**Docker 容器 `*-json.log` 截断**）、**用户缓存**（`/root|/home/*/.cache` 与回收站；**有意不含 `/tmp`、`/var/tmp`**——存在运行中程序的 socket/锁）；**Windows**：系统日志（CBS/DISM/WindowsUpdate）、**系统缓存**（`ProgramData` 的 WER 错误报告、USOShared 更新日志、Caches 缩略图缓存、`ProgramData\Temp`、`Windows\Temp`、**各用户 `AppData\Local\Temp`**）、网站日志（宝塔/nginx/IIS）；两者均含代理自身日志（`Log/`）。日志文件**截断清空**（保留文件、持句柄进程不受影响）、缓存目录清空（内含 `*.log` 同样截断保留）、journald 走 `journalctl --vacuum`；逐分类显示条数与大小、可展开文件明细；额外目录可通过配置文件高级项 `LogCleanupPaths` 追加（面板不提供编辑）。
+  - Windows 路径按 `%SystemRoot%` / `%ProgramData%` 解析（回退 `C:\Windows` / `C:\ProgramData`，兼容系统盘非 C:）；**有意不清理** `ProgramData\Package Cache`（VC++/VS 安装缓存，删后修复/卸载会失败）、Windows Defender 定义库、`AppRepository`、`SystemData` 等系统关键目录（单元测试断言排除）。
+  - **安全护栏**：所有清理目标（含自定义 `LogCleanupPaths`）经统一黑名单校验——根目录、`%SystemRoot%`/`System32`/`WinSxS`、`Program Files`/`ProgramData`/`Users` 的一级子目录、程序目录（内部仅允许 `Log`）一律拒绝；目录清理**不跟随符号链接/目录联接**；单目标 20 万条目 / 120 秒上限；清理在独立线程执行，不阻塞面板其它请求。
 - **插件**（权限 `plugins`）：`{base}/Plugins/<id>/` 放置含 `plugin.json` 清单的页面包，或面板「🧩 插件」页上传 zip 安装/删除；页面经 `/plugins/<id>/...` 同源服务并以 iframe 嵌入（复用登录态调用面板接口，受权限约束并记入操作日志）；清单字段 `name/description/version/icon/entry/app`（`app` 关联子服务名，可查看状态并启停）。
 - **在线插件源（宝塔式商店的安全版）**：`PluginStoreUrl` 指向自建 `catalog.json`（HTTPS），面板展示在线插件并可一键**安装/更新**（同 id 版本变化即更新，替换失败自动回滚旧版本）；安全设计：**仅 https + 强制 SHA-256 校验 + 可选 Ed25519 强制验签**（`PluginStorePubKey`；发布端用 `pek-ragent -PluginStoreKeygen` / `-PluginStoreSign` 生成密钥并签名 `catalog.json.sig`）+ 下载大小上限 32MB + **不执行任何安装脚本**；校验不通过一律拒绝（对抗中间人/被篡改的插件源）。
 - **插件发布流程**（发布端两步命令）：① 一次：`-PluginStoreKeygen` 生成密钥 + 面板「配置」填公钥；② 每次发布：`-PluginStorePublish ./store myplugin.zip --base-url https://plugins.example.com/ --key plugin-store.key`（自动校验包、计算 SHA-256、更新 `catalog.json` 并签名 `.sig`；同 id 旧版本包自动清理）→ 把整个 `store` 目录同步到 HTTPS 静态空间即完成发布；下线用 `-PluginStoreRemove`。
 - **操作日志**（日志页子页签，权限 `audit`）：登录（含失败）与全部变更类操作（配置/控制/子服务/文件管理/日志清理/数据库/用户管理）自动落库 SQLite `Agent_OperationLog`（参数摘要脱敏——密码/令牌等字段替换为 `***`；含失败与 403 越权记录）；支持关键词/操作者/结果筛选与分页。
 - **用户**（仅内置管理员）：多用户管理（用户名/密码/菜单权限勾选/启用/备注/删除）；内置管理员以虚拟条目显示在列表首行（全部权限、可编辑用户名/密码、不可删除）；面板用户存 `Data/traffic.db` 的 `Agent_PanelUser` 表（密码 `SHA-256(salt:password)` 不可逆存储，随数据库备份/还原迁移）；用户登录后仅显示被授权菜单（前端隐藏 + 服务端逐接口校验，越权返回 403 并记审计）。
-- **流量**：页签内分为 **📈 网站流量 / 🔌 端口流量** 两个子页面（URL hash 记忆：`#traffic` / `#traffic.ports`）。**网站流量**（解析 nginx/Apache/Caddy 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点，`WebLogs` 可手动补充；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 为连接视图；**按端口每日数据**：端口汇总表（总接收/发送/日均/活跃天数/占比，支持 7/30/90 天与关键词筛选）→ 点击端口钻取**该端口每日收发**（堆叠柱状图 + 逐日明细表）；另有按日期的端口每日流量总表）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
+- **流量**：页签内分为 **📈 网站流量 / 🔌 端口流量** 两个子页面（URL hash 记忆：`#traffic` / `#traffic.ports`）。**网站流量**（解析 nginx/Apache/Caddy/IIS 访问日志：每站点今日/累计流量、请求数、UV、状态码分布与实时速率；自动发现宝塔/标准 nginx/apache 站点与 **IIS 全部站点**（读取 `applicationHost.config` 并继承 `<siteDefaults>`；支持共享配置 `redirection.config`、`%VAR%` 环境变量与自定义日志目录，兼容 `<目录>\W3SVC<id>` 子目录与直接目录两种布局；**暂无日志文件、日志记录关闭、格式非 W3C/NCSA 的站点也会列出并标注原因**，不再只显示有日志的 Default Web Site；`WebLogs` 可手动补充）；**站点行显示 IIS 运行状态（运行中/已停止）与日志开关**；IIS 默认日志字段不含 `sc-bytes`，可点站点行「启用 sc-bytes」（或顶部「为全部站点启用」）自动写入 IIS 配置（需 `config` 权限，调用 `appcmd`，修改前留 `applicationHost.config.pek-bak` 备份；当前日志文件的字段头不会重写，新字段从 IIS 新建日志文件后生效，新版已兼容“旧字段头 + 行尾新增 sc-bytes”即时统计）；零侵入只读日志，重启续读不重复统计）+ **端口流量**（Linux nftables 独立计数表：各端口 TCP/UDP 收发字节与速率；无 nft/无权限时自动降级连接视图，Windows 仅连接数（接收/发送/速率显示 `—`，无按端口字节计数接口；HTTP/HTTPS 请用「网站流量」）；**按端口每日数据**：端口汇总表（总接收/发送/日均/活跃天数/占比，支持 7/30/90 天与关键词筛选）→ 点击端口钻取**该端口每日收发**（堆叠柱状图 + 逐日明细表）；另有按日期的端口每日流量总表）+ **历史数据**（每日归档落 SQLite `Data/traffic.db`——**Pek.RCode** 消费方，XCode 规范模型 `Entity/Model.xml`（与 C# 生态共用），读取走实体缓存：趋势柱状图 + 按天明细，支持最近 7/30/90 天与站点筛选；默认保留 90 天，`TrafficHistoryDays` 可调；旧版 JSON 归档首次运行自动迁移）；进入页签时 3 秒轮询、离开即停（历史数据首次进入/跨天时拉取）。
 
 **网站流量统计口径**：默认取日志中的响应体字节（nginx `$body_bytes_sent` / Apache `%b` / Caddy `size`）。如需统计 **nginx 实际发送流量（响应头+响应体）**，为站点启用扩展日志格式（行尾追加 `$bytes_sent $request_length`），本代理自动识别并改用 `$bytes_sent`：
 
@@ -462,6 +491,7 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | 端点 | 说明 |
 |------|------|
 | `POST /api/login`、`POST /api/logout` | 登录（返回 Token）/ 注销 |
+| `GET /api/loginChallenge`、`POST /api/logoutAll` | 登录挑战（一次性 nonce + 盐，密码不出网）/ 退出所有其它设备（仅内置管理员） |
 | `GET /api/status`、`GET /api/health` | 服务状态 / 健康指标 |
 | `POST /api/control` | 启停重启代理（`{"action":"start|stop|restart"}`） |
 | `GET /api/freeMemory` | 释放内存 |
@@ -470,13 +500,17 @@ access_log /www/wwwlogs/example.com.log agent_bw;
 | `POST /api/syncTime` | 同步系统时间（`{"timeMs": 毫秒时间戳}`，以浏览器机时间为准；Linux 需 root、Windows 需服务账户/管理员） |
 | `GET /star/services`、`POST /star/startService`、`POST /star/stopService`、`POST /star/restartService` | 子服务列表与操作 |
 | `POST /star/addService`、`POST /star/removeService` | 子服务新增/更新与删除（持久化到配置） |
+| `POST /star/appDeploy` | 应用包一键部署（请求体=包内容；查询参数 `fileName` 包名、`name` 服务名（留空自动识别）、`arguments` 启动参数、`autoStart=1/0`）：自动解压 `.zip`/`.tar.gz`、识别主程序、写入工作目录并注册子服务 |
+| `GET /star/starAgentScan` | 扫描 C# 版星尘（`?dir=` 安装目录，留空自动探测）：返回子服务清单、C# 服务已安装/运行状态；未找到时 `found=false` + 常见路径候选 |
+| `POST /star/starAgentMigrate` | 从 C# 星尘一键迁移（`?dir=&names=&stopApps=&stopService=&disableService=&startApps=`）：停 C# 子服务 → 停/禁用 C# 星尘服务 → 导入配置（相对路径绝对化）→ 启动 |
 | `GET /star/getStarConfig`、`POST /star/updateStarConfig` | 星尘配置读取/更新 |
-| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程 |
-| `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制） |
+| `GET /star/machine`、`GET /star/getProcessList` | 本机详情 / Top 进程（`getProcessList?sort=cpu|memory&count=N`；字段口径对齐 htop / 云监控：`cpuPercent` 瞬时占单核百分比（可 >100）、`memoryMB`、`user`、`exe`、`command`、`cwd`、`threadCount`、`handleCount`（Linux 为打开文件数）、`startTime`；**`app`/`appPath` 为真正的应用**——`dotnet /path/App.dll` 这类解释器宿主会解析出 `App.dll` 及其完整路径，而不是只显示 `dotnet`；Windows `w3wp.exe`（IIS 工作进程）会自动解析应用池并显示站点/应用物理路径（读取 `applicationHost.config`，失败时回退为宿主路径），并额外返回 `appPool`/`iisSites`） |
+| `GET /star/webTraffic`、`GET /star/portTraffic` | 网站流量 / 端口流量统计快照（`WebTraffic` / `PortTraffic` 配置控制；网站流量含 IIS 站点运行状态、日志开关与 sc-bytes 状态） |
+| `POST /star/webLogFix` | 为 IIS 站点启用日志记录并勾选 `BytesSent`（流量字段；`{"site":"站点名"}` 或 `{"all":true}`；需 `config` 权限；修改 IIS 配置前留 `applicationHost.config.pek-bak` 备份） |
 | `GET /star/trafficHistory` | 流量历史每日归档（`?days=90` 最近 N 天：网站按站/端口按天数据与保留天数） |
 | `GET /star/fileList`、`GET /star/fileRead`、`POST /star/fileWrite` | 文件管理：目录浏览 / 读取（在线编辑） / 保存 |
 | `POST /star/fileMkdir`、`POST /star/fileNewFile`、`POST /star/fileRename`、`POST /star/fileDelete`、`POST /star/fileCopy`、`POST /star/fileMove` | 文件管理：新建/重命名/删除/复制/移动（均支持批量） |
-| `GET /star/fileDownload`、`POST /star/fileUpload`、`POST /star/fileCompress`、`POST /star/fileExtract`、`POST /star/fileChmod`、`GET /star/fileSearch` | 文件管理：下载/上传/压缩(ZIP)/解压/权限/搜索 |
+| `GET /star/fileDownload`、`POST /star/fileUpload`、`POST /star/fileCheck`、`POST /star/fileUploadChunk`、`GET /star/fileUploadStatus`、`POST /star/fileUploadAbort`、`POST /star/fileCompress`、`POST /star/fileExtract`、`POST /star/fileChmod`、`GET /star/fileSearch` | 文件管理：下载 / 上传（`overwrite=0` 拒同名）/ 同名检查 / 分片上传（`id`+`offset`+`total`，断点续传）/ 分片进度 / 放弃分片 / 压缩(ZIP) / 多格式解压（`password` 可传，默认目标=同名子目录）/ 权限 / 搜索 |
 | `GET /star/logCleanScan`、`POST /star/logCleanRun` | 日志清理：扫描分类占用（条数/大小/明细） / 按分类清理（`{"keys":["system",…]}`） |
 | `GET /star/pluginList`、`POST /star/pluginInstall?name=`、`POST /star/pluginDelete` | 插件：列表 / 上传安装（zip 请求体）/ 卸载（`{"id":…}`）；插件页面静态服务 `/plugins/<id>/...` |
 | `GET /star/pluginStore`、`POST /star/pluginStoreInstall` | 在线插件源：列表（含已安装/可更新状态；未配置时 `configured=false`） / 安装或更新（`{"id":…}`；HTTPS 下载 + SHA-256 + 可选强制验签，校验失败拒绝） |
@@ -554,6 +588,8 @@ src/
 ├─ manager.rs    应用管理器：多应用守护、控制、状态持久化、看门狗、配置热更新
 ├─ app.rs        单应用运行时：启动/停止/退出检测/内存/文件变动
 ├─ deploy.rs     部署：解压、影子目录、可执行文件检索、安全文件替换
+├─ apppkg.rs     应用包一键部署：解压（zip / tar.gz）、主程序识别、注册子服务
+├─ migrate.rs    从 C# 版星尘迁移子服务：只读扫描、停 C# 侧（UDP RPC + 服务）、路径绝对化、导入
 ├─ server.rs     本地 HTTP 控制接口 + Web 面板路由（dhrust::net 控制器）
 ├─ webpanel.rs   Web 管理面板：登录鉴权/令牌/限流、/api 与 /star 控制器
 ├─ web/          面板前端（index.html，编译期内嵌）
@@ -564,7 +600,7 @@ src/
 └─ util.rs       基础辅助（路径/日志/通配/参数切分）
 ```
 
-- 单元测试：`cargo test`（71 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
+- 单元测试：`cargo test`（171 项：配置、部署模式、可执行文件检索、影子解压、安全替换、参数切分、僵尸进程判定、面板鉴权（三级级别）/限流/子服务 CRUD/应用包部署（zip/tar.gz 解压、主程序识别、同名升级）/日志/机器信息/整机资源/时间同步/后台采样器/系统采集解析等）；
 - 冒烟脚本思路（本机已验证）：临时目录启动 `-run` → `Invoke-RestMethod` 调用接口 → 验证影子目录切换、运行中替换部署包、代理重启后的进程接管、面板登录与各端点。
 
 ### 11.1 版本号规范（发布约定）
@@ -591,4 +627,4 @@ src/
 
 ## 13. Web 应用防火墙（Pek.RWaf）
 
-面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.json` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。
+面板与控制接口挂载 **Pek.RWaf** 中间件（独立公共库 `pek-rwaf`，sibling `../Pek.RWaf`）：拦截恶意爬虫与扫描器（MJ12bot/sqlmap/python-requests/curl 等）与路径探测（`.env`/`.php` 等），带 CC 限速（300/分钟/IP）；配置 `Config/Waf.toml` 首启自动生成、修改后 ≤10 秒热重载。管理端预设不放行任何机器人；在线 SQL/文件管理/AI 端点经 `skipAttackPrefixes` 跳过攻击检测（安全由业务护栅与权限负责）。回环地址默认豁免（本地工具/冒烟不受影响）。面板「**配置 → 🛡 安全**」子页签提供在线开关与完整参考配置（保存后立即生效并写入配置文件）。

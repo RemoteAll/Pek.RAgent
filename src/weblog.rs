@@ -1,4 +1,4 @@
-//! 网站流量统计（WebTraffic）：自动发现 nginx/apache 站点访问日志（`WebLogs` 手动补充），
+//! 网站流量统计（WebTraffic）：自动发现 nginx/apache/IIS 站点访问日志（`WebLogs` 手动补充），
 //! 后台增量解析（inode+offset 防轮转/截断），按站点聚合今日/昨日/累计流量、请求数、UV
 //! 与状态码分布，供 Web 面板 `/star/webTraffic` 展示。
 //!
@@ -10,6 +10,8 @@
 //! 支持格式：
 //! - combined / common（nginx 默认与宝塔、Apache 默认）：`ip - - [time] "req" status bytes ...`
 //! - JSON 行（Caddy 默认访问日志）：取 `status` / `size` / `request.remote_ip`
+//! - IIS W3C（Windows 默认）：按 `#Fields:` 头解析 `sc-status` / `sc-bytes` / `c-ip`；
+//!   IIS 日志默认不含 `sc-bytes` 时只能统计请求数/UV/状态码，流量为 0（需在 IIS 日志记录中勾选字节字段）。
 //!
 //! 持久化 `Data/web_traffic.json`（30 秒节流）：站点累计与文件读取位置（inode+offset），
 //! 重启续读不重复统计。UV 集合不持久化（重启后按“基数 + 新集合”近似）。
@@ -35,13 +37,23 @@ use crate::util;
 /// 日志轮询间隔。
 const POLL_INTERVAL: Duration = Duration::from_millis(1000);
 /// 单次读取上限（字节）：防首次回溯读超大文件时长时间占用（未读完下一轮继续）。
-const MAX_CHUNK: usize = 8 * 1024 * 1024;
+///
+/// 2026-10-26 由 8 MB 降到 1 MB：块内是一行一个字符串的临时分配，块越大
+/// 启动回溯时的瞬时堆峰值越高（8 MB 文本 ≈ 10 MB 堆），1 MB 足够摊薄系统调用。
+const MAX_CHUNK: usize = 1024 * 1024;
 /// 半行缓冲上限（畸形日志保护）。
 const MAX_LINE_BUF: usize = 1024 * 1024;
 /// 站点数量上限（保护）。
 const MAX_SITES: usize = 256;
-/// 今日 UV 集合上限（保护内存）。
-const MAX_UV: usize = 1_000_000;
+/// 精确 UV 集合的条数上限：超过后降级为 HyperLogLog（每集合固定 16 KB）。
+///
+/// 动机（2026-10-26）：首次回溯会把当天全部访问 IP 读进内存，百万级
+/// `HashSet<IpAddr>` 约 20~35 MB，是代理常驻内存的最大变量。UV 只作展示，
+/// 0.8% 误差可接受；小站点仍走精确集合，日常数据不受影响。
+const UV_EXACT_LIMIT: usize = 20_000;
+/// HyperLogLog 精度：p=14 → 16384 个寄存器（16 KB），标准误差 1.04/√m ≈ 0.81%。
+const HLL_P: usize = 14;
+const HLL_M: usize = 1 << HLL_P;
 /// 持久化节流间隔。
 const PERSIST_INTERVAL: Duration = Duration::from_secs(30);
 /// 自动发现重扫间隔（新站点上线后最多 5 分钟可见）。
@@ -52,6 +64,16 @@ const REDISCOVER_EMPTY_INTERVAL: Duration = Duration::from_secs(30);
 const RATE_WINDOW: usize = 5;
 
 // ————— 数据模型 —————
+
+/// IIS W3C 字段索引（来自 `#Fields:` 头）。
+#[derive(Clone, Debug)]
+struct W3cFields {
+    status: usize,
+    bytes: Option<usize>,
+    ip: Option<usize>,
+    /// 头部声明的字段数（用于识别“头未刷新但行尾新增 sc-bytes”的情况）
+    count: usize,
+}
 
 /// 单个日志文件的读取状态。
 #[derive(Default)]
@@ -64,8 +86,160 @@ struct FileState {
     pending: Vec<u8>,
     /// 是否已初始化（决定首次读取的起始位置）
     initialized: bool,
+    /// IIS W3C 字段索引（非 IIS 日志为 None）
+    w3c: Option<W3cFields>,
     /// 错误日志节流（避免每秒刷屏）
     error_logged: bool,
+}
+
+/// IP 的稳定散列（`DefaultHasher` 固定种子：同一次运行内外一致，无需持久化）。
+fn hash_ip(ip: IpAddr) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    ip.hash(&mut h);
+    h.finish()
+}
+
+/// `2^-r` 查表（HyperLogLog 估算用；避免每个寄存器都算一次 `powi`）。
+fn rank_table() -> &'static [f64; 64] {
+    static TABLE: std::sync::OnceLock<[f64; 64]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = [0f64; 64];
+        for (i, v) in table.iter_mut().enumerate() {
+            *v = 2f64.powi(-(i as i32));
+        }
+        table
+    })
+}
+
+/// 固定 16 KB 的基数估算器（HyperLogLog，标准误差约 0.81%）。
+#[derive(Clone)]
+struct HyperLogLog {
+    regs: Vec<u8>,
+}
+
+impl HyperLogLog {
+    fn new() -> Self {
+        Self {
+            regs: vec![0u8; HLL_M],
+        }
+    }
+
+    fn add_hash(&mut self, hash: u64) {
+        // 高 p 位做桶下标，其余位的前导零个数 + 1 作为 rank（上限 64-p+1）
+        let index = (hash >> (64 - HLL_P)) as usize;
+        let rest = hash << HLL_P;
+        let rank = if rest == 0 {
+            (64 - HLL_P + 1) as u8
+        } else {
+            rest.leading_zeros() as u8 + 1
+        };
+        if rank > self.regs[index] {
+            self.regs[index] = rank;
+        }
+    }
+
+    /// 基数估算（标准 HLL：原始估计 + 小范围线性计数修正）。
+    fn estimate(&self) -> u64 {
+        let table = rank_table();
+        let m = HLL_M as f64;
+        let sum: f64 = self
+            .regs
+            .iter()
+            .map(|&r| table[(r as usize).min(table.len() - 1)])
+            .sum();
+        let alpha = 0.7213 / (1.0 + 1.079 / m);
+        let raw = alpha * m * m / sum;
+        let zeros = self.regs.iter().filter(|&&r| r == 0).count();
+        let value = if raw <= 2.5 * m && zeros > 0 {
+            // 小范围修正：寄存器大量为 0 时原始估计偏差大
+            m * (m / zeros as f64).ln()
+        } else {
+            raw
+        };
+        value.round().max(0.0) as u64
+    }
+
+    #[cfg(test)]
+    fn memory_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.regs.capacity()
+    }
+}
+
+/// UV 集合：小基数精确（`HashSet`），大基数自动降级为 HyperLogLog。
+#[derive(Clone)]
+enum UvSet {
+    Exact(HashSet<IpAddr>),
+    Approx(HyperLogLog),
+}
+
+impl Default for UvSet {
+    fn default() -> Self {
+        Self::Exact(HashSet::new())
+    }
+}
+
+impl UvSet {
+    /// 记录一个访客 IP（同一 IP 重复只计一次）。
+    fn add(&mut self, ip: IpAddr) {
+        match self {
+            Self::Exact(set) => {
+                if set.contains(&ip) {
+                    return;
+                }
+                if set.len() < UV_EXACT_LIMIT {
+                    set.insert(ip);
+                    return;
+                }
+                // 超过上限：把已收集的精确集合灌进 HyperLogLog 后切换（一次性开销）
+                let mut hll = HyperLogLog::new();
+                for old in set.iter() {
+                    hll.add_hash(hash_ip(*old));
+                }
+                hll.add_hash(hash_ip(ip));
+                *self = Self::Approx(hll);
+            }
+            Self::Approx(hll) => hll.add_hash(hash_ip(ip)),
+        }
+    }
+
+    fn estimate(&self) -> u64 {
+        match self {
+            Self::Exact(set) => set.len() as u64,
+            Self::Approx(hll) => hll.estimate(),
+        }
+    }
+
+    #[cfg(test)]
+    fn is_approx(&self) -> bool {
+        matches!(self, Self::Approx(_))
+    }
+
+    #[cfg(test)]
+    fn memory_bytes(&self) -> usize {
+        match self {
+            // hashbrown：每桶 ≈ 键大小 + 1 字节控制位，按容量估算即可（只用于展示）
+            Self::Exact(set) => {
+                std::mem::size_of::<Self>()
+                    + set.capacity() * (std::mem::size_of::<IpAddr>() + 1)
+            }
+            Self::Approx(hll) => std::mem::size_of::<Self>() + hll.memory_bytes(),
+        }
+    }
+
+    /// 释放内存：精确集合收缩到实际大小（估算集合本就定长）。返回释放字节数估算。
+    fn compact(&mut self) -> usize {
+        match self {
+            Self::Exact(set) => {
+                let per_slot = std::mem::size_of::<IpAddr>() + 1;
+                let before = std::mem::size_of::<Self>() + set.capacity() * per_slot;
+                set.shrink_to_fit();
+                let after = std::mem::size_of::<Self>() + set.capacity() * per_slot;
+                before.saturating_sub(after)
+            }
+            Self::Approx(_) => 0,
+        }
+    }
 }
 
 /// 单日统计。
@@ -77,8 +251,8 @@ struct DayStats {
     s3xx: u64,
     s4xx: u64,
     s5xx: u64,
-    /// 今日 UV 集合（本次运行期间新见到的 IP）
-    uv: HashSet<IpAddr>,
+    /// 今日 UV 集合（本次运行期间新见到的 IP；大基数自动降级为估算）
+    uv: UvSet,
     /// UV 基数（持久化恢复的历史数量；重启后集合从零，基数为准）
     uv_base: u64,
 }
@@ -86,7 +260,7 @@ struct DayStats {
 impl DayStats {
     /// UV 展示值（基数 + 本次集合）。
     fn uv_total(&self) -> u64 {
-        self.uv_base + self.uv.len() as u64
+        self.uv_base + self.uv.estimate()
     }
 }
 
@@ -131,9 +305,7 @@ impl SiteStats {
             _ => {}
         }
         if let Some(ip) = line.ip {
-            if self.today.uv.len() < MAX_UV {
-                self.today.uv.insert(ip);
-            }
+            self.today.uv.add(ip);
         }
     }
 
@@ -164,9 +336,31 @@ struct Source {
     path: PathBuf,
 }
 
+/// 自动发现结果：可统计的日志源 + 暂不可统计的站点（名称 + 原因）。
+struct Discovery {
+    sources: Vec<Source>,
+    /// 站点存在但当前无法统计（日志关闭/格式不支持/暂无日志文件）
+    pending: Vec<(String, String)>,
+    /// IIS 站点元信息（运行状态/日志字段；非 IIS 为空）
+    iis: Vec<(String, IisMeta)>,
+}
+
+/// IIS 站点面板展示信息。
+#[derive(Clone)]
+struct IisMeta {
+    state: String,
+    log_enabled: bool,
+    sc_bytes: bool,
+    format: String,
+}
+
 /// 模块共享状态。
 struct Inner {
     sources: Vec<Source>,
+    /// 配置中存在但暂时无法统计的站点（面板仍列出，避免“只剩 Default Web Site”）
+    pending: Vec<(String, String)>,
+    /// IIS 站点元信息（站点名 → 状态/日志字段）
+    iis: HashMap<String, IisMeta>,
     stats: HashMap<String, SiteStats>,
     files: HashMap<PathBuf, FileState>,
     last_discover: Option<Instant>,
@@ -198,6 +392,8 @@ pub(crate) fn start(manager: Arc<AppManager>) {
             enabled: AtomicBool::new(false),
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
+                pending: Vec::new(),
+                iis: HashMap::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -246,31 +442,62 @@ fn reconfigure(t: &WebTraffic, cfg: &AgentConfig) {
     if !cfg.web_traffic {
         // 关闭时清空源（统计数据保留，重新启用后续读；文件偏移状态保留不重复读）
         inner.sources.clear();
+        inner.pending.clear();
         return;
     }
     let manual = parse_manual_logs(&cfg.web_logs);
     let auto = discover_sites();
-    apply_sources(&mut inner, merge_sources(manual, auto));
+    apply_sources(
+        &mut inner,
+        merge_sources(manual, auto.sources),
+        auto.pending,
+        auto.iis,
+    );
+}
+
+/// 外部修改了 IIS 日志配置后（如启用 sc-bytes），尽快重新发现站点日志。
+pub(crate) fn request_rediscover() {
+    if let Some(t) = INSTANCE.get()
+        && let Ok(mut inner) = t.inner.lock() {
+            inner.last_discover = None;
+        }
 }
 
 /// 替换日志源并确保站点统计条目存在。
-fn apply_sources(inner: &mut Inner, sources: Vec<Source>) {
+fn apply_sources(
+    inner: &mut Inner,
+    sources: Vec<Source>,
+    pending: Vec<(String, String)>,
+    iis: Vec<(String, IisMeta)>,
+) {
     inner.last_discover = Some(Instant::now());
+    // 已有日志源的站点（含手动指定）不再重复标记“暂不可统计”
+    let pending: Vec<(String, String)> = pending
+        .into_iter()
+        .filter(|(name, _)| !sources.iter().any(|s| &s.site == name))
+        .collect();
     for s in &sources {
         inner.stats.entry(s.site.clone()).or_default();
     }
+    // 无法统计的站点也保留条目：面板会列出并显示原因（0 流量不是“没这个站点”）
+    for (name, _) in &pending {
+        inner.stats.entry(name.clone()).or_default();
+    }
     if sources.len() != inner.sources.len()
+        || pending != inner.pending
         || sources
             .iter()
             .zip(inner.sources.iter())
             .any(|(a, b)| a.site != b.site || a.path != b.path)
     {
         util::log_format(
-            "网站流量：发现 {} 个站点日志源",
-            &[&sources.len().to_string()],
+            "网站流量：发现 {} 个站点日志源（{} 个站点暂不可统计）",
+            &[&sources.len().to_string(), &pending.len().to_string()],
         );
     }
     inner.sources = sources;
+    inner.pending = pending;
+    inner.iis = iis.into_iter().collect();
 }
 
 /// 单次采样：发现（如有必要）→ 读取增量 → 聚合 → 节流持久化。
@@ -289,7 +516,12 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
     if need_rediscover {
         let manual = parse_manual_logs(&cfg.web_logs);
         let auto = discover_sites();
-        apply_sources(&mut inner, merge_sources(manual, auto));
+        apply_sources(
+            &mut inner,
+            merge_sources(manual, auto.sources),
+            auto.pending,
+            auto.iis,
+        );
     }
 
     // 跨天收尾与滚动（先归档旧日、再滚动，避免跨天瞬间写错日期）
@@ -297,35 +529,47 @@ fn tick(t: &WebTraffic, cfg: &AgentConfig) {
     // 历史保留清理（内部每天最多执行一次，开销可忽略）
     history::maybe_prune(&t.base, cfg.traffic_history_days);
 
-    // 读取增量并聚合成事件（先收集，避免多字段可变借用冲突）
+    // 读取增量并就地聚合（流式：读一块聚一块，不累积全量事件——
+    // 首次回溯几十 MB 日志时，原实现的事件缓冲是启动内存峰值的主要来源）
     let sources = inner.sources.clone();
-    let mut events: Vec<(String, LogLine)> = Vec::new();
-    for src in &sources {
-        let st = inner.files.entry(src.path.clone()).or_default();
-        match read_increment(&src.path, st) {
-            Ok(lines) => {
-                st.error_logged = false;
-                for line in lines {
-                    if let Some(ev) = parse_log_line(&line) {
-                        events.push((src.site.clone(), ev));
+    let mut any = false;
+    {
+        // 字段级拆分：文件状态与站点统计同时可变借用（不同字段，互不冲突）
+        let Inner { files, stats, .. } = &mut *inner;
+        for src in &sources {
+            let st = files.entry(src.path.clone()).or_default();
+            let site = stats.entry(src.site.clone()).or_default();
+            let mut added = 0usize;
+            let result = read_increment(&src.path, st, |line, w3c| {
+                // IIS W3C：字段顺序由 #Fields 头决定；其它格式走 combined/JSON 解析。
+                let parsed = if w3c.is_some() || looks_like_w3c_line(line) {
+                    parse_w3c_line(line, w3c)
+                } else {
+                    parse_log_line(line)
+                };
+                if let Some(ev) = parsed {
+                    site.add(&ev);
+                    added += 1;
+                }
+            });
+            match result {
+                Ok(_) => st.error_logged = false,
+                Err(e) => {
+                    if !st.error_logged {
+                        st.error_logged = true;
+                        util::log_format(
+                            "网站日志读取失败：{}（{}）",
+                            &[&src.path.display().to_string(), &e.to_string()],
+                        );
                     }
                 }
             }
-            Err(e) => {
-                if !st.error_logged {
-                    st.error_logged = true;
-                    util::log_format(
-                        "网站日志读取失败：{}（{}）",
-                        &[&src.path.display().to_string(), &e.to_string()],
-                    );
-                }
+            if added > 0 {
+                any = true;
             }
         }
     }
-    for (site, ev) in &events {
-        inner.stats.entry(site.clone()).or_default().add(ev);
-    }
-    if !events.is_empty() {
+    if any {
         inner.dirty = true;
     }
 
@@ -360,6 +604,36 @@ fn flush(t: &WebTraffic) {
     }
 }
 
+/// 释放内存（面板「释放内存」按钮）：清理可重建的缓存，返回可释放字节数估算。
+///
+/// 只清理不影响统计口径的东西：站点 UV 集合收缩到实际大小（大基数集合在采集时
+/// 已降级为 16 KB 的 HyperLogLog）、站点/文件表的多余容量。**不动**日志半行缓冲
+/// （清掉会丢失未完成的一行）。
+///
+/// 为什么需要它（2026-10-26）：musl（Linux 静态包）没有 `malloc_trim`，面板按钮
+/// 原来在 Linux 上实际是空操作；改为先清理本进程缓存，再由分配器在释放大块时归还，
+/// RSS 才会真降。
+pub(crate) fn release_caches() -> usize {
+    let Some(t) = INSTANCE.get() else {
+        return 0;
+    };
+    let Ok(mut inner) = t.inner.lock() else {
+        return 0;
+    };
+    let mut freed = 0usize;
+    for st in inner.stats.values_mut() {
+        freed += st.today.uv.compact();
+        freed += st.yesterday.uv.compact();
+    }
+    let before = inner.stats.capacity() + inner.files.capacity();
+    inner.stats.shrink_to_fit();
+    inner.files.shrink_to_fit();
+    let after = inner.stats.capacity() + inner.files.capacity();
+    // 每个槽位按 (键 + 值 + 控制位) 粗略估算（只用于展示释放量）
+    freed += before.saturating_sub(after) * 128;
+    freed
+}
+
 // ————— 面板快照 —————
 
 /// 面板数据（`/star/webTraffic`）。
@@ -372,8 +646,14 @@ pub(crate) fn snapshot_json() -> Json {
         });
     };
 
-    let inner = t.inner.lock().unwrap();
     let enabled = t.enabled.load(Ordering::Relaxed);
+    // 站点运行状态（appcmd 15 秒缓存）：持锁前查询，避免阻塞日志读取
+    let states = if enabled {
+        crate::iis::site_states()
+    } else {
+        HashMap::new()
+    };
+    let inner = t.inner.lock().unwrap();
 
     // 按站点聚合展示（同名多日志合并），保持发现顺序
     let mut order: Vec<String> = Vec::new();
@@ -385,6 +665,62 @@ pub(crate) fn snapshot_json() -> Json {
         logs.entry(s.site.as_str())
             .or_default()
             .push(s.path.display().to_string());
+    }
+    // 无法统计的站点同样列出（附原因），并排在日志源之后
+    let mut notes: HashMap<String, String> = inner.pending.iter().cloned().collect();
+    // IIS 配置可判断字段是否包含 sc-bytes（比日志头解析更早、更准）；手动源仍回退到日志头判断
+    for s in &inner.sources {
+        if notes.contains_key(&s.site) {
+            continue;
+        }
+        if let Some(meta) = inner.iis.get(&s.site) {
+            if !meta.log_enabled {
+                notes.insert(
+                    s.site.clone(),
+                    "IIS 日志记录已关闭（需在 IIS 管理器中启用）".to_string(),
+                );
+            } else if meta.format.eq_ignore_ascii_case("W3C") {
+                if !meta.sc_bytes {
+                    notes.insert(
+                        s.site.clone(),
+                        "日志字段未包含 sc-bytes：流量统计为 0（IIS 日志 → 选择字段 → 勾选“发送的字节数”）"
+                            .to_string(),
+                    );
+                } else {
+                    // 配置已包含 sc-bytes，但当前日志文件的 #Fields 头仍是旧的（等 IIS 新建日志文件）
+                    let file_missing = inner
+                        .files
+                        .get(&s.path)
+                        .and_then(|f| f.w3c.as_ref())
+                        .is_some_and(|w| w.bytes.is_none());
+                    if file_missing {
+                        notes.insert(
+                            s.site.clone(),
+                            "配置已启用 sc-bytes：当前日志文件尚未生效（等 IIS 新建日志文件/滚动后开始统计）"
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+            continue;
+        }
+        let missing_bytes = inner
+            .files
+            .get(&s.path)
+            .and_then(|f| f.w3c.as_ref())
+            .is_some_and(|w| w.bytes.is_none());
+        if missing_bytes {
+            notes.insert(
+                s.site.clone(),
+                "日志字段未包含 sc-bytes：流量统计为 0（IIS 日志 → 选择字段 → 勾选“发送的字节数”）"
+                    .to_string(),
+            );
+        }
+    }
+    for (name, _) in inner.pending.iter() {
+        if !order.iter().any(|n| n == name) {
+            order.push(name.clone());
+        }
     }
 
     let mut sites: Vec<Json> = Vec::new();
@@ -423,6 +759,16 @@ pub(crate) fn snapshot_json() -> Json {
         sites.push(json!({
             "name": name,
             "logs": logs.get(name.as_str()).cloned().unwrap_or_default(),
+            "note": notes.get(name.as_str()).map(String::as_str).unwrap_or(""),
+            "isIis": inner.iis.contains_key(name),
+            "iisState": states
+                .get(name)
+                .cloned()
+                .or_else(|| inner.iis.get(name).map(|m| m.state.clone()))
+                .unwrap_or_default(),
+            "logEnabled": inner.iis.get(name).map(|m| m.log_enabled).unwrap_or(true),
+            "scBytes": inner.iis.get(name).map(|m| m.sc_bytes).unwrap_or(false),
+            "logFormat": inner.iis.get(name).map(|m| m.format.clone()).unwrap_or_default(),
             "todayBytes": tb,
             "todayRequests": tr,
             "uv": uv,
@@ -441,12 +787,13 @@ pub(crate) fn snapshot_json() -> Json {
     let message = if !enabled {
         "网站流量统计未启用（配置 WebTraffic=true 开启）"
     } else if sites.is_empty() {
-        "未发现网站日志（自动扫描 nginx/apache 常见目录；如站点在非标准位置，可在配置文件 WebLogs 项手动指定：名称=路径;名称2=路径2）"
+        "未发现网站日志（自动扫描 nginx/apache/IIS 常见目录；如站点在非标准位置，可在配置文件 WebLogs 项手动指定：名称=路径;名称2=路径2）"
     } else {
         ""
     };
     json!({
         "enabled": enabled,
+        "localTime": chrono::Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string(),
         "sites": sites,
         "message": message,
     })
@@ -541,6 +888,120 @@ fn parse_json_line(line: &str) -> Option<LogLine> {
     Some(LogLine { ip, status, bytes })
 }
 
+/// IIS W3C 行是否值得尝试：`#Fields:` 头或以日期 `YYYY-MM-DD` 开头。
+fn looks_like_w3c_line(line: &str) -> bool {
+    let line = line.trim_start_matches('\u{feff}').trim_start();
+    line.to_ascii_lowercase().starts_with("#fields:")
+        || line
+            .split_whitespace()
+            .next()
+            .is_some_and(looks_like_w3c_date)
+}
+
+fn looks_like_w3c_date(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..].iter().all(u8::is_ascii_digit)
+}
+
+/// 解析一行 IIS W3C 日志。
+///
+/// - `#Fields:` 头更新字段索引（`sc-status` 必需，`sc-bytes`/`c-ip` 可选）；
+/// - 没有头时，若首字段像日期则按 IIS 默认字段序解析（默认序通常不含 `sc-bytes`，
+///   此时只能统计请求数/UV/状态码，流量按 0）；
+/// - 非 W3C 行返回 `None`，由调用方回退到 combined/JSON 解析。
+fn parse_w3c_line(line: &str, fields: &mut Option<W3cFields>) -> Option<LogLine> {
+    let line = line.trim_start_matches('\u{feff}').trim();
+    if line.is_empty() {
+        return None;
+    }
+    if line.to_ascii_lowercase().starts_with("#fields:") {
+        if let Some(parsed) = parse_w3c_fields(&line[8..]) {
+            *fields = Some(parsed);
+        }
+        return None;
+    }
+    if line.starts_with('#') {
+        return None;
+    }
+    let values: Vec<&str> = line.split_whitespace().collect();
+    if values.is_empty() {
+        return None;
+    }
+    if fields.is_none() {
+        if !looks_like_w3c_date(values[0]) {
+            return None;
+        }
+        *fields = Some(default_w3c_fields());
+    }
+    let f = fields.as_ref()?;
+    let status = values.get(f.status)?.parse::<u16>().ok()?;
+    if !(100..=599).contains(&status) {
+        return None;
+    }
+    let bytes = match f.bytes {
+        Some(i) => values.get(i).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0),
+        // IIS 修改日志字段后，当前日志文件的 #Fields 头不会立即重写，新增的 BytesSent
+        // 会作为行尾附加列出现：字段数比头部多时取最后一列（本工具总是把 BytesSent 加到末尾）。
+        None if values.len() > f.count => values
+            .last()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0),
+        None => 0,
+    };
+    let ip = f
+        .ip
+        .and_then(|i| values.get(i))
+        .and_then(|v| v.parse::<IpAddr>().ok());
+    Some(LogLine { ip, status, bytes })
+}
+
+fn parse_w3c_fields(header: &str) -> Option<W3cFields> {
+    let names: Vec<String> = header
+        .split_whitespace()
+        .map(|name| name.to_ascii_lowercase())
+        .collect();
+    let status = names.iter().position(|name| name == "sc-status")?;
+    Some(W3cFields {
+        status,
+        bytes: names.iter().position(|name| name == "sc-bytes"),
+        ip: names.iter().position(|name| name == "c-ip"),
+        count: names.len(),
+    })
+}
+
+/// IIS 默认字段序（无 `#Fields:` 头时的回退；默认不含 `sc-bytes`）。
+fn default_w3c_fields() -> W3cFields {
+    W3cFields {
+        status: 11,
+        bytes: None,
+        ip: Some(8),
+        count: 15,
+    }
+}
+
+/// 读取文件开头的 `#Fields:` 头（首次从文件末尾续读老日志时使用）。
+fn read_w3c_header(path: &Path) -> Option<W3cFields> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = vec![0u8; 8192];
+    let n = file.read(&mut buf).ok()?;
+    let text = String::from_utf8_lossy(&buf[..n]);
+    for line in text.lines() {
+        let line = line.trim_start_matches('\u{feff}').trim();
+        if line.to_ascii_lowercase().starts_with("#fields:") {
+            return parse_w3c_fields(&line[8..]);
+        }
+        if !line.is_empty() && !line.starts_with('#') {
+            break;
+        }
+    }
+    None
+}
+
 // ————— 站点发现 —————
 
 /// 手动配置解析：`名称=路径;名称2=路径2`（分号/换行分隔）。
@@ -571,7 +1032,7 @@ fn parse_manual_logs(text: &str) -> Vec<Source> {
 fn merge_sources(manual: Vec<Source>, auto: Vec<Source>) -> Vec<Source> {
     let mut out: Vec<Source> = Vec::new();
     let mut seen: HashSet<PathBuf> = HashSet::new();
-    for src in manual.into_iter().chain(auto.into_iter()) {
+    for src in manual.into_iter().chain(auto) {
         if out.len() >= MAX_SITES {
             break;
         }
@@ -585,7 +1046,7 @@ fn merge_sources(manual: Vec<Source>, auto: Vec<Source>) -> Vec<Source> {
 }
 
 /// 自动发现站点日志（nginx/apache 常见目录；仅 Unix）。
-fn discover_sites() -> Vec<Source> {
+fn discover_sites() -> Discovery {
     #[cfg(unix)]
     {
         const NGINX_DIRS: &[&str] = &[
@@ -622,14 +1083,55 @@ fn discover_sites() -> Vec<Source> {
                 }
             }
         }
-        out
+        Discovery {
+            sources: out,
+            pending: Vec::new(),
+            iis: Vec::new(),
+        }
     }
 
     #[cfg(not(unix))]
     {
-        // Windows 等平台没有固定的 vhost 目录约定（nginx 多为绿色版自定义路径），
-        // 仅支持 WebLogs 手动配置
-        Vec::new()
+        #[cfg(windows)]
+        {
+            // Windows：IIS 站点清单 → 最新 W3C 日志；无日志/日志关闭的站点也列出（附原因），
+            // 否则新站/停用站会让面板看起来“只剩 Default Web Site”。
+            // 绿色版 nginx/apache 仍可通过 WebLogs 手动指定。
+            let mut sources = Vec::new();
+            let mut pending = Vec::new();
+            let mut iis = Vec::new();
+            for site in crate::iis::discover_log_sites() {
+                iis.push((
+                    site.name.clone(),
+                    IisMeta {
+                        state: site.state.clone(),
+                        log_enabled: site.enabled,
+                        sc_bytes: site.sc_bytes,
+                        format: site.format.clone(),
+                    },
+                ));
+                match site.file {
+                    Some(path) => sources.push(Source {
+                        site: site.name,
+                        path,
+                    }),
+                    None => pending.push((site.name, site.note)),
+                }
+            }
+            Discovery {
+                sources,
+                pending,
+                iis,
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            Discovery {
+                sources: Vec::new(),
+                pending: Vec::new(),
+                iis: Vec::new(),
+            }
+        }
     }
 }
 
@@ -825,16 +1327,14 @@ fn parse_apache_vhosts(text: &str) -> Vec<(String, PathBuf)> {
             if server_name.is_none() {
                 server_name = parts.next().map(|s| s.to_string());
             }
-        } else if cmd.eq_ignore_ascii_case("CustomLog") {
-            if custom_log.is_none() {
-                if let Some(p) = parts.next() {
+        } else if cmd.eq_ignore_ascii_case("CustomLog")
+            && custom_log.is_none()
+                && let Some(p) = parts.next() {
                     // 仅接受绝对路径（相对路径基于 ServerRoot，无法可靠解析）
                     if p != "/dev/null" && looks_like_abs_path(p) {
                         custom_log = Some(PathBuf::from(p));
                     }
                 }
-            }
-        }
     }
     out
 }
@@ -902,13 +1402,24 @@ fn today_string() -> String {
     chrono::Local::now().format("%Y-%m-%d").to_string()
 }
 
-/// 读取文件增量，返回完整行列表（不完整行留在缓冲，下一轮拼接）。
+/// 读取文件增量并**逐行回调**（不完整行留在缓冲，下一轮拼接）。
+///
+/// 为什么流式（2026-10-26）：首次回溯会把当天整个日志读一遍。原实现先把所有行
+/// 收集成 `Vec<String>`、解析后再全部聚合成一个事件 `Vec`，几十 MB 日志会把瞬时堆
+/// 推到几十 MB（"刚启动就占 40+ MB"的主因之一）。现改为「读一块 → 解析一块 → 聚合
+/// 一块」，峰值只与单块大小相关。
 ///
 /// 处理三类边界：
 /// - 首次读取：文件今天更新过 → 从头读（补今日已有数据）；否则跳到末尾（只统计增量）；
 /// - 日志轮转：文件身份变化（inode 不同）→ 新文件从头读；
 /// - 截断（copytruncate）：长度小于已读偏移 → 从头读。
-fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String>> {
+///
+/// 回调参数：行文本（已去掉行尾 `\r`）、IIS W3C 字段状态（解析时可更新）。
+/// 返回本次产出的完整行数。
+fn read_increment<F>(path: &Path, st: &mut FileState, mut on_line: F) -> std::io::Result<usize>
+where
+    F: FnMut(&str, &mut Option<W3cFields>),
+{
     let meta = std::fs::metadata(path)?;
     let len = meta.len();
     let ident = file_identity(path, &meta);
@@ -916,19 +1427,25 @@ fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String
     if !st.initialized {
         st.inode = ident;
         st.offset = if mtime_is_today(&meta) { 0 } else { len };
+        // 老 IIS 日志从末尾续读时看不到文件头的 #Fields，单独读取一次
+        if st.offset > 0 {
+            st.w3c = read_w3c_header(path);
+        }
         st.initialized = true;
     } else if ident != 0 && st.inode != ident {
         // 日志轮转：新文件从头读
         st.inode = ident;
         st.offset = 0;
         st.pending.clear();
+        st.w3c = None;
     } else if len < st.offset {
         // 截断：从头读
         st.offset = 0;
         st.pending.clear();
+        st.w3c = None;
     }
 
-    let mut lines: Vec<String> = Vec::new();
+    let mut lines = 0usize;
     if len > st.offset {
         let mut file = std::fs::File::open(path)?;
         file.seek(SeekFrom::Start(st.offset))?;
@@ -939,20 +1456,24 @@ fn read_increment(path: &Path, st: &mut FileState) -> std::io::Result<Vec<String
         st.offset += n as u64;
 
         st.pending.extend_from_slice(&chunk);
+        // 同一结构体的不同字段分别可变借用（逐行回调期间不经过 `st` 的方法）
+        let pending = &mut st.pending;
+        let w3c = &mut st.w3c;
         let mut start = 0usize;
-        for i in 0..st.pending.len() {
-            if st.pending[i] == b'\n' {
-                let line = &st.pending[start..i];
-                lines.push(String::from_utf8_lossy(line).trim_end_matches('\r').to_string());
+        for i in 0..pending.len() {
+            if pending[i] == b'\n' {
+                let raw = String::from_utf8_lossy(&pending[start..i]);
+                on_line(raw.trim_end_matches('\r'), w3c);
+                lines += 1;
                 start = i + 1;
             }
         }
         if start > 0 {
-            st.pending.drain(..start);
+            pending.drain(..start);
         }
-        if st.pending.len() > MAX_LINE_BUF {
+        if pending.len() > MAX_LINE_BUF {
             // 畸形保护：超长无换行内容直接丢弃
-            st.pending.clear();
+            pending.clear();
         }
     }
     Ok(lines)
@@ -1021,7 +1542,7 @@ fn day_from_json(v: Option<&Json>) -> DayStats {
         s3xx: get("s3xx"),
         s4xx: get("s4xx"),
         s5xx: get("s5xx"),
-        uv: HashSet::new(),
+        uv: UvSet::default(),
         uv_base: get("uv"),
     }
 }
@@ -1129,10 +1650,12 @@ fn load_persisted(base: &Path, inner: &mut Inner) {
 
     if let Some(files) = v.get("files").and_then(|x| x.as_object()) {
         for (p, f) in files {
-            let mut st = FileState::default();
-            st.inode = f.get("inode").and_then(|x| x.as_u64()).unwrap_or(0);
-            st.offset = f.get("offset").and_then(|x| x.as_u64()).unwrap_or(0);
-            st.initialized = true;
+            let st = FileState {
+                inode: f.get("inode").and_then(|x| x.as_u64()).unwrap_or(0),
+                offset: f.get("offset").and_then(|x| x.as_u64()).unwrap_or(0),
+                initialized: true,
+                ..FileState::default()
+            };
             inner.files.insert(PathBuf::from(p), st);
         }
     }
@@ -1200,6 +1723,59 @@ mod tests {
 
         // 非访问日志的 JSON 行（无 status）被忽略
         assert!(parse_log_line(r#"{"level":"info","msg":"starting"}"#).is_none());
+    }
+
+    #[test]
+    fn parses_iis_w3c_with_fields_header() {
+        let mut fields = None;
+        assert!(parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken sc-bytes",
+            &mut fields
+        )
+        .is_none());
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET /Default.aspx - 80 - 1.2.3.4 Mozilla/5.0 - 200 0 0 123 4567";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 4567);
+        assert_eq!(ev.ip.unwrap().to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn parses_iis_w3c_without_sc_bytes() {
+        let mut fields = None;
+        parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken",
+            &mut fields,
+        );
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 5.6.7.8 UA - 404 0 0 10";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 404);
+        assert_eq!(ev.bytes, 0, "IIS 默认字段无 sc-bytes，流量按 0 计");
+        assert_eq!(ev.ip.unwrap().to_string(), "5.6.7.8");
+    }
+
+    #[test]
+    fn parses_sc_bytes_appended_before_header_refresh() {
+        // 启用 sc-bytes 后，当前日志文件的 #Fields 头仍是旧的；新增列出现在行尾
+        let mut fields = None;
+        parse_w3c_line(
+            "#Fields: date time s-ip cs-method cs-uri-stem cs-uri-query s-port cs-username c-ip cs(User-Agent) cs(Referer) sc-status sc-substatus sc-win32-status time-taken",
+            &mut fields,
+        );
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 5.6.7.8 UA - 200 0 0 10 4567";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 4567, "旧头部+行尾新增 sc-bytes 也应立即统计");
+    }
+
+    #[test]
+    fn parses_iis_w3c_default_fields_without_header() {
+        let mut fields = None;
+        let line = "2026-10-20 12:34:56 172.18.82.8 GET / - 80 - 9.9.9.9 UA - 200 0 0 10";
+        let ev = parse_w3c_line(line, &mut fields).unwrap();
+        assert_eq!(ev.status, 200);
+        assert_eq!(ev.bytes, 0);
+        assert_eq!(ev.ip.unwrap().to_string(), "9.9.9.9");
     }
 
     // ————— nginx 配置 —————
@@ -1401,23 +1977,27 @@ server
 
         let mut st = FileState::default();
         // 首次读取：mtime 是今天 → 从头读
-        let lines = read_increment(&log, &mut st).unwrap();
+        let mut lines: Vec<String> = Vec::new();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 2, "半行不应产出：{lines:?}");
 
         // 无新增：无行
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert!(lines.is_empty());
 
         // 补全半行：产出完整行
         append(&log, "0 300\n");
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GET /3"));
 
         // 模拟 logrotate：改名旧文件 + 新文件
         std::fs::rename(&log, dir.join("access.log.1")).unwrap();
         append(&log, "2.2.2.2 - - [t] \"GET /new HTTP/1.1\" 500 50\n");
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1, "轮转后应读取新文件：{lines:?}");
         assert!(lines[0].contains("GET /new"));
 
@@ -1430,15 +2010,80 @@ server
         let log = dir.join("a.log");
         append(&log, "1.1.1.1 - - [t] \"GET /1 HTTP/1.1\" 200 100\n");
         let mut st = FileState::default();
-        assert_eq!(read_increment(&log, &mut st).unwrap().len(), 1);
+        let mut lines: Vec<String> = Vec::new();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
+        assert_eq!(lines.len(), 1);
 
         // 截断重写（copytruncate）
         std::fs::write(&log, "1.1.1.9 - - [t] \"GET /2 HTTP/1.1\" 200 1\n").unwrap();
-        let lines = read_increment(&log, &mut st).unwrap();
+        lines.clear();
+        read_increment(&log, &mut st, |line, _| lines.push(line.to_string())).unwrap();
         assert_eq!(lines.len(), 1);
         assert!(lines[0].contains("GET /2"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ————— UV 基数（精确 → HyperLogLog 降级） —————
+
+    #[test]
+    fn uv_counts_unique_ips_only() {
+        let mut uv = UvSet::default();
+        for _ in 0..5 {
+            uv.add("1.2.3.4".parse().unwrap());
+        }
+        uv.add("1.2.3.5".parse().unwrap());
+        assert!(!uv.is_approx());
+        assert_eq!(uv.estimate(), 2);
+    }
+
+    #[test]
+    fn uv_degrades_to_hyperloglog_beyond_limit() {
+        let mut uv = UvSet::default();
+        for i in 0..UV_EXACT_LIMIT {
+            let ip: IpAddr = format!("10.{}.{}.{}", i / 65536, (i / 256) % 256, i % 256)
+                .parse()
+                .unwrap();
+            uv.add(ip);
+        }
+        assert!(!uv.is_approx(), "上限内应保持精确集合");
+        assert_eq!(uv.estimate(), UV_EXACT_LIMIT as u64);
+
+        uv.add("192.168.9.9".parse().unwrap());
+        assert!(uv.is_approx(), "超限后应降级为 HyperLogLog");
+        let est = uv.estimate() as f64;
+        let expect = (UV_EXACT_LIMIT + 1) as f64;
+        let err = (est - expect).abs() / expect;
+        assert!(err < 0.05, "降级后估算误差过大：{est} vs {expect}");
+        assert!(
+            uv.memory_bytes() < 32 * 1024,
+            "估算集合应固定小体积：{} 字节",
+            uv.memory_bytes()
+        );
+    }
+
+    #[test]
+    fn hyperloglog_estimates_large_cardinality() {
+        let mut hll = HyperLogLog::new();
+        let n = 100_000u32;
+        for i in 0..n {
+            let ip: IpAddr = std::net::Ipv4Addr::from(i).into();
+            hll.add_hash(hash_ip(ip));
+        }
+        let est = hll.estimate() as f64;
+        let err = (est - n as f64).abs() / n as f64;
+        assert!(err < 0.03, "HLL 误差过大：{:.2}%（估算 {est}）", err * 100.0);
+    }
+
+    #[test]
+    fn hyperloglog_is_accurate_for_small_sets() {
+        let mut hll = HyperLogLog::new();
+        for i in 0..100u32 {
+            let ip: IpAddr = std::net::Ipv4Addr::from(i).into();
+            hll.add_hash(hash_ip(ip));
+        }
+        let est = hll.estimate() as i64;
+        assert!((est - 100).abs() <= 5, "小基数估算偏差过大：{est}");
     }
 
     // ————— 聚合与滚动 —————
@@ -1501,6 +2146,8 @@ server
             enabled: AtomicBool::new(true),
             inner: Mutex::new(Inner {
                 sources: Vec::new(),
+                pending: Vec::new(),
+                iis: HashMap::new(),
                 stats: HashMap::new(),
                 files: HashMap::new(),
                 last_discover: None,
@@ -1520,16 +2167,20 @@ server
             });
             st.today.uv_base = 5; // 模拟历史 UV 基数
             inner.stats.insert("s1".to_string(), st);
-            let mut fst = FileState::default();
-            fst.inode = 42;
-            fst.offset = 1024;
-            fst.initialized = true;
+            let fst = FileState {
+                inode: 42,
+                offset: 1024,
+                initialized: true,
+                ..FileState::default()
+            };
             inner.files.insert(PathBuf::from("/x/a.log"), fst);
             save_persisted(&t, &inner);
         }
 
         let mut inner = Inner {
             sources: Vec::new(),
+            pending: Vec::new(),
+            iis: HashMap::new(),
             stats: HashMap::new(),
             files: HashMap::new(),
             last_discover: None,

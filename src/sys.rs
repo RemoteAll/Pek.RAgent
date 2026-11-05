@@ -13,12 +13,196 @@ pub(crate) use dhrust::sys::machine::{
 };
 pub(crate) use dhrust::sys::monitor::{
     disk_io, is_process_running, load_average, process_cpu_seconds, process_cpu_split,
-    process_stats, system_cpu_rate, tcp_counts, top_processes, DiskIo,
+    process_stats, system_cpu_rate, tcp_counts, top_processes, top_processes_union, DiskIo,
+    ProcItem,
 };
 pub(crate) use dhrust::sys::process::{
-    empty_working_set, is_alive, memory_mb, process_name, raise_priority, set_oom_score_adjust,
-    signal_force, signal_graceful, spawn, stop_process, Handle, SpawnRequest,
+    command_line, empty_working_set, is_alive, memory_mb, process_name, raise_priority,
+    reap_child, set_oom_score_adjust, signal_force, signal_graceful, spawn, stop_process,
+    working_set_trim_supported, Handle, SpawnRequest,
 };
+
+// 监听端口查询已下沉 `dhrust::sys::monitor`：进程 Top（`ProcItem.ports`）与
+// 「未配置 HealthCheck 时自动探活」共用同一份快照，避免两套实现口径漂移。
+// 再导出保持本模块既有调用路径 `sys::listen_ports_of` 不变。
+pub(crate) use dhrust::sys::monitor::listen_ports_of;
+
+/// 重启本机（平台「服务器节点」页下发 `reboot` 指令时调用）。
+///
+/// 延迟 3 秒执行：留出写日志与平台侧记录的时间。以服务身份运行（root / LocalSystem）才有权限，
+/// 权限不足时命令会失败并记日志，同时把失败原因回报平台（`rebootResult`）。
+pub(crate) fn reboot_machine(agent_id: &str) {
+    let agent_id = agent_id.to_string();
+    std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_secs(3));
+        crate::util::log_info("执行系统重启（平台下发指令）");
+        match do_reboot() {
+            Ok(()) => crate::util::log_info("已提交系统重启请求"),
+            Err(e) => {
+                let msg = format!("系统重启失败：{e}");
+                crate::util::log_error(&msg);
+                crate::panel_ws::send_event(
+                    &agent_id,
+                    serde_json::json!({ "type": "rebootResult", "ok": false, "reason": msg }),
+                );
+            }
+        }
+    });
+}
+
+/// 重启前预检：返回 `Err(原因)` 表示当前环境不可能重启整机（避免"点了没反应、原因只在日志里"）。
+///
+/// 覆盖三类常见失败：
+/// 1. **容器内**（Docker/LXC/K8s）：重启容器 ≠ 重启宿主机，指令在容器里执行只会失败；
+/// 2. **非 root**（Linux）：`systemctl reboot` / `shutdown` 均需 root（或 polkit 授权）；
+/// 3. **缺少重启工具**（极简镜像可能没有 systemctl/shutdown）。
+pub(crate) fn reboot_precheck() -> Result<(), String> {
+    // 容器环境识别（容器内重启无效）
+    if std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists()
+    {
+        return Err("检测到容器环境（/.dockerenv）：Agent 跑在容器里，重启容器不会重启宿主机".to_string());
+    }
+    if let Ok(cg) = std::fs::read_to_string("/proc/1/cgroup")
+        && (cg.contains("docker") || cg.contains("lxc") || cg.contains("kubepods"))
+    {
+        return Err("检测到容器环境（cgroup）：Agent 跑在容器里，无法重启宿主机".to_string());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // 需要 root：读 /proc/self/status 的 "Uid: <real> <effective> ..."
+        let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+        if let Some(uid) = status
+            .lines()
+            .find(|l| l.starts_with("Uid:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+        {
+            if uid != "0" {
+                return Err(format!(
+                    "当前以非 root 用户（uid={uid}）运行，systemctl reboot/shutdown 需要 root 权限：请把 Agent 装成系统服务（root）后重试"
+                ));
+            }
+        }
+        if !has_command("systemctl") && !has_command("shutdown") && !has_reboot_syscall_support() {
+            return Err("系统缺少 systemctl/shutdown 且 reboot(2) 不可用，无法执行重启".to_string());
+        }
+    }
+    #[cfg(windows)]
+    {
+        if !has_command("shutdown") && !std::path::Path::new(&format!(
+            "{}\\System32\\shutdown.exe",
+            std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string())
+        ))
+        .is_file()
+        {
+            return Err("系统缺少 shutdown.exe，无法执行重启".to_string());
+        }
+    }
+    Ok(())
+}
+
+/// Linux 下 `reboot(2)` 系统调用是否可用（需 root / CAP_SYS_BOOT）。
+#[cfg(target_os = "linux")]
+fn has_reboot_syscall_support() -> bool {
+    true
+}
+
+/// 命令是否可用（在 PATH 中找得到）。
+fn has_command(name: &str) -> bool {
+    let paths = std::env::var_os("PATH").unwrap_or_default();
+    std::env::split_paths(&paths).any(|dir| {
+        let p = dir.join(name);
+        p.is_file()
+            || p.with_extension("exe").is_file()
+            || dir.join(format!("{name}.exe")).is_file()
+    })
+}
+
+#[cfg(windows)]
+fn do_reboot() -> Result<(), String> {
+    // 绝对路径优先（服务环境 PATH 可能被精简）；再退化到按名字查找
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    let exe = format!("{sysroot}\\System32\\shutdown.exe");
+    let bin = if std::path::Path::new(&exe).is_file() {
+        exe
+    } else {
+        "shutdown".to_string()
+    };
+    let st = std::process::Command::new(&bin)
+        .args(["/r", "/t", "0", "/f"])
+        .status()
+        .map_err(|e| format!("调用 {bin} 失败：{e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("{bin} /r 返回 {st}（服务账户需要关机权限 SeShutdownPrivilege）"))
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn do_reboot() -> Result<(), String> {
+    // ① **首选直接系统调用**（root / CAP_SYS_BOOT 下最可靠）：
+    //    不依赖 PATH、不依赖 systemctl 能否连上 systemd 总线（星尘拉起的子进程 PATH 往往很精简，
+    //    /sbin、/usr/sbin 可能不在其中，导致 Command::new("systemctl"/"shutdown") 直接找不到）。
+    unsafe {
+        libc::sync();
+    }
+    if unsafe { libc::reboot(libc::LINUX_REBOOT_CMD_RESTART) } == 0 {
+        return Ok(());
+    }
+    let syscall_err = std::io::Error::last_os_error();
+    let mut errs = vec![format!("reboot(2) 系统调用失败：{syscall_err}")];
+    // ② 绝对路径命令兜底（不走 PATH；顺序与系统实际布局一致）
+    const CANDIDATES: &[(&str, &[&str])] = &[
+        ("/usr/bin/systemctl", &["reboot"]),
+        ("/bin/systemctl", &["reboot"]),
+        ("/usr/sbin/reboot", &[]),
+        ("/sbin/reboot", &[]),
+        ("/usr/sbin/shutdown", &["-r", "now"]),
+        ("/sbin/shutdown", &["-r", "now"]),
+    ];
+    for (bin, args) in CANDIDATES {
+        if !std::path::Path::new(bin).is_file() {
+            continue;
+        }
+        match std::process::Command::new(bin).args(*args).output() {
+            Ok(out) if out.status.success() => return Ok(()),
+            Ok(out) => {
+                let stderr = String::from_utf8_lossy(&out.stderr);
+                errs.push(format!(
+                    "{bin} {}：{}{}",
+                    args.join(" "),
+                    out.status,
+                    if stderr.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!("（{}）", stderr.trim().lines().next().unwrap_or(""))
+                    }
+                ));
+            }
+            Err(e) => errs.push(format!("{bin}：{e}")),
+        }
+    }
+    Err(errs.join("；"))
+}
+
+#[cfg(target_os = "macos")]
+fn do_reboot() -> Result<(), String> {
+    let bin = if std::path::Path::new("/sbin/shutdown").is_file() {
+        "/sbin/shutdown"
+    } else {
+        "shutdown"
+    };
+    let st = std::process::Command::new(bin)
+        .args(["-r", "now"])
+        .status()
+        .map_err(|e| format!("调用 {bin} 失败：{e}"))?;
+    if st.success() {
+        Ok(())
+    } else {
+        Err(format!("{bin} 返回 {st}"))
+    }
+}
 
 /// 机器信息文本（用于 `-ShowMachineInfo`）。
 ///
@@ -145,21 +329,13 @@ pub fn machine_info() -> String {
 
 /// 系统运行时长文本（如 `21天13小时`）。秒数来自 `dhrust::sys::machine`（Windows/Linux）；
 /// 其它平台返回 None。
+///
+/// 格式化复用 `dhrust::web::uptime_text_compact`（星尘 C# 口径，与 Rust 面板一致）。
 pub(crate) fn uptime_text() -> Option<String> {
     if !cfg!(any(windows, target_os = "linux")) {
         return None;
     }
-    let total_minutes = host_uptime_seconds() / 60;
-    let days = total_minutes / 1440;
-    let hours = (total_minutes % 1440) / 60;
-    let minutes = total_minutes % 60;
-    if days > 0 {
-        Some(format!("{days}天{hours}小时"))
-    } else if hours > 0 {
-        Some(format!("{hours}小时{minutes}分"))
-    } else {
-        Some(format!("{minutes}分"))
-    }
+    Some(dhrust::web::uptime_text_compact(host_uptime_seconds()))
 }
 
 /// 字节数友好格式（对齐 C# `ToGMK`：1024 进制，保留 1 位小数，如 `63.7G`）。

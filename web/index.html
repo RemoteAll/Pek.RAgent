@@ -16,6 +16,7 @@
 <input id="luser" placeholder="请输入用户名" autocomplete="username" autofocus>
 <label>密码</label>
 <input id="lpass" type="password" placeholder="请输入密码" autocomplete="current-password">
+<label class="remember"><input type="checkbox" id="lremember" checked><span>保持登录（此设备免密）</span></label>
 <button class="btn btn-primary btn-lg" style="width:100%;margin-top:8px" onclick="doLogin()">登 录</button>
 
 <div id="lerr" class="err"></div>
@@ -39,12 +40,10 @@
 <a data-panel="services">📦 子服务</a>
 <a data-panel="traffic">📈 流量</a>
 <a data-panel="control">⚡ 控制</a>
-<a data-panel="security">🛡 安全</a>
 <a data-panel="config">⚙ 配置</a>
 <a data-panel="logs">📋 日志</a>
 <a data-panel="database">🗄 数据库</a>
-<a data-panel="fileman">🗂 文件管理</a>
-<a data-panel="plugins">🧩 插件</a>
+<a data-panel="fileman">🗂 文件管理</a> <a data-panel="cert">🔐 证书</a><a data-panel="plugins">🧩 插件</a>
 <a data-panel="ai">🤖 AI 助手</a>
 <a data-panel="terminal">🖥 在线终端</a>
 <a data-panel="users">👥 用户</a>
@@ -57,11 +56,11 @@
 <div id="panel-services" class="panel"></div>
 <div id="panel-traffic" class="panel"></div>
 <div id="panel-control" class="panel"></div>
-<div id="panel-security" class="panel"></div>
 <div id="panel-config" class="panel"></div>
 <div id="panel-logs" class="panel"></div>
 <div id="panel-database" class="panel"></div>
 <div id="panel-fileman" class="panel"></div>
+<div id="panel-cert" class="panel"></div>
 <div id="panel-plugins" class="panel"></div>
 <div id="panel-ai" class="panel"></div>
 <div id="panel-terminal" class="panel"></div>
@@ -69,10 +68,10 @@
 </main>
 </div>
 
-<footer id="srv-foot" class="srv-foot">服务端处理耗时：-- ms（最近一次请求）</footer>
+<footer id="srv-foot" class="srv-foot">Pek.RAgent · 服务端处理耗时：-- ms（最近一次请求）</footer>
 
 <div id="modal-overlay" class="modal-overlay hidden">
-<div class="modal-box">
+ <div class="modal-box" id="modal-box">
 <h3 id="modal-title"></h3>
 <div id="modal-body" style="font-size:13px;color:var(--text-secondary);margin-bottom:22px;line-height:1.6"></div>
 <div class="modal-actions">

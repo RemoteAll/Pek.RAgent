@@ -10,6 +10,16 @@ use crate::deploy::{self, PrepareContext};
 use crate::sys::{self, Handle, SpawnRequest};
 use crate::util;
 
+/// 连续健康检查失败多少次判定为「假死」并重启。
+const HEALTH_FAIL_LIMIT: u32 = 3;
+
+/// 探活间隔：守护循环 1 秒一跳，但真正探活最多这么一次。
+///
+/// 探活需要发 HTTP/TCP 请求（Linux 自动发现端口还要读 `/proc`），
+/// 每秒一次会把自己变成资源消耗源：10 秒一次 → 假死判定 30 秒内完成，
+/// 开销降到原来的 1/10。
+const HEALTH_INTERVAL: Duration = Duration::from_secs(10);
+
 /// 应用状态快照。
 #[derive(Clone, Debug)]
 pub struct AppStatus {
@@ -21,6 +31,14 @@ pub struct AppStatus {
     pub process_name: String,
     /// 开始时间文本
     pub start_time: String,
+    /// 连续健康检查失败次数（0 = 正常；未配置 HealthCheck 时恒 0）
+    pub health_fails: u32,
+    /// 最近一次健康检查失败原因（成功时清空）
+    pub health_error: Option<String>,
+    /// 最近一次健康检查通过时间（Unix 秒；0 = 未知）
+    pub health_ok_at: i64,
+    /// 最近一次应用心跳（Unix 秒；0 = 从未上报）
+    pub last_heartbeat: i64,
 }
 
 /// 检查结果。
@@ -59,6 +77,18 @@ struct AppState {
     files: HashMap<PathBuf, u64>,
     files_primed: bool,
     reload_ready: Option<Instant>,
+    /// 连续健康检查失败次数（假死判定）
+    health_fails: u32,
+    /// 最近一次健康检查失败原因
+    health_error: Option<String>,
+    /// 最近一次健康检查通过时间（Unix 秒）
+    health_ok_at: i64,
+    /// 文件活性探针：上次观测到的 (修改时间秒, 大小) 与最后变化时刻
+    activity: Option<(u64, u64, i64)>,
+    /// 主动心跳：最后一次上报时间（Unix 秒；0 = 尚未上报）
+    last_heartbeat: i64,
+    /// 上次真正探活的时刻（节流用：守护循环 1 秒一跳，探活最多 [`HEALTH_INTERVAL`] 一次）
+    health_at: Option<Instant>,
 }
 
 /// 应用运行时。
@@ -91,6 +121,12 @@ impl AppRuntime {
                 files: HashMap::new(),
                 files_primed: false,
                 reload_ready: None,
+                health_fails: 0,
+                health_error: None,
+                health_ok_at: 0,
+                activity: None,
+                last_heartbeat: 0,
+                health_at: None,
             }),
         }
     }
@@ -122,6 +158,10 @@ impl AppRuntime {
                 pid: 0,
                 process_name: String::new(),
                 start_time: String::new(),
+                health_fails: 0,
+                health_error: None,
+                health_ok_at: 0,
+                last_heartbeat: 0,
             };
         }
 
@@ -136,6 +176,10 @@ impl AppRuntime {
                     dt.format("%Y-%m-%d %H:%M:%S").to_string()
                 })
                 .unwrap_or_default(),
+            health_fails: st.health_fails,
+            health_error: st.health_error.clone(),
+            health_ok_at: st.health_ok_at,
+            last_heartbeat: st.last_heartbeat,
         }
     }
 
@@ -150,6 +194,12 @@ impl AppRuntime {
         st.hosted = false;
         st.error_count = 0;
         st.next_start = None;
+        st.health_fails = 0;
+        st.health_error = None;
+        st.health_ok_at = 0;
+        st.activity = None;
+        st.last_heartbeat = 0;
+        st.health_at = None;
         // 接管不经过 start()，需在此补算工作目录（文件变动监视/停止清理等依赖它；缺失会静默跳过）
         let wd = crate::deploy::work_dir(&self.base, &st.cfg);
         st.work_dir = wd;
@@ -215,6 +265,42 @@ impl AppRuntime {
             });
         }
 
+        // 启动前防重复：影子目录共用一个可执行文件，代理重启/旧版本遗留时可能已有
+        // 同路径进程在跑（它占着监听端口，新实例会因绑定失败退出，形成重启循环）。
+        // 发现后直接接管其中一个，并清理多余实例；任务模式不接管（允许一次性并发）。
+        if !prepared.task
+            && let Some(run_file) = prepared.run_file.as_deref() {
+                let shadow_base = prepared.shadow.as_deref().and_then(|p| p.parent());
+                let mut found = existing_instances(run_file, &self.name, shadow_base);
+                if !found.is_empty() {
+                    // 优先保留已有监听端口的实例，其次保留最早启动的（通常是旧的服务实例）。
+                    found.sort_by(|a, b| {
+                        b.ports
+                            .len()
+                            .cmp(&a.ports.len())
+                            .then(a.start_time.cmp(&b.start_time))
+                    });
+                    let keep = found.remove(0);
+                    for extra in &found {
+                        util::log_format(
+                            "应用[{}]发现重复实例 PID={}，停止以只保留一个实例",
+                            &[&self.name, &extra.pid.to_string()],
+                        );
+                        let _ = sys::stop_process(extra.pid, 3_000);
+                    }
+                    util::log_format(
+                        "应用[{}]启动前发现已运行实例 PID={} 进程={}，直接接管（不再重复启动）",
+                        &[&self.name, &keep.pid.to_string(), &keep.name],
+                    );
+                    drop(st);
+                    self.adopt(keep.pid, keep.name);
+                    return Ok(StartResult {
+                        started: true,
+                        task: false,
+                    });
+                }
+            }
+
         let log_file = if cfg.debug || (retry && global.debug) {
             Some(self.base.join("Log").join(format!("app-{}.log", cfg.name)))
         } else {
@@ -241,13 +327,17 @@ impl AppRuntime {
 
         let pid = child.id();
         let process_name = sys::process_name(pid).unwrap_or_else(|| prepared.program.clone());
+        let retry_text = if retry { "true" } else { "false" };
+        let error_count_text = st.error_count.to_string();
         util::log_format(
-            "启动成功：应用[{}] PID={} 进程={} 工作目录={}",
+            "启动成功：应用[{}] PID={} 进程={} 工作目录={} retry={} errorCount={}",
             &[
                 &self.name,
                 &pid.to_string(),
                 &process_name,
                 &prepared.work_dir.display().to_string(),
+                retry_text,
+                &error_count_text,
             ],
         );
         if let Some(shadow) = &prepared.shadow {
@@ -265,6 +355,12 @@ impl AppRuntime {
         st.next_start = None;
         st.files.clear();
         st.files_primed = false;
+        st.health_fails = 0;
+        st.health_error = None;
+        st.health_ok_at = 0;
+        st.activity = None;
+        st.last_heartbeat = 0;
+        st.health_at = None;
 
         // OOM 分值（仅 Linux）
         if cfg.oom_score_adjust != 0 {
@@ -284,8 +380,8 @@ impl AppRuntime {
         }
 
         // 健康检查（失败只记日志，与 C# 行为一致）
-        if let Some(hc) = cfg.health_check.as_deref() {
-            if !hc.trim().is_empty() {
+        if let Some(hc) = cfg.health_check.as_deref()
+            && !hc.trim().is_empty() {
                 let wait = global.start_wait;
                 drop(st);
                 std::thread::sleep(Duration::from_millis(wait));
@@ -307,7 +403,6 @@ impl AppRuntime {
                     Err(e) => util::log_format("健康检查失败（仅记录）：{}", &[&e]),
                 }
             }
-        }
 
         Ok(StartResult {
             started: true,
@@ -321,6 +416,15 @@ impl AppRuntime {
         st.error_count += 1;
         let delay = global.delay.max(1_000);
         st.next_start = Some(Instant::now() + Duration::from_millis(delay));
+        util::log_format(
+            "应用[{}]记录失败：errorCount={}，退避 {}ms，守卫周期 {}ms",
+            &[
+                &self.name,
+                &st.error_count.to_string(),
+                &delay.to_string(),
+                &global.guard_period.to_string(),
+            ],
+        );
         if st.error_count >= global.max_fails && !st.fail_limit_logged {
             st.fail_limit_logged = true;
             util::log_format(
@@ -332,7 +436,7 @@ impl AppRuntime {
 
     /// 停止应用（优雅 → 强制）。返回是否已退出。
     pub fn stop(&self, reason: &str) -> bool {
-        let (pid, handle, work_dir, was_running, hosted) = {
+        let (pid, handle, work_dir, was_running, hosted, process_name) = {
             let mut st = self.state.lock().unwrap();
             let was_running = st.running;
             st.running = false;
@@ -342,8 +446,9 @@ impl AppRuntime {
             let pid = st.pid;
             let work_dir = st.work_dir.clone();
             let hosted = st.hosted;
+            let process_name = st.process_name.clone();
             st.hosted = false;
-            (pid, handle, work_dir, was_running, hosted)
+            (pid, handle, work_dir, was_running, hosted, process_name)
         };
 
         if !was_running && handle.is_none() {
@@ -355,30 +460,113 @@ impl AppRuntime {
             return true;
         }
 
+        // 防呆：配置/状态错误把代理自身当成子服务时，绝不能停止自己
+        if pid == std::process::id() {
+            util::log_error(&format!(
+                "应用[{}]停止被拒绝：PID={pid} 是星尘代理自身（请检查子服务配置）",
+                self.name
+            ));
+            return false;
+        }
+
+        // PID 复用保护：记录的是 A 进程，但 PID 已被系统复用给 B 进程时，绝不能对 B 发信号。
+        // （停止失败后旧状态可能残留；重启后 PID 复用尤其常见）
+        if handle.is_none() && pid > 0 && !process_name.is_empty()
+            && let Some(actual) = sys::process_name(pid)
+            && !actual.eq_ignore_ascii_case(&process_name)
+        {
+            util::log_error(&format!(
+                "应用[{}]停止：PID={pid} 已被复用为 {actual}（原进程 {process_name} 已退出），不再发送信号；按已停止处理",
+                self.name
+            ));
+            let mut st = self.state.lock().unwrap();
+            st.pid = 0;
+            st.running = false;
+            st.handle = None;
+            return true;
+        }
+
         util::log_format(
             "停止应用[{}] PID={}，原因：{}",
             &[&self.name, &pid.to_string(), reason],
         );
 
+        // 僵尸进程只能由父进程 waitpid 回收；RAgent 重启后可能丢失 Child 句柄但仍是父进程。
+        if handle.is_none() && pid > 0 && !sys::is_alive(pid) {
+            let reaped = sys::reap_child(pid);
+            if reaped {
+                util::log_info(&format!(
+                    "应用[{}]已退出，已回收僵尸进程 PID={pid}",
+                    self.name
+                ));
+            }
+        }
+
+        // systemd 托管的应用：直接 kill PID 会被 systemd 立刻拉起，永远停不掉。
+        // 仅当目标进程属于**另一个** systemd 单元时才走 systemctl stop；
+        // 与代理同单元（普通子进程继承 cgroup）时仍按 PID 停止，绝不能停掉 StarAgentRust 自己。
+        #[cfg(not(target_os = "linux"))]
+        let systemd_result: Option<bool> = None;
+        #[cfg(target_os = "linux")]
+        let mut systemd_result: Option<bool> = None;
+        #[cfg(target_os = "linux")]
+        if handle.is_none() && pid > 0
+            && let Some(unit) = systemd_unit_of(pid)
+            && current_systemd_unit().as_deref() != Some(unit.as_str())
+        {
+            util::log_info(&format!(
+                "应用[{}]由 systemd 单元 {unit} 托管，改用 systemctl stop（直接 kill 会被 systemd 拉起）",
+                self.name
+            ));
+            let stopped = std::process::Command::new("systemctl")
+                .args(["stop", &unit])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while sys::is_alive(pid) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            let gone = !sys::is_alive(pid);
+            if !(stopped && gone) {
+                util::log_error(&format!(
+                    "应用[{}]停止 systemd 单元 {unit} 失败（systemctl={stopped}，进程仍存活={}）；请检查 `systemctl status {unit}` 与 journalctl",
+                    self.name,
+                    !gone
+                ));
+            }
+            systemd_result = Some(stopped && gone);
+        }
+
         // 自有子进程用 Child::try_wait 回收（避免僵尸导致 is_alive 误判）；
         // 接管进程按 pid 停止
-        let ok = match handle {
-            Some(Handle::Owned(mut child)) => {
-                sys::signal_graceful(pid);
-                let mut exited = wait_child(&mut child, 3_000);
-                if !exited {
-                    sys::signal_force(pid);
-                    exited = wait_child(&mut child, 2_000);
+        let ok = match systemd_result {
+            #[cfg(target_os = "linux")]
+            Some(ok) => ok,
+            _ => match handle {
+                Some(Handle::Owned(mut child)) => {
+                    sys::signal_graceful(pid);
+                    let mut exited = wait_child(&mut child, 3_000);
+                    if !exited {
+                        sys::signal_force(pid);
+                        exited = wait_child(&mut child, 2_000);
+                    }
+                    exited
                 }
-                exited
-            }
-            _ => sys::stop_process(pid, 3_000),
+                _ => sys::stop_process(pid, 3_000),
+            },
         };
 
         {
             let mut st = self.state.lock().unwrap();
             st.handle = None;
-            st.pid = 0;
+            if ok {
+                st.pid = 0;
+            } else {
+                // 停止失败必须保留 PID（否则面板/菜单再也无法定位并重试）
+                st.pid = pid;
+                st.running = sys::is_alive(pid);
+            }
         }
 
         // 停稳后清理占用期产生的临时文件（*.del 等）
@@ -389,10 +577,163 @@ impl AppRuntime {
         if ok {
             util::log_format("应用[{}]已退出", &[&self.name]);
         } else {
-            util::log_format("应用[{}]停止超时，进程仍可能存在", &[&self.name]);
+            let actual = sys::process_name(pid).unwrap_or_else(|| "?".to_string());
+            util::log_error(&format!(
+                "应用[{}]停止超时：PID={pid} 仍在运行（进程名={actual}，原进程名={process_name}）；已保留 PID 供重试，必要时请手动 kill -9 {pid}",
+                self.name
+            ));
         }
 
         ok
+    }
+
+    /// 周期性健康检查（假死自愈）。
+    ///
+    /// 进程「活着」不等于「能干活」：死锁、阻塞线程池耗尽、内部锁中毒等情况下进程仍在，
+    /// 但请求一律无响应（面板此前只判 PID 存在，于是显示「运行中」而实际已假死）。
+    ///
+    /// - **显式配置** `HealthCheck` → 按配置探活（`http(s)://` 最准；`tcp://` 只能查端口）；
+    /// - **未配置** → 自动发现该应用（含子进程树）的 TCP 监听口并探活，无需任何配置；
+    /// - `HealthCheck=off|none` → 显式关闭探活；
+    /// - 无监听端口的应用（纯计算/批处理）不做假死判定；
+    /// - 启动后 `max(StartWait, 5s)` 宽限期内不判定（刚拉起可能尚未就绪）；
+    /// - 连续 [`HEALTH_FAIL_LIMIT`] 次失败 → 视为假死：停止并安排重启（走全局 `Delay` 退避）。
+    fn check_health(&self, global: &AgentConfig) {
+        let (cfg, pid, started, running) = {
+            let st = self.state.lock().unwrap();
+            (st.cfg.clone(), st.pid, st.start_time, st.running)
+        };
+        if !running || pid == 0 {
+            return;
+        }
+        let targets = health_targets(&cfg, pid, global.local_port);
+        if targets.is_empty() {
+            return;
+        }
+        // 启动宽限：刚拉起未就绪时不判失败
+        let grace = Duration::from_millis(global.start_wait.max(5_000));
+        if let Some(started) = started
+            && started.elapsed().map(|d| d < grace).unwrap_or(false) {
+                return;
+            }
+
+        // 探活节流：守护循环 1 秒一跳，探活不需每秒做（HTTP/TCP 请求 + 端口发现都要系统调用），
+        // 严格按 [`HEALTH_INTERVAL`] 一次，避免 RAgent 自己成为负担。
+        {
+            let mut st = self.state.lock().unwrap();
+            if let Some(at) = st.health_at
+                && at.elapsed() < HEALTH_INTERVAL {
+                    return;
+                }
+            st.health_at = Some(Instant::now());
+        }
+
+        let mut last_error = String::new();
+        for target in &targets {
+            let result = match target {
+                HealthTarget::Addr(spec) => health_check(spec),
+                HealthTarget::Port(port) => probe_alive(*port),
+                HealthTarget::File(path, within) => self.probe_file_activity(path, *within),
+                HealthTarget::Heartbeat(within) => self.probe_heartbeat(*within),
+            };
+            match result {
+                Ok(()) => {
+                    let mut st = self.state.lock().unwrap();
+                    if st.health_fails != 0 || st.health_error.is_some() {
+                        util::log_format("应用[{}]健康检查已恢复", &[&self.name]);
+                    }
+                    st.health_fails = 0;
+                    st.health_error = None;
+                    st.health_ok_at = SystemTime::now()
+                        .duration_since(SystemTime::UNIX_EPOCH)
+                        .map(|d| d.as_secs() as i64)
+                        .unwrap_or(0);
+                    return;
+                }
+                Err(e) => last_error = e,
+            }
+        }
+
+        {
+            let fails = {
+                let mut st = self.state.lock().unwrap();
+                st.health_fails = st.health_fails.saturating_add(1);
+                st.health_error = Some(last_error.clone());
+                st.health_fails
+            };
+            util::log_format(
+                "应用[{}]健康检查失败（连续 {} 次）：{}",
+                &[&self.name, &fails.to_string(), &last_error],
+            );
+            if fails >= HEALTH_FAIL_LIMIT {
+                util::log_format(
+                    "应用[{}]连续 {} 次健康检查失败，判定假死，准备重启",
+                    &[&self.name, &fails.to_string()],
+                );
+                self.stop("健康检查失败（假死）");
+                let mut st = self.state.lock().unwrap();
+                st.health_fails = 0;
+                if st.cfg.enable {
+                    let delay = global.delay.max(1_000);
+                    st.next_start = Some(Instant::now() + Duration::from_millis(delay));
+                }
+            }
+        }
+    }
+
+    /// 文件活性探针：窗口内文件（日志/输出/数据库）没有任何变化 → 视为假死。
+    ///
+    /// 首次观测只建立基线（不判失败），之后以「窗口内是否出现过变化」为准。
+    /// 适合「不监听端口、由定时任务/队列驱动」的应用。
+    fn probe_file_activity(&self, path: &Path, within: i64) -> Result<(), String> {
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("读取 {} 失败：{e}", path.display()))?;
+        let mtime = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let size = meta.len();
+        let now = now_unix();
+        let mut st = self.state.lock().unwrap();
+        match st.activity {
+            Some((prev_m, prev_s, changed_at)) if prev_m == mtime && prev_s == size => {
+                if now - changed_at >= within {
+                    return Err(format!(
+                        "{} 已 {} 秒无变化（疑似假死）",
+                        path.display(),
+                        now - changed_at
+                    ));
+                }
+            }
+            _ => st.activity = Some((mtime, size, now)),
+        }
+        Ok(())
+    }
+
+    /// 主动心跳探针（对齐 DH.NAgent / DH.NStar 的看门狗思路）。
+    ///
+    /// 应用在窗口内调用 `POST /star/appHeartbeat?name=<应用名>` 即视为存活。
+    /// **从未上报过时不做任何判定**（应用本身不支持心跳 → 不探、不误杀）；
+    /// 一旦上报过一次，之后超过窗口未上报才判假死并重启。
+    fn probe_heartbeat(&self, within: i64) -> Result<(), String> {
+        let st = self.state.lock().unwrap();
+        let last = st.last_heartbeat;
+        if last <= 0 {
+            return Ok(());
+        }
+        let now = now_unix();
+        if now - last > within {
+            return Err(format!("已 {} 秒未收到心跳", now - last));
+        }
+        Ok(())
+    }
+
+    /// 记录一次应用心跳（`/star/appHeartbeat`）。
+    pub fn mark_heartbeat(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.last_heartbeat = now_unix();
     }
 
     /// 守护检查（由管理器周期调用）：退出检测、内存限制、文件变动重启。
@@ -404,8 +745,38 @@ impl AppRuntime {
         {
             let mut st = self.state.lock().unwrap();
             if st.running {
+                let pid = st.pid;
+                let start_time = st.start_time;
+                let error_count = st.error_count;
                 if let Some(handle) = st.handle.as_mut() {
-                    if handle.has_exited() {
+                    let handle_kind = match &*handle {
+                        Handle::Owned(_) => "Owned",
+                        Handle::Adopted(_) => "Adopted",
+                    };
+                    let exit_status = exit_status_text(handle);
+                    if let Some(status) = exit_status {
+                        // 诊断日志（2026-10-21）：区分“RAgent 误判退出”和“应用真实退出”。
+                        // Owned 直接读取 Child::try_wait 的 ExitStatus；这里额外用独立 PID
+                        // 查询复核存活，并输出实际运行时长与退出码（正常 0 / Ctrl+C / 崩溃）。
+                        let alive = sys::is_alive(pid);
+                        let process = sys::process_name(pid).unwrap_or_else(|| "-".to_string());
+                        let run_secs = start_time
+                            .and_then(|t| SystemTime::now().duration_since(t).ok())
+                            .map(|d| format!("{:.3}", d.as_secs_f64()))
+                            .unwrap_or_else(|| "?".to_string());
+                        util::log_format(
+                            "应用[{}]退出检测：handle={} pid={} is_alive={} process={} 实际运行={}s errorCount={} exit={}",
+                            &[
+                                &self.name,
+                                handle_kind,
+                                &pid.to_string(),
+                                if alive { "true" } else { "false" },
+                                &process,
+                                &run_secs,
+                                &error_count.to_string(),
+                                status.as_str(),
+                            ],
+                        );
                         just_exited = true;
                         util::log_format(
                             "应用[{}]进程已退出（PID={}）",
@@ -463,6 +834,9 @@ impl AppRuntime {
                 st.next_start = Some(Instant::now() + Duration::from_millis(delay));
             }
         }
+
+        // 2.5) 周期性健康检查（假死自愈：进程活着但不响应时自动重启）
+        self.check_health(global);
 
         // 3) 计划启动（失败退避 / 文件变动重启）
         let should_start = {
@@ -552,6 +926,113 @@ impl AppRuntime {
     }
 }
 
+/// 扫描系统进程，找出可执行文件路径与 `run_file` 相同的存活实例。
+///
+/// 影子模式共用同一路径；若上一任代理/旧版本遗留下的进程仍在跑，它就是监听端口的
+/// 真正持有者。此时必须接管它，否则新实例会绑定失败并退出，形成循环。
+fn existing_instances(
+    run_file: &Path,
+    app_name: &str,
+    shadow_base: Option<&Path>,
+) -> Vec<sys::ProcItem> {
+    let target = std::fs::canonicalize(run_file).unwrap_or_else(|_| run_file.to_path_buf());
+    let self_pid = std::process::id();
+    let prefix = format!("{app_name}-");
+    sys::top_processes(usize::MAX, true)
+        .into_iter()
+        .filter(|p| {
+            p.pid != 0
+                && p.pid != self_pid
+                && (same_exe(&p.exe, &target)
+                    || is_shadow_exe(&p.exe, shadow_base, &prefix))
+        })
+        .collect()
+}
+
+/// 是否为同一应用的影子目录进程（覆盖旧 MD5 影子路径，例如版本升级后遗留的租户）。
+fn is_shadow_exe(proc_exe: &str, shadow_base: Option<&Path>, prefix: &str) -> bool {
+    let Some(base) = shadow_base else {
+        return false;
+    };
+    if proc_exe.trim().is_empty() {
+        return false;
+    }
+    let path = std::fs::canonicalize(proc_exe).unwrap_or_else(|_| PathBuf::from(proc_exe));
+    let base = std::fs::canonicalize(base).unwrap_or_else(|_| base.to_path_buf());
+    // shadow/{app}-{hash}/{exe}：父目录名以 "{app}-" 开头，祖父目录是 shadow 根。
+    let Some(app_dir) = path.parent() else {
+        return false;
+    };
+    let Some(parent) = app_dir.parent() else {
+        return false;
+    };
+    let parent_same = {
+        #[cfg(windows)]
+        {
+            parent
+                .to_string_lossy()
+                .eq_ignore_ascii_case(&base.to_string_lossy())
+        }
+        #[cfg(not(windows))]
+        {
+            parent == base
+        }
+    };
+    if !parent_same {
+        return false;
+    }
+    app_dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_ascii_lowercase().starts_with(&prefix.to_ascii_lowercase()))
+        .unwrap_or(false)
+}
+
+/// 可执行文件路径比较（Windows 大小写不敏感；先规范化再比）。
+fn same_exe(proc_exe: &str, target: &Path) -> bool {
+    if proc_exe.trim().is_empty() {
+        return false;
+    }
+    let proc_path = Path::new(proc_exe);
+    let a = std::fs::canonicalize(proc_path).unwrap_or_else(|_| proc_path.to_path_buf());
+    let b = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    #[cfg(windows)]
+    {
+        a.to_string_lossy().eq_ignore_ascii_case(&b.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        a == b
+    }
+}
+
+/// 退出状态文本（诊断用）：Owned 直接取 `Child::try_wait` 的 `ExitStatus`，
+/// Adopted 只有 PID，无法取得退出码。
+///
+/// 退出码用于区分：0=正常退出、0xC000013A=Ctrl+C/控制台关闭、101=panic、
+/// 0xC0000005 等=崩溃；对应 Windows `ExitStatus` 的数值。
+fn exit_status_text(handle: &mut Handle) -> Option<String> {
+    match handle {
+        Handle::Owned(child) => match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status
+                    .code()
+                    .map(|c| format!("{c:#X}"))
+                    .unwrap_or_else(|| "无".to_string());
+                Some(format!("{status}（code={code}）"))
+            }
+            Ok(None) => None,
+            Err(e) => Some(format!("try_wait 错误：{e}")),
+        },
+        Handle::Adopted(pid) => {
+            if sys::is_alive(*pid) {
+                None
+            } else {
+                Some("已退出（接管 PID，无退出码）".to_string())
+            }
+        }
+    }
+}
+
 /// 等待子进程退出（轮询 `try_wait` 并回收）。
 fn wait_child(child: &mut std::process::Child, timeout_ms: u64) -> bool {
     let deadline = Instant::now() + Duration::from_millis(timeout_ms);
@@ -602,6 +1083,121 @@ fn file_changed(path: &Path, files: &mut HashMap<PathBuf, u64>) -> bool {
     }
 }
 
+/// 健康探针目标。
+enum HealthTarget {
+    /// 显式地址（http(s):// / tcp:// / host:port）
+    Addr(String),
+    /// 自动发现的本机监听端口
+    Port(u16),
+    /// 文件活性：路径 + 判定窗口（秒）
+    File(PathBuf, i64),
+    /// 主动心跳：判定窗口（秒）
+    Heartbeat(i64),
+}
+
+/// 默认活性窗口（秒）：文件活性 / 主动心跳多久没动静算异常。
+const ACTIVITY_WINDOW_SECS: i64 = 300;
+
+/// 当前 Unix 秒。
+fn now_unix() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// 解析 `?within=秒` 后缀（缺省用默认窗口）。
+fn split_within(spec: &str) -> (String, i64) {
+    match spec.split_once("?within=") {
+        Some((head, tail)) => (
+            head.trim().to_string(),
+            tail.trim().parse::<i64>().unwrap_or(ACTIVITY_WINDOW_SECS).max(10),
+        ),
+        None => (spec.trim().to_string(), ACTIVITY_WINDOW_SECS),
+    }
+}
+
+/// 健康检查目标解析。
+///
+/// - `off` / `none` → 空（不探活，面板标「未探活」）；
+/// - `http(s)://` / `tcp://` / `host:port` → 按配置探活；
+/// - `file:<路径>[?within=秒]` → **文件活性**（日志/输出/数据库文件在窗口内有变化即存活），
+///   适合「不监听端口、靠定时任务干活」的应用；
+/// - `heartbeat[?within=秒]` → **主动心跳**（应用调 `POST /star/appHeartbeat?name=<应用名>`），
+///   最精确，需应用配合；
+/// - 空 → **自动发现**该进程（含子进程树）的 TCP 监听口（`auto:`，最多 3 个，排除 RAgent 端口）；
+/// - 都没有 → 不做假死判定（避免误杀纯计算/常驻型应用）。
+fn health_targets(cfg: &AppConfig, pid: u32, exclude_port: u16) -> Vec<HealthTarget> {
+    let raw = cfg.health_check.as_deref().unwrap_or("").trim();
+    if raw.eq_ignore_ascii_case("off") || raw.eq_ignore_ascii_case("none") {
+        return Vec::new();
+    }
+    if raw.eq_ignore_ascii_case("heartbeat") || raw.to_ascii_lowercase().starts_with("heartbeat?") {
+        let (_, within) = split_within(raw);
+        return vec![HealthTarget::Heartbeat(within)];
+    }
+    if raw.to_ascii_lowercase().starts_with("file:") {
+        let (spec, within) = split_within(raw);
+        let path = spec.trim_start_matches("file:").trim();
+        if path.is_empty() {
+            return Vec::new();
+        }
+        let path = PathBuf::from(path);
+        let path = if path.is_absolute() {
+            path
+        } else if let Some(dir) = cfg.working_directory.as_deref().filter(|d| !d.trim().is_empty()) {
+            PathBuf::from(dir).join(path)
+        } else {
+            path
+        };
+        return vec![HealthTarget::File(path, within)];
+    }
+    if !raw.is_empty() {
+        return vec![HealthTarget::Addr(raw.to_string())];
+    }
+    // 未配置：自动发现监听端口
+    let mut ports: Vec<u16> = sys::listen_ports_of(pid)
+        .into_iter()
+        .filter(|p| *p != exclude_port)
+        .collect();
+    ports.truncate(3);
+    ports.into_iter().map(HealthTarget::Port).collect()
+}
+
+
+/// 宽松探活（自动模式）：TCP 连上后发一个最小 HTTP 请求，**2 秒内收到任何字节或对端关闭**
+/// 都算存活（兼容非 HTTP 协议，避免把 gRPC/数据库等误判为死亡）；
+/// 连接成功但读超时 → 判定疑似假死（accept 队列在内核里完成握手，进程不处理请求）。
+///
+/// 超时取 2 秒（守护线程串行，卡太久会拖慢其它应用的调度）。
+fn probe_alive(port: u16) -> Result<(), String> {
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+
+    if port == 0 {
+        return Err("端口无效".to_string());
+    }
+    let addr: SocketAddr = format!("127.0.0.1:{port}")
+        .parse()
+        .map_err(|e| format!("地址无效：{e}"))?;
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
+        .map_err(|e| format!("连接 {addr} 失败：{e}"))?;
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let _ = stream.write_all(b"GET / HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n");
+    let mut buf = [0u8; 256];
+    match stream.read(&mut buf) {
+        Ok(_) => Ok(()),
+        Err(e)
+            if e.kind() == std::io::ErrorKind::WouldBlock
+                || e.kind() == std::io::ErrorKind::TimedOut =>
+        {
+            Err("连接成功但 2 秒内无任何响应（疑似假死）".to_string())
+        }
+        Err(e) => Err(format!("读取失败：{e}")),
+    }
+}
+
 /// 健康检查：`http://` 或 `tcp://host:port` / `host:port`。
 fn health_check(spec: &str) -> Result<(), String> {
     let spec = spec.trim();
@@ -611,10 +1207,11 @@ fn health_check(spec: &str) -> Result<(), String> {
         // 必须用 offthread 版本：本函数也会在 tokio 连接线程内被调用（HTTP 控制接口
         // /StartService 的启动尾段健康检查），直接 blocking_get_text 会因"运行时内
         // block_on"panic → 连接无响应关闭（客户端只见 Empty reply）。
+        let ua = util::user_agent();
         return dhrust::net::http_client::blocking_request_offthread(
             "GET",
             spec,
-            &[],
+            &[("User-Agent", ua.as_str())],
             None,
             Vec::new(),
             Duration::from_millis(5_000),
@@ -634,3 +1231,167 @@ fn health_check(spec: &str) -> Result<(), String> {
 
     Err(format!("不支持的健康检查地址：{}", spec))
 }
+
+/// 目标 PID 所属的 systemd 单元（Linux；普通子进程通常继承代理自己的单元）。
+#[cfg(target_os = "linux")]
+fn systemd_unit_of(pid: u32) -> Option<String> {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+    systemd_unit_from_cgroup(&text)
+}
+
+/// 当前代理进程自己的 systemd 单元（手动运行时通常为 None）。
+#[cfg(target_os = "linux")]
+fn current_systemd_unit() -> Option<String> {
+    let text = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+    systemd_unit_from_cgroup(&text)
+}
+
+/// 从 `/proc/<pid>/cgroup` 文本中提取单元名（只认 `.service`；scope/session 不算）。
+#[cfg(target_os = "linux")]
+fn systemd_unit_from_cgroup(text: &str) -> Option<String> {
+    for line in text.lines() {
+        let path = line.rsplit(':').next().unwrap_or("");
+        if let Some(unit) = path.split('/').find(|s| s.ends_with(".service")) {
+            return Some(unit.to_string());
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ragent-app-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn shadow_matcher_covers_old_hashes_and_ignores_other_apps() {
+        let base = temp_dir("shadow-base");
+        let app_dir = base.join("myapp-abc123");
+        std::fs::create_dir_all(&app_dir).unwrap();
+        let exe = app_dir.join("myapp.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        let exe_text = exe.to_string_lossy().to_string();
+
+        assert!(is_shadow_exe(&exe_text, Some(&base), "myapp-"));
+        assert!(!is_shadow_exe(&exe_text, Some(&base), "other-"));
+        assert!(!is_shadow_exe(&exe_text, None, "myapp-"));
+    }
+
+    #[test]
+    fn same_exe_matches_current_process_binary() {
+        let exe = std::env::current_exe().unwrap();
+        assert!(same_exe(&exe.to_string_lossy(), &exe));
+    }
+
+    #[test]
+    fn health_targets_modes() {
+        let mut cfg = AppConfig {
+            health_check: Some("off".to_string()),
+            ..AppConfig::default()
+        };
+        assert!(health_targets(&cfg, 1, 5501).is_empty(), "off 应关闭探活");
+
+        cfg.health_check = Some("http://127.0.0.1:8282/panel".to_string());
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::Addr(s) if s == "http://127.0.0.1:8282/panel"));
+
+        cfg.health_check = Some("heartbeat?within=60".to_string());
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::Heartbeat(60)));
+
+        let dir = temp_dir("targets");
+        let file = dir.join("run.log");
+        std::fs::write(&file, "a").unwrap();
+        cfg.health_check = Some(format!("file:{}?within=30", file.display()));
+        let targets = health_targets(&cfg, 1, 5501);
+        assert!(matches!(&targets[0], HealthTarget::File(p, 30) if p == &file));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_alive_flags_silent_listener() {
+        use std::net::TcpListener;
+        // 只 listen 不 accept：内核完成握手，进程不处理请求 → 正是「假死」形态
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let err = probe_alive(port).unwrap_err();
+        assert!(err.contains("疑似假死"), "{err}");
+        drop(listener);
+    }
+
+    #[test]
+    fn probe_alive_accepts_responder() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let worker = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 64];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(b"HTTP/1.0 200 OK\r\n\r\n");
+            }
+        });
+        assert!(probe_alive(port).is_ok());
+        let _ = worker.join();
+    }
+
+    #[test]
+    fn file_activity_probe_detects_stall() {
+        let dir = temp_dir("stall");
+        let file = dir.join("out.log");
+        std::fs::write(&file, "x").unwrap();
+        let runtime = AppRuntime::new(&dir, AppConfig::default());
+        // 首次观测只建立基线
+        assert!(runtime.probe_file_activity(&file, 1).is_ok());
+        std::thread::sleep(Duration::from_millis(2_200));
+        // 窗口内没有变化 → 判定假死
+        let err = runtime.probe_file_activity(&file, 1).unwrap_err();
+        assert!(err.contains("无变化"), "{err}");
+        // 文件重新有变化 → 恢复正常
+        std::fs::write(&file, "xy").unwrap();
+        assert!(runtime.probe_file_activity(&file, 1).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn heartbeat_probe_skips_when_never_reported() {
+        let dir = temp_dir("heartbeat");
+        let runtime = AppRuntime::new(&dir, AppConfig::default());
+        // 从未上报 → 不判定（应用不支持心跳时不误杀）
+        assert!(runtime.probe_heartbeat(1).is_ok());
+        // 上报一次后正常
+        runtime.mark_heartbeat();
+        assert!(runtime.probe_heartbeat(60).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn systemd_unit_parsing_from_cgroup() {
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/system.slice/dhdeploy-agent.service\n"),
+            Some("dhdeploy-agent.service".to_string())
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/system.slice/StarAgentRust.service/child\n"),
+            Some("StarAgentRust.service".to_string())
+        );
+        // scope/session 不是 systemd 服务，回退按 PID 停止
+        assert_eq!(
+            systemd_unit_from_cgroup("0::/user.slice/user-0.slice/session-1.scope\n"),
+            None
+        );
+    }
+}
+

@@ -98,11 +98,10 @@ pub struct Prepared {
 
 /// 计算应用的工作目录（与 C# `Fix` 约定一致）。
 pub fn work_dir(base: &Path, app: &AppConfig) -> PathBuf {
-    if let Some(wd) = app.working_directory.as_deref() {
-        if !wd.trim().is_empty() {
+    if let Some(wd) = app.working_directory.as_deref()
+        && !wd.trim().is_empty() {
             return util::resolve(base, wd);
         }
-    }
 
     let file_name = app.file_name.trim();
     if !file_name.is_empty() && (file_name.contains('/') || file_name.contains('\\')) {
@@ -357,8 +356,8 @@ fn build_envs(
         envs.push(("DOTNET_GCHeapHardLimit".to_string(), format!("{:x}", bytes)));
     }
 
-    if global.startup_hook {
-        if let Some(dir) = run_file.and_then(|p| p.parent()) {
+    if global.startup_hook
+        && let Some(dir) = run_file.and_then(|p| p.parent()) {
             let has_runtimeconfig = std::fs::read_dir(dir)
                 .map(|it| {
                     it.flatten().any(|e| {
@@ -377,7 +376,6 @@ fn build_envs(
                 ));
             }
         }
-    }
 
     envs
 }
@@ -605,11 +603,10 @@ pub fn find_exe(dir: &Path, name: &str, arguments: &mut String) -> Option<PathBu
     }
 
     // 2. name.exe（仅 Windows）
-    if cfg!(windows) {
-        if let Some(p) = find(&format!("{}.exe", name)) {
+    if cfg!(windows)
+        && let Some(p) = find(&format!("{}.exe", name)) {
             return Some(p);
         }
-    }
 
     // 3. 第一个参数可能就是可执行文件
     let text = arguments.trim();
@@ -701,9 +698,11 @@ mod tests {
         let src = work.join("myagent");
         std::fs::write(&src, b"v1").unwrap();
 
-        let mut app = AppConfig::default();
-        app.name = "shadowapp".to_string();
-        app.file_name = src.to_string_lossy().into_owned();
+        let mut app = AppConfig {
+            name: "shadowapp".to_string(),
+            file_name: src.to_string_lossy().into_owned(),
+            ..AppConfig::default()
+        };
         app.working_directory = Some(work.to_string_lossy().into_owned());
         app.mode = "shadow".to_string();
 

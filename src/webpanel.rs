@@ -4,7 +4,8 @@
 //! - `/api/*`：login / logout / status / control / freeMemory / configMetadata /
 //!   updateConfig / changePassword / logs / logFiles / health / watchdog / syncTime
 //! - `/star/*`：services / startService / stopService / restartService / addService /
-//!   removeService / getStarConfig / updateStarConfig / machine / webTraffic / portTraffic /
+//!   removeService / appDeploy / starAgentScan / starAgentMigrate / getStarConfig /
+//!   updateStarConfig / machine / webTraffic / portTraffic /
 //!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
 //!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup /
 //!   fileList / fileRead / fileWrite / fileMkdir / fileNewFile / fileDelete / fileRename /
@@ -20,12 +21,12 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Local};
+use chrono::{DateTime, Local, TimeZone};
 use dhrust::net::controller::{
-    arg, arg_i64, json_body, json_error, json_result, ActionResult, Controller,
+    ActionResult, Controller, arg, arg_bool, arg_i64, json_body, json_error, json_result,
 };
 use dhrust::net::http::HttpResponse;
 use dhrust::net::login_guard::LoginGuard;
@@ -33,6 +34,7 @@ use dhrust::net::panel_auth::{bearer_token, client_ip, is_loopback, AuthLevel, T
 use dhrust::net::router::Ctx;
 use dhrust::web::{format_bytes, format_speed};
 use pek_radmin::panel::{action_name_of, truncate_text};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value as Json};
 
 use crate::agent;
@@ -44,7 +46,7 @@ use crate::sys;
 use crate::util;
 
 /// 请求主体（已认证身份）：内置管理员或数据库面板用户。
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Principal {
     /// 登录名（审计记录用；`None` 鉴权级别下远程请求记为 `anon`）
     pub name: String,
@@ -61,6 +63,23 @@ impl Principal {
     }
 }
 
+/// 面板会话文件相对路径（`WebSessionHours > 0` 时启用：未过期令牌落盘，重启/升级后免重登）。
+const SESSIONS_FILE: &str = "Data/panel-sessions.json";
+/// 内置管理员的虚拟盐值（挑战登录统一口径：`SHA-256(salt:password)`，与数据库用户一致）。
+const BUILTIN_SALT: &str = "staragent-builtin";
+/// 登录挑战有效期（秒；一次性，用完即废）。
+const CHALLENGE_TTL_SECS: i64 = 120;
+
+/// 登录挑战记录（`nonce` → 期望的密码摘要 + 用户名）。
+struct Challenge {
+    /// 发起挑战时的用户名（登录时必须一致）
+    user: String,
+    /// 期望的密码摘要（`SHA-256(salt:password)`，与库中存储口径一致）
+    expect: String,
+    /// 到期墙钟（毫秒）
+    expire: i64,
+}
+
 /// 面板共享状态。
 pub struct WebPanel {
     /// 应用管理器
@@ -73,8 +92,14 @@ pub struct WebPanel {
     started: Instant,
     /// 进程启动墙钟
     started_at: DateTime<Local>,
-    /// 令牌表（令牌 → 会话主体；实现下沉 `dhrust::net::panel_auth::TokenStore`，默认 24 小时）
+    /// 令牌表（令牌 → 会话主体；实现下沉 `dhrust::net::panel_auth::TokenStore`）
+    ///
+    /// 有效期由 `WebSessionHours` 决定（默认 12 小时），**滑动续期**：期间用过面板就不会掉线。
     tokens: TokenStore<Principal>,
+    /// 会话落盘文件（`None` = 不持久化；见 `WebSessionHours`）
+    sessions_file: Option<PathBuf>,
+    /// 登录挑战表（一次性 nonce；默认 2 分钟过期）
+    challenges: Mutex<HashMap<String, Challenge>>,
     /// 登录限流（默认 15 分钟 5 次 → 封禁 5 分钟；实现下沉 `dhrust::net::login_guard`）
     logins: LoginGuard,
     /// Web 应用防火墙（「安全」页：在线开关 + 参考配置）
@@ -89,16 +114,105 @@ impl WebPanel {
         port: u16,
         waf: Arc<pek_rwaf::Waf>,
     ) -> Arc<WebPanel> {
-        Arc::new(WebPanel {
+        let cfg = manager.config();
+        let hours = i64::from(cfg.web_session_hours.min(8760));
+        // 0 = 关闭持久化：退回进程内 24 小时（旧行为），重启即失效
+        let ttl_ms = if hours > 0 {
+            hours * 3_600_000
+        } else {
+            24 * 3_600_000
+        };
+        let panel = Arc::new(WebPanel {
             manager,
             base: base.to_path_buf(),
             port,
             started: Instant::now(),
             started_at: Local::now(),
-            tokens: TokenStore::new(),
+            tokens: TokenStore::with_ttl_ms(ttl_ms),
+            sessions_file: (hours > 0).then(|| base.join(SESSIONS_FILE)),
+            challenges: Mutex::new(HashMap::new()),
             logins: LoginGuard::new(),
             waf,
-        })
+        });
+        panel.load_sessions();
+        panel
+    }
+
+    /// 恢复上次运行留下的登录会话（令牌文件不存在/损坏时静默跳过）。
+    fn load_sessions(&self) {
+        let Some(path) = &self.sessions_file else {
+            return;
+        };
+        let Ok(text) = std::fs::read_to_string(path) else {
+            return;
+        };
+        let Ok(root) = serde_json::from_str::<Json>(&text) else {
+            util::log_error("面板会话文件格式错误，已忽略（下次登录会重建）");
+            return;
+        };
+        let mut items = Vec::new();
+        for item in root
+            .get("sessions")
+            .and_then(|v| v.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let (Some(token), Some(expire), Some(principal)) = (
+                item.get("token").and_then(|v| v.as_str()),
+                item.get("expire").and_then(|v| v.as_i64()),
+                item.get("principal").cloned(),
+            ) else {
+                continue;
+            };
+            let Ok(principal) = serde_json::from_value::<Principal>(principal) else {
+                continue;
+            };
+            items.push((token.to_string(), expire, principal));
+        }
+        let count = self.tokens.restore(items);
+        if count > 0 {
+            let restored = count.to_string();
+            util::log_format(
+                "面板会话已恢复：{} 个（重启后无需重新登录）",
+                &[&restored],
+            );
+        }
+    }
+
+    /// 会话落盘（原子替换；Unix 下权限 0600）。失败只记日志，不影响请求。
+    fn save_sessions(&self) {
+        let Some(path) = &self.sessions_file else {
+            return;
+        };
+        let sessions: Vec<Json> = self
+            .tokens
+            .snapshot()
+            .into_iter()
+            .map(|(token, expire, principal)| {
+                json!({ "token": token, "expire": expire, "principal": principal })
+            })
+            .collect();
+        let body = json!({
+            "version": 1,
+            "updatedAt": Local::now().to_rfc3339(),
+            "sessions": sessions,
+        });
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let tmp = path.with_extension("json.tmp");
+        if let Err(e) = std::fs::write(&tmp, body.to_string()) {
+            util::log_error(&format!("写入面板会话文件失败：{e}"));
+            return;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        }
+        if let Err(e) = std::fs::rename(&tmp, path) {
+            util::log_error(&format!("替换面板会话文件失败：{e}"));
+        }
     }
 
     /// 面板端口。
@@ -177,6 +291,81 @@ impl WebPanel {
         Some(self.tokens.issue_with(principal))
     }
 
+    /// 按用户名解析主体（挑战登录通过后使用；权限/启用状态以当前库为准）。
+    fn principal_by_name(&self, user: &str) -> Option<Principal> {
+        let name = user.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let cfg = self.manager.config();
+        if !cfg.web_user_name.trim().is_empty()
+            && !cfg.web_user_password.is_empty()
+            && name.eq_ignore_ascii_case(cfg.web_user_name.trim())
+        {
+            return Some(Principal {
+                name: cfg.web_user_name.trim().to_string(),
+                is_admin: true,
+                perms: Vec::new(),
+            });
+        }
+        match audit::find_user(&self.base, name) {
+            Ok(Some(u)) if u.enabled => Some(Principal {
+                name: u.user_name.clone(),
+                is_admin: false,
+                perms: u.permissions.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    /// 用户口令摘要 `(salt, SHA-256(salt:password))`：挑战登录用。
+    ///
+    /// 内置管理员用固定虚拟盐现算；数据库用户直接取库中盐与哈希（同一口径）。
+    /// 用户不存在/被禁用时返回 `None`（调用方回填随机值，避免用户名枚举）。
+    fn credential_digest(&self, user: &str) -> Option<(String, String)> {
+        let name = user.trim();
+        if name.is_empty() {
+            return None;
+        }
+        let cfg = self.manager.config();
+        if !cfg.web_user_name.trim().is_empty()
+            && !cfg.web_user_password.is_empty()
+            && name.eq_ignore_ascii_case(cfg.web_user_name.trim())
+        {
+            return Some((
+                BUILTIN_SALT.to_string(),
+                dhrust::sign::salted_sha256_hex(BUILTIN_SALT, &cfg.web_user_password),
+            ));
+        }
+        match audit::find_user(&self.base, name) {
+            Ok(Some(u)) if u.enabled && !u.salt.is_empty() && !u.password_hash.is_empty() => {
+                Some((u.salt, u.password_hash))
+            }
+            _ => None,
+        }
+    }
+
+    /// 校验一次性挑战：`response == SHA-256(nonce + ":" + SHA-256(salt:password))`。
+    ///
+    /// `nonce` 一次性（无论成败都作废）、默认 2 分钟过期；**密码本身不经网络传输**，
+    /// 抓包只能得到一次性摘要，无法重放、也无法直接得到明文。
+    fn verify_challenge(&self, user: &str, nonce: &str, response: &str) -> Option<Principal> {
+        let now = dhrust::times::getmilltimestamp() as i64;
+        let record = {
+            let mut map = self.challenges.lock().unwrap();
+            map.retain(|_, c| c.expire > now);
+            map.remove(nonce)
+        }?;
+        if record.expire <= now || !record.user.eq_ignore_ascii_case(user.trim()) {
+            return None;
+        }
+        let expect = dhrust::sign::sha256_hex(format!("{nonce}:{}", record.expect).as_bytes());
+        if !expect.eq_ignore_ascii_case(response.trim()) {
+            return None;
+        }
+        self.principal_by_name(user)
+    }
+
     /// 校验令牌（测试辅助；生产路径直接用 `tokens.get`）。
     #[cfg(test)]
     fn validate_token(&self, token: &str) -> bool {
@@ -186,6 +375,14 @@ impl WebPanel {
     /// 吊销令牌（绑定主体随令牌一并失效）。
     fn revoke_token(&self, token: &str) {
         self.tokens.revoke(token);
+    }
+
+    /// 让「其它」会话立即失效（改密码/改用户后调用；保留当前令牌，避免自己掉线）。
+    fn revoke_other_sessions(&self, ctx: &Ctx) {
+        let current = bearer_token(ctx).unwrap_or_default();
+        if self.tokens.revoke_all_except(&current) > 0 {
+            self.save_sessions();
+        }
     }
 
     /// 重命名当前令牌绑定的会话主体（内置管理员改名后立即生效，无需重新登录）。
@@ -207,16 +404,38 @@ impl WebPanel {
         self.principal(ctx).is_some()
     }
 
+    /// 当前请求的真实客户端 IP（含反代口径，见 [`effective_client_ip`]）。
+    pub(crate) fn client_ip(&self, ctx: &Ctx) -> String {
+        effective_client_ip(self.manager.config().trust_forwarded_for, ctx).0
+    }
+
+    /// 当前请求是否可按“本机”对待（`LocalOnly` 免登录、契约接口放行）。
+    fn is_local_request(&self, ctx: &Ctx) -> bool {
+        let trust = self.manager.config().trust_forwarded_for;
+        let (ip, proxied) = effective_client_ip(trust, ctx);
+        is_loopback(&ip) && !(proxied && !trust)
+    }
+
     /// 解析请求主体（已认证身份；`None` = 未认证）。
     ///
     /// Bearer 令牌有效 → 会话绑定的用户与权限；无令牌时按鉴权级别兜底
     /// （详见 [`WebPanel::check_auth`]）。
     pub(crate) fn principal(&self, ctx: &Ctx) -> Option<Principal> {
-        if let Some(token) = bearer_token(ctx) {
-            if let Some(p) = self.tokens.get(&token) {
+        if let Some(token) = bearer_token(ctx)
+            && let Some(p) = self.tokens.get(&token) {
+                // 平台远程改/删用户后：非管理员会话必须重新确认「用户仍存在且启用」
+                // （命中缓存则零 SQL；平台下发时清空缓存，下一次请求即生效，无需等令牌过期）。
+                if !p.is_admin && !user_still_active(&self.base, &p.name) {
+                    self.tokens.revoke(&token);
+                    self.save_sessions();
+                    return None;
+                }
+                // 滑动续期：一直在用就一直有效；只有改动到期时间时才写盘（低频）
+                if self.tokens.touch(&token) {
+                    self.save_sessions();
+                }
                 return Some(p);
             }
-        }
         let cfg = self.manager.config();
         let mut admin = Principal {
             name: cfg.web_user_name.trim().to_string(),
@@ -228,13 +447,13 @@ impl WebPanel {
         }
         match self.auth_level() {
             AuthLevel::None => {
-                if !is_loopback(&client_ip(ctx)) {
+                if !self.is_local_request(ctx) {
                     admin.name = "anon".to_string();
                 }
                 Some(admin)
             }
             AuthLevel::LocalOnly => {
-                if is_loopback(&client_ip(ctx)) {
+                if self.is_local_request(ctx) {
                     Some(admin)
                 } else {
                     None
@@ -259,6 +478,49 @@ impl WebPanel {
     }
 }
 
+// ————— 子用户在线状态（平台统一管控后即时失效） —————
+
+/// 子用户「仍存在且启用」缓存：`用户名(小写) → (校验时刻, 是否有效)`。
+///
+/// 每次带令牌请求都查库太贵；30 秒 TTL 兜底，平台下发变更时 [`invalidate_user_cache`]
+/// 立即清空 → 下一个请求即拒绝（删除/禁用用户后不必等会话过期）。
+static USER_ACTIVE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+
+fn user_active_cache() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
+    USER_ACTIVE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 清空子用户状态缓存（面板本地改用户、平台下发变更后调用）。
+pub(crate) fn invalidate_user_cache() {
+    user_active_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
+}
+
+/// 子用户是否仍存在且启用（30 秒缓存；查不到/禁用 = 无效）。
+fn user_still_active(base: &Path, name: &str) -> bool {
+    let key = name.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return false;
+    }
+    {
+        let cache = user_active_cache().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, ok)) = cache.get(&key)
+            && at.elapsed() < Duration::from_secs(30)
+        {
+            return *ok;
+        }
+    }
+    let ok = matches!(audit::find_user(base, name), Ok(Some(u)) if u.enabled);
+    let mut cache = user_active_cache().lock().unwrap_or_else(|e| e.into_inner());
+    if cache.len() > 4096 {
+        cache.clear();
+    }
+    cache.insert(key, (Instant::now(), ok));
+    ok
+}
+
 // ————— 动作守卫（认证 + 权限 + 审计） —————
 
 /// 权限 key（与前端导航 `data-panel` 一致；可授予列表见 [`crate::audit::ALL_PERMISSIONS`]）。
@@ -277,6 +539,8 @@ pub(crate) const PERM_PLUGINS: &str = "plugins";
 pub(crate) const PERM_AUDIT: &str = "audit";
 pub(crate) const PERM_AI: &str = "ai";
 pub(crate) const PERM_TERMINAL: &str = "terminal";
+/// 网站证书（站点盘点 + 证书部署）。
+pub(crate) const PERM_CERT: &str = "cert";
 /// 用户管理：仅内置管理员（不参与授权列表）。
 pub(crate) const PERM_USERS: &str = "users";
 
@@ -346,7 +610,7 @@ fn record_audit(
         &audit::AuditEntry {
             category: None,
             user: principal.name.clone(),
-            ip: client_ip(ctx),
+            ip: panel.client_ip(ctx),
             action: action.to_string(),
             title: action_title(action),
             method: ctx.req.method.clone(),
@@ -400,10 +664,15 @@ fn action_title(action: &str) -> String {
 /// 动作 → 中文名映射（审计展示；`action_name_of` 来自 `pek_radmin::panel`）。
 const ACTION_TITLES: &[(&str, &str)] = &[
     ("login", "登录"),
+    ("loginChallenge", "获取登录挑战"),
     ("logout", "退出登录"),
+    ("logoutAll", "退出所有设备"),
     ("control", "服务控制"),
     ("dhdeployPanel", "DHDeploy 面板访问"),
     ("freeMemory", "释放内存"),
+    ("freeMemoryAll", "清理内存"),
+    ("freeSystemMemory", "清理系统缓存"),
+    ("swapConfig", "虚拟内存设置"),
     ("updateConfig", "更新配置"),
     ("changePassword", "修改密码"),
     ("upgrade", "程序升级"),
@@ -413,6 +682,9 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("stopService", "停止子服务"),
     ("restartService", "重启子服务"),
     ("addService", "添加/更新子服务"),
+    ("appDeploy", "部署应用包"),
+    ("starAgentScan", "扫描 C# 星尘"),
+    ("starAgentMigrate", "迁移 C# 星尘"),
     ("removeService", "删除子服务"),
     ("updateStarConfig", "更新星尘设置"),
     ("dbQuery", "数据库查询"),
@@ -431,12 +703,16 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("fileMove", "移动文件"),
     ("fileCopy", "复制文件"),
     ("fileUpload", "上传文件"),
+    ("fileUploadChunk", "分片上传"),
+    ("fileUploadAbort", "放弃上传"),
+    ("fileCheck", "检查同名文件"),
     ("fileDownload", "下载文件"),
     ("fileCompress", "压缩文件"),
     ("fileExtract", "解压文件"),
     ("fileChmod", "修改文件权限"),
     ("fileSearch", "搜索文件"),
     ("fileSize", "计算目录大小"),
+    ("webLogFix", "启用 IIS 日志字段"),
     ("logCleanRun", "日志清理"),
     ("logCleanConfig", "日志清理配置"),
     ("logCleanConfigSave", "保存日志清理配置"),
@@ -445,11 +721,76 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("pluginStoreInstall", "安装/更新在线插件"),
     ("aiChat", "AI 助手对话"),
     ("termReset", "重置终端会话"),
+    ("termWs", "打开在线终端"),
+    ("termClose", "关闭在线终端"),
+    ("termCommand", "终端命令"),
     ("userSave", "保存面板用户"),
     ("userDelete", "删除面板用户"),
     ("userResetPassword", "重置用户密码"),
     ("auditLogs", "查看操作日志"),
 ];
+
+/// 解析真实客户端 IP：返回（IP，是否经过反代）。
+///
+/// - 默认（`trust=false`）：对端是回环又带 `X-Real-IP` / `X-Forwarded-For` 时，按**反代来的远程请求**
+///   处理（不享受本机免登录），防止 nginx 后 `LocalOnly` 整体免鉴权；
+/// - `trust=true`：仅当对端是回环才采纳转发头（优先 `X-Real-IP`，否则取 XFF 最后一段——反代追加时
+///   最后一段才是真实客户端；客户端可伪造左侧字段）。
+pub(crate) fn effective_client_ip(trust: bool, ctx: &Ctx) -> (String, bool) {
+    resolve_client_ip(
+        &client_ip(ctx),
+        ctx.header("x-real-ip"),
+        ctx.header("x-forwarded-for"),
+        trust,
+    )
+}
+
+/// [`effective_client_ip`] 的纯函数版本（便于单测）。
+fn resolve_client_ip(
+    peer: &str,
+    real: Option<&str>,
+    xff: Option<&str>,
+    trust: bool,
+) -> (String, bool) {
+    let peer = peer.trim().to_string();
+    if !is_loopback(&peer) {
+        return (peer, false);
+    }
+    let real = real.map(str::trim).filter(|s| !s.is_empty());
+    let xff = xff.map(str::trim).filter(|s| !s.is_empty());
+    if real.is_none() && xff.is_none() {
+        return (peer, false);
+    }
+    if !trust {
+        return (peer, true);
+    }
+    let ip = real
+        .map(|s| s.to_string())
+        .or_else(|| {
+            xff.and_then(|s| s.rsplit(',').next())
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap_or(peer);
+    (strip_ip_port(&ip), true)
+}
+
+/// 去掉 IP 串可能带的端口（`1.2.3.4:56`、`[::1]:56`）。
+fn strip_ip_port(raw: &str) -> String {
+    let s = raw.trim().trim_matches('"');
+    if let Some(rest) = s.strip_prefix('[')
+        && let Some((host, _)) = rest.split_once(']')
+    {
+        return host.to_string();
+    }
+    if s.matches(':').count() == 1
+        && let Some((host, port)) = s.rsplit_once(':')
+        && !port.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return host.to_string();
+    }
+    s.to_string()
+}
 
 /// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。
 ///
@@ -471,8 +812,14 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     // 登录/退出：无需令牌（成功与失败均写操作审计）
     let p = panel.clone();
     controller = controller.post("login", move |ctx| login(&p, ctx));
+    // 登录挑战：一次性 nonce + 用户盐（前端算摘要，密码不经网络传输）
+    let p = panel.clone();
+    controller = controller.get("loginChallenge", move |ctx| login_challenge(&p, ctx));
     let p = panel.clone();
     controller = controller.post("logout", move |ctx| logout(&p, ctx));
+    // 退出所有设备（仅内置管理员；保留当前会话）
+    let p = panel.clone();
+    controller = controller.post("logoutAll", guarded(p, PERM_USERS, logout_all));
 
     // 当前主体（前端登录后取权限渲染菜单；仅认证不校验菜单权限）
     controller = controller.get("me", guarded(panel.clone(), "", me));
@@ -480,9 +827,37 @@ pub fn build_api_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.get("status", guarded(panel.clone(), PERM_DASHBOARD, status));
     controller = controller.get("health", guarded(panel.clone(), PERM_DASHBOARD, health));
     controller = controller.get("freeMemory", guarded(panel.clone(), PERM_CONTROL, free_memory));
+    // 一键清理：本进程缓存 + 系统页缓存（状态页「内存」卡片按钮）
+    controller = controller.get(
+        "freeMemoryAll",
+        guarded(panel.clone(), PERM_CONTROL, free_memory_all),
+    );
+    // 清理系统页缓存（Linux sync + drop_caches；不释放进程自身内存）
+    controller = controller.get(
+        "freeSystemMemory",
+        guarded(panel.clone(), PERM_CONTROL, free_system_memory),
+    );
     controller = controller.get(
         "configMetadata",
         guarded(panel.clone(), PERM_CONFIG, config_metadata),
+    );
+    // 面板 HTTPS：状态（证书 SAN/剩余天数/指纹）+ 重新签发 + 下载证书
+    controller = controller.get(
+        "tls",
+        guarded(panel.clone(), PERM_CONFIG, tls_status),
+    );
+    controller = controller.post(
+        "tlsRenew",
+        guarded(panel.clone(), PERM_CONFIG, tls_renew),
+    );
+    controller = controller.get(
+        "tlsCert",
+        guarded(panel.clone(), PERM_CONFIG, tls_cert),
+    );
+    // 一键导入脚本（单文件、内嵌证书）：运维在**自己电脑**上下载后双击/执行一次即可
+    controller = controller.get(
+        "tlsInstall",
+        guarded(panel.clone(), PERM_CONFIG, tls_install),
     );
     controller = controller.post(
         "updateConfig",
@@ -520,6 +895,11 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     let mut controller = Controller::new("star");
 
     controller = controller.get("services", guarded(panel.clone(), PERM_SERVICES, services));
+    // 应用心跳（子服务调用；`HealthCheck=heartbeat` 时用于无端口应用的假死判定）
+    controller = controller.post(
+        "appHeartbeat",
+        guarded(panel.clone(), "", app_heartbeat),
+    );
     controller = controller.post(
         "startService",
         guarded(panel.clone(), PERM_SERVICES, |p, ctx| {
@@ -543,6 +923,19 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_SERVICES, add_service),
     );
     controller = controller.post(
+        "appDeploy",
+        guarded(panel.clone(), PERM_SERVICES, app_deploy),
+    );
+    // C# 版星尘迁移（面板一键；不依赖 SSH）：先 GET 预览，再 POST 执行
+    controller = controller.get(
+        "starAgentScan",
+        guarded(panel.clone(), PERM_SERVICES, star_agent_scan),
+    );
+    controller = controller.post(
+        "starAgentMigrate",
+        guarded(panel.clone(), PERM_SERVICES, star_agent_migrate),
+    );
+    controller = controller.post(
         "removeService",
         guarded(panel.clone(), PERM_SERVICES, remove_service),
     );
@@ -555,9 +948,18 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_STARCONFIG, update_star_config),
     );
     controller = controller.get("machine", guarded(panel.clone(), PERM_DASHBOARD, machine));
+    // 虚拟内存（swap）在线配置：create / remove / swappiness
+    controller = controller.post(
+        "swapConfig",
+        guarded(panel.clone(), PERM_CONTROL, swap_config),
+    );
     controller = controller.get(
         "webTraffic",
         guarded(panel.clone(), PERM_TRAFFIC, web_traffic),
+    );
+    controller = controller.post(
+        "webLogFix",
+        guarded(panel.clone(), PERM_CONFIG, web_log_fix),
     );
     controller = controller.get(
         "portTraffic",
@@ -636,6 +1038,22 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
     controller = controller.post(
         "fileUpload",
         guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload),
+    );
+    controller = controller.post(
+        "fileCheck",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_check),
+    );
+    controller = controller.post(
+        "fileUploadChunk",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_chunk),
+    );
+    controller = controller.get(
+        "fileUploadStatus",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_status),
+    );
+    controller = controller.post(
+        "fileUploadAbort",
+        guarded(panel.clone(), PERM_FILEMAN, crate::fileman::file_upload_abort),
     );
     controller = controller.get(
         "fileDownload",
@@ -730,6 +1148,29 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         "termReset",
         guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_reset),
     );
+    controller = controller.get(
+        "termBanner",
+        guarded(panel.clone(), PERM_TERMINAL, crate::terminal::term_banner),
+    );
+
+    // 网站证书（站点盘点 + 演练/部署；仅白名单站点可写）
+    controller = controller.get("sites", guarded(panel.clone(), PERM_CERT, sites_info));
+    controller = controller.post(
+        "certDeploy",
+        guarded(panel.clone(), PERM_CERT, cert_deploy),
+    );
+    controller = controller.post(
+        "certConfig",
+        guarded(panel.clone(), PERM_CERT, cert_config),
+    );
+    controller = controller.post(
+        "certAllow",
+        guarded(panel.clone(), PERM_CERT, cert_allow),
+    );
+    controller = controller.post(
+        "certDeny",
+        guarded(panel.clone(), PERM_CERT, cert_deny),
+    );
 
     controller.get(
         "getProcessList",
@@ -739,20 +1180,89 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
 
 // ————— /api 动作 —————
 
+/// 下发登录挑战：一次性 `nonce` + 用户盐（摘要口径 `SHA-256(salt:password)`）。
+///
+/// 用户不存在/被禁用时同样返回随机盐与随机摘要（仅用于比对必败），避免用户名枚举。
+fn login_challenge(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let user = arg(ctx, "user").unwrap_or_default();
+    let (salt, expect) = panel
+        .credential_digest(&user)
+        .unwrap_or_else(|| (dhrust::random::hex(16), dhrust::random::hex(32)));
+    let nonce = dhrust::random::hex(16);
+    let now = dhrust::times::getmilltimestamp() as i64;
+    {
+        let mut map = panel.challenges.lock().unwrap();
+        map.retain(|_, c| c.expire > now);
+        map.insert(
+            nonce.clone(),
+            Challenge {
+                user: user.trim().to_string(),
+                expect,
+                expire: now + CHALLENGE_TTL_SECS * 1000,
+            },
+        );
+    }
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "nonce": nonce,
+            "salt": salt,
+            "expireIn": CHALLENGE_TTL_SECS,
+        })),
+    )
+}
+
+/// 退出所有其它设备：注销除当前请求以外的全部会话（会话文件同步更新）。
+fn logout_all(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(principal) = panel.principal(ctx) else {
+        return json_error(401, "Unauthorized");
+    };
+    if !principal.is_admin {
+        return json_error(403, "仅内置管理员可执行该操作");
+    }
+    let current = bearer_token(ctx).unwrap_or_default();
+    let removed = panel.tokens.revoke_all_except(&current);
+    panel.save_sessions();
+    let count = removed.to_string();
+    util::log_format(
+        "Web 面板已退出其它会话：{} 个（{}）",
+        &[&count, &principal.name],
+    );
+    json_result(0, &format!("已退出 {removed} 个其它会话"), None)
+}
+
 /// 登录：签发令牌（成功/失败均写入操作审计）。
 fn login(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    let ip = client_ip(ctx);
+    let ip = panel.client_ip(ctx);
 
     if panel.logins.is_blocked(&ip) {
         return json_error(429, "Too many failed attempts. Try again later.");
     }
 
     let user = arg(ctx, "user").unwrap_or_default();
-    let password = arg(ctx, "password").unwrap_or_default();
 
-    match panel.authenticate(&user, &password) {
+    // 优先挑战式登录（`nonce` + `response`，密码不出网）；未提供时兼容旧明文口令（脚本/旧前端）
+    let challenge = match (arg(ctx, "nonce"), arg(ctx, "response")) {
+        (Some(nonce), Some(response))
+            if !nonce.trim().is_empty() && !response.trim().is_empty() =>
+        {
+            Some((nonce, response))
+        }
+        _ => None,
+    };
+    let principal = match &challenge {
+        Some((nonce, response)) => panel.verify_challenge(&user, nonce.trim(), response.trim()),
+        None => {
+            let password = arg(ctx, "password").unwrap_or_default();
+            panel.authenticate(&user, &password)
+        }
+    };
+
+    match principal {
         Some(principal) => {
             let token = panel.tokens.issue_with(principal.clone());
+            panel.save_sessions();
             panel.logins.record_success(&ip);
             util::log_format("Web 面板登录成功：{}（{}）", &[&principal.name, &ip]);
             audit::record(
@@ -808,7 +1318,7 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 &audit::AuditEntry {
                     category: None,
                     user: principal.name,
-                    ip: client_ip(ctx),
+                    ip: panel.client_ip(ctx),
                     action: "logout".to_string(),
                     title: action_title("logout"),
                     method: ctx.req.method.clone(),
@@ -823,6 +1333,7 @@ fn logout(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         }
         panel.revoke_token(&token);
     }
+    panel.save_sessions();
     json_result(0, "ok", None)
 }
 
@@ -847,6 +1358,10 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let memory_mb = sys::memory_mb(pid).unwrap_or(0);
     let (mem_total, mem_avail) = sys::memory_info().unwrap_or((0, 0));
     let mem_used_mb = mem_total.saturating_sub(mem_avail) / 1024 / 1024;
+    // 空闲 / 缓存（Linux `/proc/meminfo`：MemFree、Cached+SReclaimable；口径与宝塔/free 一致）
+    let mem_detail = dhrust::sys::machine::memory_detail();
+    let mem_free_mb = mem_detail.map(|m| m.free_bytes / 1024 / 1024).unwrap_or(0);
+    let mem_cached_mb = mem_detail.map(|m| m.cached_bytes / 1024 / 1024).unwrap_or(0);
     let disks = sys::disk_usages();
     // 进程 CPU 时间：供内嵌 health 字段使用（复用本次采集，避免前端第二次请求）
     let (cpu_total, cpu_kernel, cpu_user) = sys::process_cpu_seconds();
@@ -888,9 +1403,14 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "uptime": dhrust::sys::process::format_uptime(uptime),
         "uptimeSeconds": uptime.as_secs(),
         "processId": pid,
+        // 代理版本（编译期常量）：面板页脚直接展示，不依赖自升级卡片是否启用
+        "version": env!("CARGO_PKG_VERSION"),
         "memoryMB": memory_mb,
         "memoryUsedMB": mem_used_mb,
         "memoryTotalMB": mem_total / 1024 / 1024,
+        // 内存三栏（面板内存卡：已用 / 缓存 / 空闲；Linux 口径 MemFree、Cached+SReclaimable）
+        "memoryFreeMB": mem_free_mb,
+        "memoryCachedMB": mem_cached_mb,
         "threadCount": threads,
         "handleCount": handles,
         "processCpuRate": format!("{proc_cpu:.1}"),
@@ -951,6 +1471,12 @@ fn status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         "panelWs": {
             "enabled": crate::panel_ws::enabled(&cfg),
             "connected": crate::panel_ws::connected(),
+            // 配对模式：已连上平台但尚未被管理员批准（面板提示「等待批准」）
+            "pairPending": crate::panel_ws::pairing_pending(),
+            // 诊断：实际连接目标（由 AutoUpgradeUrl 推导）+ 最近一次断开原因
+            "url": crate::panel_ws::target_url(&cfg),
+            "lastError": crate::panel_ws::last_error(),
+            "tokenConfigured": !cfg.auto_upgrade_token.trim().is_empty(),
         },
         // 进程健康指标（原 /api/health 合并至此：面板每 3 秒刷新只需一次请求，
         // 且复用上面已采集的进程统计，省一次全进程快照与进程内存查询）
@@ -1007,6 +1533,37 @@ fn web_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     json_result(0, "", Some(crate::weblog::snapshot_json()))
 }
 
+/// 为 IIS 站点启用日志记录并勾选 `BytesSent`（sc-bytes）；`{"site":"名称"}` 或 `{"all":true}`。
+fn web_log_fix(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let body = json_body(ctx).unwrap_or(Json::Null);
+    let all = body.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let site = body
+        .get("site")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if !all && site.is_empty() {
+        return json_error(400, "缺少站点名称");
+    }
+    // appcmd 是阻塞调用：放独立线程，避免占用 tokio 运行时线程
+    let joined = std::thread::spawn(move || {
+        crate::iis::enable_sc_bytes(if all { None } else { Some(site.as_str()) })
+    })
+    .join();
+    match joined {
+        Ok(Ok(msg)) => {
+            crate::weblog::request_rediscover();
+            json_result(0, &msg, None)
+        }
+        Ok(Err(e)) => json_error(500, &e),
+        Err(_) => json_error(500, "操作线程异常退出"),
+    }
+}
+
 /// 端口流量统计（`/star/portTraffic`）：各端口收发字节/速率/连接数。
 fn port_traffic(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
@@ -1036,7 +1593,7 @@ fn traffic_history(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
-// ————— WAF（/star/waf*：在线开关 + 参考配置；配置落盘 Config/Waf.json 并立即生效） —————
+// ————— WAF（/star/waf*：在线开关 + 参考配置；配置落盘 Config/Waf.toml 并立即生效） —————
 
 /// WAF 状态与完整配置（参考配置页数据源）。
 fn waf_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
@@ -1046,13 +1603,13 @@ fn waf_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.waf.config();
     let mut v = serde_json::to_value(&cfg).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = v.as_object_mut() {
+        // 路径取公共库常量（`Config/Waf.toml`），不要在本仓硬编码文件名
         obj.insert(
             "configFile".to_string(),
             serde_json::json!(
                 panel
                     .base()
-                    .join("Config")
-                    .join("Waf.json")
+                    .join(pek_rwaf::config::CONFIG_REL)
                     .display()
                     .to_string()
             ),
@@ -1240,7 +1797,12 @@ fn db_delete_backup(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// 释放内存（尽力回收工作集）。
+/// 释放内存（清理可重建缓存 + 尽力回收工作集）。
+///
+/// 2026-10-26 重写：原实现只调 `empty_working_set`，而 Linux 静态包是 musl——
+/// 没有 `malloc_trim`，按钮实际什么都没做却报成功（用户实测「空操作」）。
+/// 现在先清理本进程可重建缓存（真实动作，占大头），再调平台回收并**如实**汇报：
+/// Windows 走 `EmptyWorkingSet`、glibc 走 `malloc_trim`、musl 无系统级接口。
 fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -1250,24 +1812,200 @@ fn free_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let before = sys::memory_mb(pid).unwrap_or(0);
     util::log_format("Web 面板触发释放内存，释放前 {}MB", &[&before.to_string()]);
 
-    let success = sys::empty_working_set();
+    // ① 清理可重建缓存（站点 UV 集合收缩、站点/文件表多余容量）
+    let cleared = crate::weblog::release_caches();
+    // ② 系统级回收（musl 无此能力，仅返回 false）
+    let trimmed = sys::empty_working_set();
+    let supported = sys::working_set_trim_supported();
 
     let after = sys::memory_mb(pid).unwrap_or(0);
     let freed = before.saturating_sub(after);
     util::log_format(
-        "释放内存完成，释放后 {}MB，释放 {}MB",
-        &[&after.to_string(), &freed.to_string()],
+        "释放内存完成，释放后 {}MB，释放 {}MB（清理缓存 {} 字节）",
+        &[&after.to_string(), &freed.to_string(), &cleared.to_string()],
     );
 
+    let cleared_text = format_bytes(cleared as u64);
+    let how = if trimmed {
+        "，缓存清理 + 系统工作集回收"
+    } else if supported {
+        "，缓存清理（系统回收未生效）"
+    } else {
+        "，仅缓存清理（当前平台无系统级回收接口，由分配器按需归还）"
+    };
+    let message = if freed > 0 {
+        format!(
+            "释放内存完成：{before}MB → {after}MB，释放 {freed}MB，清理缓存 {cleared_text}{how}"
+        )
+    } else {
+        format!("释放内存完成：当前 {before}MB 已无多余缓存可回收，清理缓存 {cleared_text}{how}")
+    };
+
     json_result(
-        if success { 0 } else { 500 },
-        &if success {
-            format!("释放内存完成：{before}MB → {after}MB，释放 {freed}MB")
-        } else {
-            "释放内存失败".to_string()
-        },
-        Some(json!({ "beforeMB": before, "afterMB": after, "freedMB": freed })),
+        0,
+        &message,
+        Some(json!({
+            "beforeMB": before,
+            "afterMB": after,
+            "freedMB": freed,
+            "clearedBytes": cleared,
+            "systemTrim": trimmed,
+            "systemTrimSupported": supported,
+        })),
     )
+}
+
+/// 一键清理内存（状态页「内存」卡片按钮）：本进程缓存 + 系统页缓存（Linux）。
+///
+/// 与两个细分接口的关系：
+/// - `free_memory`：只清代理自己；
+/// - `free_system_memory`：只清系统页缓存；
+/// - 本接口 = 两者合并，给用户一个「点一下就行」的入口（对齐宝塔的使用习惯）。
+fn free_memory_all(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let pid = std::process::id();
+    let self_before = sys::memory_mb(pid).unwrap_or(0);
+    let cleared = crate::weblog::release_caches();
+    let trimmed = sys::empty_working_set();
+    let self_after = sys::memory_mb(pid).unwrap_or(0);
+    let self_freed = self_before.saturating_sub(self_after);
+
+    let system = crate::memsys::drop_caches();
+    util::log_format(
+        "一键清理内存：代理自身 {} → {} MB，系统缓存 {}",
+        &[
+            &self_before.to_string(),
+            &self_after.to_string(),
+            &match &system {
+                Ok(r) => format!("释放 {}", format_bytes(r.freed())),
+                Err(e) => format!("未执行（{e}）"),
+            },
+        ],
+    );
+
+    let message = match &system {
+        Ok(r) => format!(
+            "清理完成：系统页缓存释放 {}，可用内存 {} → {}（代理自身 {} → {} MB）",
+            format_bytes(r.freed()),
+            format_bytes(r.before_avail),
+            format_bytes(r.after_avail),
+            self_before,
+            self_after
+        ),
+        Err(e) => format!(
+            "已清理代理自身缓存（{} → {} MB，清理 {}）；系统页缓存未清理：{e}",
+            self_before,
+            self_after,
+            format_bytes(cleared as u64)
+        ),
+    };
+
+    let (before_avail, after_avail, sys_freed) = match &system {
+        Ok(r) => (r.before_avail, r.after_avail, r.freed()),
+        Err(_) => {
+            let avail = sys::memory_info().map(|(_, a)| a).unwrap_or(0);
+            (avail, avail, 0)
+        }
+    };
+
+    json_result(
+        0,
+        &message,
+        Some(json!({
+            "beforeAvailMB": before_avail / 1024 / 1024,
+            "afterAvailMB": after_avail / 1024 / 1024,
+            "sysFreedMB": sys_freed / 1024 / 1024,
+            "selfFreedMB": self_freed,
+            "clearedBytes": cleared,
+            "systemTrim": trimmed,
+            "systemTrimSupported": sys::working_set_trim_supported(),
+        })),
+    )
+}
+
+/// 清理系统内存缓存（Linux `sync` + `drop_caches`）。
+///
+/// 与「释放内存」的区别：
+/// - 「释放内存」只处理**本代理自己**（清自身缓存 + EmptyWorkingSet/malloc_trim）；
+/// - 本接口清理**整机的页缓存/目录项/inode 缓存**（宝塔同类按钮的口径），
+///   但不释放任何进程占用的内存——那必须重启对应进程（面板「进程 Top」可定位）。
+fn free_system_memory(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::memsys::drop_caches() {
+        Ok(r) => {
+            let freed = r.freed();
+            let tip = if freed < 32 * 1024 * 1024 {
+                "（当前可回收的页缓存不多；进程占用的内存需重启对应服务才能释放）"
+            } else {
+                "（页缓存已释放；进程自身占用的内存不受影响）"
+            };
+            json_result(
+                0,
+                &format!(
+                    "系统缓存已清理：可用内存 {} → {}，释放 {}{tip}",
+                    format_bytes(r.before_avail),
+                    format_bytes(r.after_avail),
+                    format_bytes(freed)
+                ),
+                Some(json!({
+                    "beforeAvailMB": r.before_avail / 1024 / 1024,
+                    "afterAvailMB": r.after_avail / 1024 / 1024,
+                    "freedMB": freed / 1024 / 1024,
+                    "beforeCachedMB": r.before_cached / 1024 / 1024,
+                    "afterCachedMB": r.after_cached / 1024 / 1024,
+                })),
+            )
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 虚拟内存（swap）在线配置：`action=create|remove|swappiness`。
+///
+/// 成功时把最新状态一并返回，前端无需二次拉取。
+fn swap_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    // 坑：Controller 注册的路由是 `/star/{action}`——路径最后一段会被捕获成**路由参数 `action`**，
+    // 业务参数再叫 `action` 会被路径值（"swapConfig"）覆盖。所以用 `op`，并兼容旧前端直读 JSON 的 `action`。
+    let op = arg(ctx, "op")
+        .or_else(|| {
+            json_body(ctx).and_then(|b| {
+                b.get("action")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+            })
+        })
+        .unwrap_or_default();
+    let result = match op.as_str() {
+        "create" => {
+            let size_mb = arg_i64(ctx, "sizeMB").unwrap_or(0).max(0) as u64;
+            let path = arg(ctx, "path").unwrap_or_else(|| "/swapfile".to_string());
+            let persist = arg_bool(ctx, "persist").unwrap_or(true);
+            crate::swap::create(&path, size_mb, persist)
+        }
+        "remove" => crate::swap::remove(&arg(ctx, "path").unwrap_or_default()),
+        "swappiness" => {
+            let value = arg_i64(ctx, "value").unwrap_or(-1);
+            if !(0..=100).contains(&value) {
+                Err("swappiness 取值 0~100".to_string())
+            } else {
+                crate::swap::set_swappiness(value as u32)
+            }
+        }
+        _ => {
+            Err(format!("未知操作「{op}」（应为 create / remove / swappiness）"))
+        }
+    };
+    match result {
+        Ok(msg) => json_result(0, &msg, Some(crate::swap::status_json())),
+        Err(e) => json_error(400, &e),
+    }
 }
 
 /// 同步系统时间（`{"timeMs": 毫秒时间戳}`；Web 面板“同步时间”按钮）。
@@ -1290,7 +2028,7 @@ fn sync_time(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(400, "时间戳超出允许范围（2000~2100 年）");
     }
 
-    let ip = client_ip(ctx);
+    let ip = panel.client_ip(ctx);
     match sys::set_system_time(epoch_ms) {
         Ok(()) => {
             let local = Local::now().format("%Y-%m-%d %H:%M:%S %:z").to_string();
@@ -1317,20 +2055,24 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     let cfg = panel.manager.config();
     let items = vec![
         config_item("WebAuthLevel", "鉴权级别", "String", cfg.web_auth_level.clone(), "None不鉴权；LocalOnly本地免鉴权、远程需登录（默认）；Full全部需登录；修改后自动生效（无需重启）"),
+        config_item("TrustForwardedFor", "信任反代转发头", "Boolean", cfg.trust_forwarded_for.to_string(), "默认 false。面板前有可信 nginx/TLS 反代时开启，按 X-Real-IP / X-Forwarded-For 判定真实 IP（本机免登录、审计、登录限流）；直连部署保持 false；反代须覆盖而非追加 X-Forwarded-For。修改后自动生效"),
+        // 面板 HTTPS：自签叶子证书（SAN 含本机全部 IP）；修改后需重启服务生效
+        config_item("Tls", "面板HTTPS", "Boolean", cfg.tls.to_string(), "为真时面板同端口改用 HTTPS（自签证书，浏览器首次访问前需导入 Config/keys/panel.pem 信任）；修改需重启服务后生效"),
+        config_item("WebSessionHours", "登录保持时长（小时）", "Int32", cfg.web_session_hours.to_string(), "面板登录会话保持时长（滑动续期：期间用过面板就不掉线，重启/升级不用重新登录），默认 12；0=关闭持久化（仅进程内 24 小时）。修改需重启服务后生效（会话已落盘，重启不会掉登录）"),
         config_item("SampleInterval", "采样间隔(ms)", "Int32", cfg.sample_interval.to_string(), "后台资源采样间隔，默认1000（与任务管理器/宝塔同粒度）；0=关闭后台采样（改为面板请求时现采）。修改需重启服务后生效"),
-        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache 访问日志（自动发现站点；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
+        config_item("WebTraffic", "网站流量统计", "Boolean", cfg.web_traffic.to_string(), "解析 nginx/apache/IIS 访问日志（自动发现站点；IIS 需在日志字段中启用 sc-bytes 才能统计流量；个别未发现的站点可在配置文件 WebLogs 项补充），零侵入只读；修改后自动生效"),
         config_item("PortTraffic", "端口流量统计", "Boolean", cfg.port_traffic.to_string(), "默认开启。Linux 创建独立 nftables 计数表统计各端口收发流量（只计数不改转发，关闭/卸载自动清理；需 root）；无 nft 或权限不足、Windows 时降级为连接视图；端口自动取系统监听（个别端口可在配置文件 PortTrafficPorts 项指定）；修改后自动生效"),
         config_item("TrafficHistoryDays", "流量历史保留天数", "Int32", cfg.traffic_history_days.to_string(), "每日归档（SQLite：Data/traffic.db，Pek.RCode 消费方）的保留天数，默认 90（7~3650）；0=永久保留。修改后自动生效"),
-        config_item("PluginStoreUrl", "插件源地址（HTTPS）", "String", cfg.plugin_store_url.clone(), "在线插件目录（catalog.json）的地址；仅允许 https（127.0.0.1 例外便于本地调试）；留空=关闭在线插件。修改后自动生效"),
-        config_item("PluginStorePubKey", "插件源公钥（Ed25519 hex，可选）", "String", cfg.plugin_store_pubkey.clone(), "填写后强制校验插件源签名（catalog.json.sig），防止插件源被篡改；留空=仅 HTTPS+SHA-256 校验。修改后自动生效"),
-        config_item("AutoUpgradeUrl", "自动升级源地址（HTTPS）", "String", cfg.auto_upgrade_url.clone(), "星尘代理发行源（catalog.json）地址；默认已指向官方平台（p.sc8.fun）。仅允许 https（127.0.0.1 例外）；留空=关闭自动升级。配置「插件源公钥」后强制验签（留空=仅 HTTPS+SHA-256 校验）。修改后自动生效"),
-        config_item("AutoUpgradeIntervalMinutes", "自动升级检查间隔(分钟)", "Int32", cfg.auto_upgrade_interval_minutes.to_string(), "定期检查发行源新版本的间隔，默认 60（5~1440）。修改后自动生效"),
-    config_item("AutoUpgradeToken", "平台接入令牌", "Password", cfg.auto_upgrade_token.clone(), "Pek.RPanlServer「服务器节点」页生成的接入令牌；填写后启用实时通道：向平台上报机器数据（CPU/内存/磁盘/子服务），并接收「立即检查升级」指令。留空 = 不接入。修改后自动生效"),
+        // 安全/分发源类配置不提供在线编辑（防误改/被改乱），仅支持服务器配置文件修改：
+        // PluginStoreUrl / PluginStorePubKey / AutoUpgradeUrl / AutoUpgradeIntervalMinutes / AutoUpgradeToken
         config_item("AiEnabled", "AI 助手", "Boolean", cfg.ai_enabled.to_string(), "启用后可在「AI 助手」页对话分析服务器问题（OpenAI 兼容接口，默认接入 DeepSeek）。修改后自动生效"),
         config_item("AiBaseUrl", "AI 接口地址", "String", cfg.ai_base_url.clone(), "OpenAI 兼容 Base 地址（如 https://api.deepseek.com/v1；也可直接填完整 …/chat/completions 地址）。接入其他厂商/本地模型时修改。修改后自动生效"),
         config_item("AiModel", "AI 模型", "String", cfg.ai_model.clone(), "模型名（如 deepseek-chat 对话 / deepseek-reasoner 推理；接入其他服务时填其模型名）。修改后自动生效"),
         config_item("AiApiKey", "AI API Key", "Password", cfg.ai_api_key.clone(), "模型服务商 API Key（Bearer 令牌）。修改后自动生效"),
         config_item("TerminalEnabled", "在线终端", "Boolean", cfg.terminal_enabled.to_string(), "启用后可在「🖥 在线终端」页执行服务器命令（免 SSH 登录；命令以服务账户权限运行，全部执行记录写入审计）。修改后自动生效"),
+        config_item("TerminalCommandAudit", "终端命令审计", "Boolean", cfg.terminal_command_audit.to_string(), "记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）。关闭后只保留开关会话记录，不推荐。修改后生效"),
+        config_item("TerminalDangerPolicy", "终端危险命令策略", "String", cfg.terminal_danger_policy.clone(), "confirm=管理员需二次确认且子用户禁止（默认）；block=所有人禁止；allow=只审计不拦截。修改后生效"),
+        config_item("TerminalAllowedCommands", "子用户命令白名单", "String", cfg.terminal_allowed_commands.clone(), "留空=禁止子用户使用终端（终端本质是 root 级 shell）；非空时子用户只能执行这些前缀（分号或换行分隔，如 systemctl status;df -h）；内置管理员不受限。修改后生效"),
         config_item("LocalPort", "本地端口", "Int32", cfg.local_port.to_string(), "本地控制端口（TCP 面板与 UDP RPC 共用），默认5501（与 C# 版 StarAgent 5500 错开）；修改需重启服务后生效"),
         config_item("LocalOnly", "仅本机访问", "Boolean", cfg.local_only.to_string(), "为真时只绑定 127.0.0.1（远程无法连接）；默认为假，允许远程访问（面板凭据兜底）。修改需重启服务后生效"),
         config_item("StartWait", "启动等待(ms)", "Int32", cfg.start_wait.to_string(), "该时间内进程退出视为启动失败，默认3000"),
@@ -1341,6 +2083,99 @@ fn config_metadata(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
 
     json_result(0, "", Some(json!({ "items": items })))
 }
+
+// ————— 面板 HTTPS 证书 —————
+
+/// 面板 HTTPS 状态：证书是否存在、SAN（域名/IP）、剩余天数、指纹、建议访问地址。
+///
+/// 证书缺失或损坏时返回 `exists=false` 而非报错——面板在明文 HTTP 下也必须可用。
+fn tls_status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let cfg = panel.manager.config();
+    let body = crate::tlscfg::status(panel.manager.base(), cfg.tls, cfg.local_port);
+    json_result(0, "", Some(body))
+}
+
+/// 重新签发面板证书（删除旧证书后重建）；**重启服务后生效**。
+fn tls_renew(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match crate::tlscfg::renew(panel.manager.base()) {
+        Ok(()) => {
+            util::log_info("Web 面板已重新签发 HTTPS 证书（重启服务后生效）");
+            let cfg = panel.manager.config();
+            let mut body = crate::tlscfg::status(panel.manager.base(), cfg.tls, cfg.local_port);
+            body["message"] = json!("证书已重新签发，重启服务后生效");
+            json_result(0, "", Some(body))
+        }
+        Err(e) => json_error(500, &e),
+    }
+}
+
+/// 下载面板证书（PEM）——运维导入一次浏览器/系统信任库后，`https://内网IP:端口` 即绿锁直开。
+fn tls_cert(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let base = panel.manager.base();
+    // 首次点下载时顺带生成，省掉“先启用再下载”的来回
+    let _ = crate::tlscfg::ensure_pem(base);
+    let (cert_path, _) = crate::tlscfg::cert_paths(base);
+    match std::fs::read(&cert_path) {
+        Ok(bytes) => ActionResult::Response(
+            HttpResponse::bytes(200, "application/x-pem-file", bytes)
+                .with_header("Content-Disposition", "attachment; filename=\"panel.pem\""),
+        ),
+        Err(e) => json_error(500, &format!("读取证书失败：{e}")),
+    }
+}
+
+/// 下载「一键导入证书」脚本（**单文件、内嵌证书**，无需再传 crt）。
+///
+/// `?os=win` → `.cmd`（双击 → 导入当前用户 + 尝试导入本机，后者需管理员）；
+/// 其它 → `.sh`（macOS 走 security，Linux 走 update-ca-certificates）。
+///
+/// 说明：证书信任必须在**发起访问的那台电脑**上完成，服务端无法代劳（操作系统安全边界）；
+/// 这里把“找文件 + 选存储 + 多步向导”压缩成一次双击。
+fn tls_install(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let base = panel.manager.base();
+    let (cert_path, _) = crate::tlscfg::cert_paths(base);
+    let _ = crate::tlscfg::ensure_pem(base);
+    let Ok(pem) = std::fs::read(&cert_path) else {
+        return json_error(500, "读取证书失败");
+    };
+    let os = ctx
+        .query_value("os")
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase();
+
+    // 脚本生成统一走 dhrust（与 DHDeploy Agent 共用同一实现，避免两份漂移）
+    if os == "win" || os == "windows" {
+        let script = dhrust::net::tls::install_script_windows(&pem);
+        return ActionResult::Response(
+            HttpResponse::bytes(200, "text/plain; charset=utf-8", script.into_bytes())
+                .with_header(
+                    "Content-Disposition",
+                    "attachment; filename=\"install-panel-cert.cmd\"",
+                ),
+        );
+    }
+    let script = dhrust::net::tls::install_script_unix(&pem);
+    ActionResult::Response(
+        HttpResponse::bytes(200, "text/plain; charset=utf-8", script.into_bytes()).with_header(
+            "Content-Disposition",
+            "attachment; filename=\"install-panel-cert.sh\"",
+        ),
+    )
+}
+
 
 /// 更新面板配置（安全白名单，密码走 ChangePassword）。
 fn update_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
@@ -1401,6 +2236,8 @@ fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         panel
             .manager
             .update_config(|cfg| cfg.web_user_password = new_password);
+        // 改密码后其它设备上的会话立即失效（当前会话保留）
+        panel.revoke_other_sessions(ctx);
         util::log_info("Web 面板密码已修改");
         return json_result(0, "密码已修改，下次登录请使用新密码", None);
     }
@@ -1413,6 +2250,7 @@ fn change_password(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     ) {
         Ok(()) => {
             util::log_format("面板用户修改密码：{}", &[&principal.name]);
+            panel.revoke_other_sessions(ctx);
             json_result(0, "密码已修改，下次登录请使用新密码", None)
         }
         Err(e) => {
@@ -1554,7 +2392,22 @@ fn control(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         return json_error(401, "Unauthorized");
     }
 
-    let action = arg(ctx, "action").unwrap_or_default().to_ascii_lowercase();
+    // 动作来源：优先 **请求体 JSON** `{action}`（面板当前用法），其次 query `?action=`。
+    // 注意不能用 `arg()`——它会先命中路由路径参数，把 URL 里的 `control` 当成 action，
+    // 于是「重启服务」会报 `Unknown action: control`。
+    let action = json_body(ctx)
+        .and_then(|b| {
+            b.get("action")
+                .and_then(|x| x.as_str())
+                .map(|s| s.trim().to_ascii_lowercase())
+        })
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            ctx.query_value("action")
+                .map(|s| s.trim().to_ascii_lowercase())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or_default();
     let cfg = panel.manager.config();
 
     match action.as_str() {
@@ -1610,10 +2463,11 @@ fn dhdeploy_service_text(service: &str) -> &'static str {
 ///
 /// 阻塞 HTTP 经库内包装（独立线程 + join）——运行时线程内直接 `block_on` 会 panic（历史踩坑）。
 fn dhdeploy_probe() -> Result<(String, String), String> {
+    let ua = util::user_agent();
     let resp = dhrust::net::http_client::blocking_request_offthread(
         "GET",
         DHDEPLOY_PANEL_API,
-        &[],
+        &[("User-Agent", ua.as_str())],
         None,
         Vec::new(),
         std::time::Duration::from_millis(2000),
@@ -1651,10 +2505,11 @@ fn dhdeploy_probe() -> Result<(String, String), String> {
 /// 调用 DHDeploy 控制接口（POST JSON；阻塞 HTTP 经库内包装，运行时内安全）。
 fn dhdeploy_post(payload: &Json) -> Result<String, String> {
     let body = payload.to_string().into_bytes();
+    let ua = util::user_agent();
     let resp = dhrust::net::http_client::blocking_request_offthread(
         "POST",
         DHDEPLOY_PANEL_API,
-        &[],
+        &[("User-Agent", ua.as_str())],
         Some("application/json"),
         body,
         std::time::Duration::from_millis(3000),
@@ -1770,6 +2625,222 @@ fn dhdeploy_state_json(mode: &str, service: &str) -> Json {
 // ————— /star 动作 —————
 
 /// 子服务列表。
+/// `GET /star/sites`：站点与证书盘点（只读；本地诊断与平台「证书」页共用）。
+fn sites_info(panel: &WebPanel, _ctx: &Ctx) -> ActionResult {
+    let cfg = panel.manager.config();
+    let base = panel.manager.base();
+    let inv = crate::sites::inventory(&cfg, base);
+    json_result(
+        0,
+        "",
+        Some(json!({
+            "inventory": inv,
+            "whitelist": cfg.cert_managed_sites,
+            "nginxDirs": cfg.cert_nginx_dirs,
+            "nginxBin": cfg.cert_nginx_bin,
+            "lastResult": crate::certdeploy::last_result(base),
+        })),
+    )
+}
+
+/// `POST /star/certDeploy`：本地面板直接演练/部署证书（不依赖平台）。
+///
+/// body 同 `certdeploy::DeployRequest`（certPem/keyPem/sites/action/dryRun…）；
+/// 仍受本机白名单 `CertManagedSites` 约束（空 = 拒绝写入），默认演练。
+fn cert_deploy(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let req: crate::certdeploy::DeployRequest = match serde_json::from_value(body) {
+        Ok(r) => r,
+        Err(e) => return json_error(400, &format!("请求格式错误：{e}")),
+    };
+    let base = panel.manager.base();
+    let result = crate::certdeploy::deploy(&panel.manager.config(), base, &req);
+    json_result(
+        0,
+        "",
+        Some(serde_json::to_value(result).unwrap_or_default()),
+    )
+}
+
+/// `POST /star/certConfig`：保存证书托管设置（白名单 / nginx 目录 / nginx 可执行文件）。
+///
+/// 只改这三个键（写盘后热生效），不影响其它配置；白名单为空 = 全部站点只读。
+fn cert_config(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let managed = body
+        .get("managedSites")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let dirs = body
+        .get("nginxDirs")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let bin = body
+        .get("nginxBin")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if managed.len() > 2000 || dirs.len() > 1000 || bin.len() > 300 {
+        return json_error(400, "配置内容过长");
+    }
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = managed.clone();
+        cfg.cert_nginx_dirs = dirs.clone();
+        cfg.cert_nginx_bin = bin.clone();
+    });
+    crate::sites::invalidate_cache();
+    crate::util::log_format(
+        "证书托管设置已保存（白名单：{}）",
+        &[&if managed.is_empty() {
+            "空（全部站点只读）".to_string()
+        } else {
+            managed.clone()
+        }],
+    );
+    json_result(0, "证书托管设置已保存", None)
+}
+
+/// 从请求体读取 `sites` 数组（去空、去重空格）。
+fn parse_site_list(body: &serde_json::Value) -> Vec<String> {
+    body.get("sites")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `POST /star/certAllow`：把指定站点追加进托管白名单（`CertManagedSites`）。
+///
+/// body：`{ "sites": ["nginx:/www/server/panel/vhost/nginx/a.conf#1", ...] }`
+///
+/// 用途：面板「站点盘点」勾选「允许自动部署」——省去手抄站点 key 的麻烦。
+/// 只**追加**（去重、保留原条目），不覆盖其它站点；写入后立即热生效。
+fn cert_allow(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let items = parse_site_list(&body);
+    if items.is_empty() {
+        return json_error(400, "未指定要加入白名单的站点");
+    }
+    if items.iter().any(|s| s.len() > 500) {
+        return json_error(400, "站点标识过长");
+    }
+
+    let mut list: Vec<String> = panel
+        .manager
+        .config()
+        .cert_managed_sites
+        .split([',', ';', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let added = merge_whitelist(&mut list, &items);
+    if added == 0 {
+        return json_result(0, "该站点已在允许清单中", None);
+    }
+    let merged = list.join("; ");
+    if merged.len() > 2000 {
+        return json_error(400, "白名单过长（>2000 字符），请精简后再试");
+    }
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = merged.clone();
+    });
+    crate::sites::invalidate_cache();
+    crate::util::log_format(
+        "已加入证书托管白名单：{}（当前共 {} 条）",
+        &[&items.join(", "), &list.len().to_string()],
+    );
+    json_result(
+        0,
+        "已允许自动部署",
+        Some(json!({ "whitelist": merged })),
+    )
+}
+
+/// 把若干条目追加进白名单列表（去重，忽略大小写；返回新增条数）。
+fn merge_whitelist(list: &mut Vec<String>, items: &[String]) -> usize {
+    let mut added = 0usize;
+    for it in items {
+        let it = it.trim();
+        if it.is_empty() {
+            continue;
+        }
+        if list.iter().any(|x| x.eq_ignore_ascii_case(it)) {
+            continue;
+        }
+        list.push(it.to_string());
+        added += 1;
+    }
+    added
+}
+
+/// 从白名单列表移除指定条目（精确匹配、忽略大小写；返回移除条数）。
+fn drop_whitelist(list: &mut Vec<String>, items: &[String]) -> usize {
+    let before = list.len();
+    list.retain(|x| !items.iter().any(|it| x.eq_ignore_ascii_case(it.trim())));
+    before - list.len()
+}
+
+/// `POST /star/certDeny`：把站点从托管白名单移除（面板复选框「取消勾选」）。
+///
+/// body：`{ "sites": ["nginx:/path#1", ...] }`
+///
+/// 只移除**与站点 key 完全相同**的条目；若该站点是被通配符/目录规则（`*.example.com`、
+/// 配置文件路径）带进来的，返回提示让用户去高级设置里改（避免误删别的站点规则）。
+fn cert_deny(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let Some(body) = json_body(ctx) else {
+        return json_error(400, "缺少请求体");
+    };
+    let items = parse_site_list(&body);
+    if items.is_empty() {
+        return json_error(400, "未指定要移出白名单的站点");
+    }
+    let mut list: Vec<String> = panel
+        .manager
+        .config()
+        .cert_managed_sites
+        .split([',', ';', '\n'])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let removed = drop_whitelist(&mut list, &items);
+    if removed == 0 {
+        return json_error(
+            400,
+            "该站点不是单独加入的（可能由域名通配符或配置文件规则托管），请在「高级」里修改那些规则",
+        );
+    }
+    let merged = list.join("; ");
+    panel.manager.update_config(|cfg| {
+        cfg.cert_managed_sites = merged.clone();
+    });
+    crate::sites::invalidate_cache();
+    crate::util::log_format(
+        "已移出证书托管白名单：{}（剩余 {} 条）",
+        &[&items.join(", "), &list.len().to_string()],
+    );
+    json_result(
+        0,
+        "已取消允许（以后不再碰该站点）",
+        Some(json!({ "whitelist": merged })),
+    )
+}
+
 fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
@@ -1811,6 +2882,21 @@ fn services(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "ProcessId": st.pid,
             "ProcessName": st.process_name,
             "StartTime": st.start_time,
+            // 健康探活（假死可见化）：off 尚未探活 / ok / warn（失败未达重启阈值）/ fail
+            // 自动模式（未配置 HealthCheck 时按监听端口探测）同样会体现在这里
+            "Health": if st.health_fails >= 3 {
+                "fail"
+            } else if st.health_fails > 0 {
+                "warn"
+            } else if st.health_ok_at > 0 {
+                "ok"
+            } else {
+                "off"
+            },
+            "HealthFails": st.health_fails,
+            "HealthError": st.health_error,
+            "HealthOkAt": st.health_ok_at,
+            "LastHeartbeat": st.last_heartbeat,
         }));
     }
 
@@ -1957,9 +3043,186 @@ fn add_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
-/// 删除子服务。
-fn remove_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+/// 应用包一键部署：`POST /star/appDeploy?fileName=<包名>&name=&arguments=&autoStart=1`。
+///
+/// 请求体即发行包内容（`.zip` / `.tar.gz`）。服务端自动解压、识别主程序、
+/// 落到工作目录（`../apps/{名称}`）并按影子模式注册子服务（见 [`crate::apppkg`]），
+/// 无需人工填写文件名/工作目录/部署模式。
+fn app_deploy(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+
+    let package_name = arg(ctx, "fileName").unwrap_or_default();
+    let name_hint = arg(ctx, "name").unwrap_or_default();
+    let arguments = arg(ctx, "arguments").unwrap_or_default();
+    let auto_start = arg(ctx, "autoStart")
+        .map(|v| !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"))
+        .unwrap_or(true);
+
+    let name_opt = {
+        let t = name_hint.trim();
+        (!t.is_empty()).then_some(t)
+    };
+    let args_opt = {
+        let t = arguments.trim();
+        (!t.is_empty()).then_some(t)
+    };
+
+    match crate::apppkg::deploy_bytes(
+        panel.manager.as_ref(),
+        &package_name,
+        ctx.req.body.as_ref(),
+        name_opt,
+        args_opt,
+        auto_start,
+    ) {
+        Ok(d) => {
+            let state = if d.started {
+                "已启动".to_string()
+            } else if d.updated {
+                "已更新（未启动）".to_string()
+            } else {
+                "已安装（未启动）".to_string()
+            };
+            json_result(
+                0,
+                &format!("应用包部署完成：{} {state}", d.name),
+                Some(json!({
+                    "name": d.name,
+                    "program": d.program.display().to_string(),
+                    "workingDirectory": d.work_dir.display().to_string(),
+                    "files": d.files,
+                    "updated": d.updated,
+                    "started": d.started,
+                })),
+            )
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 扫描 C# 版星尘（迁移向导）：`GET /star/starAgentScan?dir=`。
+///
+/// 只读解析源配置，返回子服务清单与 C# 服务状态。未找到时仍返回 HTTP 200：
+/// `data.found=false` + `message` 原因 + `data.candidates` 常见安装目录，
+/// 前端据此提示“填路径 / 换一台机器”。
+fn star_agent_scan(_panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let dir = arg(ctx, "dir").unwrap_or_default();
+    let dir = dir.trim();
+    let dir_opt = (!dir.is_empty()).then(|| PathBuf::from(dir));
+    match crate::migrate::scan(dir_opt.as_deref()) {
+        Ok(s) => json_result(
+            0,
+            "",
+            Some(json!({
+                "found": true,
+                "dir": s.dir.display().to_string(),
+                "configPath": s.config_path.display().to_string(),
+                "serviceName": s.service_name,
+                "serviceInstalled": s.service_installed,
+                "serviceRunning": s.service_running,
+                "localPort": s.local_port,
+                "apps": s.apps.iter().map(|a| json!({
+                    "name": a.name,
+                    "fileName": a.file_name,
+                    "arguments": a.arguments.clone().unwrap_or_default(),
+                    "workingDirectory": a.working_directory.clone().unwrap_or_default(),
+                    "mode": crate::deploy::DeployMode::parse(&a.mode).as_str(),
+                    "enable": a.enable,
+                })).collect::<Vec<_>>(),
+                "warnings": s.warnings,
+            })),
+        ),
+        Err(e) => json_result(
+            0,
+            &e,
+            Some(json!({
+                "found": false,
+                "candidates": crate::migrate::candidates()
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>(),
+            })),
+        ),
+    }
+}
+
+/// 执行 C# 星尘迁移：`POST /star/starAgentMigrate?dir=&names=&startApps=&stopApps=&stopService=&disableService=`。
+///
+/// `names` 为逗号分隔的服务名（空 = 全部）；其余开关默认全开（停 C# 子服务、停并禁用
+/// C# 星尘服务、迁移后启动）。执行细节见 [`crate::migrate::migrate`]。
+fn star_agent_migrate(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let dir = arg(ctx, "dir").unwrap_or_default();
+    let dir = dir.trim().to_string();
+    if dir.is_empty() {
+        return json_error(400, "请填写 C# 版星尘安装目录");
+    }
+    let flag = |name: &str, def: bool| {
+        arg(ctx, name)
+            .map(|v| {
+                !matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "0" | "false" | "no" | "off" | ""
+                )
+            })
+            .unwrap_or(def)
+    };
+    let only: Vec<String> = arg(ctx, "names")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    let opts = crate::migrate::Options {
+        dir: PathBuf::from(dir),
+        stop_source_apps: flag("stopApps", true),
+        stop_source_service: flag("stopService", true),
+        disable_source_service: flag("disableService", true),
+        start_apps: flag("startApps", true),
+        only,
+    };
+    match crate::migrate::migrate(panel.manager.as_ref(), &opts) {
+        Ok(r) => {
+            let started = r.imported.iter().filter(|i| i.started).count();
+            let msg = format!(
+                "迁移完成：导入 {} 个子服务（启动 {}）；C# 服务停止={} 禁用={}",
+                r.imported.len(),
+                started,
+                if r.source_service_stopped { "是" } else { "否" },
+                if r.source_service_disabled { "是" } else { "否" }
+            );
+            json_result(
+                0,
+                &msg,
+                Some(json!({
+                    "dir": r.dir,
+                    "serviceName": r.service_name,
+                    "apps": r.imported.iter().map(|i| json!({
+                        "name": i.name,
+                        "fileName": i.file_name,
+                        "workingDirectory": i.working_directory,
+                        "mode": i.mode,
+                        "enable": i.enable,
+                        "started": i.started,
+                        "note": i.note,
+                    })).collect::<Vec<_>>(),
+                    "sourceAppsStopped": r.source_apps_stopped,
+                    "sourceServiceStopped": r.source_service_stopped,
+                    "sourceServiceDisabled": r.source_service_disabled,
+                    "sourceAgentProcessStopped": r.source_agent_process_stopped,
+                    "warnings": r.warnings,
+                })),
+            )
+        }
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 删除子服务。
+fn remove_service(panel: &WebPanel, ctx: &Ctx) -> ActionResult {    if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
 
@@ -2182,20 +3445,11 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         })
         .collect();
 
-    let processes: Vec<Json> = sys::top_processes(15, false)
-        .into_iter()
-        .map(|p| {
-            json!({
-                "name": p.name,
-                "pid": p.pid,
-                "memoryMB": p.memory_mb.to_string(),
-                "cpuTime": format!("{:.1}s", p.cpu_seconds),
-                "threadCount": p.threads,
-                "handleCount": 0,
-                "startTime": "",
-            })
-        })
-        .collect();
+    // 进程 Top：CPU 前 20 与内存前 20 取并集（前端可切换排序，
+    // 避免只按单一口径取榜导致「CPU 高的看不到」或「内存高的看不到）。
+    // 一次系统扫描出两个榜（不重复遍历进程表），只需要 Top N 的重字段与监听端口。
+    let proc_items = sys::top_processes_union(20, 20);
+    let processes: Vec<Json> = proc_items.iter().map(process_json).collect();
 
     let os = json!({
         "os": format!("{} {}", sys::os_description(), std::env::consts::ARCH),
@@ -2235,11 +3489,181 @@ fn machine(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
             "os": os,
             "cpu": cpu,
             "memory": memory,
+            "swap": crate::swap::status_json(),
             "drives": drives,
             "nics": nics,
             "processes": processes,
         })),
     )
+}
+
+/// 解释器宿主：这些进程的 exe 只是运行时，真正的应用在命令行参数里。
+const INTERPRETER_HOSTS: &[&str] = &[
+    "dotnet", "mono", "python", "python2", "python3", "node", "nodejs", "java", "php", "ruby",
+    "perl", "pwsh", "powershell", "bash", "sh", "zsh", "deno", "bun",
+];
+
+/// 从命令行解析「真正被加载的应用」。返回 `(短名, 完整路径)`。
+///
+/// - `dotnet /www/site/App.dll` → (`App.dll`, `/www/site/App.dll`)；
+/// - `python3 /opt/app/main.py` → (`main.py`, `/opt/app/main.py`)；
+/// - 直接运行的程序 → 用 exe 路径；
+/// - 相对路径按进程工作目录（cwd）补全，便于直接定位到部署目录。
+fn app_target(command: &str, exe: &str, cwd: &str) -> (String, String) {
+    let args = split_command(command);
+    let host = args.first().cloned().unwrap_or_default();
+    let host_name = base_name(&host).to_ascii_lowercase();
+    let host_name = host_name.trim_end_matches(".exe");
+
+    let is_interpreter = INTERPRETER_HOSTS.iter().any(|name| {
+        host_name == *name || host_name.starts_with(&format!("{name}."))
+    });
+    if is_interpreter
+        && let Some(script) = args
+            .iter()
+            .skip(1)
+            .find(|arg| !arg.starts_with('-') && looks_like_app(arg))
+        {
+            let path = resolve_path(script, cwd);
+            return (base_name(&path), path);
+        }
+
+    if exe.is_empty() {
+        (base_name(&host), host)
+    } else {
+        (base_name(exe), exe.to_string())
+    }
+}
+
+/// 命令行切分（支持双引号包裹的空格路径）。
+fn split_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            ' ' | '\t' if !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// 是否像「应用本体」（按扩展名判断，避免把 `--urls=http://...` 之类当应用）。
+fn looks_like_app(arg: &str) -> bool {
+    let lower = arg.to_ascii_lowercase();
+    [
+        ".dll", ".exe", ".jar", ".py", ".js", ".mjs", ".php", ".sh", ".bin", ".cmd", ".bat",
+        ".wasm",
+    ]
+    .iter()
+    .any(|ext| lower.ends_with(ext))
+}
+
+/// 取路径最后一段（兼容 `/` 与 `\`）。
+fn base_name(path: &str) -> String {
+    path.rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_string()
+}
+
+/// 相对路径按工作目录补全。
+fn resolve_path(path: &str, cwd: &str) -> String {
+    let absolute = path.starts_with('/')
+        || path.starts_with('\\')
+        || path.chars().nth(1) == Some(':');
+    if absolute || cwd.trim().is_empty() {
+        path.to_string()
+    } else {
+        let relative = path.trim_start_matches("./").trim_start_matches(".\\");
+        format!("{}/{}", cwd.trim_end_matches('/'), relative)
+    }
+}
+
+/// 进程条目 → 面板 JSON（本机详情与「进程」接口共用；口径对齐 htop / 云监控）。
+fn process_json(p: &sys::ProcItem) -> Json {
+    // IIS w3wp：exe 只是宿主，真正的站点在 applicationHost.config；
+    // 能解析出应用池/站点时，显示站点名与物理路径（解析失败回退 exe 路径）。
+    let iis = crate::iis::lookup(p.pid, &p.name, &p.user);
+    let (mut app, mut app_path) = app_target(&p.command, &p.exe, &p.cwd);
+    if let Some(worker) = &iis {
+        let (site_app, site_path) = crate::iis::display(worker);
+        if !site_app.is_empty() {
+            app = site_app;
+            app_path = site_path;
+        }
+    }
+    let iis_sites: Vec<Json> = iis
+        .as_ref()
+        .map(|w| {
+            w.sites
+                .iter()
+                .map(|s| {
+                    json!({
+                        "site": s.site.clone(),
+                        "path": s.path.clone(),
+                        "physicalPath": s.physical_path.clone(),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    json!({
+        "name": p.name,
+        "pid": p.pid,
+        "memoryMB": p.memory_mb,
+        "cpuPercent": (p.cpu_percent * 10.0).round() / 10.0,
+        "cpuTime": format!("{:.1}s", p.cpu_seconds),
+        "threadCount": p.threads,
+        "handleCount": p.handles,
+        "user": p.user,
+        "exe": p.exe,
+        "command": p.command,
+        "cwd": p.cwd,
+        // 真正被宿主加载的应用（如 `dotnet /www/xxx/App.dll` 里的 App.dll；
+        // IIS w3wp 则为站点名）
+        "app": app,
+        "appPath": app_path,
+        "appPool": iis.as_ref().map(|w| w.app_pool.clone()).unwrap_or_default(),
+        "iisSites": iis_sites,
+        // 监听端口（TCP LISTEN）：直接看出这个进程对外提供哪些服务；
+        // 与「未配置 HealthCheck 时自动探活」用的是同一份快照
+        "ports": p.ports,
+        "startTime": if p.start_time > 0 {
+            Local
+                .timestamp_opt(p.start_time, 0)
+                .single()
+                .map(|t| t.format("%Y-%m-%d %H:%M:%S").to_string())
+                .unwrap_or_default()
+        } else {
+            String::new()
+        },
+    })
+}
+
+/// 应用心跳（子服务调用：`POST /star/appHeartbeat?name=<应用名>`）。
+///
+/// 供「不监听端口、无 Web 界面」的应用证明自己还活着：配置 `HealthCheck=heartbeat`
+/// （可加 `?within=秒`）后，RAgent 超时收不到心跳即判定假死并重启。
+fn app_heartbeat(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    let name = arg(ctx, "name").unwrap_or_default();
+    if name.trim().is_empty() {
+        return json_error(400, "缺少应用名");
+    }
+    if panel.manager.mark_heartbeat(name.trim()) {
+        json_result(0, "ok", None)
+    } else {
+        json_error(404, "未找到应用")
+    }
 }
 
 /// Top 进程列表。
@@ -2249,22 +3673,12 @@ fn get_process_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 
     let sort = arg(ctx, "sort").unwrap_or_else(|| "memory".to_string());
-    let count = arg_i64(ctx, "count").unwrap_or(10).clamp(1, 200) as usize;
+    let count = arg_i64(ctx, "count").unwrap_or(10).clamp(1, 300) as usize;
     let by_cpu = sort.eq_ignore_ascii_case("cpu");
 
     let processes: Vec<Json> = sys::top_processes(count, by_cpu)
-        .into_iter()
-        .map(|p| {
-            json!({
-                "name": p.name,
-                "pid": p.pid,
-                "memoryMB": p.memory_mb.to_string(),
-                "cpuSeconds": format!("{:.1}", p.cpu_seconds),
-                "threadCount": p.threads,
-                "handleCount": 0,
-                "startTime": "",
-            })
-        })
+        .iter()
+        .map(process_json)
         .collect();
 
     let total = processes.len();
@@ -2402,6 +3816,7 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         if renamed {
             panel.rename_session(ctx, &new_name);
         }
+        panel.revoke_other_sessions(ctx);
         util::log_info("Web 面板内置管理员凭据已更新（用户管理）");
         return json_result(0, "内置管理员已更新", None);
     }
@@ -2414,6 +3829,15 @@ fn user_save(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         &remark,
     ) {
         Ok(()) => {
+            // 权限/启用状态变更：该用户已有会话立即失效（下次登录取新快照）
+            invalidate_user_cache();
+            if panel
+                .tokens
+                .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))
+                > 0
+            {
+                panel.save_sessions();
+            }
             util::log_format("面板用户已保存：{}", &[&name]);
             json_result(0, "已保存", None)
         }
@@ -2436,6 +3860,15 @@ fn user_delete(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
     match audit::delete_user(panel.base(), &name) {
         Ok(()) => {
+            // 用户删除后其会话立即失效
+            invalidate_user_cache();
+            if panel
+                .tokens
+                .revoke_where(|p| !p.is_admin && p.name.eq_ignore_ascii_case(&name))
+                > 0
+            {
+                panel.save_sessions();
+            }
             util::log_format("面板用户已删除：{}", &[&name]);
             json_result(0, "已删除", None)
         }
@@ -2612,6 +4045,16 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
     match name.to_ascii_lowercase().as_str() {
         "webusername" => set_string(value, |s| cfg.web_user_name = s),
         "webauthlevel" => set_string(value, |s| cfg.web_auth_level = s),
+        "trustforwardedfor" => set_bool(value, |b| cfg.trust_forwarded_for = b),
+        // 面板 HTTPS：写入配置后需重启服务才切换监听协议
+        "tls" => set_bool(value, |b| cfg.tls = b),
+        "websessionhours" => match value_u64(value) {
+            Some(v) if v <= 8760 => {
+                cfg.web_session_hours = v as u32;
+                true
+            }
+            _ => false,
+        },
         "localport" => set_port(value, |p| cfg.local_port = p),
         "localonly" => set_bool(value, |b| cfg.local_only = b),
         "startwait" => set_u64(value, |v| cfg.start_wait = v),
@@ -2636,22 +4079,16 @@ fn apply_config_value(cfg: &mut AgentConfig, name: &str, value: &Json) -> bool {
             _ => false,
         },
         "logcleanuppaths" => set_string(value, |s| cfg.log_cleanup_paths = s),
-        "pluginstoreurl" => set_string(value, |s| cfg.plugin_store_url = s),
-        "pluginstorepubkey" => set_string(value, |s| cfg.plugin_store_pubkey = s),
-        "autoupgradeurl" => set_string(value, |s| cfg.auto_upgrade_url = s),
-        "autoupgradetoken" => set_string(value, |s| cfg.auto_upgrade_token = s),
-        "autoupgradeintervalminutes" => match value_u64(value) {
-            Some(v) if (5..=1440).contains(&v) => {
-                cfg.auto_upgrade_interval_minutes = v as u32;
-                true
-            }
-            _ => false,
-        },
+        // 插件源/自动升级/平台接入令牌属于安全项：不在线开放修改，
+        // 只能由管理员编辑 Config/StarAgent.config（防误改/被改乱）。
         "aienabled" => set_bool(value, |b| cfg.ai_enabled = b),
         "aibaseurl" => set_string(value, |s| cfg.ai_base_url = s),
         "aimodel" => set_string(value, |s| cfg.ai_model = s),
         "aiapikey" => set_string(value, |s| cfg.ai_api_key = s),
         "terminalenabled" => set_bool(value, |b| cfg.terminal_enabled = b),
+        "terminalcommandaudit" => set_bool(value, |b| cfg.terminal_command_audit = b),
+        "terminaldangerpolicy" => set_string(value, |s| cfg.terminal_danger_policy = s),
+        "terminalallowedcommands" => set_string(value, |s| cfg.terminal_allowed_commands = s),
         "debug" => set_bool(value, |b| cfg.debug = b),
         _ => false,
     }
@@ -2697,6 +4134,72 @@ fn schedule_service_restart(cfg: &AgentConfig) {
 mod tests {
     use super::*;
     use dhrust::net::http::HttpRequest;
+
+    #[test]
+    fn merge_whitelist_appends_and_dedupes() {
+        let mut list: Vec<String> = vec![
+            "nginx:/www/server/panel/vhost/nginx/a.conf#1".to_string(),
+            "*.example.com".to_string(),
+        ];
+        let add = vec![
+            "NGINX:/www/server/panel/vhost/nginx/a.conf#1".to_string(),
+            "  nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1  ".to_string(),
+            String::new(),
+        ];
+        assert_eq!(merge_whitelist(&mut list, &add), 1);
+        assert_eq!(list.len(), 3);
+        assert_eq!(
+            list[2],
+            "nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1"
+        );
+        // 重复调用不再增长（幂等）
+        assert_eq!(merge_whitelist(&mut list, &add), 0);
+        assert_eq!(list.len(), 3);
+        // 取消勾选：精确移除，不误删通配符规则
+        let drop_list = vec!["nginx:/www/server/panel/vhost/nginx/zx.hlktech.com.conf#1".to_string()];
+        assert_eq!(drop_whitelist(&mut list, &drop_list), 1);
+        assert_eq!(list.len(), 2);
+        assert_eq!(drop_whitelist(&mut list, &drop_list), 0);
+        assert_eq!(list[1], "*.example.com");
+    }
+
+    #[test]
+    fn app_target_resolves_interpreter_hosts() {
+        // dotnet 宿主的 exe 只是运行时，真正的应用在参数里
+        assert_eq!(
+            app_target(
+                "dotnet /www/wwwroot/cloud.tdtbms.cn/HlkTechIoT.Web.dll",
+                "/usr/share/dotnet/dotnet",
+                "/www/wwwroot/cloud.tdtbms.cn"
+            ),
+            (
+                "HlkTechIoT.Web.dll".to_string(),
+                "/www/wwwroot/cloud.tdtbms.cn/HlkTechIoT.Web.dll".to_string()
+            )
+        );
+        // 相对路径按工作目录补全
+        assert_eq!(
+            app_target("dotnet bin/App.dll", "/usr/share/dotnet/dotnet", "/opt/app"),
+            ("App.dll".to_string(), "/opt/app/bin/App.dll".to_string())
+        );
+        // 选项参数不会被误当成应用
+        assert_eq!(
+            app_target(
+                "dotnet run --urls=http://0.0.0.0:8080",
+                "/usr/share/dotnet/dotnet",
+                ""
+            ),
+            (
+                "dotnet".to_string(),
+                "/usr/share/dotnet/dotnet".to_string()
+            )
+        );
+        // 非解释器：直接用 exe 路径
+        assert_eq!(
+            app_target("/usr/bin/htop", "/usr/bin/htop", ""),
+            ("htop".to_string(), "/usr/bin/htop".to_string())
+        );
+    }
 
     #[test]
     fn dhdeploy_mode_helpers() {
@@ -2783,6 +4286,53 @@ mod tests {
         }
     }
 
+    /// 复现用户的「未知操作 [swapConfig]」：
+    /// Controller 路由是 `/star/{action}`，路径段会被填进 `Ctx.params` 的 `action`，
+    /// 业务参数必须用 `op`，否则会被路径值覆盖。
+    #[test]
+    fn swap_config_parses_op_even_when_route_param_action_exists() {
+        let (panel, dir) = panel_with_default_password();
+        let token = panel.issue_token("admin", "admin").unwrap();
+
+        // ① 真实路由环境：params 里已有 ("action","swapConfig")
+        let mut ctx = context(
+            "POST",
+            "/star/swapConfig",
+            r#"{"op":"create","sizeMB":256,"path":"/swapfile","persist":"1"}"#,
+            Some(&token),
+        );
+        ctx.params
+            .push(("action".to_string(), "swapConfig".to_string()));
+        let message = body_json(swap_config(&panel, &ctx))["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !message.starts_with("未知操作"),
+            "op 未解析（被路由参数覆盖？）：{message}"
+        );
+
+        // ② 旧前端只发 action 的 JSON：直读 body 兜底也必须认
+        let mut ctx = context(
+            "POST",
+            "/star/swapConfig",
+            r#"{"action":"remove","path":"/swapfile"}"#,
+            Some(&token),
+        );
+        ctx.params
+            .push(("action".to_string(), "swapConfig".to_string()));
+        let message = body_json(swap_config(&panel, &ctx))["message"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        assert!(
+            !message.starts_with("未知操作"),
+            "旧前端 action 兜底失效：{message}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn login_issues_token_and_rejects_wrong_password() {
         let (panel, dir) = panel_with_default_password();
@@ -2822,6 +4372,85 @@ mod tests {
         // 注销后失效
         let _ = logout(&panel, &context("POST", "/api/logout", "", Some(&token)));
         assert!(!panel.validate_token(&token));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_survives_restart() {
+        let (panel, dir) = panel_with_default_password();
+        let ok = body_json(login(
+            &panel,
+            &context(
+                "POST",
+                "/api/login",
+                r#"{"user":"admin","password":"admin"}"#,
+                None,
+            ),
+        ));
+        let token = ok["data"]["token"].as_str().unwrap().to_string();
+        assert!(panel.sessions_file.is_some(), "默认应启用会话持久化");
+        assert!(
+            dir.join(SESSIONS_FILE).is_file(),
+            "登录后应写出会话文件：{}",
+            SESSIONS_FILE
+        );
+
+        // 模拟进程重启：同一目录重新创建面板，旧令牌仍应有效
+        drop(panel);
+        let manager = AppManager::new(&dir, AgentConfig::default());
+        let waf = pek_rwaf::Waf::load_with_default(&dir, pek_rwaf::WafConfig::admin_api());
+        let restarted = WebPanel::new(manager, &dir, 5501, waf);
+        assert!(restarted.validate_token(&token), "重启后会话应恢复");
+        let status = body_json(status(
+            &restarted,
+            &context("GET", "/api/status", "", Some(&token)),
+        ));
+        assert_eq!(status["code"], 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn login_challenge_never_sends_password() {
+        let (panel, dir) = panel_with_default_password();
+        let challenge = body_json(login_challenge(
+            &panel,
+            &context("GET", "/api/loginChallenge", r#"{"user":"admin"}"#, None),
+        ));
+        assert_eq!(challenge["code"], 0);
+        let nonce = challenge["data"]["nonce"].as_str().unwrap().to_string();
+        let salt = challenge["data"]["salt"].as_str().unwrap().to_string();
+        assert_eq!(salt, BUILTIN_SALT);
+
+        // 客户端口径：SHA-256(nonce : SHA-256(salt:password))
+        let digest = dhrust::sign::salted_sha256_hex(&salt, "admin");
+        let response = dhrust::sign::sha256_hex(format!("{nonce}:{digest}").as_bytes());
+        let body = json!({ "user": "admin", "nonce": nonce, "response": response }).to_string();
+        let ok = body_json(login(&panel, &context("POST", "/api/login", &body, None)));
+        assert_eq!(ok["code"], 0);
+        let token = ok["data"]["token"].as_str().unwrap().to_string();
+        assert!(panel.validate_token(&token));
+
+        // nonce 一次性：同一挑战重放必须失败
+        let replay = body_json(login(&panel, &context("POST", "/api/login", &body, None)));
+        assert_eq!(replay["code"], 401, "重放的挑战应被拒绝");
+
+        // 错误密码算出的摘要同样失败（重新申请挑战，避免与上面的 nonce 消费混淆）
+        let challenge2 = body_json(login_challenge(
+            &panel,
+            &context("GET", "/api/loginChallenge", r#"{"user":"admin"}"#, None),
+        ));
+        let nonce2 = challenge2["data"]["nonce"].as_str().unwrap().to_string();
+        let wrong = dhrust::sign::sha256_hex(
+            format!(
+                "{nonce2}:{}",
+                dhrust::sign::salted_sha256_hex(&salt, "bad-password")
+            )
+            .as_bytes(),
+        );
+        assert!(panel.verify_challenge("admin", &nonce2, &wrong).is_none());
+        assert_ne!(digest, wrong);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -3053,6 +4682,36 @@ mod tests {
         assert!(panel.manager.config().find_app("demo").is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sensitive_store_config_is_not_online_editable() {
+        let mut cfg = crate::config::AgentConfig::default();
+        assert!(!apply_config_value(
+            &mut cfg,
+            "PluginStoreUrl",
+            &json!("https://evil.example/catalog.json")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "PluginStorePubKey",
+            &json!("deadbeef")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeUrl",
+            &json!("https://evil.example/catalog.json")
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeIntervalMinutes",
+            &json!(10)
+        ));
+        assert!(!apply_config_value(
+            &mut cfg,
+            "AutoUpgradeToken",
+            &json!("stolen")
+        ));
     }
 
     #[test]
@@ -3522,7 +5181,11 @@ mod tests {
         assert!(!users.is_empty());
         assert_eq!(users[0]["userName"], "admin");
         assert_eq!(users[0]["isBuiltin"], true);
-        assert_eq!(users[0]["permissionNames"].as_array().unwrap().len(), 15);
+        assert_eq!(
+            users[0]["permissionNames"].as_array().unwrap().len(),
+            crate::audit::ALL_PERMISSIONS.len(),
+            "内置管理员应拥有全部菜单权限（含新增的证书页）"
+        );
 
         // 删除内置管理员被拒
         let j = body_json(user_delete(
@@ -3764,5 +5427,36 @@ mod tests {
         let text = summarize_request(&ctx);
         assert!(text.contains("\"AiApiKey\":\"***\""), "{text}");
         assert!(!text.contains("sk-verysecret"), "{text}");
+    }
+
+    #[test]
+    fn forwarded_for_is_never_trusted_by_default() {
+        // 直连：回环就是本机
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, None, false),
+            ("127.0.0.1".to_string(), false)
+        );
+        // 反代（对端回环 + 转发头）但未开启信任：按远程处理（proxied=true，不能免登录）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, Some("203.0.113.9"), false),
+            ("127.0.0.1".to_string(), true)
+        );
+        // 信任后取 X-Real-IP（优先）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", Some("203.0.113.9"), Some("10.0.0.1"), true).0,
+            "203.0.113.9"
+        );
+        // 没有 X-Real-IP 时取 XFF 最后一段（防客户端伪造左侧字段）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", None, Some("127.0.0.1, 203.0.113.9"), true).0,
+            "203.0.113.9"
+        );
+        // 非回环对端不采纳任何转发头（防直连伪造）
+        assert_eq!(
+            resolve_client_ip("198.51.100.5", Some("127.0.0.1"), Some("127.0.0.1"), true),
+            ("198.51.100.5".to_string(), false)
+        );
+        assert_eq!(strip_ip_port("[::1]:5501"), "::1");
+        assert_eq!(strip_ip_port("203.0.113.9:1234"), "203.0.113.9");
     }
 }

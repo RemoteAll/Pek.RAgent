@@ -1,4 +1,4 @@
-
+﻿
 document.getElementById('luser').addEventListener('keydown', e => {
  if (e.key === 'Enter') document.getElementById('lpass').focus();
 });
@@ -12,14 +12,91 @@ let histData=null,histDays=30,histSite='',histStamp=''; // 流量历史（每日
 let cmdHistory=JSON.parse(sessionStorage.getItem('agent_cmd_history')||'[]');
 const $=id=>document.getElementById(id);
 
+/* ── 令牌存储 ──
+   勾选「保持登录」→ localStorage（关浏览器、重启服务都不掉，服务端会话也已落盘）；
+   未勾选 → 仅本标签页（sessionStorage）。 */
+function setToken(t,remember){
+ token=t;
+ try{
+  if(remember){localStorage.setItem('agent_token',t);sessionStorage.removeItem('agent_token')}
+  else{sessionStorage.setItem('agent_token',t);localStorage.removeItem('agent_token')}
+ }catch(e){}
+}
+function clearToken(){
+ token='';
+ try{localStorage.removeItem('agent_token');sessionStorage.removeItem('agent_token')}catch(e){}
+}
+function storedToken(){
+ try{return localStorage.getItem('agent_token')||sessionStorage.getItem('agent_token')||''}catch(e){return ''}
+}
+
+/* ── 纯 JS SHA-256 ──
+   http 页面不是安全上下文，没有 crypto.subtle，只能自带实现（登录挑战摘要用）。 */
+const SHA256_K=new Uint32Array([
+ 0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+ 0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+ 0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+ 0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+ 0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+ 0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+ 0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+ 0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2]);
+function sha256Hex(text){
+ const bytes=new TextEncoder().encode(text);
+ const len=bytes.length,bitLen=len*8;
+ const total=(((len+8)>>6)+1)<<6;
+ const buf=new Uint8Array(total);
+ buf.set(bytes);buf[len]=0x80;
+ const hi=Math.floor(bitLen/0x100000000),lo=bitLen>>>0;
+ buf[total-8]=(hi>>>24)&255;buf[total-7]=(hi>>>16)&255;buf[total-6]=(hi>>>8)&255;buf[total-5]=hi&255;
+ buf[total-4]=(lo>>>24)&255;buf[total-3]=(lo>>>16)&255;buf[total-2]=(lo>>>8)&255;buf[total-1]=lo&255;
+ const H=new Uint32Array([0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19]);
+ const w=new Uint32Array(64);
+ const rotr=(x,n)=>((x>>>n)|(x<<(32-n)))>>>0;
+ for(let off=0;off<total;off+=64){
+  for(let t=0;t<16;t++) w[t]=((buf[off+t*4]<<24)|(buf[off+t*4+1]<<16)|(buf[off+t*4+2]<<8)|buf[off+t*4+3])>>>0;
+  for(let t=16;t<64;t++){
+   const s0=(rotr(w[t-15],7)^rotr(w[t-15],18)^(w[t-15]>>>3))>>>0;
+   const s1=(rotr(w[t-2],17)^rotr(w[t-2],19)^(w[t-2]>>>10))>>>0;
+   w[t]=(w[t-16]+s0+w[t-7]+s1)>>>0;
+  }
+  let a=H[0],b=H[1],c=H[2],d=H[3],e=H[4],f=H[5],g=H[6],h=H[7];
+  for(let t=0;t<64;t++){
+   const S1=(rotr(e,6)^rotr(e,11)^rotr(e,25))>>>0;
+   const ch=((e&f)^(~e&g))>>>0;
+   const t1=(h+S1+ch+SHA256_K[t]+w[t])>>>0;
+   const S0=(rotr(a,2)^rotr(a,13)^rotr(a,22))>>>0;
+   const maj=((a&b)^(a&c)^(b&c))>>>0;
+   const t2=(S0+maj)>>>0;
+   h=g;g=f;f=e;e=(d+t1)>>>0;d=c;c=b;b=a;a=(t1+t2)>>>0;
+  }
+  H[0]=(H[0]+a)>>>0;H[1]=(H[1]+b)>>>0;H[2]=(H[2]+c)>>>0;H[3]=(H[3]+d)>>>0;
+  H[4]=(H[4]+e)>>>0;H[5]=(H[5]+f)>>>0;H[6]=(H[6]+g)>>>0;H[7]=(H[7]+h)>>>0;
+ }
+ return Array.from(H).map(x=>x.toString(16).padStart(8,'0')).join('');
+}
+
 async function doLogin(){
  const u=$('luser').value,p=$('lpass').value,e=$('lerr');
+ const remember=$('lremember')?$('lremember').checked:true;
  e.classList.remove('show');
  if(!u&&!p){e.textContent='请输入用户名和密码';e.classList.add('show');return}
  if(!u){e.textContent='请输入用户名';e.classList.add('show');return}
  if(!p){e.textContent='请输入密码';e.classList.add('show');return}
  try{
-  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({user:u,password:p})});
+  // 挑战式登录：服务端下发一次性随机数与盐，密码只在本地算摘要，
+  // 网络上看不到明文，抓到摘要也无法重放（nonce 用完即废）。
+  let payload=null;
+  try{
+   const cr=await fetch('/api/loginChallenge?user='+encodeURIComponent(u));
+   const cj=await cr.json();
+   if(cj&&cj.code===0&&cj.data&&cj.data.nonce&&cj.data.salt){
+    const digest=sha256Hex(cj.data.salt+':'+p);
+    payload={user:u,nonce:cj.data.nonce,response:sha256Hex(cj.data.nonce+':'+digest)};
+   }
+  }catch(ex){}
+  if(!payload)payload={user:u,password:p}; // 旧服务端（无挑战接口）回退明文
+  const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const j=await r.json();
   if(j.code===429){e.textContent='登录失败次数过多，请稍后再试';e.classList.add('show');return}
   if(j.code!==0){
@@ -28,24 +105,33 @@ async function doLogin(){
    else e.textContent=j.message||'登录失败';
    e.classList.add('show');return
   }
-  token=j.data.token;sessionStorage.setItem('agent_token',token);showApp();
+  setToken(j.data.token,remember);showApp();
  }catch(ex){e.textContent='网络错误，请检查服务是否正常运行';e.classList.add('show')}
 }
 
 async function logout(){
+ // 幂等：已经在登录页时不再重复清理/抢焦点。
+ // （否则多个并发的 3 秒轮询同时 401 会反复调 logout → 把光标从密码框拽回用户名框）
+ if($('login').style.display!=='none'){
+  clearToken();
+  return;
+ }
  try{await fetch('/api/logout',{method:'POST',headers:{'Authorization':'Bearer '+token,'Content-Type':'application/json'}})}catch(e){}
- sessionStorage.removeItem('agent_token');token='';
+ clearToken();
  clearInterval(timer);if(svcTimer)clearInterval(svcTimer);if(starTimer)clearInterval(starTimer);
  if(trafficTimer){clearInterval(trafficTimer);trafficTimer=null}
- $('login').style.display='';$('app').style.display='none';$('luser').focus()
+ const active=document.activeElement;
+ $('login').style.display='';$('app').style.display='none';
+ // 只在用户当前焦点不在登录框内时才自动聚焦，避免打字时被夺走
+ if(active!==$('luser')&&active!==$('lpass'))$('luser').focus();
 }
 
 function showApp(){
  $('login').style.display='none';$('app').style.display='block';
  loadMe().then(()=>{
   // 按权限启动轮询（无权限的页签不发起请求）：仪表盘 / 子服务
-  if(canView('dashboard')){loadDashboard();timer=setInterval(loadDashboard,3000);}
-  if(canView('services')||canView('watchdog')){loadServices();svcTimer=setInterval(loadServices,3000);}
+  if(canView('dashboard')){loadDashboard();timer=setInterval(()=>{if(_activePanel==='dashboard')loadDashboard()},3000);}
+  if(canView('services')||canView('watchdog')){loadServices();svcTimer=setInterval(()=>{if(_activePanel==='services')loadServices()},3000);}
   // 刷新后仍停留在当前页签（由 URL hash 记忆；缺省/非法/无权限时回退到首个可用页）
   restorePanelFromHash();
  });
@@ -62,6 +148,8 @@ document.addEventListener('visibilitychange',()=>{
 
 // 当前登录主体（/api/me：用户名/是否内置管理员/菜单权限）；加载失败时降级为不限制
 let me=null;
+// 当前激活页签：各页的轮询只在本页运行（非当前页发请求纯属浪费 CPU/带宽）
+let _activePanel='dashboard';
 async function loadMe(){
  try{const j=await api('/api/me');me=(j&&j.code===0)?j.data:null;}catch(e){me=null}
  renderNav();
@@ -72,9 +160,8 @@ function renderNav(){
   let show=true;
   if(k==='users')show=!!(me&&me.isAdmin);
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
-  else if(k==='config')show=canView('config')||canView('starconfig'); // 配置页含“星尘设置”子页签（任一权限可见）
+  else if(k==='config')show=canView('config')||canView('starconfig')||canView('control'); // 配置页含“星尘设置/安全”子页签（任一权限可见）
   else if(k==='services')show=canView('services')||canView('watchdog'); // 子服务页含“看门狗”卡片（任一权限可见）
-  else if(k==='security')show=canView('control'); // 安全页（WAF 在线管理）随「控制」权限
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -89,7 +176,15 @@ async function api(url,opt={}){
  const r=await fetch(url,{...opt,headers:{...h,'Content-Type':'application/json'}});
  const _el=r.headers.get('X-Elapsed-Ms');if(_el)setSrvElapsed(_el);
  const j=await r.json();
- if(j.code===401||r.status===401){logout();showToast('登录已过期，请重新登录','error');throw new Error('Unauthorized')}
+ // 服务器时间锚点（/api/status、/star/webTraffic 等带 localTime）：页脚不再显示浏览器本机时间
+ if(j&&j.data&&j.data.localTime){setServerClock(j.data.localTime);if(_lastElapsed!=='--')setSrvElapsed(_lastElapsed);}
+ if(j.code===401||r.status===401){
+  // 登录页上的轮询（旧 token 已失效）不应反复弹提示、也不应反复抢焦点
+  const onLoginPage=$('login').style.display!=='none';
+  logout();
+  if(!onLoginPage)showToast('登录已过期，请重新登录','error');
+  throw new Error('Unauthorized')
+ }
  return j;
 }
 
@@ -99,16 +194,19 @@ function showToast(msg,type='info'){
 }
 
 let _modalCb=null;
-function showModal(title,body,confirmText,cb){
+function showModal(title,body,confirmText,cb,wide){
  $('modal-title').textContent=title;
  $('modal-body').innerHTML=body;
  $('modal-confirm-btn').textContent=confirmText||'确认';
+ // 宽版弹窗（文件在线编辑等大内容）；每次打开显式切换，避免上一个弹窗的尺寸残留
+ const box=$('modal-box');if(box)box.classList.toggle('modal-wide',!!wide);
  $('modal-overlay').classList.remove('hidden');_modalCb=cb;
 }
 function closeModal(){$('modal-overlay').classList.add('hidden');_modalCb=null}
 function confirmModal(){const cb=_modalCb;closeModal();if(cb)cb()}
 
 function switchPanel(name){
+ _activePanel=name;
  document.querySelectorAll('nav a').forEach(a=>a.classList.remove('active'));
  const link=document.querySelector(`nav a[data-panel="${name}"]`);if(link)link.classList.add('active');
  document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
@@ -122,11 +220,11 @@ function switchPanel(name){
   services:loadServices,
   traffic:loadTraffic,
   control:updateControlStatus,
-  security:loadSecurity,
   config:loadConfig,
   logs:loadLogs,
   database:loadDatabase,
   fileman:loadFileman,
+  cert:loadCert,
   plugins:loadPlugins,
   ai:loadAi,
   terminal:loadTerminal,
@@ -138,22 +236,37 @@ function switchPanel(name){
  let want='#'+name;
  if(name==='traffic')want=trafficSubFromHash()==='ports'?'#traffic.ports':'#traffic';
  if(name==='logs')want=logsSubFromHash()==='audit'?'#logs.audit':'#logs';
- if(name==='config')want=configSubFromHash()==='star'?'#config.star':'#config';
+ if(name==='config'){const s=configSubFromHash();want=s==='star'?'#config.star':(s==='security'?'#config.security':'#config');}
+ if(name==='fileman')want=fmPath?'#fileman?path='+encodeURIComponent(fmPath):'#fileman';
  if(location.hash!==want)history.replaceState(null,'',want);
 }
 
 // 从 URL hash 解析页签名（非法/缺省/无权限返回空串；与导航实际可见页签比对，避免选择器注入）
 // 支持子页后缀：traffic.ports → 返回主页名 traffic（子页由 trafficSubFromHash 解析）；兼容早期独立页签书签 #ports / #audit / #starconfig / #cleanup / #watchdog
+// 文件管理页带查询串：#fileman?path=D%3A%5Cwwwroot → 页签名仍为 fileman（path 由 fmPathFromHash 解析）
 function panelFromHash(){
- const h=(location.hash||'').replace(/^#\/?/,'');
+ const raw=(location.hash||'').replace(/^#\/?/,'');
+ if(!raw)return '';
+ const h=raw.split('?')[0];
  if(!h)return '';
  if(h==='ports')return 'traffic';
  if(h==='audit')return 'logs';
  if(h==='starconfig')return 'config'; // 兼容早期独立页签书签
+ if(h==='security')return 'config'; // “安全”已并入“配置”页子页签
  if(h==='cleanup')return 'plugins'; // “日志清理”已迁移为插件（🧩 插件 → 日志清理）
  if(h==='watchdog')return 'services'; // “看门狗”已并入“子服务”页
  const name=h.split('.')[0];
  return [...document.querySelectorAll('nav a[data-panel]')].some(a=>a.dataset.panel===name&&a.style.display!=='none')?name:'';
+}
+// 文件管理页目录（`#fileman?path=...`）；无则返回空串
+function fmPathFromHash(){
+ const raw=(location.hash||'').replace(/^#\/?/,'');
+ if(!raw.startsWith('fileman'))return '';
+ const q=raw.indexOf('?');
+ if(q<0)return '';
+ const m=/[?&]path=([^&]*)/.exec(raw.slice(q));
+ if(!m)return '';
+ try{return decodeURIComponent(m[1])}catch(e){return ''}
 }
 // 流量页子页签（site 网站流量 / ports 端口流量）
 function trafficSubFromHash(){
@@ -185,10 +298,10 @@ window.addEventListener('hashchange',()=>{
  if(link&&!link.classList.contains('active'))switchPanel(h);
  else if(h==='traffic'&&$('traffic-sub-site'))applyTrafficSub(trafficSubFromHash()); // 流量页内子页签同步
  else if(h==='logs'&&$('logs-sub-tabs'))applyLogsSub(logsSubFromHash()); // 日志页内子页签同步
- else if(h==='config'&&$('config-sub-tabs'))applyConfigSub(configSubFromHash()); // 配置页内子页签同步
+ else if(h==='config'&&$('config-sub-tabs'))configSubSwitch(configSubFromHash()); // 配置页内子页签同步（含旧 #security 书签规范化）
 });
 
-/* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.json） ── */
+/* ── 安全（WAF 在线开关 + 参考配置；库 Pek.RWaf / config 落盘 Config/Waf.toml） ── */
 let wafCfg=null;
 const WAF_ACTS=[['off','关闭'],['monitor','仅记录'],['block','拦截']];
 function wafActSel(id,v){return '<select id="'+id+'" class="waf-sel">'+WAF_ACTS.map(a=>'<option value="'+a[0]+'"'+(v===a[0]?' selected':'')+'>'+a[1]+'</option>').join('')+'</select>'}
@@ -197,15 +310,15 @@ function wafParseList(t){return String(t||'').split(/[,，;；\s]+/).filter(Bool
 async function loadSecurity(){
  try{
   const j=await api('/star/waf');
-  if(j.code!==0){$('panel-security').innerHTML='<div class="card"><h3>🛡 WAF</h3><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
+  if(j.code!==0){$('config-sub-security').innerHTML='<div class="glass-card card"><h2>🛡 WAF</h2><p>加载失败：'+esc(j.message||'')+'</p></div>';return}
   wafCfg=j.data;renderSecurity();
  }catch(e){}
 }
 function renderSecurity(){
  const c=wafCfg||{};
- $('panel-security').innerHTML=`
-<div class="card">
- <h3>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.json')}</span></h3>
+ $('config-sub-security').innerHTML=`
+<div class="glass-card card">
+ <h2>🛡 Web 应用防火墙（Pek.RWaf）<span class="text-muted" style="font-size:12px;margin-left:8px;font-weight:400">配置：${escAttr(c.configFile||'Config/Waf.toml')}</span></h2>
  <p class="text-muted" style="font-size:12px;margin:2px 0 10px">爬虫分级（放行正常搜索引擎/GEO-AI，拦恶意爬虫与扫描器）+ SQL 注入/路径探测防护 + CC 限速；保存后立即生效，并写入配置文件。</p>
  <div class="waf-row">
   <label><input type="checkbox" id="waf-enable" ${c.enable?'checked':''}> <b>启用 WAF</b>（关闭后请求全放行）</label>
@@ -233,8 +346,8 @@ function renderSecurity(){
  </div>
  <div style="margin-top:12px"><button class="btn btn-primary" onclick="wafSave()">💾 保存并立即生效</button></div>
 </div>
-<div class="card">
- <h3>📖 参考配置（完整 JSON）</h3>
+<div class="glass-card card">
+ <h2>📖 参考配置（完整 JSON）</h2>
  <p class="text-muted" style="font-size:12px;margin:2px 0 8px">高级项（如规则集 <code>ruleset</code>、跳过检测前缀 <code>skipAttackPrefixes</code>）可直接编辑 JSON 保存；也可直接编辑服务器配置文件（修改后 10 秒内热生效）。</p>
  <textarea id="waf-json" class="waf-json" spellcheck="false">${JSON.stringify(c,null,2).replace(/</g,'\\u003c')}</textarea>
  <div style="margin-top:10px"><button class="btn btn-primary" onclick="wafSaveJson()">💾 保存 JSON</button></div>
@@ -275,11 +388,34 @@ function wafSaveJson(){
  try{const c=JSON.parse($('waf-json').value);wafPost(c)}catch(e){showToast('JSON 解析失败：'+e.message,'error')}
 }
 
-/* ── 页脚：服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
+/* ── 页脚：代理版本 + 服务端处理耗时（dhrust 为每个响应附加 X-Elapsed-Ms） ── */
+let _agentVer='';      // 代理版本（来自 /api/status 的 selfUpgrade.current）
+let _lastElapsed='--'; // 最近一次服务端耗时
+let _srvClockMs=null;  // 服务器本地时间锚点（毫秒）
+let _srvClockAt=0;     // 锚点建立时的浏览器时钟
+function setServerClock(localTime){
+ // 取服务器“墙钟”时间（忽略时区偏移，避免浏览器时区不同导致显示错位）
+ const m=/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2}):(\d{2})/.exec(String(localTime||'').trim());
+ if(!m)return;
+ _srvClockMs=Date.UTC(+m[1],+m[2]-1,+m[3],+m[4],+m[5],+m[6]);
+ _srvClockAt=Date.now();
+}
+function serverClockText(){
+ const p=n=>String(n).padStart(2,'0');
+ if(_srvClockMs==null){
+  const t=new Date();
+  return `${p(t.getMonth()+1)}-${p(t.getDate())} ${p(t.getHours())}:${p(t.getMinutes())}:${p(t.getSeconds())}`;
+ }
+ const d=new Date(_srvClockMs+(Date.now()-_srvClockAt));
+ return `${p(d.getUTCMonth()+1)}-${p(d.getUTCDate())} ${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
+}
 function setSrvElapsed(v){
  const f=$('srv-foot');if(!f)return;
- const t=new Date().toLocaleTimeString('zh-CN',{hour12:false});
- f.textContent='服务端处理耗时：'+v+' ms（最近一次请求 · '+t+'）';
+ _lastElapsed=v;
+ const label=_srvClockMs==null?'本机时间':'服务器时间';
+ // 版本未上报时也显示产品名：一眼能分辨页脚来自新版前端（旧版没有产品名前缀）
+ const head='Pek.RAgent'+(_agentVer?(' v'+_agentVer):'');
+ f.textContent=head+' · 服务端处理耗时：'+v+' ms（最近一次请求 · '+label+' '+serverClockText()+'）';
 }
 
 /* ── Dashboard ── */
@@ -294,6 +430,9 @@ async function loadDashboard(){
   const s=await api('/api/status');
   if(s.code!==0)return;statusData=s.data;
   const d=s.data;const h={data:d.health||null};
+  // 页脚版本号（优先 /api/status 顶层 version；回退自升级卡片的 current）
+  const _ver=String(d.version||(d.selfUpgrade&&d.selfUpgrade.current)||'').trim();
+  if(_ver&&_ver!==_agentVer){_agentVer=_ver;setSrvElapsed(_lastElapsed);}
   const title='StarAgent';
   document.title=title+' 管理面板';
   $('header-title').textContent=title+' 管理面板';
@@ -358,7 +497,7 @@ function buildDashboard(d,health){
  // 顺序与宝塔一致：负载 → CPU → 内存 → 磁盘（负载仅 Linux 显示）
  if(hasLoad)html+=ringGauge('负载', d.load1.toFixed(2), d.load5.toFixed(2)+' / '+d.load15.toFixed(2), loadPct, 'gauge-load', '平均负载');
  html+=ringGauge('CPU 使用率', (d.cpuCount||0)+' 核', '', cpuPct, 'gauge-cpu');
- html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem');
+ html+=ringGauge('内存', fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '', memPct, 'gauge-mem', '已使用', `<div style="margin-top:8px;display:flex;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--text-secondary)"><span>已用 <b id="mem-used" style="color:var(--text-primary)">${fmtMem(memUsedMB)}</b></span><span>缓存 <b id="mem-cached" style="color:var(--text-primary)">${fmtMem(d.memoryCachedMB||0)}</b></span><span>空闲 <b id="mem-free" style="color:var(--text-primary)">${fmtMem(d.memoryFreeMB||0)}</b></span></div><div style="margin-top:10px"><button class="btn btn-ghost btn-sm" onclick="freeMemoryAll()" style="width:100%" title="清理系统页缓存（宝塔口径）；进程自身占用的内存需重启对应服务">🧹 清理内存</button></div>`);
  (d.disks||[]).forEach((x,i)=>{
   html+=ringGauge('磁盘 '+x.name, fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '', pct(x.usedMB,x.totalMB), 'gauge-disk-'+i);
  });
@@ -368,14 +507,8 @@ function buildDashboard(d,health){
   html+=`<div class="collapse-body" id="gc-body"><div class="gc-stats">`;
   html+=gcStat('Gen 0',health.gcCollections.gen0,'gc-gen0')+gcStat('Gen 1',health.gcCollections.gen1,'gc-gen1')+gcStat('Gen 2',health.gcCollections.gen2,'gc-gen2');
   html+=gcStat('GC 内存',health.gcTotalMemory+' MB','gc-mem')+gcStat('CPU 时间',health.totalProcessorTime+'s','gc-cpu');
-  html+=`</div><div style="margin-top:12px;text-align:right"><button class="btn btn-ghost btn-sm" onclick="freeMemory()">🗑 释放内存</button></div></div></div>`;
+  html+=`</div></div></div>`;
  }
- html+=`</div>`;
-
- // 流量 / 磁盘 IO 趋势图（独立卡片，对齐宝塔：下划线页签 + 统计块 + 平滑双曲线）
- html+=`<div class="glass-card card"><div class="chart-head"><div class="chart-tabs"><span class="chart-tab active" id="tab-net" onclick="switchChart('net')">流量</span><span class="chart-tab" id="tab-disk" onclick="switchChart('disk')">磁盘 IO</span></div><span class="chart-hint">近 30 秒 · 每 3 秒采样</span></div>`;
- html+=`<div class="chart-stats" id="chart-stats"></div>`;
- html+=`<div class="chart-wrap"><svg id="trend-svg" viewBox="0 0 600 150"></svg></div></div>`;
 
  // 系统信息
  html+=`<div class="glass-card card"><h2>🖥 系统信息</h2><table class="info-table">`;
@@ -422,6 +555,11 @@ function updateDashboard(d,health){
  const loadPct = hasLoad && d.cpuCount>0 ? Math.min(100, Math.round(d.load1/(d.cpuCount*2)*100)) : 0;
  updateGauge('gauge-cpu', cpuPct, (d.cpuCount||0)+' 核', '');
  updateGauge('gauge-mem', memPct, fmtMem(memUsedMB)+' / '+fmtMem(memTotalMB), '');
+ // 内存三栏（已用/缓存/空闲）随 3 秒轮询一起更新
+ const mu=$('mem-used'), mc=$('mem-cached'), mf=$('mem-free');
+ if(mu)mu.textContent=fmtMem(memUsedMB);
+ if(mc)mc.textContent=fmtMem(d.memoryCachedMB||0);
+ if(mf)mf.textContent=fmtMem(d.memoryFreeMB||0);
  (d.disks||[]).forEach((x,i)=>{
   updateGauge('gauge-disk-'+i, pct(x.usedMB,x.totalMB), fmtMem(x.usedMB)+' / '+fmtMem(x.totalMB), '');
  });
@@ -439,8 +577,9 @@ function updateDashboard(d,health){
    setText('gc-cpu',health.totalProcessorTime+'s');
   }
  }
- // 每30秒刷新本机详情
- if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(loadMachineDetail,30000)}
+ // 本机详情（含进程 Top，全量采集约 34ms/次）：只在状态页轮询，30 秒一次；
+ // 整机 CPU/内存卡片由 /api/status 3 秒刷新（轻量），进程明细不需要秒级。
+ if(!_machineInfoBuilt){_machineInfoBuilt=true;setInterval(()=>{if(_activePanel==='dashboard')loadMachineDetail()},30000)}
 }
 
 async function loadMachineDetail(){
@@ -450,6 +589,8 @@ async function loadMachineDetail(){
   const j=await api('/star/machine');
   if(j.code!==0){el.innerHTML=`<p class="text-muted">加载失败</p>`;return}
   const d=j.data;
+  // 保留用户正在填写的虚拟内存表单（页面每 30 秒重绘一次）
+  const keep={size:(($('swap-size')||{}).value||''),path:(($('swap-path')||{}).value||''),persist:$('swap-persist')?$('swap-persist').checked:true};
   let html='';
 
   // 系统概览
@@ -476,6 +617,54 @@ async function loadMachineDetail(){
   html+=infoRow('可用',d.memory.availableMemory,'text-green');
   html+=infoRow('使用率',d.memory.memoryRatePercent,parseFloat(d.memory.memoryRate)>0.8?'text-yellow':'');
   html+=`</table>`;
+  // 虚拟内存（swap）：Linux 支持在线创建/关闭；Windows 仅展示
+  if(d.swap){
+   const s=d.swap;
+   const warn=parseFloat(s.usedPercent)>80?'text-yellow':'';
+   html+=`<div class="section-title mt-16">虚拟内存（Swap）</div><table class="info-table">`;
+   html+=infoRow('总量',s.totalMB>0?s.totalText:'未启用');
+   html+=infoRow('已用',s.totalMB>0?s.usedText:'—',warn);
+   html+=infoRow('使用率',s.totalMB>0?s.usedPercent:'—',warn);
+   if(s.swappiness!=null)html+=infoRow('swappiness',String(s.swappiness));
+   // 分区类型：swapon 报 Invalid argument 时，这一行是判断「环境不支持」还是「文件创建方式不对」的关键
+   if(s.fsType)html+=infoRow('分区文件系统',s.fsType+(s.container?' · 容器':''));
+   html+=`</table>`;
+   if(s.entries&&s.entries.length>0){
+    html+=`<table class="info-table" style="margin-top:8px"><tr><td style="${TH};font-size:11px">交换文件</td><td style="${TH};font-size:11px">大小</td><td style="${TH};font-size:11px">已用</td><td style="${TH};font-size:11px">优先级</td><td></td></tr>`;
+    s.entries.forEach(e=>{
+     html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(e.path)}</td><td>${esc(e.sizeText)}</td><td>${esc(e.usedText)}</td><td>${e.priority}</td><td><button class="btn btn-ghost btn-sm" onclick="swapRemove('${escAttr(e.path)}')">关闭并删除</button></td></tr>`;
+    });
+    html+=`</table>`;
+   }
+   if(s.configurable&&s.root){
+    const defSize=String(keep.size||s.recommendedMB||512);
+    html+=`<div class="swap-box">
+     <div class="swap-note">推荐交换区共 ${s.recommendedTotalMB} MB（物理内存 ${s.physMB} MB，已启用 ${s.totalMB} MB）${s.recommendedMB>0?'，建议再加 '+s.recommendedMB+' MB':'，当前已满足推荐值'}</div>
+     <div class="swap-form">
+      <div class="form-group"><label>大小（MB）</label><input id="swap-size" type="number" min="${s.minMB}" max="${s.maxMB}" value="${escAttr(defSize)}"></div>
+      <div class="form-group"><label>交换文件路径</label><input id="swap-path" type="text" value="${escAttr(keep.path||s.defaultPath)}"></div>
+     </div>
+     <div class="swap-actions">
+      <label><input type="checkbox" id="swap-persist" ${keep.persist?'checked':''}> 开机自动挂载</label>
+      <button class="btn btn-primary btn-sm" onclick="swapCreate()">➕ 创建并启用</button>
+     </div>
+     <div class="swap-actions" style="align-items:flex-start">
+      <div style="display:flex;flex-direction:column;gap:4px">
+       <span style="font-size:12px;color:var(--text-secondary)">换出积极度（swappiness）</span>
+       <div style="display:flex;gap:8px;align-items:center">
+        <input id="swap-swap" type="number" min="0" max="100" value="${s.swappiness==null?'':s.swappiness}">
+        <button class="btn btn-primary btn-sm" onclick="swapSwappiness()">保存</button>
+        ${s.swappiness!==0?'<button class="btn btn-ghost btn-sm" onclick="swapSetRecommended()">用推荐值 60</button>':''}
+       </div>
+      </div>
+      <div class="swap-hint" style="flex:1;min-width:260px;line-height:1.7;${s.swappiness===0?'color:var(--yellow)':''}">${s.swappiness===0
+        ? '⚠️ 当前为 0：系统几乎不会把内存换出到交换区，建的 swap 等于闲置；物理内存一吃紧，内核会直接杀掉占用最多的进程（OOM）。改成 60 才会真正兜底。'
+        : '这个值决定「内存紧张时，系统多愿意把不常用的内存挪到交换区」。60 是系统默认的平衡值：内存够用时不动，紧张时兜底；不要在内存充裕的机器上盲目调大。'}</div>
+     </div>
+    </div>`;
+   }
+   if(s.hint)html+=`<div class="text-muted" style="font-size:11px;margin-top:6px">${esc(s.hint)}</div>`;
+  }
 
   // 磁盘分区
   if(d.drives&&d.drives.length>0){
@@ -497,14 +686,14 @@ async function loadMachineDetail(){
    html+=`</table>`;
   }
 
-  // 进程 Top
+  // 进程 Top（字段对齐 htop / 云监控：用户 / CPU% / 内存 / 线程句柄 / 启动时间 / 命令行与路径）
   if(d.processes&&d.processes.length>0){
-   html+=`<div class="section-title mt-16">进程 Top 15（按内存排序）</div><table class="info-table">`;
-   html+=`<tr><td style="font-size:11px;color:var(--text-tertiary)">进程名</td><td style="font-size:11px;color:var(--text-tertiary)">PID</td><td style="font-size:11px;color:var(--text-tertiary)">内存</td><td style="font-size:11px;color:var(--text-tertiary)">线程</td><td style="font-size:11px;color:var(--text-tertiary)">CPU时间</td></tr>`;
-   d.processes.forEach(p=>{
-    html+=`<tr><td style="font-family:var(--font-mono);font-size:12px">${esc(p.name)}</td><td>${p.pid}</td><td>${p.memoryMB} MB</td><td>${p.threadCount}</td><td>${p.cpuTime}</td></tr>`;
-   });
-   html+=`</table>`;
+   _procData=d.processes;
+   html+=`<div class="section-title mt-16">进程 Top 20（排序：<span class="proc-sort" data-sort="cpu" onclick="setProcSort('cpu')">CPU</span> · <span class="proc-sort" data-sort="mem" onclick="setProcSort('mem')">内存</span>）<button class="btn btn-ghost btn-sm" style="float:right;margin-top:-4px" onclick="loadMachineDetail()">↻ 刷新</button></div>
+   <div style="overflow-x:auto"><table class="info-table proc-table" style="min-width:640px">
+    <tr><td style="${TH};white-space:nowrap">PID</td><td style="${TH};white-space:nowrap">用户</td><td style="${TH}">进程 / 可执行文件</td><td style="${TH};white-space:nowrap">监听端口</td><td style="${TH};white-space:nowrap">CPU</td><td style="${TH};white-space:nowrap">内存</td><td style="${TH};white-space:nowrap">线程/句柄</td><td style="${TH};white-space:nowrap">启动时间</td></tr>
+    <tbody id="proc-rows"></tbody>
+   </table></div>`;
   }
 
   // GPU 信息
@@ -517,7 +706,88 @@ async function loadMachineDetail(){
   }
 
   el.innerHTML=html;
+  renderProcRows();
  }catch(e){el.innerHTML=`<p class="text-muted">加载失败</p>`}
+}
+
+/* ── 虚拟内存（swap）操作 ── */
+let _swapBusy=false;
+async function swapSubmit(payload){
+ if(_swapBusy)return;_swapBusy=true;
+ showToast('处理中，请稍候...','info');
+ try{
+  const j=await api('/star/swapConfig',{method:'POST',body:JSON.stringify(payload)});
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'操作失败'),'error')}
+  loadMachineDetail();
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{_swapBusy=false}
+}
+function swapCreate(){
+ const size=parseInt((($('swap-size')||{}).value)||'0',10);
+ const path=((($('swap-path')||{}).value)||'/swapfile').trim();
+ const persist=$('swap-persist')?$('swap-persist').checked:true;
+ if(!size||size<128){showToast('请填写不小于 128 MB 的大小','error');return}
+ if(!confirm(`将在 ${path} 创建 ${size} MB 交换文件并启用，继续？`))return;
+ swapSubmit({op:'create',sizeMB:size,path:path,persist:persist?'1':'0'});
+}
+function swapRemove(path){
+ if(!confirm(`关闭并删除交换区 ${path}？\n关闭时会把已换出的数据拉回内存，内存紧张时可能较慢或失败。`))return;
+ swapSubmit({op:'remove',path:path});
+}
+function swapSwappiness(){
+ const v=parseInt((($('swap-swap')||{}).value)||'-1',10);
+ if(!(v>=0&&v<=100)){showToast('swappiness 取值 0~100','error');return}
+ swapSubmit({op:'swappiness',value:v});
+}
+/** 一键填推荐值 60 并保存（小白场景：不懂 swappiness 就直接用默认平衡值）。 */
+function swapSetRecommended(){
+ const el=$('swap-swap');if(!el){return}
+ el.value='60';
+ swapSwappiness();
+}
+
+/* ── 进程表（本机详情；可切换 CPU / 内存排序） ── */
+let _procData=[], _procSort='cpu';
+function setProcSort(k){
+ _procSort=k;
+ renderProcRows();
+ document.querySelectorAll('.proc-sort').forEach(s=>s.classList.toggle('active',s.dataset.sort===k));
+}
+function renderProcRows(){
+ const body=$('proc-rows');if(!body)return;
+ const num=v=>{const n=parseFloat(v);return isNaN(n)?0:n};
+ const rows=_procData.slice().sort((a,b)=>_procSort==='cpu'
+  ?(num(b.cpuPercent)-num(a.cpuPercent))||(num(b.memoryMB)-num(a.memoryMB))
+  :(num(b.memoryMB)-num(a.memoryMB))||(num(b.cpuPercent)-num(a.cpuPercent))).slice(0,20);
+ body.innerHTML=rows.map(p=>{
+  const app=p.app||p.name;
+  const appPath=p.appPath||p.exe||'';
+  const cwd=p.cwd||'';
+  const host=(p.name&&app&&p.name.toLowerCase()!==app.toLowerCase())?(' · 宿主 '+p.name):'';
+  const iisSites=Array.isArray(p.iisSites)?p.iisSites:[];
+  const hint=[p.command||'', cwd?('工作目录: '+cwd):'', p.appPool?('IIS 应用池: '+p.appPool):'',
+   ...iisSites.map(s=>(s.site||'')+(s.path||'')+': '+(s.physicalPath||''))].filter(Boolean).join('\n');
+  const cpu=num(p.cpuPercent);
+  const ports=Array.isArray(p.ports)?p.ports:[];
+  // 每个端口一个 inline-block span：列窄时自动换行，不会把整表撑宽
+  const portHtml=ports.map(v=>`<span style="display:inline-block;margin:0 5px 0 0">:${v}</span>`).join('');
+  // 启动时间拆两行（日期 / 时间），列宽减半，窄窗口下不会把表撑出横向滚动
+  const stParts=String(p.startTime||'').trim().split(' ');
+  const stDate=stParts[0]||'—';
+  const stClock=stParts[1]||'';
+  return `<tr>
+   <td style="white-space:nowrap">${p.pid}</td>
+   <td style="white-space:nowrap">${esc(p.user||'—')}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all;min-width:120px" title="${escAttr(hint)}">${esc(app)}${host?`<span class="text-muted" style="font-size:10px;white-space:nowrap">${esc(host)}</span>`:''}${appPath?`<div class="text-muted" style="font-size:10px;word-break:break-all">${esc(appPath)}</div>`:''}</td>
+   <td style="font-family:var(--font-mono);font-size:11px;white-space:normal;${ports.length?'':'color:var(--text-tertiary)'}">${ports.length?portHtml:'—'}</td>
+   <td style="white-space:nowrap"${cpu>=50?' class="text-yellow"':''}>${cpu.toFixed(1)}%</td>
+   <td style="white-space:nowrap">${p.memoryMB} MB</td>
+   <td style="white-space:nowrap">${p.threadCount||0}/${p.handleCount||0}</td>
+   <td style="font-size:10px;white-space:nowrap">${esc(stDate)}${stClock?`<div style="font-size:10px;color:var(--text-tertiary)">${esc(stClock)}</div>`:''}</td>
+  </tr>`;
+ }).join('');
+ document.querySelectorAll('.proc-sort').forEach(s=>s.classList.toggle('active',s.dataset.sort===_procSort));
 }
 
 /* ── 流量统计（网站访问日志 + 端口计数） ── */
@@ -540,7 +810,7 @@ function ensureTrafficShell(){
   </div>
   <div id="traffic-sub-site">
    <div class="glass-card card">
-    <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy）· 今日与累计</span></h2>
+    <h2>📈 网站流量 <span style="font-size:11px;font-weight:400;color:var(--text-tertiary)">解析访问日志（nginx / Apache / Caddy / IIS）· 今日与累计</span></h2>
     <div id="web-traffic-body"><p class="text-muted">加载中…</p></div>
    </div>
    <div class="glass-card card">
@@ -612,22 +882,58 @@ function renderWebTraffic(d){
  if(!d.enabled){el.innerHTML=`<p class="text-muted">${esc(d.message||'网站流量统计未启用（配置 WebTraffic=true 开启）')}</p>`;return}
  const sites=d.sites||[];
  if(!sites.length){el.innerHTML=`<p class="text-muted">${esc(d.message||'未发现网站日志')}</p>`;return}
- let html=`<table class="info-table"><tr>`;
- html+=['站点','今日流量','请求','UV','2xx / 4xx / 5xx','速率','累计流量'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ const w3c=s=>String(s.logFormat||'W3C').toUpperCase()==='W3C';
+ const supported=s=>/^(W3C|NCSA)?$/i.test(String(s.logFormat||''));
+ const fixable=sites.filter(s=>s.isIis&&supported(s)&&((w3c(s)&&!s.scBytes)||s.logEnabled===false)).length;
+ let html='';
+ if(fixable&&canView('config')) html+=`<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px"><button class="btn btn-ghost btn-sm" id="iis-fix-all">🔧 为全部 ${fixable} 个站点启用 sc-bytes</button><span class="text-muted" style="font-size:12px">修改 IIS 配置（applicationHost.config），仅拥有配置权限的账号可操作</span></div>`;
+ html+=`<table class="info-table"><tr>`;
+ html+=['站点','状态','今日流量','请求','UV','2xx / 4xx / 5xx','速率','累计流量','操作'].map(h=>`<td style="${TH}">${h}</td>`).join('');
  html+=`</tr>`;
  sites.forEach(s=>{
   const logs=(s.logs||[]).join('\n');
+  const note=s.note?`<div class="text-muted" style="font-size:11px;margin-top:2px">${esc(s.note)}</div>`:'';
+  let status='<span class="text-muted">—</span>';
+  if(s.isIis){
+   const st=String(s.iisState||'');
+   const state=st==='Started'?'<span class="text-green">运行中</span>':(st==='Stopped'?'<span class="text-red">已停止</span>':(st?esc(st):'<span class="text-muted">—</span>'));
+   const log=s.logEnabled===false?'<span class="text-yellow">日志关闭</span>':'<span class="text-muted">日志已开</span>';
+   status=state+'<div style="font-size:11px;margin-top:2px">'+log+'</div>';
+  }
+  const needBytes=s.isIis&&supported(s)&&w3c(s)&&!s.scBytes;
+  const needLog=s.isIis&&supported(s)&&s.logEnabled===false;
+  let action='';
+  if(needBytes||needLog){
+   const label=needBytes?'启用 sc-bytes':'启用日志';
+   action=canView('config')
+    ?`<button class="btn btn-ghost btn-sm" data-iis-fix="${escAttr(s.name)}" title="修改 IIS 配置：启用日志记录并勾选“发送的字节数（sc-bytes）”">${label}</button>`
+    :'<span class="text-muted" style="font-size:11px">需配置权限</span>';
+  }else if(s.isIis){action='<span class="text-muted">正常</span>'}
   html+=`<tr>
-   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${esc(logs)}">${esc(s.name)}</td>
+   <td style="font-family:var(--font-mono);font-size:12px;word-break:break-all" title="${escAttr(logs)}">${esc(s.name)}${note}</td>
+   <td style="white-space:nowrap">${status}</td>
    <td>${fmtBytes(s.todayBytes)}</td>
    <td>${s.todayRequests||0}</td>
    <td>${s.uv||0}</td>
    <td><span class="text-green">${s.s2xx||0}</span> / <span class="${s.s4xx?'text-yellow':'text-muted'}">${s.s4xx||0}</span> / <span class="${s.s5xx?'text-red':'text-muted'}">${s.s5xx||0}</span></td>
    <td>${fmtRate(s.rateBps)}</td>
    <td>${fmtBytes(s.totalBytes)}</td>
+   <td style="white-space:nowrap">${action}</td>
   </tr>`;
  });
  el.innerHTML=html+`</table>`;
+ el.querySelectorAll('[data-iis-fix]').forEach(b=>{b.onclick=()=>iisLogFix(b.getAttribute('data-iis-fix'))});
+ const allBtn=$('iis-fix-all');if(allBtn)allBtn.onclick=()=>iisLogFix(null);
+}
+
+async function iisLogFix(site){
+ const what=site?('站点「'+site+'」'):'全部 IIS 站点';
+ if(!confirm('将为'+what+'启用日志记录并勾选 sc-bytes（发送的字节数）。\n修改会写入 IIS 配置 applicationHost.config，是否继续？'))return;
+ try{
+  const j=await api('/star/webLogFix',{method:'POST',body:JSON.stringify(site?{site}:{all:true})});
+  if(j.code===0){showToast(j.message||'已启用','success');setTimeout(loadTraffic,1200);}
+  else showToast(j.message||'操作失败','error');
+ }catch(e){}
 }
 function renderPortTraffic(d){
  const el=$('port-traffic-body');if(!el)return;
@@ -639,19 +945,23 @@ function renderPortTraffic(d){
  const note=d.message?`<p class="text-muted" style="margin-bottom:10px">${esc(d.message)}</p>`:'';
  if(!rows.length){el.innerHTML=note+'<p class="text-muted">暂无数据（采样中…）</p>';return}
  let html=note+`<table class="info-table"><tr>`;
- html+=['端口','协议','状态','连接数','接收','发送','↓ 速率','↑ 速率'].map(h=>`<td style="${TH}">${h}</td>`).join('');
+ html+=['端口','协议','状态','应用（PID）','路径','连接数','接收','发送','↓ 速率','↑ 速率'].map(h=>`<td style="${TH}">${h}</td>`).join('');
  html+=`</tr>`;
  rows.forEach(r=>{
   const st=r.listen?'<span class="text-green">监听中</span>':'—';
+  const proc=r.process?esc(r.process)+(r.pid?` (${r.pid})`:''):'—';
+  const path=r.path?`<span title="${esc(r.path)}" style="word-break:break-all">${esc(r.path)}</span>`:'—';
   html+=`<tr>
    <td style="font-family:var(--font-mono);font-size:12px">${r.port}</td>
    <td>${esc((r.proto||'').toUpperCase())}</td>
    <td>${st}</td>
+   <td style="font-size:12px;white-space:nowrap">${proc}</td>
+   <td style="font-family:var(--font-mono);font-size:11px;max-width:420px;word-break:break-all">${path}</td>
    <td>${r.conns||0}</td>
    <td>${r.rxBytes==null?'—':fmtBytes(r.rxBytes)}</td>
    <td>${r.txBytes==null?'—':fmtBytes(r.txBytes)}</td>
-   <td>${fmtRate(r.rxBps)}</td>
-   <td>${fmtRate(r.txBps)}</td>
+   <td>${r.rxBytes==null?'—':fmtRate(r.rxBps)}</td>
+   <td>${r.txBytes==null?'—':fmtRate(r.txBps)}</td>
   </tr>`;
  });
  el.innerHTML=html+`</table>`;
@@ -1060,7 +1370,7 @@ function infoRow(lbl,val,cls='',id=''){return `<tr><td>${esc(lbl)}</td><td><span
 function gcStat(lbl,val,id=''){return `<div class="gc-stat"><div class="gc-val"${id?` id="${id}"`:''}>${esc(val)}</div><div class="gc-lbl">${lbl}</div></div>`}
 function pct(v,max){return max>0?Math.min(100,Math.round(v/max*100)):0}
 function fmtMem(mb){return mb>=1024?(mb/1024).toFixed(1)+' GB':Math.round(mb)+' MB'}
-function ringGauge(label,val,max,pctVal,id,unit='已使用'){
+function ringGauge(label,val,max,pctVal,id,unit='已使用',extra=''){
  const r=48,c=2*Math.PI*r,offset=c-(pctVal/100)*c;
  const cls=pctVal>80?'#ef4444':pctVal>50?'#f59e0b':'url(#gaugeGrad)';
  return `<div class="gauge-card glass-card"${id?` id="${id}-card"`:''}><div class="gauge-label">${label}</div>
@@ -1068,7 +1378,7 @@ function ringGauge(label,val,max,pctVal,id,unit='已使用'){
  <svg width="120" height="120" viewBox="0 0 120 120"><defs><linearGradient id="gaugeGrad" x1="0%" y1="0%" x2="100%" y2="0%"><stop offset="0%" stop-color="#5b5bff"/><stop offset="100%" stop-color="#8b5cf6"/></linearGradient></defs>
  <circle class="ring-bg" cx="60" cy="60" r="${r}"/><circle class="ring-fill" cx="60" cy="60" r="${r}" stroke="${cls}" stroke-dasharray="${c}" stroke-dashoffset="${offset}"${id?` id="${id}-fill"`:''}/></svg>
  <div class="ring-text"><span class="pct"${id?` id="${id}-pct"`:''}>${pctVal}%</span><span class="unit">${unit}</span></div></div>
- <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)}${max?` / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}`:''}</div></div>`;
+ <div class="gauge-detail">${id?`<span id="${id}-val">${esc(val)}</span>`:esc(val)}${max?` / ${id?`<span id="${id}-max">${esc(max)}</span>`:esc(max)}`:''}</div>${extra}</div>`;
 }
 
 /* ── 流量 / 磁盘 IO 趋势图（SVG 手绘，对齐宝塔：双曲线 + 渐变面积 + 页签） ── */
@@ -1213,6 +1523,7 @@ async function loadServices(){
   if(sj&&sj.code===0)_servicesData=sj.data;
   if(wj&&wj.code===0)_watchdogData=(wj.data&&wj.data.services)||[];
   renderServices();
+  mgDetectOnce();
  }catch(e){}
 }
 
@@ -1222,7 +1533,16 @@ function renderServices(){
  if(canView('services')&&d){
  const svcs=d.services||[];
  html+=`<div class="glass-card card"><div class="flex-between mb-16"><h2>📦 子服务管理</h2><span style="font-size:12px;color:var(--text-tertiary)">运行 ${d.running||0} / 总计 ${d.total||0}</span></div>`;
- html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button></div>`;
+ html+=`<div class="mb-12 form-inline"><button class="btn btn-primary btn-sm" onclick="showAddService()">➕ 添加服务</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showAppPkgForm()">📦 上传应用包</button><button class="btn btn-secondary btn-sm" style="margin-left:8px" onclick="showMigrateForm()">🔄 迁移 C# 星尘</button></div>`;
+ if(_mgHint)html+=`<div class="mb-12" style="border-left:3px solid var(--orange);background:rgba(255,153,0,.08);padding:10px 12px;border-radius:8px;display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap">
+  <div style="font-size:12.5px">🔄 检测到 C# 版星尘：<code>${esc(_mgHint.dir)}</code> · 服务 <b>${esc(_mgHint.serviceName)}</b>（${_mgHint.serviceRunning?'运行中':'已停止'}）· ${(_mgHint.apps||[]).length} 个子服务</div>
+  <div style="white-space:nowrap"><button class="btn btn-primary btn-sm" onclick="showMigrateForm('${escAttr(_mgHint.dir)}')">一键迁移</button>
+  <button class="btn btn-ghost btn-sm" onclick="_mgHint=null;renderServices()">忽略</button></div></div>`;
+ html+=`<div class="ap-drop-zone" onclick="showAppPkgForm()">
+  <div style="font-size:22px;line-height:1">📦</div>
+  <div style="margin-top:6px"><b>把发布包拖到这里自动部署</b>（.zip / .tar.gz / .tgz），或点击选择文件</div>
+  <div style="font-size:11px;margin-top:4px">自动解压、识别主程序、注册子服务并启动；需要自定义参数时用上方「添加服务」手动填写</div>
+ </div>`;
  if(svcs.length===0){
   html+=`<div class="empty-state"><div class="empty-icon">📦</div><p>暂无子服务</p><p style="font-size:11px;margin-top:4px">点击"添加服务"按钮创建第一个子服务</p></div>`;
  }else{
@@ -1232,7 +1552,14 @@ function renderServices(){
    html+=`<tr><td><div class="svc-name">${esc(s.Name)}</div></td>`;
    html+=`<td><div class="svc-file">${esc(s.FileName||'')}${s.Arguments?' '+esc(s.Arguments):''}</div></td>`;
    html+=`<td><span class="badge ${s.Enable?'badge-green':'badge-gray'}">${s.Enable?'启用':'禁用'}</span></td>`;
-   html+=`<td><span class="badge ${run?'badge-green':'badge-red'}">${run?'运行中':'已停止'}</span></td>`;
+   // 状态：运行中 + 探活结果（warn/fail 表示「进程在但不响应」，即假死/正在假死）
+   const health=s.Health||'off';
+   let stateCell=run?'<span class="badge badge-green">运行中</span>':'<span class="badge badge-red">已停止</span>';
+   if(run&&(health==='warn'||health==='fail')){
+    const txt=health==='fail'?'探活失败':('探活异常 '+(s.HealthFails||0)+'/3');
+    stateCell+=`<span class="badge" style="margin-left:4px;background:var(--orange);color:#fff" title="${escAttr(s.HealthError||'')}">${txt}</span>`;
+   }
+   html+=`<td>${stateCell}</td>`;
    html+=`<td style="font-family:var(--font-mono);font-size:12px">${run?(s.ProcessId||'')+(s.ProcessName?' '+esc(s.ProcessName):''):'-'}</td>`;
    html+=`<td style="font-size:12px;white-space:nowrap">${run?(s.CpuRate!=null?s.CpuRate.toFixed(1)+'%':'—')+(s.MemoryMB!=null?' · '+fmtMem(s.MemoryMB):''):'-'}</td>`;
    html+=`<td><div class="svc-actions">`;
@@ -1264,6 +1591,37 @@ function renderServices(){
  }
  if(!html)return;
  $('panel-services').innerHTML=html;
+ servicesDragBind();
+}
+
+/* 子服务页拖拽上传：把发布包拖进页面即弹出部署确认（只接受 .zip / .tar.gz / .tgz）。
+   绑定在容器上（容器不随 3 秒轮询重绘，委托才不会被冲掉）。 */
+function servicesDragBind(){
+ const panel=$('panel-services');if(!panel||panel._apDragBound)return;
+ panel._apDragBound=true;
+ const hasFiles=e=>e.dataTransfer&&Array.prototype.indexOf.call(e.dataTransfer.types||[],'Files')>=0;
+ panel.addEventListener('dragover',e=>{
+  if(!hasFiles(e))return;
+  e.preventDefault();
+  try{e.dataTransfer.dropEffect='copy'}catch(err){}
+  panel.classList.add('ap-drag');
+ });
+ panel.addEventListener('dragleave',e=>{
+  // 仅在真正离开容器时取消高亮（子元素间移动会连发 dragleave）
+  if(e.target===panel||!panel.contains(e.relatedTarget))panel.classList.remove('ap-drag');
+ });
+ panel.addEventListener('drop',e=>{
+  panel.classList.remove('ap-drag');
+  if(!hasFiles(e))return;
+  e.preventDefault();
+  const f=e.dataTransfer.files&&e.dataTransfer.files[0];
+  if(!f)return;
+  const n=(f.name||'').toLowerCase();
+  if(!(n.endsWith('.zip')||n.endsWith('.tar.gz')||n.endsWith('.tgz'))){
+   showToast('请拖入 .zip / .tar.gz / .tgz 发布包','error');return;
+  }
+  showAppPkgForm(f);
+ });
 }
 
 function editServiceByIdx(idx){
@@ -1283,6 +1641,144 @@ async function doSvcAction(action,name){
 }
 
 function showAddService(){showServiceForm(null,'添加子服务')}
+
+/* ── 应用包一键部署（上传/拖拽 .zip / .tar.gz → 自动解压识别 → 注册子服务 → 启动） ── */
+let _apPkgFile=null; // 拖拽或选择得到的 File（input 无法用脚本赋值，故单独持有）
+function showAppPkgForm(file){
+ _apPkgFile=file||null;
+ const picked=_apPkgFile?`${esc(_apPkgFile.name)}（${fmtBytes(_apPkgFile.size)}）`:'未选择（支持 .zip / .tar.gz / .tgz）';
+ const html=`<div class="form-group"><label>发布包 *</label>
+  <div style="display:flex;gap:8px;align-items:center">
+   <label class="btn btn-secondary btn-sm" style="white-space:nowrap">📦 选择发布包<input type="file" id="ap-file" accept=".zip,.gz,.tgz" style="display:none" onchange="apFilePicked(this)"></label>
+   <span id="ap-file-name" class="text-muted" style="font-size:12px">${picked}</span>
+  </div>
+  <div class="text-muted" style="font-size:11px;margin-top:4px">也可以直接把发布包拖到「子服务」页面</div></div>
+ <div class="form-row">
+  <div class="form-group"><label>服务名称</label><input type="text" id="ap-name" placeholder="留空按包内主程序名自动识别"></div>
+  <div class="form-group"><label>启动参数</label><input type="text" id="ap-args" placeholder="留空=无参数（升级时保留原参数）"></div>
+ </div>
+ <div class="form-group"><label class="toggle"><input type="checkbox" id="ap-autostart" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">部署后立即启动（已运行的服务会自动重启到新版本）</div></div>
+ <div class="text-muted" style="font-size:11px">服务端自动解压、识别主程序并按影子模式注册子服务（工作目录默认 <code>../apps/{名称}</code>）；升级=重复上传新包，旧影子目录自动清理。</div>`;
+ showModal('上传应用包部署',html,'部署',()=>apDeploy());
+}
+function apFilePicked(el){
+ const f=el&&el.files?el.files[0]:null;
+ _apPkgFile=f||null;
+ const n=$('ap-file-name');
+ if(n)n.textContent=f?`${f.name}（${fmtBytes(f.size)}）`:'未选择（支持 .zip / .tar.gz / .tgz）';
+}
+function apDeploy(){
+ let f=_apPkgFile;
+ if(!f){const el=$('ap-file');f=el&&el.files?el.files[0]:null}
+ if(!f){showToast('请选择发布包（.zip / .tar.gz）','error');return}
+ const name=($('ap-name')?.value||'').trim();
+ const args=($('ap-args')?.value||'').trim();
+ const auto=($('ap-autostart')?.checked)?1:0;
+ const qs=`fileName=${encodeURIComponent(f.name)}&name=${encodeURIComponent(name)}&arguments=${encodeURIComponent(args)}&autoStart=${auto}`;
+ const xhr=new XMLHttpRequest();
+ xhr.open('POST','/star/appDeploy?'+qs);
+ if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+ xhr.setRequestHeader('Content-Type','application/octet-stream');
+ xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传部署包：${Math.round(e.loaded/e.total*100)}%`,'info')};
+ xhr.onload=()=>{
+  let j=null;try{j=JSON.parse(xhr.responseText)}catch(e){}
+  if(!j){showToast('部署失败：响应无法解析','error');return}
+  if(j.code!==0){showToast(j.message||'部署失败','error');return}
+  _apPkgFile=null;
+  showToast(j.message||'部署完成','success');loadServices();
+ };
+ xhr.onerror=()=>showToast('部署失败：网络错误','error');
+ xhr.send(f);
+}
+
+/* ── 从 C# 版星尘迁移（面板一键；无需 SSH） ──
+   流程：GET /star/starAgentScan 预览源配置 → 勾选子服务 → POST /star/starAgentMigrate
+   服务端：停 C# 子服务（UDP RPC）→ 停/禁用 C# 星尘服务 → 导入配置（相对路径绝对化）→ 启动 */
+let _mgData=null;        // 最近一次扫描结果
+let _mgHint=null;        // 自动检测到的可迁移源（子服务页横幅）
+let _mgDetectDone=false; // 自动检测每次登录只做一次（避免每次轮询都扫盘）
+
+async function mgDetectOnce(){
+ if(_mgDetectDone||!canView('services'))return;
+ _mgDetectDone=true;
+ try{
+  const j=await api('/star/starAgentScan');
+  const d=(j&&j.data)||{};
+  if(d.found&&(d.apps||[]).length){_mgHint=d;renderServices()}
+ }catch(e){}
+}
+
+function showMigrateForm(dir){
+ _mgData=null;
+ const html=`<div class="form-group"><label>C# 星尘安装目录</label>
+  <div style="display:flex;gap:8px">
+   <input type="text" id="mg-dir" value="${escAttr(dir||'')}" placeholder="留空自动探测（如 C:\\StarAgent）">
+   <button class="btn btn-secondary btn-sm" type="button" onclick="mgScan()" style="white-space:nowrap">扫描</button>
+  </div>
+  <div class="text-muted" style="font-size:11px;margin-top:4px">只读解析 C# 的 <code>Config/StarAgent.config</code>；不会修改原配置，应用文件也留在原目录（迁移只改“谁来守护”）</div></div>
+ <div id="mg-body" class="text-muted" style="font-size:12px">正在扫描…</div>`;
+ showModal('从 C# 版星尘迁移',html,'开始迁移',()=>mgRun(),true);
+ mgScan();
+}
+
+async function mgScan(){
+ const dir=($('mg-dir')?.value||'').trim();
+ const body=$('mg-body');
+ if(body)body.textContent='正在扫描…';
+ try{
+  const j=await api('/star/starAgentScan?dir='+encodeURIComponent(dir));
+  const d=(j&&j.data)||{};
+  if(!d.found){
+   _mgData=null;
+   if(body)body.innerHTML=`<div style="color:var(--red)">${esc(j.message||'未找到 C# 星尘')}</div>`+
+    ((d.candidates&&d.candidates.length)?`<div class="text-muted" style="font-size:11px;margin-top:6px">常见路径：${d.candidates.map(esc).join('、')}</div>`:'');
+   return;
+  }
+  _mgData=d;
+  const svc=d.serviceInstalled?(d.serviceRunning?'运行中':'已停止'):'未安装';
+  let html=`<div class="text-muted" style="font-size:12px;margin-bottom:8px">源：<code>${esc(d.configPath)}</code><br>服务 <b>${esc(d.serviceName)}</b>（${svc}）· 本地端口 ${d.localPort}</div>`;
+  const apps=d.apps||[];
+  if(!apps.length){
+   html+='<div style="color:var(--orange)">该配置里没有子服务——可直接用「📦 上传应用包」安装</div>';
+   if(body)body.innerHTML=html;return;
+  }
+  html+=`<table class="svc-table"><thead><tr><th style="width:36px"><input type="checkbox" id="mg-all" checked onchange="mgAll(this.checked)"></th><th>名称</th><th>文件 / 参数</th><th>模式</th><th>启用</th></tr></thead><tbody>`;
+  apps.forEach(a=>{
+   html+=`<tr><td><input type="checkbox" class="mg-pick" data-name="${escAttr(a.name)}" checked></td>`;
+   html+=`<td><div class="svc-name">${esc(a.name)}</div></td>`;
+   html+=`<td><div class="svc-file">${esc(a.fileName||'')}${a.arguments?' '+esc(a.arguments):''}</div></td>`;
+   html+=`<td style="font-size:12px">${esc(a.mode||'shadow')}</td>`;
+   html+=`<td>${a.enable?'<span class="badge badge-green">启用</span>':'<span class="badge badge-gray">禁用</span>'}</td></tr>`;
+  });
+  html+='</tbody></table>';
+  html+=`<div class="form-row" style="margin-top:10px">
+   <div class="form-group"><label class="toggle"><input type="checkbox" id="mg-stop-service" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">停止并禁用 C# 星尘服务（防重启/守护再拉起）</div></div>
+   <div class="form-group"><label class="toggle"><input type="checkbox" id="mg-start" checked><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">迁移后启动（仅启用状态的子服务）</div></div>
+  </div>`;
+  if((d.warnings||[]).length)html+=`<div class="text-muted" style="font-size:11px;margin-top:6px;line-height:1.6">${d.warnings.map(esc).join('<br>')}</div>`;
+  if(body)body.innerHTML=html;
+ }catch(e){if(body)body.innerHTML='<span style="color:var(--red)">扫描失败</span>'}
+}
+
+function mgAll(on){document.querySelectorAll('.mg-pick').forEach(c=>c.checked=!!on)}
+
+function mgRun(){
+ if(!_mgData){showToast('请先扫描确认要迁移的子服务','error');return}
+ const picks=[...document.querySelectorAll('.mg-pick')].filter(c=>c.checked).map(c=>c.dataset.name);
+ if(!picks.length){showToast('请至少勾选一个子服务','error');return}
+ const dir=($('mg-dir')?.value||_mgData.dir||'').trim();
+ const stopSvc=($('mg-stop-service')?.checked)?1:0;
+ const startApps=($('mg-start')?.checked)?1:0;
+ const qs=`dir=${encodeURIComponent(dir)}&names=${encodeURIComponent(picks.join(','))}`
+  +`&stopApps=1&stopService=${stopSvc}&disableService=${stopSvc}&startApps=${startApps}`;
+ showToast('正在迁移（停 C# 子服务 → 停 C# 星尘 → 导入并启动）…','info');
+ api('/star/starAgentMigrate?'+qs,{method:'POST'}).then(j=>{
+  if(j.code!==0){showToast(j.message||'迁移失败','error');return}
+  showToast(j.message||'迁移完成','success');
+  _mgHint=null;_mgData=null;
+  setTimeout(loadServices,800);
+ }).catch(e=>showToast('迁移失败：网络错误','error'));
+}
 
 function showServiceForm(svc,title){
  const isEdit=svc!==null;
@@ -1310,7 +1806,8 @@ function showServiceForm(svc,title){
   <div class="form-group"><label>部署模式</label><select id="sf-mode"><option value="Standard" ${mode==='Standard'?'selected':''}>Standard</option><option value="Shadow" ${mode==='Shadow'?'selected':''}>Shadow</option><option value="Hosted" ${mode==='Hosted'?'selected':''}>Hosted</option><option value="Task" ${mode==='Task'?'selected':''}>Task</option></select></div>
   <div class="form-group"><label>最大内存 (MB)</label><input type="number" id="sf-maxmem" value="${maxMem}" placeholder="0 不限制"></div>
  </div>
- <div class="form-group"><label>健康检查地址</label><input type="text" id="sf-health" value="${esc(health)}" placeholder="http://localhost:port/health"></div>
+ <div class="form-group"><label>健康检查地址</label><input type="text" id="sf-health" value="${esc(health)}" placeholder="留空=自动探测监听端口；或 http://…、file:/path/app.log、heartbeat"></div>
+<div class="text-muted" style="font-size:11px;margin:-6px 0 10px">留空自动探测该进程（含子进程）的监听端口；无端口的应用可用 <code>file:&lt;日志/输出文件&gt;</code>（窗口内无变化即判假死）或 <code>heartbeat</code>（应用每 5 分钟调一次 <code>POST /star/appHeartbeat?name=本应用</code>）；填 <code>off</code> 关闭探活。窗口可用 <code>?within=秒</code> 覆盖（默认 300）。</div>
  <div class="form-group"><label>环境变量</label><input type="text" id="sf-env" value="${esc(env)}" placeholder="KEY=VALUE;KEY2=VALUE2"></div>
  <div class="form-row">
   <div class="form-group"><label class="toggle"><input type="checkbox" id="sf-enable" ${enable?'checked':''}><span class="track"><span class="thumb"></span></span></label><div style="font-size:12px;color:var(--text-tertiary)">启用</div></div>
@@ -1362,6 +1859,7 @@ function confirmRemoveService(name){
 
 /* ── Control ── */
 let _freeMemRunning=false;
+let _freeSysMemRunning=false;
 
 async function freeMemory(){
  if(_freeMemRunning)return;_freeMemRunning=true;
@@ -1377,6 +1875,33 @@ async function freeMemory(){
   setTimeout(()=>{loadDashboard();},1000);
  }catch(e){showToast('❌ 请求失败','error')}
  finally{if(btn)btn.disabled=false;_freeMemRunning=false}
+}
+
+/* 清理系统页缓存（Linux sync + drop_caches）：只释放页缓存，不动任何进程的内存 */
+async function freeSystemMemory(){
+ if(_freeSysMemRunning)return;_freeSysMemRunning=true;
+ const btn=$('btn-free-sys-mem');if(btn)btn.disabled=true;
+ showToast('正在清理系统缓存...','info');
+ try{
+  const j=await api('/api/freeSystemMemory');
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'清理失败'),'error')}
+  setTimeout(()=>{loadDashboard();},1200);
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{if(btn)btn.disabled=false;_freeSysMemRunning=false}
+}
+
+/* 一键清理内存：本进程缓存 + 系统页缓存（状态页「内存」卡片按钮） */
+async function freeMemoryAll(){
+ if(_freeMemRunning)return;_freeMemRunning=true;
+ showToast('正在清理内存...','info');
+ try{
+  const j=await api('/api/freeMemoryAll');
+  if(j.code===0){showToast('✅ '+j.message,'success')}
+  else{showToast('❌ '+(j.message||'清理失败'),'error')}
+  setTimeout(()=>{loadDashboard();},1200);
+ }catch(e){showToast('❌ 请求失败','error')}
+ finally{_freeMemRunning=false}
 }
 
 let _syncingTime=false;
@@ -1429,6 +1954,7 @@ async function changePassword(){
  <button class="btn btn-danger btn-lg" onclick="doControl('stop')" id="btn-stop">⏹ 停止服务</button>
  <button class="btn btn-lg" style="background:var(--orange);color:#fff;box-shadow:0 2px 8px rgba(249,115,22,0.3)" onclick="doControl('restart')" id="btn-restart">↻ 重启服务</button>
  <button class="btn btn-lg" style="background:var(--gradient-brand);color:#fff;box-shadow:0 2px 8px rgba(91,91,255,0.3)" onclick="freeMemory()" id="btn-free-mem">🗑 释放内存</button>
+ <button class="btn btn-lg btn-ghost" onclick="freeSystemMemory()" id="btn-free-sys-mem">🧹 清理系统缓存</button>
  </div>`;
  html+=`<div class="section-title">操作记录</div><div style="font-size:11px;color:var(--text-muted);margin-bottom:8px">通过本面板发起的启停操作，保存在浏览器本地存储</div><div class="cmd-history" id="cmd-history">`;
  if(cmdHistory.length===0)html+=`<div class="text-muted" style="font-size:12px">暂无操作记录</div>`;
@@ -1440,7 +1966,7 @@ async function changePassword(){
  html+=`<div class="glass-card card" style="margin-top:16px"><h2>⬆️ 自动升级 / 平台通道</h2><div id="upgrade-box"><div class="text-muted" style="font-size:12px">加载中...</div></div></div>`;
  $('panel-control').innerHTML=html;
  // 进入控制页时由 switchPanel 的 loaders 立即拉一次状态；停留期间按 3 秒轮询（仅控制页激活时请求）
- setInterval(updateControlStatus,3000);updateControlStatus();
+ setInterval(()=>{if(_activePanel==='control')updateControlStatus()},3000);updateControlStatus();
 })();
 
 // DHDeploy Agent（Rust）访问控制：本机 8282 控制接口（仅回环）；节流探测，切换后延时刷新
@@ -1482,7 +2008,10 @@ async function setDHDeploy(kind,value){
 }
 
 async function updateControlStatus(){
- if(document.hidden||!document.querySelector('#panel-control.active'))return;
+ if(document.hidden)return;
+ // 登录页不发任何轮询：否则 3 秒一次的 401 会反复触发登出流程（抢焦点 / 反复弹提示）
+ if($('login').style.display!=='none')return;
+ if(!document.querySelector('#panel-control.active'))return;
  try{
   const j=await api('/api/status');if(j.code!==0)return;const d=j.data;
   const el=$('ctrl-status');if(!el)return;
@@ -1500,12 +2029,18 @@ function renderUpgradeBox(d){
  const pw=d.panelWs||{};
  const chk=su.checkedAt?('最近检查：'+esc(su.checkedAt)):'';
  const info=su.message?esc(su.message):(su.latest?('最新版本 v'+esc(su.latest)):'');
- const pwText=pw.connected?'<span style="color:var(--green)">已连接</span>':(pw.enabled?'<span style="color:var(--yellow,#eab308)">连接中/离线</span>':'未配置');
+ const pwText=pw.connected?'<span style="color:var(--green)">已连接</span>'
+  :(pw.pairPending?'<span style="color:var(--yellow,#eab308)">等待平台批准</span>'
+   :(pw.enabled?'<span style="color:var(--yellow,#eab308)">连接中/离线</span>':'未配置'));
+ // 诊断：实际连接目标（由「升级源」推导）+ 凭据类型 + 最近一次断开原因
+ const pwDiag=(pw.url?('目标：'+esc(pw.url)):'')
+  +(pw.enabled?(pw.tokenConfigured?' · 凭据：节点令牌':' · 凭据：免令牌配对'):'')
+  +(pw.lastError?('<br><span style="color:var(--red)">最近断开：'+esc(pw.lastError)+'</span>'):'');
  box.innerHTML=`
   <div style="display:flex;gap:28px;flex-wrap:wrap;margin-bottom:10px">
    <div><div style="font-size:12px;color:var(--text-muted)">当前版本</div><div style="font-size:16px;font-weight:600">v${esc(su.current||'')}</div></div>
    <div><div style="font-size:12px;color:var(--text-muted)">自动升级</div><div style="font-size:16px;font-weight:600">${su.enabled?'<span style="color:var(--green)">已启用</span>':'未配置'}</div></div>
-   <div><div style="font-size:12px;color:var(--text-muted)">平台实时通道</div><div style="font-size:16px;font-weight:600">${pwText}</div></div>
+   <div><div style="font-size:12px;color:var(--text-muted)">平台实时通道</div><div style="font-size:16px;font-weight:600">${pwText}</div><div style="font-size:11px;color:var(--text-muted);max-width:420px;white-space:normal">${pwDiag}</div></div>
   </div>
   <div style="font-size:12px;color:var(--text-muted);margin-bottom:10px">${chk}${info?' · '+info:''}<br>升级源：${esc(su.url||'（未配置）')}${su.intervalMinutes?(' · 检查间隔 '+su.intervalMinutes+' 分钟'):''}</div>
   <button class="btn btn-sm btn-primary" onclick="checkUpgradeNow()">⬆️ 立即检查升级</button>
@@ -1532,42 +2067,50 @@ async function doControl(action){
  });
 }
 
-/* ── Config（Agent 配置 / 星尘设置 子页签） ── */
+/* ── Config（Agent 配置 / 星尘设置 / 安全 子页签） ── */
 function ensureConfigShell(){
  if($('config-sub-tabs'))return;
  $('panel-config').innerHTML=`
   <div class="chart-tabs" id="config-sub-tabs" style="margin-bottom:14px">
    <span class="chart-tab active" data-sub="agent" id="config-tab-agent" onclick="configSubSwitch('agent')">⚙ Agent 配置</span>
    <span class="chart-tab" data-sub="star" id="config-tab-star" onclick="configSubSwitch('star')">🌐 星尘设置</span>
+   <span class="chart-tab" data-sub="security" id="config-tab-security" onclick="configSubSwitch('security')">🛡 安全</span>
   </div>
   <div id="config-sub-agent"></div>
-  <div id="config-sub-star" style="display:none"></div>`;
+  <div id="config-sub-star" style="display:none"></div>
+  <div id="config-sub-security" style="display:none"></div>`;
 }
-// 配置页子页签（agent Agent 配置 / star 星尘设置；兼容旧 #starconfig 独立页书签）
+// 配置页子页签（agent Agent 配置 / star 星尘设置 / security 安全；兼容旧 #starconfig、#security 书签）
 function configSubFromHash(){
  const h=(location.hash||'').replace(/^#\/?/,'');
+ if(h==='config.security'||h==='security')return 'security';
  return (h==='config.star'||h==='starconfig')?'star':'agent';
 }
 function configSubSwitch(sub){
- applyConfigSub(sub);
- const h=sub==='star'?'#config.star':'#config';
+ const effective=applyConfigSub(sub);
+ const h=effective==='star'?'#config.star':(effective==='security'?'#config.security':'#config');
  if(location.hash!==h)history.replaceState(null,'',h);
 }
-// 应用子页签：按权限显隐标签与内容（仅有 starconfig 权限时自动落到星尘设置子页）
+// 应用子页签：按权限显隐标签与内容（无当前子页权限时落到有权限的子页；返回最终生效子页）
 function applyConfigSub(sub){
- const agent=$('config-sub-agent'),star=$('config-sub-star');if(!agent||!star)return;
- const canAgent=canView('config'),canStar=canView('starconfig');
- const tabAgent=$('config-tab-agent'),tabStar=$('config-tab-star');
+ const agent=$('config-sub-agent'),star=$('config-sub-star'),security=$('config-sub-security');
+ if(!agent||!star||!security)return sub;
+ const canAgent=canView('config'),canStar=canView('starconfig'),canSecurity=canView('control');
+ const tabAgent=$('config-tab-agent'),tabStar=$('config-tab-star'),tabSecurity=$('config-tab-security');
  if(tabAgent)tabAgent.style.display=canAgent?'':'none';
  if(tabStar)tabStar.style.display=canStar?'':'none';
- if(sub==='star'&&!canStar)sub='agent';
- if(sub==='agent'&&!canAgent)sub='star';
- agent.style.display=sub==='star'?'none':'';
+ if(tabSecurity)tabSecurity.style.display=canSecurity?'':'none';
+ if(sub==='star'&&!canStar)sub=canAgent?'agent':(canSecurity?'security':'agent');
+ if(sub==='security'&&!canSecurity)sub=canAgent?'agent':(canStar?'star':'agent');
+ if(sub==='agent'&&!canAgent)sub=canStar?'star':(canSecurity?'security':'star');
+ agent.style.display=sub==='agent'?'':'none';
  star.style.display=sub==='star'?'':'none';
+ security.style.display=sub==='security'?'':'none';
  document.querySelectorAll('#config-sub-tabs .chart-tab').forEach(el=>el.classList.toggle('active',el.dataset.sub===sub));
- if(sub==='star')loadStarConfig();else loadAgentConfig();
+ if(sub==='security')loadSecurity();else if(sub==='star')loadStarConfig();else loadAgentConfig();
+ return sub;
 }
-async function loadConfig(){ensureConfigShell();applyConfigSub(configSubFromHash())}
+async function loadConfig(){ensureConfigShell();configSubSwitch(configSubFromHash())}
 
 async function loadAgentConfig(){
  try{
@@ -1576,7 +2119,8 @@ async function loadAgentConfig(){
   items.forEach(item=>{
    html+=`<tr><td>${esc(item.displayName)}</td><td>${renderConfigInput(item)}</td><td>${esc(item.description)}</td></tr>`;
   });
-  html+=`</tbody></table><div class="mt-16"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">部分配置需重启服务后生效</span></div></div>`;
+  html+=`</tbody></table><div class="mt-16"><button class="btn btn-primary" onclick="saveConfig()">💾 保存配置</button> <span style="font-size:12px;color:var(--text-muted);margin-left:12px">部分配置需重启服务后生效</span></div>`;
+  html+=`<p class="text-muted" style="font-size:12px;margin-top:12px">插件源地址/公钥、自动升级源/间隔、平台接入令牌等安全项已从面板移除，请直接在服务器 <code>Config/StarAgent.config</code> 中修改。</p></div>`;
 
   // 修改密码卡片：内置管理员在「用户」页管理凭据（用户名/密码），此处仅为数据库用户保留本人改密
   if(!(me&&me.isAdmin)){
@@ -1599,8 +2143,71 @@ async function loadAgentConfig(){
   html+=`<button class="btn btn-primary" onclick="doUpgrade()">⬆ 上传并升级</button>`;
   html+=`<span id="upgrade-msg" style="font-size:12px;color:var(--text-muted)"></span></div></div>`;
 
+  // 面板 HTTPS 证书卡片
+  html+=`<div class="glass-card card" style="margin-top:16px"><h2>🔒 面板 HTTPS</h2>`;
+  html+=`<div id="tls-box" style="font-size:13px;color:var(--text-muted)">加载中…</div>`;
+  html+=`<div style="margin-top:12px;display:flex;gap:10px;flex-wrap:wrap">`;
+  html+=`<button class="btn btn-primary" onclick="downloadTlsInstall('win')">⬇ Windows 一键导入</button>`;
+  html+=`<button class="btn btn-primary" onclick="downloadTlsInstall('sh')">⬇ Linux / macOS 一键导入</button>`;
+  html+=`<button class="btn" onclick="downloadTlsCert()">⬇ 仅下载证书 (.crt)</button>`;
+  html+=`<button class="btn" onclick="renewTlsCert()">♻ 重新签发</button>`;
+  html+=`</div>`;
+  html+=`<p class="text-muted" style="font-size:12px;margin-top:10px">导入必须在<strong>打开浏览器的这台电脑</strong>上做（服务器无法代劳）。一键脚本已内嵌证书：<br>· Windows：下载后双击 → UAC 点“是” → <strong>完全退出并重开浏览器</strong>；<br>· Linux/macOS：<code>sh install-panel-cert.sh</code>（要求 sudo）；<br>· <strong>Firefox 例外</strong>：它用自己的证书库，需在 设置 → 隐私与安全 → 证书 → 查看证书 → 导入 手动导一次。<br>不导入也能用：浏览器点「高级 → 继续前往」即可，链路仍是加密的。</p></div>`;
+
   $('config-sub-agent').innerHTML=html;
+  loadTlsStatus();
  }catch(e){$('config-sub-agent').innerHTML=`<div class="glass-card card"><h2>⚙ Agent 配置</h2><p class="text-muted">加载失败</p></div>`}
+}
+
+/* ── 面板 HTTPS 证书 ── */
+async function loadTlsStatus(){
+ const box=$('tls-box');if(!box)return;
+ try{
+  const j=await api('/api/tls');
+  if(j.code!==0){box.textContent='证书状态读取失败：'+(j.message||'');return}
+  const d=j.data||{};
+  const on=d.enabled?'<span style="color:#16a34a;font-weight:600">已启用 HTTPS</span>':'<span style="color:#d97706;font-weight:600">未启用（当前明文 HTTP）</span>';
+  let h=`<div>状态：${on}</div>`;
+  if(d.exists){
+   h+=`<div>证书：${esc(d.path)}</div>`;
+   h+=`<div>有效期至：${esc(d.notAfter)}（剩余 ${d.daysLeft} 天${d.expiringSoon?'，<span style="color:#dc2626">即将到期，请重新签发</span>':''}）</div>`;
+   h+=`<div>覆盖名称：${esc((d.sans||[]).join(', '))}</div>`;
+   h+=`<div style="word-break:break-all">SHA-256：${esc(d.sha256||'')}</div>`;
+  }else{
+   h+=`<div>证书：尚未生成（启用 HTTPS 或点「下载证书」时自动生成）</div>`;
+  }
+  h+=`<div>建议地址：<code>${esc(d.panelUrl||'')}</code></div>`;
+  box.innerHTML=h;
+ }catch(e){box.textContent='证书状态读取失败'}
+}
+async function downloadTlsCert(){
+ await downloadFromApi('/api/tlsCert','panel.crt','已导出 panel.crt')
+}
+/* 一键导入脚本（单文件、内嵌证书）：os = win | sh */
+async function downloadTlsInstall(os){
+ const name = os==='win' ? 'install-panel-cert.cmd' : 'install-panel-cert.sh'
+ await downloadFromApi('/api/tlsInstall?os='+os, name, '已导出 '+name+'（在目标电脑双击/执行一次即可）')
+}
+/* 通用下载：带 Bearer 取二进制并触发浏览器保存 */
+async function downloadFromApi(path, filename, okMsg){
+ try{
+  const r=await fetch(path,{headers:{'Authorization':'Bearer '+token}});
+  if(!r.ok){showToast('下载失败','error');return}
+  const blob=await r.blob();
+  if(!blob.size){showToast('下载失败：内容为空','error');return}
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;a.click();
+  setTimeout(()=>URL.revokeObjectURL(a.href),3000);
+  showToast(okMsg||'已下载','success');
+ }catch(e){showToast('下载失败','error')}
+}
+async function renewTlsCert(){
+ showModal('重新签发证书','将删除现有证书并重新生成（SAN 含本机全部 IP）。<br><span style="font-size:12px;color:var(--text-muted)">重启服务后生效；已导入信任的旧证书需重新导入一次。</span>','确认重签',async()=>{
+  try{
+   const j=await api('/api/tlsRenew',{method:'POST',body:'{}'});
+   showToast(j.message||(j.code===0?'已重新签发':'重签失败'),j.code===0?'success':'error');
+   loadTlsStatus();
+  }catch(e){showToast('重签失败','error')}
+ });
 }
 
 function renderConfigInput(item){
@@ -1785,7 +2392,11 @@ async function fetchLogContent(){
 }
 
 /* ── 文件管理 ── */
-let fmData=null,fmPath='',fmSelected=new Set();
+let fmData=null;
+// 目录记忆：优先恢复 URL hash（`#fileman?path=...`，刷新/收藏/换标签页均不丢），
+// 其次 localStorage（下次打开面板回到上次访问的目录；服务端拒绝时自动回退根目录）
+let fmPath=fmPathFromHash() || (()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
+let fmSelected=new Set();
 let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
 function fmJoin(name){
@@ -1802,14 +2413,41 @@ function fmParentText(){
 }
 function fmReady(){if(fmData&&fmData.path)return true;showToast('请先进入具体目录','error');return false}
 function fmNavigate(path){fmPath=path;loadFileman()}
+/** 记忆当前目录（下次进入文件管理自动回到这里） */
+function fmSavePath(p){try{localStorage.setItem('fm_path',p||'')}catch(e){}}
+/** 把当前目录同步进 URL hash（刷新/收藏可直达；replaceState 不产生浏览器历史记录） */
+function syncFmHash(){
+ const want=fmPath?'#fileman?path='+encodeURIComponent(fmPath):'#fileman';
+ if((location.hash||'')!==want)history.replaceState(null,'',want);
+}
 
 async function loadFileman(){
  try{
   const j=await api('/star/fileList?path='+encodeURIComponent(fmPath||''));
-  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  if(j.code!==0){
+   // 记忆的目录可能已被删除/无权访问：清掉记忆并回退根目录（只回退一次，防死循环）
+   if(fmPath){fmPath='';fmSavePath('');showToast((j.message||'加载失败')+'，已回到根目录','error');return loadFileman()}
+   showToast(j.message||'加载失败','error');return;
+  }
   fmData=j.data;fmSelected=new Set();
+  fmPath=j.data.path||'';fmSavePath(fmPath); // 以服务端归一化后的路径为准
+  syncFmHash();
   renderFileman();
  }catch(e){}
+}
+
+/** 路径栏回车：跳转；Esc：放弃编辑回显当前目录 */
+function fmPathKey(e){
+ if(e.key==='Enter'){e.preventDefault();fmPathGo()}
+ else if(e.key==='Escape'){e.preventDefault();renderFileman()}
+}
+/** 按路径栏输入跳转（空=根目录/计算机） */
+function fmPathGo(){
+ const el=$('fm-path-input');if(!el)return;
+ const v=(el.value||'').trim();
+ if(!v){fmNavigate('');return}
+ if(v===((fmData&&fmData.path)||'')){el.blur();return}
+ fmNavigate(v);
 }
 
 function renderFileman(){
@@ -1823,7 +2461,7 @@ function renderFileman(){
   const icon=it.isDir?(it.isLink?'🔗':'📁'):'📄';
   rows+=`<tr>
    <td style="width:34px"><input type="checkbox" ${checked} onchange="fmToggle('${escAttr(name)}',this.checked)"></td>
-   <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
+   <td><a class="fm-name" onclick="fmOpen('${escAttr(name)}',${it.isDir?1:0},${it.isDir?0:(it.size||0)})" title="${escAttr(name)}">${icon} ${esc(name)}</a></td>
    <td style="width:92px" class="text-secondary">${it.isDir?fmSizeCell(name):fmtBytes(it.size)}</td>
    <td style="width:152px" class="text-muted">${esc(it.mtime||'')}</td>
    <td style="width:72px" class="text-muted">${esc(it.perm||'—')}</td>
@@ -1851,7 +2489,8 @@ function renderFileman(){
   <div class="fm-toolbar">
    <button class="btn btn-ghost btn-sm" onclick="fmNavigate('')">🖥 根目录</button>
    <button class="btn btn-ghost btn-sm" ${canUp?'':'disabled'} onclick="fmNavigate(fmParentText())">⬆ 上一级</button>
-   <span class="fm-path" title="${escAttr(d.path||'计算机')}">${esc(d.path||'计算机')}</span>
+   <input type="text" id="fm-path-input" class="fm-path-input" spellcheck="false" value="${escAttr(d.path||'')}" placeholder="输入路径后回车切换（Windows 例：C:\\Windows；Linux 例：/var/log）" title="可直接编辑路径后回车跳转；Esc 取消" onkeydown="fmPathKey(event)">
+   <button class="btn btn-ghost btn-sm" onclick="fmPathGo()">» 前往</button>
    <span style="flex:1"></span>
    <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmCompress()">🗜 压缩</button>
    <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmExtract()">📤 解压</button>
@@ -1864,15 +2503,15 @@ function renderFileman(){
    <thead><tr><th style="width:34px"></th><th>名称</th><th>大小</th><th>修改时间</th><th>权限</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传/编辑上限 64MB/2MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${(d.items||[]).length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 文件夹大小点“计算”按需统计 · 上传单文件上限 2GB（>8MB 自动分片）/ 在线编辑 10MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
 }
 
 function fmToggle(name,checked){checked?fmSelected.add(name):fmSelected.delete(name);renderFileman()}
-function fmOpen(name,isDir){
+function fmOpen(name,isDir,size){
  if(isDir){fmNavigate(fmJoin(name));return}
- fmEdit(fmJoin(name));
+ fmEdit(fmJoin(name),size);
 }
 
 // 目录大小单元格：未计算显示“计算”，已计算显示大小（点击可重新计算）
@@ -1905,32 +2544,94 @@ function fmPrompt(title,labelHtml,value,okText,cb){
  setTimeout(()=>{const el=$('fm-prompt-input');if(el){el.focus();el.select()}},50);
 }
 
+// 分片上传片大小（服务端按片收，内存不随文件大小增长）
+const FM_CHUNK=8*1024*1024;
+
 function fmUpload(input){
  const files=[...input.files];input.value='';
  if(!files.length)return;
  if(!fmReady())return;
- const dir=fmData.path;let i=0,ok=0,fail=0;
+ const dir=fmData.path;
+ // 先查同名：有冲突必须由用户确认；取消则一个字节都不发
+ api('/star/fileCheck',{method:'POST',body:JSON.stringify({dir,names:files.map(f=>f.name)})})
+  .then(j=>{
+   const existing=(j&&j.data&&j.data.existing)||[];
+   if(!existing.length){fmUploadRun(files,dir,false);return}
+   showModal('文件已存在',
+    `以下 <b>${existing.length}</b> 个文件已存在，继续将<b>覆盖</b>：<br><span class="text-muted" style="word-break:break-all">${existing.map(n=>esc(n)).join('、')}</span>`,
+    '确认覆盖',()=>fmUploadRun(files,dir,true));
+  })
+  .catch(()=>fmUploadRun(files,dir,false));
+}
+
+function fmUploadRun(files,dir,overwrite){
+ let i=0,ok=0,fail=0;
  const next=()=>{
   if(i>=files.length){
    showToast(`上传完成：成功 ${ok} 个${fail?`，失败 ${fail} 个`:''}`,fail?'error':'success');
    loadFileman();return;
   }
   const f=files[i++];
-  showToast(`正在上传 ${i}/${files.length}：${f.name}`,'info');
-  const xhr=new XMLHttpRequest();
-  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name));
-  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
-  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${i}/${files.length}：${f.name} ${Math.round(e.loaded/e.total*100)}%`,'info')};
-  xhr.onload=()=>{
-   let msg='';
-   try{const j=JSON.parse(xhr.responseText);if(j.code===0)ok++;else{fail++;msg=j.message||''}}catch(e){fail++}
-   if(msg)console.warn('上传失败 '+f.name+'：'+msg);
-   next();
-  };
-  xhr.onerror=()=>{fail++;next()};
-  xhr.send(f);
+  const label=`${i}/${files.length}：${f.name}`;
+  const done=v=>{v?ok++:fail++;next()};
+  if(f.size>FM_CHUNK){
+   fmUploadChunked(f,dir,overwrite,label).then(done).catch(e=>{console.warn('上传失败 '+f.name+'：'+((e&&e.message)||e));done(false)});
+  }else{
+   fmUploadSmall(f,dir,overwrite,label).then(done);
+  }
  };
  next();
+}
+
+// 小文件整块上传（带上传进度）
+function fmUploadSmall(f,dir,overwrite,label){
+ return new Promise(res=>{
+  showToast(`正在上传 ${label}`,'info');
+  const xhr=new XMLHttpRequest();
+  xhr.open('POST','/star/fileUpload?path='+encodeURIComponent(dir)+'&name='+encodeURIComponent(f.name)+'&overwrite='+(overwrite?1:0));
+  if(token)xhr.setRequestHeader('Authorization','Bearer '+token);
+  xhr.upload.onprogress=e=>{if(e.lengthComputable)showToast(`正在上传 ${label} ${Math.round(e.loaded/e.total*100)}%`,'info')};
+  xhr.onload=()=>{
+   let ok=false,msg='';
+   try{const j=JSON.parse(xhr.responseText);ok=j.code===0;if(!ok)msg=j.message||''}catch(e){msg='响应解析失败'}
+   if(!ok)console.warn('上传失败 '+f.name+'：'+msg);
+   res(ok);
+  };
+  xhr.onerror=()=>{console.warn('上传失败 '+f.name+'：网络错误');res(false)};
+  xhr.send(f);
+ });
+}
+
+// 大文件分片上传（每片 8MB）
+function fmUploadChunked(f,dir,overwrite,label){
+ const id='u'+Date.now().toString(36)+Math.random().toString(36).slice(2,10);
+ const q=`path=${encodeURIComponent(dir)}&name=${encodeURIComponent(f.name)}&id=${encodeURIComponent(id)}&total=${f.size}&overwrite=${overwrite?1:0}`;
+ const chunks=Math.ceil(f.size/FM_CHUNK);
+ return (async()=>{
+  let offset=0;
+  while(offset<f.size){
+   const end=Math.min(offset+FM_CHUNK,f.size);
+   showToast(`正在上传 ${label} ${Math.round(end/f.size*100)}%（分片 ${Math.floor(offset/FM_CHUNK)+1}/${chunks}）`,'info');
+   const j=await fmPostBinary('/star/fileUploadChunk?'+q+'&offset='+offset,f.slice(offset,end));
+   if(!j||j.code!==0){
+    console.warn('上传失败 '+f.name+'（offset='+offset+'）：'+((j&&j.message)||'未知错误'));
+    try{await api('/star/fileUploadAbort?path='+encodeURIComponent(dir)+'&id='+encodeURIComponent(id),{method:'POST'})}catch(e){}
+    return false;
+   }
+   offset=end;
+  }
+  return true;
+ })();
+}
+
+// 二进制 POST（不走 api()：它会强制 JSON Content-Type）
+async function fmPostBinary(url,body){
+ const h={'Content-Type':'application/octet-stream'};
+ if(token)h['Authorization']='Bearer '+token;
+ const r=await fetch(url,{method:'POST',body,headers:h});
+ let j=null;try{j=await r.json()}catch(e){}
+ if(r.status===401||(j&&j.code===401)){logout();throw new Error('登录已过期')}
+ return j;
 }
 
 async function fmDownload(path){
@@ -2002,13 +2703,53 @@ function fmCompress(){
  });
 }
 
+function fmArchiveLabel(name){
+ const l=(name||'').toLowerCase();
+ if(l.endsWith('.tar.gz')||l.endsWith('.tgz'))return 'TAR.GZ';
+ if(l.endsWith('.tar.bz2')||l.endsWith('.tbz2')||l.endsWith('.tbz'))return 'TAR.BZ2';
+ if(l.endsWith('.tar.xz')||l.endsWith('.txz'))return 'TAR.XZ';
+ if(l.endsWith('.tar.zst')||l.endsWith('.tzst')||l.endsWith('.tar.zstd'))return 'TAR.ZST';
+ if(l.endsWith('.tar'))return 'TAR';
+ if(l.endsWith('.zip'))return 'ZIP';
+ if(l.endsWith('.7z'))return '7Z';
+ if(l.endsWith('.gz'))return 'GZ';
+ if(l.endsWith('.bz2'))return 'BZ2';
+ if(l.endsWith('.xz'))return 'XZ';
+ if(l.endsWith('.zst')||l.endsWith('.zstd'))return 'ZST';
+ if(l.endsWith('.rar'))return 'RAR';
+ return '';
+}
+function fmArchiveStem(name){
+ return (name||'').replace(/\.(tar\.gz|tar\.bz2|tar\.xz|tar\.zst|tar\.zstd|tgz|tbz2|tbz|txz|tzst|tar|zip|7z|gz|bz2|xz|zst|zstd)$/i,'');
+}
+
 function fmExtract(){
  const names=[...fmSelected];if(names.length!==1||!fmReady())return;
  const name=names[0];
- showModal('解压 ZIP',`将 <b>${esc(name)}</b> 解压到所在目录（保留内部目录结构）？`,'解压',async()=>{
-  const j=await api('/star/fileExtract',{method:'POST',body:JSON.stringify({path:fmJoin(name)})});
+ const label=fmArchiveLabel(name);
+ if(label==='RAR'){showToast('RAR 暂不支持（无纯 Rust 解压实现），请先转换为 ZIP 或 7Z','error');return}
+ // 默认解压到「同级同名子目录」（a.zip → a/），可改
+ const def=fmJoin(fmArchiveStem(name));
+ const canPwd=(label==='ZIP'||label==='7Z');
+ showModal('解压'+(label?` · ${esc(label)}`:''),`
+  <div class="text-muted" style="margin-bottom:10px">压缩包：<b>${esc(name)}</b></div>
+  <label class="text-muted" style="font-size:12px">目标目录（不存在会自动创建；默认同名子目录）</label>
+  <input type="text" id="fm-ex-target" value="${escAttr(def)}" spellcheck="false" style="width:100%;margin:6px 0 12px">
+  <label class="text-muted" style="font-size:12px">密码${canPwd?'（加密包才需要）':'（该格式不支持密码）'}</label>
+  <input type="password" id="fm-ex-pass" placeholder="${canPwd?'加密的 ZIP/7Z 请填密码':'—'}" ${canPwd?'':'disabled'} style="width:100%;margin-top:6px">
+ `,'解压',async()=>{
+  const tEl=$('fm-ex-target'),pEl=$('fm-ex-pass');
+  const target=tEl?tEl.value.trim():'';
+  const password=pEl?pEl.value.trim():'';
+  showToast('正在解压…','info');
+  const j=await api('/star/fileExtract',{method:'POST',body:JSON.stringify({path:fmJoin(name),target,password})});
   if(j.code!==0){showToast(j.message||'解压失败','error');return}
-  showToast(`解压完成：${j.data.fileCount} 个文件`,'success');loadFileman();
+  const d=j.data||{};
+  let msg=`解压完成（${d.formatLabel||label||'压缩包'}）：${d.fileCount} 个文件，${fmtBytes(d.bytes||0)}`;
+  if(d.overridden)msg+=`；覆盖 ${d.overridden} 个同名文件`;
+  if(d.skipped)msg+=`；跳过 ${d.skipped} 个可疑条目`;
+  showToast(msg,(d.overridden||d.skipped)?'info':'success');
+  loadFileman();
  });
 }
 
@@ -2053,21 +2794,252 @@ function fmSearchPrompt(){
 
 function fmReveal(path){closeModal();fmNavigate(path)}
 
-async function fmEdit(path){
+async function fmEdit(path,size){
+ // 在线编辑需将全文载入内存并经 JSON 传输，上限 10MB（与服务端 MAX_EDIT_SIZE 一致）；
+ // 大文件在点击时即拦截，避免先发请求再弹“文件过大”
+ const EDIT_MAX=10*1024*1024;
+ if(size&&size>EDIT_MAX){
+  showToast(`该文件 ${fmtBytes(size)}，超出在线编辑上限 10MB，请用下载按钮（≤ 256MB）或 SFTP 查看`,'error');
+  return;
+ }
  try{
   const j=await api('/star/fileRead?path='+encodeURIComponent(path));
   if(j.code!==0){showToast(j.message||'读取失败','error');return}
   const shortName=path.split(/[\\/]/).pop()||path;
   showModal('编辑：'+shortName,
-   `<div class="text-muted" style="margin-bottom:8px">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</div><textarea id="fm-editor" class="fm-editor" spellcheck="false"></textarea>`,
+   `<div class="text-muted" style="margin-bottom:8px;display:flex;align-items:center;gap:10px"><span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(j.data.path)} · ${fmtBytes(j.data.size)}</span><button class="btn btn-secondary" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmReloadEditor()">⟳ 重新加载</button><button class="btn btn-secondary" id="fm-wrap-btn" style="padding:4px 10px;font-size:12px;flex:none" onclick="fmToggleWrap()">↵ 自动换行</button></div><textarea id="fm-editor" class="fm-editor" spellcheck="false" data-path="${encodeURIComponent(path)}"></textarea>`,
    '保存',async()=>{
     const content=$('fm-editor')?$('fm-editor').value:'';
     const r=await api('/star/fileWrite',{method:'POST',body:JSON.stringify({path,content})});
     if(r.code!==0){showToast(r.message||'保存失败','error');return}
     showToast('已保存','success');loadFileman();
-   });
+   },true);
   const el=$('fm-editor');if(el)el.value=j.data.content;
+  fmApplyWrap(el);
  }catch(e){}
+}
+
+/** 自动换行开关状态（记忆到 localStorage，默认开启：日志/长行默认折行可见） */
+function fmWrapOn(){try{return localStorage.getItem('fm_wrap')!=='0'}catch(e){return true}}
+/** 应用换行状态到编辑器与开关按钮 */
+function fmApplyWrap(el){
+ const e=el||$('fm-editor');if(!e)return;
+ const on=fmWrapOn();
+ // textarea 折行最终由 white-space 决定，切换 class 即可（同步 wrap 属性更稳妥）
+ e.wrap=on?'soft':'off';
+ e.classList.toggle('fm-nowrap',!on);
+ const b=$('fm-wrap-btn');
+ if(b){
+  b.textContent=on?'↵ 自动换行：开':'↵ 自动换行：关';
+  b.classList.toggle('btn-primary',on);
+  b.classList.toggle('btn-secondary',!on);
+ }
+}
+/** 切换自动换行 */
+function fmToggleWrap(){
+ try{localStorage.setItem('fm_wrap',fmWrapOn()?'0':'1')}catch(e){}
+ fmApplyWrap();
+}
+
+/** 文件编辑弹窗：重新拉取服务端最新内容（日志跟进、外部改动时用） */
+async function fmReloadEditor(){
+ const el=$('fm-editor');if(!el||!el.dataset.path)return;
+ const path=decodeURIComponent(el.dataset.path);
+ try{
+  const j=await api('/star/fileRead?path='+encodeURIComponent(path));
+  if(j.code!==0){showToast(j.message||'重新加载失败','error');return}
+  el.value=j.data.content;
+  showToast('已重新加载最新内容（'+fmtBytes(j.data.size)+'）','success');
+ }catch(e){showToast('重新加载失败','error')}
+}
+
+/* ── 网站证书（站点盘点 + 本机演练/部署；仅白名单站点可写） ── */
+let certInv=null,certLast=null,certData=null,certShowSystem=false;
+const certSel=new Set();
+
+async function loadCert(){
+ try{
+  const j=await api('/star/sites');
+  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  const d=j.data||{};
+  certInv=d.inventory||{web:[],sites:[]};certLast=d.lastResult;certData=d;
+  // 先算好默认勾选集合再渲染（否则已托管站点渲染成未勾选、计数却是 N）
+  certSel.clear();
+  (certInv.sites||[]).forEach(s=>{if(s.managed&&(s.domains||[]).length)certSel.add(s.key)});
+  $('panel-cert').innerHTML=certShellHtml(d);
+  certSyncSel();
+ }catch(e){}
+}
+
+function certShellHtml(d){
+ const inv=certInv||{web:[],sites:[]};
+ const all=inv.sites||[];
+ const sysCount=all.filter(s=>s.system).length;
+ const list=all.filter(s=>certShowSystem||!s.system);
+ let rows='';
+ for(const s of list){
+  const cert=s.cert
+   ?`<span style="color:${s.cert.expired?'var(--red)':'var(--green,#16a34a)'};font-weight:600">${s.cert.expired?'已过期':(s.cert.daysLeft+' 天')}</span><div class="text-muted" style="font-size:11px">${esc((s.cert.domains||[]).join(', '))}</div><div class="text-muted" style="font-size:11px">至 ${esc(certDate(s.cert.notAfter))} UTC · ${esc((s.cert.sha1||'').slice(0,12))}</div>`
+   :(s.note?`<span class="text-muted" style="font-size:11px">${esc(s.note)}</span>`:'—');
+  rows+=`<tr>
+   <td>${esc(s.kind)}</td>
+   <td><div style="font-weight:600">${esc(s.name)}</div><div class="text-muted" style="font:11px ui-monospace,Consolas,monospace;word-break:break-all">${esc(s.key)}</div>${s.file?`<div class="text-muted" style="font-size:11px;word-break:break-all">${esc(s.file)}</div>`:''}</td>
+   <td style="max-width:260px;white-space:normal">${esc((s.domains||[]).join(', ')||'—')}</td>
+   <td>${s.ssl?'✓':'—'}</td>
+   <td>${cert}</td>
+   <td>${s.managed?`<span style="color:var(--green,#16a34a)">已允许</span><div class="text-muted" style="font-size:11px;word-break:break-all">规则：${esc(s.managedBy||s.key)}</div>`:'<span class="text-muted">不碰（未允许）</span>'}</td>
+   <td>
+    <label style="display:flex;gap:6px;align-items:center;cursor:pointer;white-space:nowrap">
+     <input type="checkbox" data-cert-site="${escAttr(s.key)}" ${s.managed?'checked':''} ${(s.domains||[]).length?'':'disabled'} title="${(s.domains||[]).length?'勾选 = 允许本机与平台给这个站点自动装证书；取消 = 不再碰它':'该站点没有域名，无法匹配证书'}" onchange="certToggleSite(this)">
+     <span>允许</span>
+    </label>
+    ${s.managed?'':`<div class="text-muted" style="font-size:11px">不勾 = 不碰</div>`}
+   </td>
+  </tr>`;
+ }
+ if(!rows)rows='<tr><td colspan="6" class="text-muted">（未发现站点：nginx 配置目录不存在或为 Windows/IIS 未安装；可在「高级」里补充 nginx 目录后刷新）</td></tr>';
+ const last=certLast
+  ?`<pre style="max-height:260px;overflow:auto;font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all">${esc(JSON.stringify(certLast,null,2))}</pre>`
+  :'<div class="text-muted">（本次进程尚未执行过部署）</div>';
+ const web=(inv.web||[]).join(' + ')||'未检测到';
+ return `<div class="glass-card card">
+  <div class="flex-between mb-16"><h2>🔐 网站证书</h2>
+   <div style="display:flex;gap:8px;align-items:center">
+    <button class="btn btn-secondary btn-sm" onclick="loadCert()">⟳ 重新盘点</button>
+   </div></div>
+  <div class="text-muted" style="font-size:13px">检测到的 Web 服务器：<b>${esc(web)}</b>。<b>在下面表格里勾选「允许自动部署」的那个站点，才会被本机和平台自动装证书</b>（不勾的站点一律不碰）——这是防误操作的安全闸。安装时会先备份配置 → 执行 <code>nginx -t</code> 校验 → 失败自动回滚，不会把站点改坏。</div>
+ </div>
+ <div class="glass-card card">
+  <div class="flex-between mb-16"><h2 style="font-size:16px">🌐 站点盘点</h2>
+   <div style="display:flex;gap:14px;align-items:center">
+    ${sysCount?`<label class="text-muted" style="font-size:12px;display:flex;gap:5px;align-items:center;cursor:pointer"><input type="checkbox" ${certShowSystem?'checked':''} onchange="certToggleSystem(this)"> 显示无域名站点（${sysCount}）</label>`:''}
+    <span class="text-muted" style="font-size:12px">已允许 <b id="cert-sel-count">0</b> 个站点</span>
+   </div></div>
+  <table><thead><tr><th>类型</th><th>站点</th><th>域名</th><th>SSL</th><th>现有证书</th><th>允许自动部署</th></tr></thead><tbody>${rows}</tbody></table>
+ </div>
+ <details class="glass-card card" style="padding:16px">
+  <summary style="cursor:pointer;font-weight:600;font-size:14px">⚙ 高级（一般不用动）</summary>
+  <div style="display:grid;gap:8px;margin-top:12px">
+   <div class="text-muted" style="font-size:12px">上面勾选会自动维护这份清单（<code>CertManagedSites</code>）；只有要按<b>域名通配符</b>批量允许（如 <code>*.example.com</code>）或指定配置文件时才需要手改。</div>
+   <label class="text-muted" style="font-size:12px">允许自动部署规则（站点 key / 配置文件路径 / 域名或通配符，逗号或分号分隔）</label>
+   <textarea id="cert-managed" rows="2" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="例：*.example.com">${esc(d.whitelist||'')}</textarea>
+   <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px">
+    <div><label class="text-muted" style="font-size:12px">nginx 额外配置目录（CertNginxDirs，逗号分隔）</label><input id="cert-nginxdirs" value="${escAttr(d.nginxDirs||'')}" style="width:100%"></div>
+    <div><label class="text-muted" style="font-size:12px">nginx 可执行文件（CertNginxBin，留空 = PATH）</label><input id="cert-nginxbin" value="${escAttr(d.nginxBin||'')}" placeholder="/www/server/nginx/sbin/nginx" style="width:100%"></div>
+   </div>
+   <div><button class="btn btn-primary btn-sm" onclick="certSaveSettings()">💾 保存设置</button></div>
+  </div>
+ </details>
+ <div class="glass-card card">
+  <div class="flex-between mb-16"><h2 style="font-size:16px">📤 本机演练 / 部署</h2><span class="text-muted" style="font-size:12px">平台下发也使用同一逻辑（节点主动拉取证书）</span></div>
+  <div style="display:grid;gap:8px">
+   <div><label class="text-muted" style="font-size:12px">证书链 PEM（粘贴或选择文件）</label>
+    <div style="display:flex;gap:8px;align-items:center"><input type="file" id="cert-pem-file" accept=".pem,.crt,.cer,.txt" onchange="certReadFile(this,'cert-pem')"><span class="text-muted" id="cert-pem-name" style="font-size:12px"></span></div>
+    <textarea id="cert-pem" rows="3" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="-----BEGIN CERTIFICATE-----"></textarea></div>
+   <div><label class="text-muted" style="font-size:12px">私钥 PEM（nginx 必需）</label>
+    <div style="display:flex;gap:8px;align-items:center"><input type="file" id="cert-key-file" accept=".key,.pem,.txt" onchange="certReadFile(this,'cert-key')"><span class="text-muted" id="cert-key-name" style="font-size:12px"></span></div>
+    <textarea id="cert-key" rows="2" style="width:100%;box-sizing:border-box;font:12px ui-monospace,Consolas,monospace" placeholder="-----BEGIN PRIVATE KEY-----"></textarea></div>
+   <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <select id="cert-action" style="width:300px">
+     <option value="auto">自动（有证书指令则替换，否则启用 HTTPS）</option>
+     <option value="replace">仅替换现有证书</option>
+     <option value="enable_https">启用 HTTPS（新增 443 监听）</option>
+    </select>
+    <button class="btn btn-secondary" onclick="certRun(true)">🔍 演练（不写文件）</button>
+    <button class="btn btn-primary" onclick="certRunConfirm()">📤 真实部署</button>
+   </div>
+   <pre id="cert-result" style="max-height:320px;overflow:auto;font:11px/1.5 ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all"></pre>
+  </div>
+ </div>
+ <div class="glass-card card">
+  <h2 style="font-size:16px;margin-bottom:8px">📋 上次执行结果（Data/CertLastResult.json）</h2>
+  ${last}
+ </div>`;
+}
+
+/* 勾选 = 允许自动部署该站点（自动记入清单）；取消 = 不再碰它 */
+async function certToggleSite(cb){
+ const k=cb.dataset.certSite;
+ if(!k)return;
+ cb.disabled=true;
+ try{
+  if(cb.checked){
+   const j=await api('/star/certAllow',{method:'POST',body:JSON.stringify({sites:[k]})});
+   if(j.code!==0){showToast(j.message||'允许失败','error');cb.checked=false;cb.disabled=false;return}
+   showToast(j.message||'已允许自动部署','success');
+  }else{
+   const j=await api('/star/certDeny',{method:'POST',body:JSON.stringify({sites:[k]})});
+   if(j.code!==0){showToast(j.message||'取消失败','error');cb.checked=true;cb.disabled=false;return}
+   showToast(j.message||'已取消允许','success');
+  }
+  await loadCert();
+ }catch(e){cb.disabled=false}
+}
+function certSyncSel(){
+ const el=$('cert-sel-count');if(el)el.textContent=String(certSel.size);
+}
+/* 无域名站点（宝塔 0.default.conf / phpfpm_status 等）默认隐藏，可临时显示用于诊断 */
+function certToggleSystem(cb){
+ certShowSystem=!!(cb&&cb.checked);
+ const el=$('panel-cert');
+ if(el)el.innerHTML=certShellHtml(certData||{});
+ certSyncSel();
+}
+/* Unix 秒 → YYYY-MM-DD（与平台证书库的 UTC 口径一致） */
+function certDate(ts){
+ if(!ts)return '—';
+ const d=new Date(Number(ts)*1000);
+ const p=n=>String(n).padStart(2,'0');
+ return d.getUTCFullYear()+'-'+p(d.getUTCMonth()+1)+'-'+p(d.getUTCDate());
+}
+function certReadFile(input,target){
+ const f=input.files&&input.files[0];if(!f)return;
+ const nameEl=$(target+'-name');if(nameEl)nameEl.textContent=f.name+'（'+(f.size/1024).toFixed(1)+' KB）';
+ const r=new FileReader();
+ r.onload=()=>{const el=$(target);if(el)el.value=String(r.result||'')};
+ r.readAsText(f);
+}
+async function certSaveSettings(){
+ const j=await api('/star/certConfig',{method:'POST',body:JSON.stringify({
+  managedSites:$('cert-managed').value,
+  nginxDirs:$('cert-nginxdirs').value,
+  nginxBin:$('cert-nginxbin').value
+ })});
+ showToast(j.code===0?(j.message||'已保存'):(j.message||'保存失败'), j.code===0?'success':'error');
+ if(j.code===0)await loadCert();
+}
+function certRunConfirm(){
+ const n=certSel.size;
+ if(!n)return showToast('请先勾选要部署的站点','error');
+ showModal('确认部署证书',
+  `<div style="font-size:13px;line-height:1.7">将向 <b>${n}</b> 个站点写入证书：<br>· nginx：改站点配置 → <code>nginx -t</code> → reload（失败自动回滚）<br>· IIS：导入证书 → 绑定<br>· 仅限白名单站点<br><br>确定要真实执行吗？（建议先用「演练」确认计划）</div>`,
+  '确认部署',()=>certRun(false));
+}
+async function certRun(dryRun){
+ const sites=[...certSel];
+ if(!sites.length)return showToast('请先勾选站点','error');
+ const certPem=($('cert-pem')?$('cert-pem').value:'').trim();
+ if(!certPem)return showToast('请粘贴或选择证书链 PEM','error');
+ const out=$('cert-result');if(out)out.textContent='执行中…';
+ const body={
+  certId:'local-'+Date.now().toString(36),
+  certName:'本地上传',
+  certPem,
+  keyPem:($('cert-key')?$('cert-key').value:'').trim(),
+  domains:[],
+  sites,
+  action:$('cert-action')?$('cert-action').value:'auto',
+  dryRun:!!dryRun
+ };
+ try{
+  const j=await api('/star/certDeploy',{method:'POST',body:JSON.stringify(body)});
+  if(j.code!==0){if(out)out.textContent='';showToast(j.message||'执行失败','error');return}
+  const r=j.data||{};
+  if(out)out.textContent=JSON.stringify(r,null,2);
+  showToast(r.ok?'已'+(dryRun?'演练':'部署')+'完成':'含失败项', r.ok?'success':'error');
+  await loadCert();
+  const o=$('cert-result');if(o&&r.items)o.textContent=JSON.stringify(r,null,2);
+ }catch(e){if(out)out.textContent='执行失败';}
 }
 
 /* ── 日志清理：已迁移为插件（🧩 插件 → 日志清理；后端接口 logCleanScan/logCleanRun/logCleanConfig 保留在核心） ── */
@@ -2320,7 +3292,7 @@ async function aiSend(){
 /* ── 在线终端（真 PTY + xterm.js；WebSocket 流式，单区域、光标闪烁、命令回显） ── */
 let termSid=sessionStorage.getItem('term_sid')||'';
 if(!termSid){termSid=('t'+Date.now().toString(36)+Math.random().toString(36).slice(2)+Math.random().toString(36).slice(2)).slice(0,40);sessionStorage.setItem('term_sid',termSid)}
-let termInst=null,termFit=null,termWs=null,termReconnectTimer=null;
+let termInst=null,termFit=null,termWs=null,termReconnectTimer=null,termBannerText=null,termBannerTimer=null,termBannerShown=false;
 
 // 资源按需加载（xterm.js 仅在进入终端页时拉取）
 function termEnsureAssets(cb){
@@ -2343,11 +3315,11 @@ function loadTerminal(){
    </div>
   </div>
   <div id="term-box" class="term-box"></div>
-  <div class="text-muted" style="margin-top:8px;font-size:12px">真终端（PTY）：支持 vim/top 等交互式程序与完整键盘操作；命令以服务账户权限运行（Linux 通常 root）；会话在标签页内保持、空闲 30 分钟自动回收；刷新页面自动重连并回放最近输出。</div>
+  <div class="text-muted" style="margin-top:8px;font-size:12px">真终端（PTY）：支持 vim/top 等交互式程序与完整键盘操作；命令以服务账户权限运行（Linux 通常 root）；<b>每条完整命令写入审计</b>（不记逐键输入、疑似口令不记）；危险命令默认需二次确认（子用户直接禁止，可按「Sub 用户白名单」限制可用命令）；会话在标签页内保持、空闲 30 分钟自动回收；刷新页面自动重连并回放最近输出。</div>
  </div>`;
  termEnsureAssets(()=>termInit());
 }
-function termInit(){
+async function termInit(){
  const box=$('term-box');if(!box)return;
  if(!termInst){
   termInst=new Terminal({cursorBlink:true,fontSize:13,fontFamily:'Consolas,"Cascadia Mono",Menlo,"Courier New",monospace',theme:{background:'#0b1220',foreground:'#cbd5e1',cursor:'#60a5fa',selectionBackground:'#334155'},scrollback:5000});
@@ -2357,6 +3329,10 @@ function termInit(){
  }
  if(termInst.element){box.appendChild(termInst.element)}else{termInst.open(box)}
  try{termFit&&termFit.fit()}catch(e){}
+ // 新连接前先取「服务器概况」（失败不阻断：直接连终端）
+ if(!termBannerText){
+  try{const j=await api('/star/termBanner');if(j&&j.code===0&&j.data&&j.data.text)termBannerText=j.data.text}catch(e){}
+ }
  // 已有活连接（面板未离开过）则不重连，避免重复回放；仅同步状态文字
  if(termWs&&termWs.readyState===1){termSetState('已连接','ok');termInst.focus();return}
  termConnect();
@@ -2371,15 +3347,39 @@ function termConnect(){
  if(token)url+='&token='+encodeURIComponent(token);
  let ws;try{ws=new WebSocket(url)}catch(e){termSetState('连接失败','err');return}
  termWs=ws;
- ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');if(termInst){try{termInst.reset()}catch(e){}}try{termFit&&termFit.fit()}catch(e){}};
- ws.onmessage=ev=>{if(termInst&&typeof ev.data==='string')termInst.write(ev.data)};
+ ws.onopen=()=>{if(termWs!==ws)return;termSetState('已连接','ok');termBannerShown=false;try{termFit&&termFit.fit()}catch(e){}termScheduleBanner(700)};
+ ws.onmessage=ev=>{
+  if(!termInst||typeof ev.data!=='string')return;
+  // 控制帧（U+0001 开头）：危险命令二次确认请求
+  if(ev.data.charCodeAt(0)===1){
+   try{const info=JSON.parse(ev.data.slice(1));if(info&&info.t==='askConfirm')termAskConfirm(ws,info)}catch(e){}
+   return;
+  }
+  termInst.write(ev.data);if(!termBannerShown)termScheduleBanner(450);
+ };
  ws.onclose=()=>{if(termWs!==ws)return;termWs=null;termSetState('已断开（3 秒后自动重连）','err');termReconnectTimer=setTimeout(()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active'))termConnect()},3000)};
  ws.onerror=()=>{};
 }
 function termSetState(text,kind){const el=$('term-state');if(el){el.textContent=text;el.className='term-state '+(kind||'')}}
+/* 危险命令二次确认：服务端已清掉当前行，确认后回发一次性令牌才真正执行 */
+function termAskConfirm(ws,info){
+ const cmd=String(info&&info.cmd||''),reason=String(info&&info.reason||'');
+ showModal('⚠ 危险命令确认',
+  `<div class="text-muted" style="font-size:12px;margin-bottom:8px">该命令可能影响系统可用性（${esc(reason)}）。确认后将立即以服务账户权限执行，并记入审计；取消则命令不执行。</div>`+
+  `<pre style="white-space:pre-wrap;word-break:break-all;background:#0b1220;color:#fca5a5;padding:10px;border-radius:8px;font-size:12px;margin:0">${esc(cmd)}</pre>`,
+  '确认执行',()=>{if(termWs===ws&&ws.readyState===1)ws.send(JSON.stringify({t:'cf',token:info.token}))},true);
+}
+/* 服务器概况在「PTY 初始输出静默」后写入：ConPTY 启动会发清屏序列，早写会被擦掉 */
+function termScheduleBanner(ms){
+ clearTimeout(termBannerTimer);
+ termBannerTimer=setTimeout(()=>{
+  if(termBannerShown||!termBannerText||!termInst)return;
+  termBannerShown=true;
+  try{termInst.write(termBannerText)}catch(e){}
+ }, ms||500);
+}
 async function termReset(){
  try{await api('/star/termReset',{method:'POST',body:JSON.stringify({sid:termSid})})}catch(e){}
- if(termInst){try{termInst.reset()}catch(e){}}
  termConnect();
 }
 window.addEventListener('resize',()=>{const el=$('panel-terminal');if(el&&el.classList.contains('active')&&termFit){try{termFit.fit()}catch(e){}}});
@@ -2485,15 +3485,32 @@ function renderUsers(){
  let html=`<div class="glass-card card">
   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
    <h2>👥 用户管理</h2>
-   <button class="btn btn-primary btn-sm" onclick="userEdit('')">➕ 新增用户</button>
+   <div style="display:flex;gap:8px;flex-wrap:wrap">
+    <button class="btn btn-secondary btn-sm" onclick="logoutAllDevices()">🚪 退出所有设备</button>
+    <button class="btn btn-primary btn-sm" onclick="userEdit('')">➕ 新增用户</button>
+   </div>
   </div>
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr><th>用户名</th><th>菜单权限</th><th>状态</th><th style="text-align:right">操作</th></tr></thead>
    <tbody>${rows||'<tr><td colspan="4" class="fm-empty">暂无用户</td></tr>'}</tbody>
   </table></div>
   <div class="text-muted" style="margin-top:10px;font-size:12px">内置管理员（配置文件凭据）拥有全部权限且不可删除（可在此编辑用户名/密码）；其余用户登录后仅能看到被勾选的菜单，越权请求会被服务端拒绝并记入操作日志。</div>
+  <div class="text-muted" style="margin-top:6px;font-size:12px">登录会话默认保持 12 小时（滑动续期，期间用过面板就不掉线；重启/升级服务无需重新登录），可在「配置」页 WebSessionHours 调整；改密码或「退出所有设备」会立即注销其它会话。</div>
  </div>`;
  $('panel-users').innerHTML=html;
+}
+
+// 退出所有其它设备（保留当前浏览器会话）
+function logoutAllDevices(){
+ showModal('退出所有设备',
+  '<div class="text-muted">将注销除当前浏览器以外的全部登录会话，其它设备下次打开面板需要重新输入密码；当前页面保持登录。</div>',
+  '确定退出',
+  async()=>{
+   try{
+    const j=await api('/api/logoutAll',{method:'POST',body:'{}'});
+    showToast(j.code===0?(j.message||'已退出'):(j.message||'操作失败'),j.code===0?'success':'error');
+   }catch(e){}
+  });
 }
 
 // 编辑内置管理员（用户名/密码，均写入配置文件凭据）
@@ -2503,11 +3520,18 @@ function userAdminEdit(name){
    <span class="text-secondary" style="font-size:12px">用户名</span>
    <input type="text" id="admin-name" value="${escAttr(name)}" style="width:100%;margin-top:4px">
    <span class="text-secondary" style="font-size:12px;display:block;margin-top:10px">新密码（留空则不修改）</span>
-   <input type="password" id="admin-pass" style="width:100%;margin-top:4px" autocomplete="new-password">`,
+   <input type="password" id="admin-pass" style="width:100%;margin-top:4px" autocomplete="new-password">
+   <span class="text-secondary" style="font-size:12px;display:block;margin-top:10px">确认新密码</span>
+   <input type="password" id="admin-pass2" style="width:100%;margin-top:4px" autocomplete="new-password" placeholder="再次输入以确认">`,
   '保存',async()=>{
    const nm=$('admin-name')?$('admin-name').value.trim():'';
    const pw=$('admin-pass')?$('admin-pass').value:'';
+   const pw2=$('admin-pass2')?$('admin-pass2').value:'';
    if(!nm){showToast('用户名不能为空','error');return}
+   if(pw || pw2){
+    if(pw.length<4){showToast('密码至少 4 位','error');return}
+    if(pw!==pw2){showToast('两次输入的密码不一致','error');return}
+   }
    if(nm.toLowerCase()===name.toLowerCase()&&!pw){showToast('未修改任何内容','error');return}
    const payload={name,newName:nm};
    if(pw)payload.password=pw;
@@ -2527,6 +3551,8 @@ function userEdit(name){
    <input type="text" id="user-name" value="${escAttr(name)}" ${u?'disabled':''} style="width:100%;margin-top:4px" placeholder="登录用户名"></div>
   <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">密码${u?'（留空则不修改）':'（必填）'}</span>
    <input type="password" id="user-pass" style="width:100%;margin-top:4px" placeholder="${u?'••••••':'设置初始密码'}" autocomplete="new-password"></div>
+  <div style="margin-bottom:10px"><span class="text-secondary" style="font-size:12px">确认密码</span>
+   <input type="password" id="user-pass2" style="width:100%;margin-top:4px" placeholder="再次输入以确认（防手误）" autocomplete="new-password"></div>
   <div style="margin-bottom:6px"><span class="text-secondary" style="font-size:12px">菜单权限</span></div>
   <div class="perm-grid">${boxes}</div>
   <div style="margin:8px 0 10px"><label class="perm-item" style="font-size:13px"><input type="checkbox" id="user-enabled" ${!u||u.enabled?'checked':''}> 启用该用户</label></div>
@@ -2536,10 +3562,17 @@ function userEdit(name){
   const nmEl=$('user-name');
   const nameVal=nmEl?nmEl.value.trim():name;
   const pass=$('user-pass')?$('user-pass').value:'';
+  const pass2=$('user-pass2')?$('user-pass2').value:'';
   const enabled=$('user-enabled')?$('user-enabled').checked:true;
   const remark=$('user-remark')?$('user-remark').value.trim():'';
   const permissions=[...document.querySelectorAll('.perm-grid input:checked')].map(c=>c.value);
   if(!nameVal){showToast('用户名不能为空','error');return}
+  // 新增用户密码必填；编辑时留空 = 不改密码；两次输入必须一致（防手误）
+  if(!u && !pass){showToast('请设置初始密码','error');return}
+  if(pass || pass2){
+   if(pass.length<4){showToast('密码至少 4 位','error');return}
+   if(pass!==pass2){showToast('两次输入的密码不一致','error');return}
+  }
   const builtin=(usersData&&usersData.users||[]).find(x=>x.isBuiltin);
   if(builtin&&nameVal.toLowerCase()===String(builtin.userName||'').toLowerCase()){showToast('该名称属于内置管理员，请另选名称','error');return}
   const payload={name:nameVal,enabled,remark,permissions};
@@ -2625,7 +3658,7 @@ function installDropUpload(){
 }
 installDropUpload();
 
-token=sessionStorage.getItem('agent_token')||'';
+token=storedToken();
 if(token)showApp();
 else probeAuthlessAccess();
 

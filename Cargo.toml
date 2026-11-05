@@ -1,6 +1,6 @@
 [package]
 name = "pek-ragent"
-version = "0.1.13"
+version = "0.1.98"
 edition = "2024"
 description = "Pek.RAgent：星尘代理（StarAgent 的 Rust 实现）——多应用守护、影子目录部署、跨平台服务管理与本地 HTTP 控制接口"
 authors = ["PeiKeSmart"]
@@ -15,7 +15,7 @@ license = "MIT"
 # 插件协议（plugin：插件包格式 + 插件源目录 Ed25519 签名，与 Pek.RPanlServer 共用）、
 # AI 客户端（net::openai：OpenAI 兼容 /chat/completions）
 # 网络与 TLS：服务器节点 wss 通道依赖 net-tls（含 http-tls，覆盖 AI 助手/插件源等 HTTPS 调用）
-dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch"] }
+dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch", "fileman"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
 # 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
@@ -31,12 +31,21 @@ chrono = "0.4"
 
 # 部署包解压（与 Pek.RCode 同版本同特性；纯 Rust deflate）
 zip = { version = "2", default-features = false, features = ["deflate"] }
+# 应用包一键部署（面板「上传应用包」）：Linux 发行包常见 .tar.gz，需 gzip + tar 解包
+# （两者均为纯 Rust，可 zig 交叉编译到全部 musl 目标）
+flate2 = "1"
+tar = "0.4"
 # 注：在线插件源签名（Ed25519）已随插件协议下沉至 dhrust::plugin（feature "plugin"）
 # HTTP 服务端宿主运行时（dhrust::net::http 基于 hyper/tokio）
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[lints.rust]
+# zig 交叉链接时会输出 “ignoring deprecated linker optimization setting” 提示（-Wl,-O1），
+# 属工具链噪音而非代码/链接问题；静默以免掩盖真正的构建告警。
+linker_messages = "allow"
 
 [target.'cfg(windows)'.dependencies]
 # 注：Windows 服务运行时（windows-service）已随 service 模块下沉至 dhrust
@@ -64,4 +73,12 @@ windows-sys = { version = "0.59", features = [
 lto = "thin"
 strip = true
 # 启用增量编译：重打包时只重编改动部分（缓存位于 target/*/release/incremental）
+incremental = true
+
+# 本地快速构建（继承 release，关闭 LTO、提高并行）：cargo build --profile fast
+# 只用于日常调测，不作为交付物（交付走 scripts/build-release.ps1）
+[profile.fast]
+inherits = "release"
+lto = false
+codegen-units = 16
 incremental = true

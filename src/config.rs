@@ -70,6 +70,14 @@ pub struct AgentConfig {
     pub web_user_password: String,
     /// Web 面板鉴权级别。None 不鉴权；LocalOnly 本地免鉴权、远程需鉴权（默认）；Full 全部鉴权
     pub web_auth_level: String,
+    /// 信任反向代理转发头（`X-Real-IP` / `X-Forwarded-For`）。**仅在面板前面有可信反代时开启**。
+    ///
+    /// 开启后，对端为回环且带转发头时按真实 IP 判定“是否本机”、写入审计与登录限流；
+    /// 默认 false：只要对端是回环又带转发头，就按“反代来的远程请求”要求登录（防 nginx 后整体免登录）。
+    pub trust_forwarded_for: bool,
+    /// 面板登录会话保持时长（小时，滑动续期：期间用过面板就不掉线；重启/升级不掉登录）。
+    /// 默认 12；0 = 关闭持久化（仅进程内 24 小时，重启即失效）
+    pub web_session_hours: u32,
     /// 后台资源采样间隔（毫秒）。默认 1000；0 = 关闭后台采样（回退为面板请求时现采）
     pub sample_interval: u64,
     /// 网站流量统计。解析 nginx/apache 访问日志（自动发现常见站点 + `web_logs` 手动补充），默认开启
@@ -81,11 +89,25 @@ pub struct AgentConfig {
     pub port_traffic: bool,
     /// 端口流量统计端口列表。形如 `22,80,443,3306`；留空 = 自动取系统监听端口
     pub port_traffic_ports: String,
+    /// 面板 HTTPS（自签**叶子**证书，SAN 自动含本机全部网卡 IP；证书落 `Config/keys/panel.pem`）。
+    /// **默认开启**（同端口切换，不额外占端口）：浏览器用 `https://内网IP:端口` 访问，
+    /// 旧书签 `http://` 会被自动 301 到 https（不会连不上）；首次访问前需导入一次证书信任。
+    /// **修改后重启服务生效**
+    pub tls: bool,
     /// 流量历史保留天数（SQLite 每日归档 `Data/traffic.db`，模型见 `Entity/Model.xml`）。默认 90；0 = 永久保留
     pub traffic_history_days: u32,
     /// 日志清理自定义路径（分号分隔；目录=清空内容、文件=截断清空）。
     /// 供 Web 面板「日志清理」页在平台内置分类之外额外扫描/清理
     pub log_cleanup_paths: String,
+    /// 证书托管白名单（逗号/分号分隔；**空 = 全部站点只读**，不接受任何平台下发的写入）。
+    ///
+    /// 平台「证书」页只能对白名单内的站点执行安装/替换；支持：
+    /// 站点 key（`nginx:/path#1` / `iis:站点名`）、nginx 配置文件路径、域名或域名通配符（`*.example.com`）。
+    pub cert_managed_sites: String,
+    /// nginx 站点配置目录（逗号分隔，追加在自动发现目录之后；如 `/data/nginx/vhost`）
+    pub cert_nginx_dirs: String,
+    /// nginx 可执行文件（空 = `nginx`，即 PATH 查找；宝塔常为 `/www/server/nginx/sbin/nginx`）
+    pub cert_nginx_bin: String,
     /// 在线插件源地址（`catalog.json` URL；仅 https，127.0.0.1 例外）。空 = 关闭在线插件
     pub plugin_store_url: String,
     /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
@@ -99,6 +121,9 @@ pub struct AgentConfig {
     /// 平台接入令牌（Pek.RPanlServer「服务器节点」页生成；配置后启用 WebSocket 实时通道：
     /// 上报机器数据到平台并接收「立即检查升级」指令。空 = 不接入）
     pub auto_upgrade_token: String,
+    /// 免令牌配对：令牌为空时是否仍尝试接入平台（默认 true）。
+    /// 接上后平台把它放进「待批准」队列，管理员批准即下发专用令牌并写回本配置。
+    pub pairing_enabled: bool,
     /// 节点标识（平台「服务器节点」识别本机的唯一 ID）。首次运行自动生成随机值并写入本文件，
     /// 此后保持不变；克隆镜像/整机复制的多台服务器也不会撞号。一般无需修改
     pub agent_id: String,
@@ -112,6 +137,13 @@ pub struct AgentConfig {
     pub ai_api_key: String,
     /// 在线终端。启用后可在面板「在线终端」页执行服务器命令（免 SSH；命令以本程序/服务账户权限运行，全部记入审计）
     pub terminal_enabled: bool,
+    /// 在线终端：记录每一条完整命令（只记命令行，不记逐键输入；疑似口令输入不记）
+    pub terminal_command_audit: bool,
+    /// 在线终端：危险命令策略。`confirm`=管理员需二次确认、子用户禁止（默认）；`block`=所有人禁止；`allow`=只审计不拦截
+    pub terminal_danger_policy: String,
+    /// 在线终端：子用户命令白名单（`;` 或换行分隔的前缀，如 `systemctl restart;df -h`）。
+    /// **留空 = 禁止子用户使用终端**（终端本质是 root 级 shell）；管理员不受限制
+    pub terminal_allowed_commands: String,
     /// 应用服务集合
     pub apps: Vec<AppConfig>,
 }
@@ -138,6 +170,9 @@ impl Default for AgentConfig {
             web_user_name: "admin".to_string(),
             web_user_password: "admin".to_string(),
             web_auth_level: "LocalOnly".to_string(),
+            trust_forwarded_for: false,
+            // 登录会话：默认保持 12 小时（滑动续期），避免重启后/隔天反复输入密码
+            web_session_hours: 12,
             sample_interval: 1000,
             // 网站流量：只读日志文件、无系统副作用，默认开启（面板直接可见）
             web_traffic: true,
@@ -146,20 +181,31 @@ impl Default for AgentConfig {
             // 关闭/卸载自动清理；无 nft/权限不足自动降级连接视图，Windows 为连接视图）
             port_traffic: true,
             port_traffic_ports: String::new(),
+            // 面板 HTTPS：默认开启（同端口切换；明文请求自动 301 到 https）
+            tls: true,
             // 流量历史：每日归档保留 90 天（0 = 永久）
             traffic_history_days: 90,
             log_cleanup_paths: String::new(),
+            // 证书托管：默认**空**（全部站点只读，平台只能盘点/生成计划，不能写入）——
+            // 生产环境先只读盘点，确认无误后再把试验站点加入白名单
+            cert_managed_sites: String::new(),
+            cert_nginx_dirs: String::new(),
+            cert_nginx_bin: String::new(),
             plugin_store_url: String::new(),
             plugin_store_pubkey: String::new(),
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
             auto_upgrade_interval_minutes: 60,
             auto_upgrade_token: String::new(),
+            pairing_enabled: true,
             agent_id: String::new(),
             ai_enabled: true,
             ai_base_url: "https://api.deepseek.com/v1".to_string(),
             ai_model: "deepseek-chat".to_string(),
             ai_api_key: String::new(),
             terminal_enabled: true,
+            terminal_command_audit: true,
+            terminal_danger_policy: "confirm".to_string(),
+            terminal_allowed_commands: String::new(),
             apps: sample_apps(),
         }
     }
@@ -389,6 +435,10 @@ impl AgentConfig {
         if self.web_auth_level.trim().is_empty() {
             self.web_auth_level = "LocalOnly".to_string();
         }
+        // 会话保持时长：0 = 关闭持久化；上限 8760 小时（365 天，防误配成天文数字）
+        if self.web_session_hours > 8760 {
+            self.web_session_hours = 8760;
+        }
         // 采样间隔：0 = 关闭后台采样；非 0 时限定 200ms~60s（防误配打爆 CPU 或采样过粗）
         if self.sample_interval != 0 {
             self.sample_interval = self.sample_interval.clamp(200, 60_000);
@@ -400,6 +450,15 @@ impl AgentConfig {
         self.plugin_store_pubkey = self.plugin_store_pubkey.trim().to_string();
         self.auto_upgrade_url = self.auto_upgrade_url.trim().to_string();
         self.auto_upgrade_token = self.auto_upgrade_token.trim().to_string();
+        // 终端危险命令策略：只认三档，非法值回落 confirm（最安全的默认口径）
+        self.terminal_danger_policy = self.terminal_danger_policy.trim().to_ascii_lowercase();
+        if !matches!(
+            self.terminal_danger_policy.as_str(),
+            "confirm" | "block" | "allow"
+        ) {
+            self.terminal_danger_policy = "confirm".to_string();
+        }
+        self.terminal_allowed_commands = self.terminal_allowed_commands.trim().to_string();
         if self.auto_upgrade_interval_minutes == 0 {
             self.auto_upgrade_interval_minutes = 60;
         } else {
@@ -482,6 +541,7 @@ impl AgentConfig {
     /// - 已存在同名（大小写不敏感）：覆盖程序路径，目录/参数传 `None` 时保留原值；
     /// - 不存在：新增条目；
     /// - 两者均置为启用（注册即启用，星尘启动/重载时会拉起）。
+    ///
     /// 返回 `true` 表示产生变化；名称或程序路径为空时返回 `false`。
     pub fn upsert_app(
         &mut self,
@@ -526,6 +586,15 @@ impl AgentConfig {
 
 /// 读取 XML 配置（键值 + `Services/ServiceInfo` 属性列表）。
 fn read_xml_config(path: &Path) -> Result<AgentConfig, String> {
+    read_config_file(path).map(|(cfg, _)| cfg)
+}
+
+/// 只读读取**任意路径**的星尘 XML 配置（不生成默认、不补齐、不写盘）。
+///
+/// 返回（配置对象, 原始根对象）：原始根对象供调用方读取 Rust 未建模的 C# 键
+/// （如 C# 版 `LocalPort`/`ServiceName` 的“未填写”与默认值区分）。仅用于
+/// 从 C# 版星尘迁移（见 `crate::migrate`）等需要“看一眼别人配置”的场景。
+pub fn read_config_file(path: &Path) -> Result<(AgentConfig, Json), String> {
     let text = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let json = dhrust::config::read_xml_to_json(&text).map_err(|e| e.to_string())?;
     let root = json
@@ -536,7 +605,7 @@ fn read_xml_config(path: &Path) -> Result<AgentConfig, String> {
     if !root.is_object() {
         return Err("未识别的配置结构（缺少根节点）".to_string());
     }
-    Ok(config_from_json(&root))
+    Ok((config_from_json(&root), root))
 }
 
 /// XML（JSON 形态）→ 配置。缺失键取默认值；C# 特有字段忽略但保留在文件中。
@@ -617,6 +686,12 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_nonempty(obj, "WebAuthLevel") {
         cfg.web_auth_level = v;
     }
+    if let Some(v) = parse_of::<u32>(obj, "WebSessionHours") {
+        cfg.web_session_hours = v;
+    } else if let Some(v) = parse_of::<u32>(obj, "WebSessionDays") {
+        // 兼容旧键（按天换算）
+        cfg.web_session_hours = v.saturating_mul(24);
+    }
     if let Some(v) = parse_of::<u64>(obj, "SampleInterval") {
         cfg.sample_interval = v;
     }
@@ -629,6 +704,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = bool_of(obj, "PortTraffic") {
         cfg.port_traffic = v;
     }
+    if let Some(v) = bool_of(obj, "Tls") {
+        cfg.tls = v;
+    }
     if let Some(v) = text_of(obj, "PortTrafficPorts") {
         cfg.port_traffic_ports = v;
     }
@@ -637,6 +715,15 @@ fn config_from_json(root: &Json) -> AgentConfig {
     }
     if let Some(v) = text_of(obj, "LogCleanupPaths") {
         cfg.log_cleanup_paths = v;
+    }
+    if let Some(v) = text_of(obj, "CertManagedSites") {
+        cfg.cert_managed_sites = v;
+    }
+    if let Some(v) = text_of(obj, "CertNginxDirs") {
+        cfg.cert_nginx_dirs = v;
+    }
+    if let Some(v) = text_of(obj, "CertNginxBin") {
+        cfg.cert_nginx_bin = v;
     }
     if let Some(v) = text_of(obj, "PluginStoreUrl") {
         cfg.plugin_store_url = v;
@@ -670,6 +757,15 @@ fn config_from_json(root: &Json) -> AgentConfig {
     }
     if let Some(v) = bool_of(obj, "TerminalEnabled") {
         cfg.terminal_enabled = v;
+    }
+    if let Some(v) = bool_of(obj, "TerminalCommandAudit") {
+        cfg.terminal_command_audit = v;
+    }
+    if let Some(v) = text_of(obj, "TerminalDangerPolicy") {
+        cfg.terminal_danger_policy = v;
+    }
+    if let Some(v) = text_of(obj, "TerminalAllowedCommands") {
+        cfg.terminal_allowed_commands = v;
     }
 
     // 应用列表：<Services><ServiceInfo Name=".." FileName=".." ... /></Services>
@@ -792,13 +888,19 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("WebUserName", cfg.web_user_name.clone());
         push("WebPassword", cfg.web_user_password.clone());
         push("WebAuthLevel", cfg.web_auth_level.clone());
+        push("TrustForwardedFor", bool_text(cfg.trust_forwarded_for));
+        push("WebSessionHours", cfg.web_session_hours.to_string());
         push("SampleInterval", cfg.sample_interval.to_string());
         push("WebTraffic", bool_text(cfg.web_traffic));
         push("WebLogs", cfg.web_logs.clone());
         push("PortTraffic", bool_text(cfg.port_traffic));
         push("PortTrafficPorts", cfg.port_traffic_ports.clone());
+        push("Tls", bool_text(cfg.tls));
         push("TrafficHistoryDays", cfg.traffic_history_days.to_string());
         push("LogCleanupPaths", cfg.log_cleanup_paths.clone());
+        push("CertManagedSites", cfg.cert_managed_sites.clone());
+        push("CertNginxDirs", cfg.cert_nginx_dirs.clone());
+        push("CertNginxBin", cfg.cert_nginx_bin.clone());
         push("PluginStoreUrl", cfg.plugin_store_url.clone());
         push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
         push("AutoUpgradeUrl", cfg.auto_upgrade_url.clone());
@@ -813,6 +915,9 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("AiModel", cfg.ai_model.clone());
         push("AiApiKey", cfg.ai_api_key.clone());
         push("TerminalEnabled", bool_text(cfg.terminal_enabled));
+        push("TerminalCommandAudit", bool_text(cfg.terminal_command_audit));
+        push("TerminalDangerPolicy", cfg.terminal_danger_policy.clone());
+        push("TerminalAllowedCommands", cfg.terminal_allowed_commands.clone());
         // 文件承载键（C# 特有标量）：当前文件有值则原样带入（缺省保持模板默认，防重建丢 C# 数据）
         for key in [
             "Code",
@@ -868,16 +973,14 @@ fn template_comments() -> HashMap<String, String> {
             pending = Some(comment.to_string());
             continue;
         }
-        if let Some(rest) = trimmed.strip_prefix('<') {
-            if let Some(end) = rest.find('>') {
+        if let Some(rest) = trimmed.strip_prefix('<')
+            && let Some(end) = rest.find('>') {
                 let name = &rest[..end];
-                if !name.starts_with('/') && !name.starts_with('?') {
-                    if let Some(comment) = pending.take() {
+                if !name.starts_with('/') && !name.starts_with('?')
+                    && let Some(comment) = pending.take() {
                         map.insert(name.to_string(), comment);
                     }
-                }
             }
-        }
     }
     map
 }
@@ -930,15 +1033,14 @@ fn render_services(previous: &[Json], apps: &[AppConfig]) -> String {
                 .and_then(|v| v.as_str())
                 .map(|n| n.eq_ignore_ascii_case(&app.name))
                 .unwrap_or(false)
-        }) {
-            if let Some(obj) = old.as_object() {
+        })
+            && let Some(obj) = old.as_object() {
                 for (key, value) in obj {
                     if !KNOWN_SERVICE_ATTRS.contains(&key.as_str()) {
                         attrs.push((key.clone(), value.as_str().unwrap_or("").to_string()));
                     }
                 }
             }
-        }
 
         // Rust 字段（固定顺序，对齐 C# `ServiceInfo` 声明序；Mode 写 C# 数值 10-13）
         attrs.push(("Name".to_string(), app.name.clone()));
@@ -1083,8 +1185,10 @@ mod tests {
         assert_eq!(cfg.sample_interval, 2500);
 
         // 归一化：下限/上限保护；0 = 关闭后台采样
-        let mut cfg = AgentConfig::default();
-        cfg.sample_interval = 50;
+        let mut cfg = AgentConfig {
+            sample_interval: 50,
+            ..AgentConfig::default()
+        };
         cfg.normalize();
         assert_eq!(cfg.sample_interval, 200);
         cfg.sample_interval = 999_999;
@@ -1095,8 +1199,10 @@ mod tests {
         assert_eq!(cfg.sample_interval, 0);
 
         // 渲染：写入模板骨架（保留注释）
-        let mut cfg = AgentConfig::default();
-        cfg.sample_interval = 2500;
+        let cfg = AgentConfig {
+            sample_interval: 2500,
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<SampleInterval>2500</SampleInterval>"),
@@ -1167,8 +1273,10 @@ mod tests {
         assert!(AgentConfig::default().log_cleanup_paths.is_empty());
 
         // 渲染：模板骨架带上新字段（注释由模板保障；空值也应写出空元素）
-        let mut cfg = AgentConfig::default();
-        cfg.log_cleanup_paths = "/www/wwwlogs;/tmp/cache".to_string();
+        let cfg = AgentConfig {
+            log_cleanup_paths: "/www/wwwlogs;/tmp/cache".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<LogCleanupPaths>/www/wwwlogs;/tmp/cache</LogCleanupPaths>"),
@@ -1191,8 +1299,10 @@ mod tests {
         let default = AgentConfig::default();
         assert!(default.plugin_store_url.is_empty());
         assert!(default.plugin_store_pubkey.is_empty());
-        let mut cfg = AgentConfig::default();
-        cfg.plugin_store_url = "https://x.example/catalog.json".to_string();
+        let cfg = AgentConfig {
+            plugin_store_url: "https://x.example/catalog.json".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(
             text.contains("<PluginStoreUrl>https://x.example/catalog.json</PluginStoreUrl>"),
@@ -1225,8 +1335,10 @@ mod tests {
         assert!(default.ai_enabled);
         assert!(default.ai_api_key.is_empty());
 
-        let mut cfg = AgentConfig::default();
-        cfg.ai_model = "deepseek-reasoner".to_string();
+        let cfg = AgentConfig {
+            ai_model: "deepseek-reasoner".to_string(),
+            ..AgentConfig::default()
+        };
         let text = render_xml(&cfg, None).unwrap();
         assert!(text.contains("<AiModel>deepseek-reasoner</AiModel>"), "{text}");
         assert!(
@@ -1245,6 +1357,30 @@ mod tests {
         assert!(AgentConfig::default().terminal_enabled);
         let text = render_xml(&AgentConfig::default(), None).unwrap();
         assert!(text.contains("<TerminalEnabled>true</TerminalEnabled>"), "{text}");
+    }
+
+    #[test]
+    fn terminal_control_read_render() {
+        let json: Json = serde_json::from_str(
+            r#"{ "TerminalCommandAudit": "false", "TerminalDangerPolicy": "BLOCK", "TerminalAllowedCommands": " docker ps;systemctl restart " }"#,
+        )
+        .unwrap();
+        let mut cfg = config_from_json(&json);
+        cfg.normalize();
+        assert!(!cfg.terminal_command_audit);
+        assert_eq!(cfg.terminal_danger_policy, "block");
+        assert_eq!(cfg.terminal_allowed_commands, "docker ps;systemctl restart");
+
+        // 非法策略回落 confirm（最安全默认）
+        let bad: Json = serde_json::from_str(r#"{ "TerminalDangerPolicy": "whatever" }"#).unwrap();
+        let mut cfg = config_from_json(&bad);
+        cfg.normalize();
+        assert_eq!(cfg.terminal_danger_policy, "confirm");
+
+        let text = render_xml(&AgentConfig::default(), None).unwrap();
+        assert!(text.contains("<TerminalCommandAudit>true</TerminalCommandAudit>"), "{text}");
+        assert!(text.contains("<TerminalDangerPolicy>confirm</TerminalDangerPolicy>"), "{text}");
+        assert!(text.contains("<TerminalAllowedCommands></TerminalAllowedCommands>"), "{text}");
     }
 
     #[test]
@@ -1423,8 +1559,10 @@ mod tests {
     #[test]
     fn migrates_from_legacy_json() {
         let base = temp_base("migrate");
-        let mut old = AgentConfig::default();
-        old.local_port = 5601;
+        let mut old = AgentConfig {
+            local_port: 5601,
+            ..AgentConfig::default()
+        };
         old.apps = vec![AppConfig {
             name: "legacy".to_string(),
             file_name: "legacy.zip".to_string(),

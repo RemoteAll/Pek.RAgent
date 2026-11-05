@@ -16,7 +16,7 @@
 //! - `Agent_WebTrafficDaily`：日期 + 站点 → 请求数 / 字节 / UV / 状态码分布；
 //! - `Agent_PortTrafficDaily`：日期 + 协议 + 端口 → 当日接收 / 发送字节。
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -162,6 +162,10 @@ pub(crate) fn drop_storage_for_test(base: &Path) {
 // ————— 写入 —————
 
 /// 合并写入某日网站快照（按自然键“日期 + 站点”覆盖；幂等）。
+///
+/// 性能：先**一次查询**取出当日已有行建立「站点 → 主键」索引，随后命中行按主键更新、
+/// 新增行合成**一次批量插入**。相比逐行 `upsert_by_key`（每行 1 次 SELECT + 1 次写），
+/// 每次归档的 SQL 往返从 `2N` 降到约 `1 + K + 1`（跨天首次归档只需 2 次）。
 pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
     if sites.is_empty() {
         return;
@@ -180,14 +184,43 @@ pub fn update_web(base: &Path, date: &str, sites: &BTreeMap<String, SiteDay>) {
             return;
         }
     };
+    let dal = store.dal();
+    let known = load_day_index(dal, session.as_mut(), &day)
+        .map(|index| index.web)
+        .unwrap_or_default();
+    let mut fresh: Vec<Vec<(&str, DbValue)>> = Vec::new();
     for (site, stats) in sites {
-        if let Err(e) = upsert_web_row(store.dal(), session.as_mut(), &day, site, stats) {
-            util::log_error(&format!("网站流量落库失败（{date} {site}）：{e}"));
+        let values = web_values(stats);
+        match known.get(site) {
+            Some(id) => {
+                if let Err(e) = dal
+                    .table(TABLE_WEB)
+                    .and_then(|t| t.update_by_pk(session.as_mut(), &values, &[(*id).into()]))
+                {
+                    util::log_error(&format!("网站流量落库失败（{date} {site}）：{e}"));
+                }
+            }
+            None => {
+                let mut row: Vec<(&str, DbValue)> = Vec::with_capacity(values.len() + 2);
+                row.push(("StatDate", day.into()));
+                row.push(("Site", site.as_str().into()));
+                row.extend(values);
+                fresh.push(row);
+            }
         }
+    }
+    if !fresh.is_empty()
+        && let Err(e) =
+            dal.table(TABLE_WEB)
+                .and_then(|t| t.insert_batch(session.as_mut(), &fresh, None))
+    {
+        util::log_error(&format!("网站流量新增落库失败（{date}）：{e}"));
     }
 }
 
 /// 合并写入某日端口快照（按自然键“日期 + 协议 + 端口”覆盖；幂等）。
+///
+/// 性能策略同 [`update_web`]：一次查询建索引 + 命中逐行更新 + 新增批量插入。
 pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounters>) {
     if ports.is_empty() {
         return;
@@ -206,17 +239,121 @@ pub fn update_ports(base: &Path, date: &str, ports: &BTreeMap<String, PortCounte
             return;
         }
     };
+    let dal = store.dal();
+    let known = load_day_index(dal, session.as_mut(), &day)
+        .map(|index| index.ports)
+        .unwrap_or_default();
+    let mut fresh: Vec<Vec<(&str, DbValue)>> = Vec::new();
     for (key, counters) in ports {
         let Some((proto, port)) = parse_port_key(key) else {
             continue;
         };
-        if let Err(e) = upsert_port_row(store.dal(), session.as_mut(), &day, proto, port, counters) {
-            util::log_error(&format!("端口流量落库失败（{date} {key}）：{e}"));
+        let values: [(&str, DbValue); 2] = [
+            ("Rx", to_i64(counters.rx).into()),
+            ("Tx", to_i64(counters.tx).into()),
+        ];
+        match known.get(&(proto.to_string(), port)) {
+            Some(id) => {
+                if let Err(e) = dal
+                    .table(TABLE_PORTS)
+                    .and_then(|t| t.update_by_pk(session.as_mut(), &values, &[(*id).into()]))
+                {
+                    util::log_error(&format!("端口流量落库失败（{date} {key}）：{e}"));
+                }
+            }
+            None => {
+                let mut row: Vec<(&str, DbValue)> = Vec::with_capacity(values.len() + 3);
+                row.push(("StatDate", day.into()));
+                row.push(("Proto", proto.into()));
+                row.push(("Port", i32::from(port).into()));
+                row.extend(values);
+                fresh.push(row);
+            }
         }
+    }
+    if !fresh.is_empty()
+        && let Err(e) =
+            dal.table(TABLE_PORTS)
+                .and_then(|t| t.insert_batch(session.as_mut(), &fresh, None))
+    {
+        util::log_error(&format!("端口流量新增落库失败（{date}）：{e}"));
     }
 }
 
-/// 插入或更新一行网站流量（自然键：日期 + 站点；机制下沉 `pek_rcode::dal::TableRef::upsert_by_key`）。
+/// 当日已有行索引（自然键 → 主键 Id）。
+#[derive(Default)]
+struct DayIndex {
+    /// 站点 → Id（`Agent_WebTrafficDaily`）。
+    web: HashMap<String, i64>,
+    /// (协议, 端口) → Id（`Agent_PortTrafficDaily`）。
+    ports: HashMap<(String, u16), i64>,
+}
+
+/// 一次查询取出当日两类表的 `(主键, 自然键)`，供归档时直接按主键更新。
+fn load_day_index(
+    dal: &Dal,
+    session: &mut dyn SqlSession,
+    day: &NaiveDateTime,
+) -> pek_rcode::Result<DayIndex> {
+    let mut index = DayIndex::default();
+    let web = dal.table(TABLE_WEB)?;
+    let rows = web.query(
+        session,
+        &Query::new()
+            .column("Id")
+            .column("Site")
+            .filter(Where::new().eq("StatDate", *day)),
+    )?;
+    for row in rows.rows.iter() {
+        let Some(id) = row.get_by_name("Id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        if let Some(site) = row.get_by_name("Site").and_then(|v| v.as_str()) {
+            index.web.insert(site.to_string(), id);
+        }
+    }
+    let ports = dal.table(TABLE_PORTS)?;
+    let rows = ports.query(
+        session,
+        &Query::new()
+            .column("Id")
+            .column("Proto")
+            .column("Port")
+            .filter(Where::new().eq("StatDate", *day)),
+    )?;
+    for row in rows.rows.iter() {
+        let Some(id) = row.get_by_name("Id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let proto = row
+            .get_by_name("Proto")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default()
+            .to_string();
+        let port = row
+            .get_by_name("Port")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            .clamp(0, u16::MAX as i64) as u16;
+        index.ports.insert((proto, port), id);
+    }
+    Ok(index)
+}
+
+/// 网站流量计数列（与自然键无关的可变部分）。
+fn web_values(stats: &SiteDay) -> [(&'static str, DbValue); 7] {
+    [
+        ("Hits", to_i64(stats.hits).into()),
+        ("Bytes", to_i64(stats.bytes).into()),
+        ("UV", to_i64(stats.uv).into()),
+        ("S2xx", to_i64(stats.s2xx).into()),
+        ("S3xx", to_i64(stats.s3xx).into()),
+        ("S4xx", to_i64(stats.s4xx).into()),
+        ("S5xx", to_i64(stats.s5xx).into()),
+    ]
+}
+
+/// 插入或更新一行网站流量（自然键：日期 + 站点；旧 JSON 迁移与测试用）。
 fn upsert_web_row(
     dal: &Dal,
     session: &mut dyn SqlSession,
@@ -226,15 +363,7 @@ fn upsert_web_row(
 ) -> pek_rcode::Result<()> {
     let table = dal.table(TABLE_WEB)?;
     let keys: [(&str, DbValue); 2] = [("StatDate", (*day).into()), ("Site", site.into())];
-    let values: [(&str, DbValue); 7] = [
-        ("Hits", to_i64(stats.hits).into()),
-        ("Bytes", to_i64(stats.bytes).into()),
-        ("UV", to_i64(stats.uv).into()),
-        ("S2xx", to_i64(stats.s2xx).into()),
-        ("S3xx", to_i64(stats.s3xx).into()),
-        ("S4xx", to_i64(stats.s4xx).into()),
-        ("S5xx", to_i64(stats.s5xx).into()),
-    ];
+    let values = web_values(stats);
     table.upsert_by_key(session, &keys, &values, &[])?;
     Ok(())
 }
@@ -314,26 +443,18 @@ pub fn maybe_prune(base: &Path, retention_days: u32) {
         let Ok(table) = store.dal().table(table_name) else {
             continue;
         };
-        let filter = Where::new().lt("StatDate", cutoff);
-        let rows = match table.query(
+        // 单条分块删除（引擎生成 `DELETE ... WHERE ...` 分批执行），
+        // 相比「查 Id 再逐条 delete_by_pk」省掉 N 次往返。
+        match table.delete_where_batched(
             session.as_mut(),
-            &Query::new()
-                .column("Id")
-                .filter(filter)
-                .take(MAX_PRUNE_ROWS),
+            &Where::new().lt("StatDate", cutoff),
+            None,
+            Some(MAX_PRUNE_ROWS as u64),
+            None,
         ) {
-            Ok(rows) => rows,
+            Ok(rows) => removed += rows as usize,
             Err(e) => {
-                util::log_error(&format!("流量历史清理查询失败（{table_name}）：{e}"));
-                continue;
-            }
-        };
-        for row in &rows {
-            let Some(id) = row.get_by_name("Id").and_then(|v| v.as_i64()) else {
-                continue;
-            };
-            if table.delete_by_pk(session.as_mut(), &[id.into()]).is_ok() {
-                removed += 1;
+                util::log_error(&format!("流量历史清理失败（{table_name}）：{e}"));
             }
         }
     }
@@ -1116,6 +1237,184 @@ mod tests {
         assert_eq!(days[2]["web"]["sites"]["a.com"]["uv"], 1);
 
         cleanup(&base);
+    }
+
+    /// 批量归档（一次取索引 + 命中按主键更新 + 新增批量插入）与逐行 upsert 结果一致。
+    ///
+    /// 两轮：首轮全部新增（覆盖 `insert_batch` 路径），次轮全部更新（覆盖 `update_by_pk` 路径）。
+    #[test]
+    fn batch_archive_matches_rowwise_upsert() {
+        let batch_base = temp_dir("batch-archive");
+        let row_base = temp_dir("row-archive");
+        let day = "2026-10-22";
+        let mut web: BTreeMap<String, SiteDay> = BTreeMap::new();
+        for i in 0..5u64 {
+            web.insert(format!("s{i}.com"), site(100 + i, 1000 + i, 3));
+        }
+        let mut ports: BTreeMap<String, PortCounters> = BTreeMap::new();
+        for i in 0..8u16 {
+            ports.insert(
+                port_key("tcp", 9000 + i),
+                PortCounters {
+                    rx: 10 + u64::from(i),
+                    tx: 20,
+                },
+            );
+        }
+        for round in 0..2u64 {
+            let bumped: BTreeMap<String, SiteDay> = web
+                .iter()
+                .map(|(k, v)| {
+                    let mut s = v.clone();
+                    s.hits += round;
+                    s.bytes += round;
+                    (k.clone(), s)
+                })
+                .collect();
+            let bumped_ports: BTreeMap<String, PortCounters> = ports
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        PortCounters {
+                            rx: v.rx + round,
+                            tx: v.tx,
+                        },
+                    )
+                })
+                .collect();
+
+            // 被测路径：批量
+            update_web(&batch_base, day, &bumped);
+            update_ports(&batch_base, day, &bumped_ports);
+
+            // 对照路径：逐行 upsert
+            let store = storage(&row_base).unwrap();
+            let _guard = store.lock();
+            let mut session = store.dal().open_session().unwrap();
+            let day_dt = parse_day(day).unwrap();
+            for (k, v) in &bumped {
+                upsert_web_row(store.dal(), session.as_mut(), &day_dt, k, v).unwrap();
+            }
+            for (k, c) in &bumped_ports {
+                let (proto, port) = parse_port_key(k).unwrap();
+                upsert_port_row(store.dal(), session.as_mut(), &day_dt, proto, port, c).unwrap();
+            }
+        }
+
+        assert_eq!(day_web_sites(&batch_base, day), day_web_sites(&row_base, day));
+        assert_eq!(day_ports(&batch_base, day), day_ports(&row_base, day));
+
+        drop_storage_for_test(&batch_base);
+        drop_storage_for_test(&row_base);
+        let _ = std::fs::remove_dir_all(&batch_base);
+        let _ = std::fs::remove_dir_all(&row_base);
+    }
+
+    /// 归档往返基准（手动运行）：
+    /// `cargo test --release bench_archive_roundtrip -- --ignored --nocapture`
+    ///
+    /// 对比「逐行 upsert_by_key」（每行 1 次 SELECT + 1 次写）与
+    /// 「一次取索引 + 命中按主键更新 + 新增批量插入」两种归档实现的耗时。
+    #[test]
+    #[ignore]
+    fn bench_archive_roundtrip() {
+        use std::time::Instant;
+        const ROUNDS: usize = 20;
+        const SITES: usize = 30;
+        const PORTS: usize = 150;
+        let day = "2026-10-22";
+
+        let mut web: BTreeMap<String, SiteDay> = BTreeMap::new();
+        for i in 0..SITES {
+            web.insert(format!("site{i}.example.com"), site(100, 10_000, 10));
+        }
+        let mut ports: BTreeMap<String, PortCounters> = BTreeMap::new();
+        for i in 0..PORTS {
+            ports.insert(
+                port_key("tcp", 10_000 + i as u16),
+                PortCounters { rx: 100, tx: 200 },
+            );
+        }
+
+        // 旧路径：逐行 upsert
+        let old_base = temp_dir("bench-old");
+        let old_day = parse_day(day).unwrap();
+        let start = Instant::now();
+        for round in 0..ROUNDS {
+            let store = storage(&old_base).unwrap();
+            let _guard = store.lock();
+            let mut session = store.dal().open_session().unwrap();
+            for (site_name, stats) in &web {
+                let mut s = stats.clone();
+                s.hits += round as u64;
+                upsert_web_row(store.dal(), session.as_mut(), &old_day, site_name, &s).unwrap();
+            }
+            for (key, counters) in &ports {
+                let (proto, port) = parse_port_key(key).unwrap();
+                let mut c = *counters;
+                c.rx += round as u64;
+                upsert_port_row(store.dal(), session.as_mut(), &old_day, proto, port, &c).unwrap();
+            }
+        }
+        let old_elapsed = start.elapsed();
+
+        // 新路径：索引 + 批量
+        let new_base = temp_dir("bench-new");
+        let start = Instant::now();
+        for round in 0..ROUNDS {
+            let w: BTreeMap<String, SiteDay> = web
+                .iter()
+                .map(|(k, v)| {
+                    let mut s = v.clone();
+                    s.hits += round as u64;
+                    (k.clone(), s)
+                })
+                .collect();
+            update_web(&new_base, day, &w);
+            let p: BTreeMap<String, PortCounters> = ports
+                .iter()
+                .map(|(k, v)| {
+                    (
+                        k.clone(),
+                        PortCounters {
+                            rx: v.rx + round as u64,
+                            tx: v.tx,
+                        },
+                    )
+                })
+                .collect();
+            update_ports(&new_base, day, &p);
+        }
+        let new_elapsed = start.elapsed();
+
+        let rows = (SITES + PORTS) as f64;
+        println!("\n=== 归档往返基准（{ROUNDS} 轮 x {SITES} 站点 + {PORTS} 端口）===");
+        println!(
+            "旧（逐行 upsert，约 {:.0} 次 SQL）：{:?}（{:.2} ms/轮）",
+            rows * 2.0 * ROUNDS as f64,
+            old_elapsed,
+            old_elapsed.as_secs_f64() * 1000.0 / ROUNDS as f64
+        );
+        println!(
+            "新（索引+批量，约 {:.0} 次 SQL）：{:?}（{:.2} ms/轮）",
+            (rows + 2.0) * ROUNDS as f64,
+            new_elapsed,
+            new_elapsed.as_secs_f64() * 1000.0 / ROUNDS as f64
+        );
+        println!(
+            "加速比：{:.2}x\n",
+            old_elapsed.as_secs_f64() / new_elapsed.as_secs_f64()
+        );
+
+        // 数据一致性
+        assert_eq!(day_web_sites(&old_base, day), day_web_sites(&new_base, day));
+        assert_eq!(day_ports(&old_base, day), day_ports(&new_base, day));
+
+        drop_storage_for_test(&old_base);
+        drop_storage_for_test(&new_base);
+        let _ = std::fs::remove_dir_all(&old_base);
+        let _ = std::fs::remove_dir_all(&new_base);
     }
 
     #[test]

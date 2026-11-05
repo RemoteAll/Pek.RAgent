@@ -38,6 +38,9 @@ body::before{content:'';position:fixed;inset:0;background:radial-gradient(ellips
 .login-box input:focus{border-color:var(--brand-500);box-shadow:0 0 0 3px rgba(91,91,255,0.25)}
 .login-box .err{color:var(--red);text-align:center;margin-top:12px;font-size:13px;display:none}
 .login-box .err.show{display:block}
+/* 「保持登录」复选框：避开 .login-box input 的全宽/上下留白 */
+.login-box .remember{display:flex;align-items:center;gap:8px;margin:-6px 0 16px;font-size:13px;font-weight:500;text-transform:none;letter-spacing:0;cursor:pointer}
+.login-box .remember input{width:16px;height:16px;margin:0;accent-color:var(--brand-500);cursor:pointer}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;padding:10px 20px;border:none;border-radius:var(--radius-md);font-size:14px;font-weight:600;cursor:pointer;transition:all var(--duration-normal) var(--ease-out-quart);outline:none;white-space:nowrap;letter-spacing:-0.005em}
 .btn:focus-visible{box-shadow:0 0 0 3px rgba(91,91,255,0.4)}
 .btn:disabled{opacity:0.45;cursor:not-allowed;transform:none!important}
@@ -138,11 +141,18 @@ html{overflow-anchor:none}
 .log-toolbar .filter-btn:hover{border-color:var(--border-strong);color:var(--text-primary)}
 .log-toolbar .filter-btn.active{background:var(--gradient-brand);color:#fff;border-color:transparent}
 .log-empty{text-align:center;color:var(--text-muted);padding:60px 0;font-size:14px}
+/* 进程表排序切换 */
+.proc-sort{cursor:pointer;text-decoration:underline;color:var(--brand-500);font-weight:500}
+.proc-sort.active{font-weight:700;text-decoration:none}
 .modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,0.6);backdrop-filter:blur(4px);z-index:200;display:flex;align-items:center;justify-content:center;animation:fadeIn var(--duration-fast) ease-out}
 .modal-box{background:var(--surface-1);border:1px solid var(--border-subtle);border-radius:var(--radius-xl);padding:28px;max-width:500px;width:90%;box-shadow:var(--shadow-modal);animation:scaleIn var(--duration-slow) var(--ease-out-expo)}
 .modal-box h3{font-size:17px;font-weight:700;margin-bottom:10px}
 .modal-box p{font-size:13px;color:var(--text-secondary);margin-bottom:22px;line-height:1.6}
 .modal-box .modal-actions{display:flex;gap:10px;justify-content:flex-end}
+/* 宽版弹窗（文件在线编辑等大内容场景）：占满视口大部分，编辑器自适应填充 */
+.modal-box.modal-wide{max-width:min(1180px,95vw);width:min(1180px,95vw);height:min(880px,90vh);display:flex;flex-direction:column;padding:20px 22px}
+.modal-box.modal-wide #modal-body{flex:1;min-height:0;display:flex;flex-direction:column;margin-bottom:14px}
+.modal-box.modal-wide .fm-editor{flex:1;height:auto;min-height:0;font-size:13px;line-height:1.6}
 .toast{position:fixed;top:20px;right:20px;padding:14px 22px;border-radius:var(--radius-lg);font-size:13px;font-weight:600;z-index:9999;box-shadow:var(--shadow-modal);animation:slideInRight var(--duration-slow) var(--ease-out-expo);display:none;max-width:380px}
 .toast.success{background:#065f46;color:#d1fae5;border:1px solid rgba(34,197,94,0.3)}
 .toast.error{background:#7f1d1d;color:#fecaca;border:1px solid rgba(239,68,68,0.3)}
@@ -220,10 +230,31 @@ html.light .info-table td{border-bottom-color:rgba(0,0,0,0.06)}
 .info-table td{padding:10px 14px;border-bottom:1px solid var(--border-subtle);vertical-align:middle}
 .info-table td:first-child{font-size:13px;font-weight:600;color:var(--text-secondary);white-space:nowrap;width:200px;padding-right:20px}
 .info-table td:last-child{font-size:13px;color:var(--text-primary);word-break:break-all}
+
+/* 进程表（Top N）：覆盖 info-table 的「首列 200px / 末列强制断行」——
+   PID/用户/CPU/内存/线程/启动时间这些短列用 width:1% 收到最窄（不再撑表），
+   剩余宽度全给「进程 / 可执行文件」列，长路径自动换行；
+   监听端口列允许在空格处换行。这样窗口窄时也不会把某列挤成「一列一个字」。 */
+.proc-table td{padding:8px 10px;vertical-align:top}
+.proc-table td:first-child{width:1%;padding-right:10px;font-size:12px;font-weight:500}
+.proc-table td:last-child{word-break:normal}
+.proc-table td:nth-child(1),
+.proc-table td:nth-child(2),
+.proc-table td:nth-child(5),
+.proc-table td:nth-child(6){width:1%;white-space:nowrap}
+.proc-table td:nth-child(3){word-break:break-all}
+.proc-table td:nth-child(4){white-space:normal;word-break:keep-all;max-width:150px}
+.proc-table td:nth-child(7),
+.proc-table td:nth-child(8){white-space:nowrap}
+.proc-table td:nth-child(8){padding-left:6px;padding-right:6px}
 .info-table tr:last-child td{border-bottom:none}
 /* ── 文件管理 ── */
 .fm-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 .fm-path{font-size:12px;color:var(--text-secondary);background:var(--surface-2);border:1px solid var(--border-subtle);padding:5px 10px;border-radius:var(--radius-sm);max-width:460px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--font-mono)}
+/* 可编辑路径栏（回车/点「前往」切换目录，聚焦高亮） */
+.fm-path-input{font-size:12px;color:var(--text-secondary);background:var(--surface-2);border:1px solid var(--border-subtle);padding:5px 10px;border-radius:var(--radius-sm);font-family:var(--font-mono);width:320px;max-width:52vw;outline:none;transition:border-color var(--duration-fast),color var(--duration-fast)}
+.fm-path-input:focus{border-color:var(--brand-500);color:var(--text-primary)}
+.fm-path-input::placeholder{color:var(--text-muted)}
 .fm-name{cursor:pointer;color:var(--text-primary);text-decoration:none;word-break:break-all}
 .fm-name:hover{text-decoration:underline;color:var(--brand-300)}
 html.light .fm-name:hover{color:var(--brand-600)}
@@ -235,7 +266,9 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .fm-search-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-bottom:1px solid var(--border-subtle);font-size:12px}
 .fm-search-item:last-child{border-bottom:none}
 .fm-search-item .p{flex:1;word-break:break-all;color:var(--text-secondary)}
-.fm-editor{width:100%;height:320px;font-family:var(--font-mono);font-size:12px;line-height:1.5;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px;resize:vertical;outline:none;white-space:pre;overflow:auto}
+.fm-editor{width:100%;height:320px;font-family:var(--font-mono);font-size:12px;line-height:1.5;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px;resize:vertical;outline:none;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;overflow:auto}
+/* 关闭自动换行：长行不折行、改横向滚动（查看宽表格/对齐文本时用） */
+.fm-editor.fm-nowrap{white-space:pre;word-break:normal;overflow-wrap:normal}
 /* ── 日志清理 ── */
 .clean-summary{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:16px 20px;border-radius:var(--radius-md);background:var(--gradient-brand-soft);border:1px solid var(--border-subtle);margin-bottom:16px;flex-wrap:wrap}
 .clean-summary-text{display:flex;align-items:center;gap:12px;font-size:14px;color:var(--text-secondary)}
@@ -297,3 +330,18 @@ html.light .ai-msg pre{background:rgba(0,0,0,0.05)}
 .waf-sel{padding:4px 8px;border-radius:var(--radius-sm);border:1px solid var(--border-default);background:var(--surface-2);color:var(--text-primary);outline:none}
 .waf-json{width:100%;box-sizing:border-box;min-height:280px;font-family:var(--font-mono);font-size:12px;line-height:1.55;border-radius:var(--radius-md);border:1px solid var(--border-default);background:var(--surface-2);color:var(--text-primary);padding:10px;outline:none}
 .srv-foot{text-align:center;font-size:12px;color:var(--text-muted);padding:14px 0 20px}
+/* ── 子服务页：应用包拖拽部署区 ── */
+.ap-drop-zone{margin:12px 0 16px;padding:16px 14px;text-align:center;border:2px dashed var(--border-default);border-radius:var(--radius-md);color:var(--text-tertiary);font-size:13px;cursor:pointer;transition:border-color var(--duration-fast),background var(--duration-fast),color var(--duration-fast)}
+.ap-drop-zone:hover{border-color:var(--brand-500);color:var(--text-primary);background:var(--gradient-brand-soft)}
+#panel-services.ap-drag .ap-drop-zone{border-color:var(--brand-500);background:var(--gradient-brand-soft);color:var(--text-primary)}
+/* ── 虚拟内存（swap）表单：两列对齐 + 操作行 ── */
+.swap-box{margin-top:10px;padding:12px 14px;border:1px solid var(--border-default);border-radius:var(--radius-md);background:var(--gradient-brand-soft)}
+.swap-note{font-size:11px;line-height:1.6;color:var(--text-tertiary);margin-bottom:10px}
+.swap-form{display:grid;grid-template-columns:180px minmax(240px,1fr);gap:12px 14px;align-items:start}
+.swap-form .form-group{margin-bottom:0}
+.swap-form input[type=number]{max-width:none}
+.swap-actions{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:12px;padding-top:10px;border-top:1px dashed var(--border-default)}
+.swap-actions label{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)}
+.swap-actions .swap-hint{font-size:11px;color:var(--text-muted)}
+.swap-actions input[type=number]{width:88px;max-width:88px}
+@media(max-width:768px){.swap-form{grid-template-columns:1fr}}
