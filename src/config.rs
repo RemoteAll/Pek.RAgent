@@ -329,6 +329,10 @@ impl AgentConfig {
     /// - 都没有：从内置模板生成带注释的默认配置。
     pub fn load(base: &Path) -> AgentConfig {
         let path = config_path(base);
+        // 凭据加密密钥：数据目录 `keys/secret.key`，首次启动生成；失败则残留明文（记错但不阻断启动）
+        if let Err(e) = dhrust::secret::init_keyfile(base, "") {
+            util::log_error(&format!("初始化凭据密钥失败（口令将按明文保存）：{e}"));
+        }
 
         let (mut cfg, need_save) = if path.exists() {
             match read_xml_config(&path) {
@@ -365,6 +369,18 @@ impl AgentConfig {
         };
 
         cfg.normalize();
+
+        // 兼容两种存储：密文（当前）→ 解密；明文（旧版配置）→ 原样使用，下次保存自动加密。
+        // 解不开（密钥丢失/跨机器拷贝）时回退默认口令，避免因配置损坏而彻底无法登录。
+        match dhrust::secret::reveal(&cfg.web_user_password) {
+            Ok(plain) => cfg.web_user_password = plain,
+            Err(e) => {
+                util::log_error(&format!(
+                    "配置中的 WebPassword 无法解密（{e}），已回退为默认口令 admin，请登录后立即修改"
+                ));
+                cfg.web_user_password = "admin".to_string();
+            }
+        }
 
         if need_save {
             if let Err(e) = cfg.save(base) {
@@ -886,7 +902,8 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("GuardPeriod", cfg.guard_period.to_string());
         push("WatchDog", cfg.watch_dog.clone());
         push("WebUserName", cfg.web_user_name.clone());
-        push("WebPassword", cfg.web_user_password.clone());
+        // 口令一律以密文落盘（`dhrust::secret` AES-256-GCM，前缀 `enc:v1:`；密钥在数据目录 keys/，不做配置项）
+        push("WebPassword", dhrust::secret::protect(&cfg.web_user_password));
         push("WebAuthLevel", cfg.web_auth_level.clone());
         push("TrustForwardedFor", bool_text(cfg.trust_forwarded_for));
         push("WebSessionHours", cfg.web_session_hours.to_string());
@@ -1445,6 +1462,36 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("Config")).unwrap();
         dir
+    }
+
+    #[test]
+    fn password_is_encrypted_at_rest_and_reloadeable() {
+        let base = temp_base("secret");
+        dhrust::secret::init_keyfile(&base, "").expect("应能初始化凭据密钥");
+        assert!(dhrust::secret::keyfile_ready());
+
+        let mut cfg = AgentConfig::load(&base);
+        cfg.web_user_password = "P@ssw0rd-中文".to_string();
+        cfg.save(&base).unwrap();
+
+        // 落盘必须是密文，且不出现明文口令
+        let text = std::fs::read_to_string(config_path(&base)).unwrap();
+        let line = text
+            .lines()
+            .find(|l| l.contains("<WebPassword>"))
+            .unwrap_or_default()
+            .trim();
+        assert!(line.contains("enc:v1:"), "口令应加密落盘：{line}");
+        assert!(!text.contains("P@ssw0rd"), "文件不应出现明文口令：\n{text}");
+        // 密钥文件已生成
+        assert!(dhrust::secret::keyfile_path(&base, "").is_file());
+
+        // 重新加载：应还原为明文，且渲染与磁盘一致（不写盘）
+        let cfg2 = AgentConfig::load(&base);
+        assert_eq!(cfg2.web_user_password, "P@ssw0rd-中文");
+        assert!(!cfg2.save_if_changed(&base).unwrap(), "无变化不应写盘");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]
