@@ -2429,6 +2429,7 @@ let fmData=null;
 let fmPath=fmPathFromHash() || (()=>{try{return localStorage.getItem('fm_path')||''}catch(e){return ''}})();
 let fmSelected=new Set();
 let fmLastIdx=-1; // Shift 连选锚点（上次点选的行号）
+let fmClip=fmClipLoad(); // 剪贴板：{mode:'copy'|'cut', paths:[绝对路径...]}（localStorage 持久化，刷新不丢）
 let fmDirSizes=new Map(); // 目录大小（手动计算缓存：完整路径 → 字节数）
 
 function fmJoin(name){
@@ -2508,6 +2509,7 @@ function renderFileman(){
   </tr>`;
  });}
  const sel=fmSelected.size;
+ const clip=fmClip;
  const canUp=!!(fmParentText()||d.path);
  let html=`<div class="glass-card card" data-fm-drop="1" ondragover="fmDragOver(event,this)" ondragleave="fmDragLeave(event,this)" ondrop="fmDrop(event,this)">
   <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
@@ -2532,11 +2534,19 @@ function renderFileman(){
    <span style="flex:1"></span>
    <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmCompress()">🗜 压缩</button>
    <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmExtract()">📤 解压</button>
-   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmTransfer(false)">📋 复制</button>
-   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmTransfer(true)">✂ 移动</button>
+   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmClipSet('copy')" title="复制到剪贴板（进入目标目录后点「粘贴」）">📋 复制</button>
+   <button class="btn btn-secondary btn-sm" ${sel?'':'disabled'} onclick="fmClipSet('cut')" title="剪切到剪贴板（粘贴后源文件消失）">✂ 剪切</button>
+   <button class="btn btn-secondary btn-sm" ${clip?'':'disabled'} onclick="fmPaste()" title="把剪贴板内容粘贴到当前目录">📥 粘贴${clip?`（${clip.paths.length}）`:''}</button>
    <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmChmod()">🔒 权限</button>
    <button class="btn btn-danger btn-sm" ${sel?'':'disabled'} onclick="fmDelete([...fmSelected])">🗑 删除</button>
   </div>
+  ${clip?`<div class="fm-clip">
+   <span class="fm-clip-badge">${clip.mode==='cut'?'✂ 剪切':'📋 复制'}</span>
+   <span class="fm-clip-count">${clip.paths.length} 项</span>
+   <span class="fm-clip-src" title="${escAttr(clip.paths.join('\n'))}">${esc(clip.paths.map(p=>p.split(/[\\/]/).pop()).join('、'))}</span>
+   <span class="fm-clip-tip">→ 进入目标目录后点「📥 粘贴」</span>
+   <button class="btn btn-ghost btn-sm" onclick="fmClipClear()">清空</button>
+  </div>`:''}
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr>
     <th style="width:34px"><input type="checkbox" id="fm-sel-all" title="全选 / 取消全选" onchange="fmToggleAll(this.checked)"></th>
@@ -2544,7 +2554,7 @@ function renderFileman(){
    </tr></thead>
    <tbody id="fm-tbody">${rows}</tbody>
   </table></div>
-  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${items.length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 勾选框可按 Shift 连选 · <b>支持把文件/文件夹直接拖到本页上传</b>（拖到文件夹行 = 传进该文件夹）· 上传 >8MB 自动分片并支持断点续传 · 下载 >32MB 自动分片续传 · 在线编辑 10MB</div>
+  <div class="text-muted" style="margin-top:10px;font-size:12px">共 ${items.length} 项${sel?`，选中 ${sel} 项`:''} · 单击文件夹进入、单击文件在线编辑 · 勾选框可按 Shift 连选 · <b>复制/剪切后进入目标目录点「粘贴」</b>（剪贴板跨刷新保留）· <b>支持把文件/文件夹直接拖到本页上传</b>（拖到文件夹行 = 传进该文件夹）· 上传 >8MB 自动分片并支持断点续传 · 下载 >32MB 自动分片续传 · 在线编辑 10MB</div>
  </div>`;
  $('panel-fileman').innerHTML=html;
  const tbody=$('fm-tbody');
@@ -3216,15 +3226,41 @@ function fmExtract(){
  });
 }
 
-function fmTransfer(isMove){
- const names=[...fmSelected];if(!names.length||!fmReady())return;
- fmPrompt(isMove?'移动到…':'复制到…','目标目录（绝对路径）：',fmData.path,isMove?'移动':'复制',async v=>{
-  v=v.trim();if(!v)return;
-  const paths=names.map(n=>fmJoin(n));
-  const j=await api(isMove?'/star/fileMove':'/star/fileCopy',{method:'POST',body:JSON.stringify({paths,target:v})});
-  if(j.code!==0){showToast(j.message||'操作失败','error');return}
-  showToast(isMove?'已移动':'已复制','success');loadFileman();
- });
+/* ── 剪贴板式复制 / 剪切 / 粘贴（对齐宝塔/资源管理器：先复制，进目标目录再粘贴） ── */
+function fmClipLoad(){
+ try{
+  const raw=localStorage.getItem('fm_clip');if(!raw)return null;
+  const c=JSON.parse(raw);
+  return (c&&Array.isArray(c.paths)&&c.paths.length&&(c.mode==='cut'||c.mode==='copy'))?c:null;
+ }catch(e){return null}
+}
+function fmClipSave(c){
+ try{c?localStorage.setItem('fm_clip',JSON.stringify(c)):localStorage.removeItem('fm_clip')}catch(e){}
+}
+function fmClipSet(mode){
+ if(!fmReady())return;
+ const paths=[...fmSelected].map(n=>fmJoin(n));
+ if(!paths.length)return;
+ fmClip={mode,paths,at:Date.now()};
+ fmClipSave(fmClip);
+ renderFileman();
+ showToast((mode==='cut'?'已剪切 ':'已复制 ')+paths.length+' 项，进入目标目录后点「📥 粘贴」','success');
+}
+function fmClipClear(){
+ fmClip=null;fmClipSave(null);
+ if(fmData&&fmData.path)renderFileman();
+}
+/** 粘贴到当前目录（剪贴板为 cut 时走移动） */
+async function fmPaste(){
+ if(!fmReady())return;
+ if(!fmClip||!fmClip.paths.length){showToast('剪贴板为空','error');return}
+ const isCut=fmClip.mode==='cut';
+ const j=await api(isCut?'/star/fileMove':'/star/fileCopy',{method:'POST',body:JSON.stringify({paths:fmClip.paths,target:fmData.path})});
+ if(j.code!==0){showToast(j.message||'粘贴失败','error');return}
+ const d=j.data||{};
+ showToast('已'+(isCut?'移动':'粘贴')+'：'+(d.files||fmClip.paths.length)+' 个文件（'+fmtBytes(d.bytes||0)+'）','success');
+ if(isCut)fmClipClear();
+ loadFileman();
 }
 
 function fmChmod(){

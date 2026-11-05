@@ -269,6 +269,12 @@ html.light .fm-name:hover{color:var(--brand-600)}
 .fm-editor{width:100%;height:320px;font-family:var(--font-mono);font-size:12px;line-height:1.5;background:var(--surface-2);color:var(--text-primary);border:1px solid var(--border-default);border-radius:var(--radius-sm);padding:10px;resize:vertical;outline:none;white-space:pre-wrap;word-break:break-all;overflow-wrap:anywhere;overflow:auto}
 /* 关闭自动换行：长行不折行、改横向滚动（查看宽表格/对齐文本时用） */
 .fm-editor.fm-nowrap{white-space:pre;word-break:normal;overflow-wrap:normal}
+/* 文件管理：剪贴板提示条（复制/剪切后、粘贴前） */
+.fm-clip{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px;padding:6px 10px;font-size:12px;border:1px dashed var(--brand-500);border-radius:var(--radius-sm);background:rgba(91,91,255,.08);color:var(--text-secondary)}
+.fm-clip-badge{font-weight:600;color:var(--brand-300)}
+.fm-clip-count{color:var(--text-primary)}
+.fm-clip-src{flex:1;min-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text-muted)}
+.fm-clip-tip{color:var(--text-muted)}
 /* 文件管理：拖拽落点高亮（整卡 = 当前目录；行 = 该文件夹） */
 .card.fm-drop-active{outline:2px dashed var(--brand-500);outline-offset:2px;background:rgba(91,91,255,.06)}
 tr.fm-drop-row{outline:2px dashed var(--brand-500);outline-offset:-2px;background:rgba(91,91,255,.08)}

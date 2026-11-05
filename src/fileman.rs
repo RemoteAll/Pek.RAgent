@@ -460,7 +460,13 @@ fn transfer(panel: &WebPanel, ctx: &Ctx, copy: bool) -> ActionResult {
         if !p.exists() && fs::symlink_metadata(p).is_err() {
             return json_error(404, &format!("不存在：{}", p.display()));
         }
-        if p.starts_with(&target) {
+        let dst = target.join(file_label(p));
+        // 先判“同一目录”（粘贴到源目录本身）：此前用 `p.starts_with(&target)` 会把
+        // “复制到上一级/同目录”统统误报成“目标在选中项内部”。
+        if dst == *p {
+            return json_error(400, "目标目录与源目录相同，无需粘贴");
+        }
+        if target.starts_with(p) {
             return json_error(
                 400,
                 if copy {
@@ -469,10 +475,6 @@ fn transfer(panel: &WebPanel, ctx: &Ctx, copy: bool) -> ActionResult {
                     "目标目录在选中项内部，无法移动"
                 },
             );
-        }
-        let dst = target.join(file_label(p));
-        if dst == *p {
-            return json_error(400, "目标与源相同");
         }
         if dst.exists() {
             return json_error(400, &format!("目标已存在：{}", dst.display()));
