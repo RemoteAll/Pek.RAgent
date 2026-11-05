@@ -33,6 +33,12 @@ pub const CAP_APP_UPGRADE: &str = "appUpgrade";
 /// 能力标识（平台可下发 `appsQuery` 让节点**立即**上报子应用清单，不等 60 秒心跳）。
 pub const CAP_APPS_SYNC: &str = "appsSync";
 
+/// 能力标识（平台可下发 `appDeploy`：**首次部署**一个本机还不存在的子应用）。
+pub const CAP_APP_DEPLOY: &str = "appDeploy";
+
+/// 能力标识（平台可对 **C# 星尘托管的存量应用**做 `deployOverwrite` 覆盖与 `cstarScan` 扫描）。
+pub const CAP_CSTAR: &str = "cstar";
+
 /// 摘要缓存（5 秒）：register 与首次心跳间隔很短，避免重复读库。
 static SUMMARY: OnceLock<Mutex<(Instant, String, usize)>> = OnceLock::new();
 
@@ -71,7 +77,12 @@ pub fn merge_summary(base: &Path, v: &mut Json) {
     if let Some(obj) = v.as_object_mut() {
         // `appUpgrade`：支持平台下发子应用升级包（下载 → SHA-256 校验 → 部署 → 回执）
         // `appsSync`：支持平台请求立即上报子应用清单（`appsQuery` → `appsSync`）
-        obj.insert("caps".to_string(), json!([CAP, CAP_APP_UPGRADE, CAP_APPS_SYNC]));
+        // `appDeploy`：支持首次部署（应用不存在时按平台预置目录新建）
+        // `cstar`：支持 C# 星尘存量纳管（`deployOverwrite` 覆盖 + `cstarScan` 扫描）
+        obj.insert(
+            "caps".to_string(),
+            json!([CAP, CAP_APP_UPGRADE, CAP_APPS_SYNC, CAP_APP_DEPLOY, CAP_CSTAR]),
+        );
         obj.insert("panelUsersVersion".to_string(), Json::String(digest));
         obj.insert("panelUsersCount".to_string(), json!(count));
     }

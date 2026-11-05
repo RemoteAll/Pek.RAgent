@@ -403,6 +403,39 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 let cmd = v.clone();
                 std::thread::spawn(move || handle_app_upgrade(&mgr, &cmd));
             }
+            // 平台下发**首次部署**（`appDeploy`）：允许应用不存在，可指定工作目录（平台实例预置）
+            "appDeploy" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_app_deploy(&mgr, &cmd));
+            }
+            // 平台下发**存量覆盖**（`deployOverwrite`）：只换目录里的程序文件，重启交给星尘
+            "deployOverwrite" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_overwrite(&mgr, &cmd));
+            }
+            // 平台请求扫描 C# 星尘配置（只读）：返回可纳管的子服务清单
+            "cstarScan" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || {
+                    let agent_id = mgr.config().agent_id;
+                    let reply = run_cstar_scan(&cmd);
+                    if reply.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+                        let count = reply
+                            .get("apps")
+                            .and_then(|x| x.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0);
+                        util::log_format(
+                            "C# 星尘配置扫描完成（{} 个子服务）",
+                            &[&count.to_string()],
+                        );
+                    }
+                    send_event(&agent_id, reply);
+                });
+            }
             // 平台请求**立即**上报子应用清单（面板「同步应用」：不必等 60 秒心跳）
             "appsQuery" => {
                 let mgr = msg_mgr.clone();
@@ -545,6 +578,31 @@ fn regenerate_agent_id(manager: &AppManager) {
 /// 安全边界：只允许升级**本机已存在**的子应用；下载地址只能来自 `AutoUpgradeUrl` 的 origin
 /// （平台给的是 `/store/apps/{id}?ticket=...` 相对路径），避免被冒充平台诱导去任意地址下载。
 fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
+    handle_package_command(manager, cmd, "appUpgrade", "应用升级", run_app_upgrade);
+}
+
+/// 平台下发**首次部署**（`appDeploy`）：与升级共用外壳，但允许应用不存在。
+fn handle_app_deploy(manager: &Arc<AppManager>, cmd: &Json) {
+    handle_package_command(manager, cmd, "appDeploy", "应用部署", run_app_deploy);
+}
+
+/// 平台下发**存量覆盖**（`deployOverwrite`，C# 星尘托管的应用）。
+fn handle_overwrite(manager: &Arc<AppManager>, cmd: &Json) {
+    handle_package_command(manager, cmd, "deployOverwrite", "存量覆盖", run_overwrite);
+}
+
+/// 应用包下发类指令的公共外壳：串行锁 → 执行 → 回执（`appUpgradeResult`）→ 审计。
+///
+/// `appUpgrade` / `appDeploy` / `deployOverwrite` **共用同一份回执格式**：平台侧按
+/// `(agentId, appName, version, status=sent)` 就能闭环任务，不必按动作分支。
+/// 具体是哪种动作由 `action`/`label` 区分（进日志与审计）。
+fn handle_package_command(
+    manager: &Arc<AppManager>,
+    cmd: &Json,
+    action: &'static str,
+    label: &'static str,
+    run: impl FnOnce(&Arc<AppManager>, &Json, &str, &str) -> Result<String, String>,
+) {
     let agent_id = manager.config().agent_id.clone();
     let app_name = cmd
         .get("appName")
@@ -594,11 +652,11 @@ fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
         }
     }
     let _guard = BusyGuard;
-    let result = run_app_upgrade(manager, cmd, &app_name, &version);
+    let result = run(manager, cmd, &app_name, &version);
     match &result {
         Ok(msg) => {
             util::log_format(
-                "平台应用升级完成：{} v{}——{}",
+                "平台{label}完成：{} v{}——{}",
                 &[&app_name, &version, msg],
             );
             reply(true, msg.clone());
@@ -608,8 +666,8 @@ fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
                     category: None,
                     user: "platform".to_string(),
                     ip: "platform".to_string(),
-                    action: "appUpgrade".to_string(),
-                    title: format!("平台下发应用升级：{app_name} v{version}"),
+                    action: action.to_string(),
+                    title: format!("平台下发{label}：{app_name} v{version}"),
                     method: "WS".to_string(),
                     path: "/store/agents/ws".to_string(),
                     detail: msg.clone(),
@@ -622,7 +680,7 @@ fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
         }
         Err(e) => {
             util::log_error(&format!(
-                "平台应用升级失败：{} v{}——{}",
+                "平台{label}失败：{} v{}——{}",
                 app_name, version, e
             ));
             reply(false, e.clone());
@@ -632,8 +690,8 @@ fn handle_app_upgrade(manager: &Arc<AppManager>, cmd: &Json) {
                     category: None,
                     user: "platform".to_string(),
                     ip: "platform".to_string(),
-                    action: "appUpgrade".to_string(),
-                    title: format!("平台下发应用升级：{app_name} v{version}"),
+                    action: action.to_string(),
+                    title: format!("平台下发{label}：{app_name} v{version}"),
                     method: "WS".to_string(),
                     path: "/store/agents/ws".to_string(),
                     detail: e.clone(),
@@ -654,7 +712,7 @@ fn run_app_upgrade(
     app_name: &str,
     version: &str,
 ) -> Result<String, String> {
-    // 只允许升级已有应用：远程新建任意应用会扩大攻击面，也不符合「升级」语义
+    // 只允许升级已有应用：远程新建任意应用会扩大攻击面（首次部署走 `appDeploy`）
     // （大小写不敏感匹配，避免平台包名大小写与配置不一致时误判为「不存在」）
     let actual_name = manager
         .config()
@@ -662,7 +720,51 @@ fn run_app_upgrade(
         .iter()
         .find(|a| a.name.eq_ignore_ascii_case(app_name))
         .map(|a| a.name.clone())
-        .ok_or_else(|| format!("节点上没有应用「{app_name}」（远程升级只允许升级已有应用）"))?;
+        .ok_or_else(|| {
+            format!(
+                "节点上没有应用「{app_name}」（远程升级只允许升级已有应用；首次部署请用 appDeploy）"
+            )
+        })?;
+    let pkg = fetch_package(cmd, &manager.config(), app_name, version)?;
+    let deployed = crate::apppkg::deploy_bytes(
+        manager,
+        &pkg.file_name,
+        &pkg.body,
+        Some(&actual_name),
+        None,
+        true,
+    )?;
+    if !deployed.started {
+        return Err(format!(
+            "应用包已写入，但应用未成功启动（{}）；请查看节点日志与应用日志",
+            deployed.program.display()
+        ));
+    }
+    Ok(format!(
+        "已部署并启动（{} 个文件，程序 {}）",
+        deployed.files,
+        deployed.program.display()
+    ))
+}
+
+/// 平台下发的应用包（已下载并校验）。
+struct FetchedPackage {
+    /// 包内容
+    body: Vec<u8>,
+    /// 存储文件名（仅用于推导服务名/日志）
+    file_name: String,
+}
+
+/// 下载并校验平台下发的应用包（`appUpgrade` / `appDeploy` / `deployOverwrite` 共用）。
+///
+/// 安全边界同升级：下载地址只能来自 `AutoUpgradeUrl` 的 origin（平台给的是
+/// `/store/apps/{id}?ticket=...` 相对路径），避免被冒充平台诱导去任意地址下载。
+fn fetch_package(
+    cmd: &Json,
+    cfg: &AgentConfig,
+    app_name: &str,
+    version: &str,
+) -> Result<FetchedPackage, String> {
     let path = cmd
         .get("path")
         .and_then(|x| x.as_str())
@@ -678,7 +780,7 @@ fn run_app_upgrade(
     {
         return Err("平台下发的下载路径非法（只接受平台相对路径）".to_string());
     }
-    let origin = platform_origin(&manager.config())?;
+    let origin = platform_origin(cfg)?;
     let url = format!("{origin}{path}");
     let expected_sha = cmd
         .get("sha256")
@@ -690,7 +792,7 @@ fn run_app_upgrade(
         return Err("平台下发的 SHA-256 无效".to_string());
     }
     util::log_format(
-        "开始下载应用升级包：{} v{} ← {}",
+        "开始下载应用包：{} v{} ← {}",
         &[app_name, version, &redact_url_ticket(&url)],
     );
     let ua = crate::util::user_agent();
@@ -729,6 +831,15 @@ fn run_app_upgrade(
             &actual[..12]
         ));
     }
+    util::log_format(
+        "应用包校验通过：{} v{}（{} KB，SHA-256 {}…）",
+        &[
+            app_name,
+            version,
+            &(resp.body.len() / 1024).to_string(),
+            &actual[..12],
+        ],
+    );
     let file_name = cmd
         .get("fileName")
         .and_then(|x| x.as_str())
@@ -743,25 +854,196 @@ fn run_app_upgrade(
     } else {
         file_name
     };
-    let deployed = crate::apppkg::deploy_bytes(
+    Ok(FetchedPackage {
+        body: resp.body,
+        file_name,
+    })
+}
+
+/// 平台下发**首次部署**（`appDeploy`）：允许应用不存在，并可指定工作目录。
+///
+/// 与 `appUpgrade` 的唯一差别就是「允许新建」+「新建时可指定目录」——
+/// 平台「部署实例」里的 `DirPath` 由管理员预置，客户端不可传，所以这里直接采信。
+fn run_app_deploy(
+    manager: &Arc<AppManager>,
+    cmd: &Json,
+    app_name: &str,
+    version: &str,
+) -> Result<String, String> {
+    let work_dir = cmd
+        .get("workDir")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let arguments = cmd
+        .get("arguments")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let pkg = fetch_package(cmd, &manager.config(), app_name, version)?;
+    let deployed = crate::apppkg::deploy_bytes_ext(
         manager,
-        &file_name,
-        &resp.body,
-        Some(&actual_name),
-        None,
-        true,
+        &pkg.file_name,
+        &pkg.body,
+        &crate::apppkg::DeployOptions {
+            name_hint: Some(app_name),
+            arguments,
+            auto_start: true,
+            work_dir: Some(work_dir.as_str()),
+        },
     )?;
     if !deployed.started {
         return Err(format!(
-            "应用包已写入，但应用未成功启动（{}）；请查看节点日志与应用日志",
+            "应用包已写入（{}），但应用未成功启动（{}）；请查看节点日志与应用日志",
+            deployed.work_dir.display(),
             deployed.program.display()
         ));
     }
     Ok(format!(
-        "已部署并启动（{} 个文件，程序 {}）",
+        "已{}并启动（{} 个文件，目录 {}，程序 {}）",
+        if deployed.updated { "升级" } else { "新建" },
         deployed.files,
+        deployed.work_dir.display(),
         deployed.program.display()
     ))
+}
+
+/// 平台下发**存量覆盖**（`deployOverwrite`）：只换目录里的程序文件，重启交给星尘。
+///
+/// 用于 C# 星尘托管的存量应用（`HostKind=cstar`）：平台不接管它们的托管关系，
+/// **绝不改动 C# 的 `StarAgent.config`**，只覆盖 `dirPath` 下的文件并按服务名让本机星尘重启。
+fn run_overwrite(
+    manager: &Arc<AppManager>,
+    cmd: &Json,
+    app_name: &str,
+    version: &str,
+) -> Result<String, String> {
+    use dhrust::staragent::ServiceOp;
+    let dir_path = cmd
+        .get("dirPath")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if dir_path.is_empty() {
+        return Err("缺少 dirPath（平台实例未预置部署目录）".to_string());
+    }
+    let target = std::path::PathBuf::from(&dir_path);
+    validate_overwrite_dir(&target, manager.base())?;
+    let pkg = match cmd
+        .get("path")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(_) => Some(fetch_package(cmd, &manager.config(), app_name, version)?),
+        // 无 `path` = 平台只要求**重启**（不覆盖文件）：存量应用重启不该重装一遍
+        None => None,
+    };
+    let files = match &pkg {
+        Some(p) => Some(crate::apppkg::overwrite_into(&target, &p.file_name, &p.body)?),
+        None => None,
+    };
+    // 服务名：平台显式给的优先，否则用应用名（C# 子服务名通常与程序名一致）
+    let service = cmd
+        .get("serviceName")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(app_name)
+        .to_string();
+    let restart = cmd
+        .get("restart")
+        .and_then(|x| x.as_bool())
+        .unwrap_or(true);
+    let covered = match files {
+        Some(n) => format!("已覆盖 {n} 个文件到 {}", target.display()),
+        None => format!("未覆盖文件（平台只要求重启，目录 {}）", target.display()),
+    };
+    if !restart {
+        return Ok(format!("{covered}（未重启，按平台要求保留）"));
+    }
+    util::log_format(
+        "存量覆盖完成，尝试重启星尘子服务：{}（{}）",
+        &[&service, &dir_path],
+    );
+    match dhrust::staragent::operate_by_default_ports(
+        &service,
+        ServiceOp::Restart,
+        Duration::from_secs(60),
+    ) {
+        Ok(msg) => Ok(format!("{covered}，并{msg}")),
+        Err(e) => Err(format!(
+            "{covered}，但重启服务「{service}」失败：{e}（文件已更新，请人工确认服务状态）"
+        )),
+    }
+}
+
+/// 覆盖目标目录的安全校验：必须是绝对路径，且不能是根目录 / 不能覆盖星尘自身目录。
+fn validate_overwrite_dir(target: &std::path::Path, base: &std::path::Path) -> Result<(), String> {
+    if !target.is_absolute() {
+        return Err(format!("覆盖目标必须是绝对路径：{}", target.display()));
+    }
+    if target.parent().is_none() {
+        return Err("拒绝覆盖到根目录".to_string());
+    }
+    let norm = |p: &std::path::Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        if cfg!(windows) {
+            s.to_ascii_lowercase()
+        } else {
+            s
+        }
+    };
+    let t = norm(target);
+    let b = norm(base);
+    if t == b || t.starts_with(&(b + "/")) {
+        return Err(format!(
+            "拒绝覆盖星尘自身目录（{}）；如需升级星尘本体请使用自动升级或面板升级",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 平台请求扫描 C# 星尘配置（只读）：返回可纳管的子服务清单。
+///
+/// 复用 `migrate::scan`（面板「从 C# 星尘迁移」用的同一套解析），
+/// **只读不写**：平台据此在「部署实例」里建 `Source=scanned` 的条目，不做任何迁移。
+fn run_cstar_scan(cmd: &Json) -> Json {
+    let dir = cmd
+        .get("dir")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let dir_path = if dir.is_empty() {
+        None
+    } else {
+        Some(std::path::Path::new(dir.as_str()))
+    };
+    match crate::migrate::scan(dir_path) {
+        Ok(scan) => json!({
+            "type": "cstarScanResult",
+            "ok": true,
+            "dir": scan.dir.display().to_string(),
+            "configPath": scan.config_path.display().to_string(),
+            "serviceName": scan.service_name,
+            "serviceInstalled": scan.service_installed,
+            "serviceRunning": scan.service_running,
+            "localPort": scan.local_port,
+            "apps": scan.apps.iter().map(|a| json!({
+                "name": a.name,
+                "fileName": a.file_name,
+                "workingDirectory": a.working_directory.clone().unwrap_or_default(),
+                "mode": a.mode,
+                "enable": a.enable,
+            })).collect::<Vec<_>>(),
+            "warnings": scan.warnings,
+        }),
+        Err(e) => json!({ "type": "cstarScanResult", "ok": false, "message": e }),
+    }
 }
 
 /// 日志/回执里隐藏一次性下载票据（`ticket=...`），避免凭据落进日志。

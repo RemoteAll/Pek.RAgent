@@ -64,12 +64,24 @@ fn package_kind(data: &[u8]) -> Result<PackageKind, String> {
     Err("不支持的包格式：请上传 .zip 或 .tar.gz（.tgz）发行包".to_string())
 }
 
+/// 部署参数（[`deploy_bytes_ext`] 用；比旧签名多一个「新建时的工作目录」）。
+#[derive(Debug, Clone, Default)]
+pub struct DeployOptions<'a> {
+    /// 用户指定的服务名（空 = 按包内主程序名推导）
+    pub name_hint: Option<&'a str>,
+    /// 启动参数（None = 新建无参数 / 升级保留原值）
+    pub arguments: Option<&'a str>,
+    /// 部署后是否启动（原本运行中的服务会重启）
+    pub auto_start: bool,
+    /// **仅新建时生效**：指定工作目录（平台「部署实例」里预置的 `DirPath`）。
+    ///
+    /// 升级时故意忽略：已有服务的目录不能因为平台传了个新值就被挑走，
+    /// 那会让「升级」变成「换目录部署」，旧目录里的数据也跟着失联。
+    pub work_dir: Option<&'a str>,
+}
+
 /// 部署一个应用包。
 ///
-/// - `package_name`：上传文件名（仅用于推导服务名与日志）；
-/// - `name_hint`：用户指定的服务名（留空则按包内主程序名推导）；
-/// - `arguments`：启动参数（留空则新建无参数 / 升级保留原有参数）；
-/// - `auto_start`：部署后是否启动（原本运行中的服务会重启）。
 pub fn deploy_bytes(
     manager: &AppManager,
     package_name: &str,
@@ -77,6 +89,29 @@ pub fn deploy_bytes(
     name_hint: Option<&str>,
     arguments: Option<&str>,
     auto_start: bool,
+) -> Result<Deployed, String> {
+    deploy_bytes_ext(
+        manager,
+        package_name,
+        data,
+        &DeployOptions {
+            name_hint,
+            arguments,
+            auto_start,
+            work_dir: None,
+        },
+    )
+}
+
+/// 部署一个应用包（扩展版：可指定新建时的工作目录）。
+///
+/// - `package_name`：上传文件名（仅用于推导服务名与日志）；
+/// - `opts.work_dir`：**仅新建应用时生效**（升级沿用已有配置，不搬家）。
+pub fn deploy_bytes_ext(
+    manager: &AppManager,
+    package_name: &str,
+    data: &[u8],
+    opts: &DeployOptions,
 ) -> Result<Deployed, String> {
     if data.is_empty() {
         return Err("上传内容为空".to_string());
@@ -91,15 +126,7 @@ pub fn deploy_bytes(
 
     let base = manager.base().to_path_buf();
     let staging = staging_dir(&base)?;
-    let rs = deploy_staged(
-        manager,
-        &staging,
-        package_name,
-        data,
-        name_hint,
-        arguments,
-        auto_start,
-    );
+    let rs = deploy_staged(manager, &staging, package_name, data, opts);
     // 无论成败都清理暂存目录（成功路径的文件已复制到工作目录）
     let _ = fs::remove_dir_all(&staging);
     rs
@@ -118,16 +145,84 @@ fn staging_dir(base: &Path) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
+/// 把包内容**覆盖**解压到目标目录（不注册服务、不动星尘配置）；返回写入文件数。
+///
+/// 用于「存量纳管」：C# 星尘托管的服务只换目录里的程序文件，重启交给星尘自己做
+/// （**绝不改动 C# 的 `StarAgent.config`**，否则会破坏它自己的托管关系）。
+///
+/// 只覆盖、不删多余文件：删冗余需要「哪些是包内文件」的完整快照，误删线上数据
+/// （上传目录、配置、日志）的代价远大于省下的磁盘。
+pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<usize, String> {
+    if data.is_empty() {
+        return Err("上传内容为空".to_string());
+    }
+    if data.len() > MAX_PACKAGE_SIZE {
+        return Err(format!(
+            "包过大（{} MB，上限 {} MB）",
+            data.len() / 1024 / 1024,
+            MAX_PACKAGE_SIZE / 1024 / 1024
+        ));
+    }
+    if target.as_os_str().is_empty() {
+        return Err("未指定覆盖目标目录".to_string());
+    }
+    let base = std::env::temp_dir().join(format!(
+        "ra-overwrite-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&base).map_err(|e| format!("创建暂存目录失败：{e}"))?;
+    let result = (|| -> Result<usize, String> {
+        let kind = package_kind(data)?;
+        let unpack = base.join("unpack");
+        fs::create_dir_all(&unpack).map_err(|e| format!("创建解压目录失败：{e}"))?;
+        match kind {
+            PackageKind::Zip => {
+                let pkg = base.join("package.zip");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                check_zip_limits(&pkg)?;
+                dhrust::zip::extract_zip_limited(
+                    &pkg,
+                    &unpack,
+                    MAX_UNPACKED_SIZE,
+                    MAX_ENTRY_COUNT,
+                )?;
+            }
+            PackageKind::TarGz => {
+                let pkg = base.join("package.tar.gz");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                extract_tar_gz(&pkg, &unpack)?;
+            }
+        }
+        let root = descend_root(&unpack);
+        let files = copy_tree(&root, target)?;
+        if files == 0 {
+            return Err(format!(
+                "包内没有可覆盖的文件（{}，包 {}）",
+                target.display(),
+                package_name
+            ));
+        }
+        Ok(files)
+    })();
+    let _ = fs::remove_dir_all(&base);
+    result
+}
+
 /// 具体流程（暂存目录由调用方负责清理）。
 fn deploy_staged(
     manager: &AppManager,
     staging: &Path,
     package_name: &str,
     data: &[u8],
-    name_hint: Option<&str>,
-    arguments: Option<&str>,
-    auto_start: bool,
+    opts: &DeployOptions,
 ) -> Result<Deployed, String> {
+    let name_hint = opts.name_hint;
+    let arguments = opts.arguments;
+    let auto_start = opts.auto_start;
     let kind = package_kind(data)?;
     let unpack = staging.join("unpack");
     fs::create_dir_all(&unpack).map_err(|e| format!("创建解压目录失败：{e}"))?;
@@ -176,12 +271,20 @@ fn deploy_staged(
 
     let base = manager.base().to_path_buf();
     let existing = manager.config().find_app(&name).cloned();
+    let is_new = existing.is_none();
     let mut app = existing.clone().unwrap_or_else(|| AppConfig {
         name: name.clone(),
         mode: "shadow".to_string(),
         reload_on_change: true,
         ..Default::default()
     });
+    // 新建时采纳调用方给的工作目录（平台「部署实例」预置的 DirPath）；
+    // 已有服务一律沿用原配置 —— 升级不该把应用目录搬走。
+    if is_new
+        && let Some(dir) = opts.work_dir.map(str::trim).filter(|s| !s.is_empty())
+    {
+        app.working_directory = Some(dir.to_string());
+    }
 
     // 工作目录：沿用已有配置；新应用按 deploy 约定（`{base}/../apps/{name}`）
     let work = crate::deploy::work_dir(&base, &app);
