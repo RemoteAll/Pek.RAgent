@@ -60,7 +60,9 @@ pub fn candidates() -> Vec<PathBuf> {
 }
 
 /// 星尘配置文件路径（两版同名同格式）。
-fn config_file(dir: &Path) -> PathBuf {
+///
+/// `pub` 供 `panel_ws` 计算上报签名（读 mtime/长度判断配置是否变过，不解析文件）。
+pub fn config_file(dir: &Path) -> PathBuf {
     dir.join("Config").join("StarAgent.config")
 }
 

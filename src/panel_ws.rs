@@ -44,6 +44,9 @@ static APP_UPGRADE_BUSY: std::sync::Mutex<bool> = std::sync::Mutex::new(false);
 /// 上次上报的子应用清单签名（心跳仅在变化时携带 `apps`，平台侧 `null` = 保留旧值）。
 static APPS_SIGNATURE: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
 
+/// 上次上报的 **C# 星尘**子服务清单签名（同上口径；与 Rust 版应用分开比对）。
+static CSTAR_SIGNATURE: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
+
 /// 是否启用（升级源地址非空，且「有令牌」或「开配对」）。
 pub fn enabled(cfg: &AgentConfig) -> bool {
     !cfg.auto_upgrade_url.trim().is_empty()
@@ -1316,6 +1319,8 @@ fn build_register(manager: &AppManager) -> String {
             "hostname": dhrust::sys::machine::hostname(),
             // 子应用清单：每次接入都全量上报（平台据此远程升级指定应用）
             "apps": apps_payload(&services, true),
+            // C# 星尘（存量）子服务清单：平台预填实例用，同样接入即全量
+            "cstarApps": cstar_apps_payload(true),
         }),
     )
 }
@@ -1334,6 +1339,9 @@ fn apps_payload(
         sig.push_str(&cfg.name);
         sig.push('|');
         sig.push_str(&cfg.file_name);
+        sig.push('|');
+        // 工作目录也进签名：平台靠它预填实例的 DirPath，变了不报会让平台拿到旧值
+        sig.push_str(cfg.working_directory.as_deref().unwrap_or(""));
         sig.push('|');
         sig.push_str(&cfg.mode_text());
         sig.push('|');
@@ -1359,6 +1367,8 @@ fn apps_payload(
                 json!({
                     "name": cfg.name,
                     "file": cfg.file_name,
+                    // 工作目录：平台「部署管理 → 实例」据此预填 DirPath（不再让人手抄）
+                    "workDir": cfg.working_directory.clone().unwrap_or_default(),
                     "mode": cfg.mode_text(),
                     "enable": cfg.enable,
                     "running": st.running,
@@ -1368,6 +1378,94 @@ fn apps_payload(
             })
             .collect(),
     )
+}
+
+/// C# 星尘子服务清单（`heartbeat` / `register` 携带；变化才上报）。
+///
+/// 目的：平台「部署管理 → 实例」直接列出**节点已上报的应用**（rstar 走 `apps`，
+/// cstar 走这里），导入实例时服务名/程序/目录全部预填，不用人工一个个抄。
+///
+/// 带宽与性能控制：
+/// - **不解析文件**：先用 `{C#安装目录}/Config/StarAgent.config` 的 mtime+长度做签名，
+///   未变化直接返回 `null`（平台侧 null = 保留旧值）；
+/// - 本机没有 C# 星尘时，探测结果缓存 30 分钟再重探（装星尘是罕见事件），
+///   避免每 60 秒去 stat 五个候选目录；
+/// - `force`（注册）时才强制全量。
+fn cstar_apps_payload(force: bool) -> Json {
+    let Some((dir, sig)) = cstar_probe(force) else {
+        return Json::Null;
+    };
+    let cache = CSTAR_SIGNATURE.get_or_init(|| std::sync::Mutex::new(String::new()));
+    {
+        let mut last = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if !force && *last == sig {
+            return Json::Null;
+        }
+        *last = sig;
+    }
+    match crate::migrate::scan(Some(&dir)) {
+        Ok(scan) => Json::Array(
+            scan.apps
+                .iter()
+                .map(|a| {
+                    json!({
+                        "name": a.name,
+                        "file": a.file_name,
+                        "workDir": a.working_directory.clone().unwrap_or_default(),
+                        "enable": a.enable,
+                    })
+                })
+                .collect(),
+        ),
+        Err(e) => {
+            // 配置存在但解析失败：不上报清单（null 保留旧值），留一行日志供运维定位
+            util::log_format("读取 C# 星尘配置失败，本次不上报其子服务清单：{}", &[&e]);
+            Json::Null
+        }
+    }
+}
+
+/// 探测 C# 星尘安装目录并算出配置签名（不解析内容）。
+///
+/// 返回 `None` = 本机没有 C# 星尘（或配置不可读），调用方据此跳过上报。
+fn cstar_probe(force: bool) -> Option<(std::path::PathBuf, String)> {
+    struct Probe {
+        at: Option<Instant>,
+        dir: Option<std::path::PathBuf>,
+    }
+    static PROBE: OnceLock<std::sync::Mutex<Probe>> = OnceLock::new();
+    /// 没装 C# 星尘时的重新探测间隔：装星尘是罕见事件，不必每跳都扫目录
+    const REPROBE: Duration = Duration::from_secs(1800);
+
+    let m = PROBE.get_or_init(|| {
+        std::sync::Mutex::new(Probe {
+            at: None,
+            dir: None,
+        })
+    });
+    let mut st = m.lock().unwrap_or_else(|e| e.into_inner());
+    let need_detect = match (&st.at, &st.dir) {
+        (None, _) => true,
+        // 已知目录：不重新探测（目录搬家属罕见，靠 force / 进程重启刷新）
+        (Some(_), Some(_)) => force,
+        // 上次没找到：强制或超过重探间隔才再找
+        (Some(at), None) => force || at.elapsed() >= REPROBE,
+    };
+    if need_detect {
+        st.dir = crate::migrate::detect();
+        st.at = Some(Instant::now());
+    }
+    let dir = st.dir.clone()?;
+    drop(st);
+    let path = crate::migrate::config_file(&dir);
+    let md = std::fs::metadata(&path).ok()?;
+    let mtime = md
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    Some((dir, format!("{}|{mtime}|{}", path.display(), md.len())))
 }
 
 /// 平台「服务器节点」展示用的面板元数据：端口 / 是否允许远程访问 / 内置管理员状态。
@@ -1439,6 +1537,8 @@ fn build_heartbeat(manager: &AppManager) -> String {
             "servicesRunning": running,
             "servicesTotal": services.len(),
             "apps": apps,
+            // C# 星尘子服务清单：只有配置变过才带（平台侧 null = 保留旧值）
+            "cstarApps": cstar_apps_payload(false),
             // 仅在站点/白名单变化时携带清单（平台侧 null = 保留旧值），省带宽
             "sites": if sites_changed { site_summary } else { serde_json::Value::Null },
         }),
