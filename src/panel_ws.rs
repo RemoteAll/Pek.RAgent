@@ -897,6 +897,11 @@ fn run_app_deploy(
         .and_then(|x| x.as_str())
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    // **先检验再上传**：目录非法/危险时在下载前就拒绝，别先拉几十 MB 再报错
+    // （解包时 `deploy_bytes_ext` 还会再校验一次，这里纯粹是为了省流量与时间）
+    if !work_dir.is_empty() {
+        crate::apppkg::validate_deploy_dir(std::path::Path::new(&work_dir), manager.base())?;
+    }
     let pkg = fetch_package(cmd, &manager.config(), app_name, version)?;
     let deployed = crate::apppkg::deploy_bytes_ext(
         manager,
@@ -947,6 +952,17 @@ fn run_overwrite(
     }
     let target = std::path::PathBuf::from(&dir_path);
     crate::apppkg::validate_deploy_dir(&target, manager.base())?;
+    // 服务名：平台显式给的优先，否则用应用名（C# 子服务名通常与程序名一致）
+    let service = cmd
+        .get("serviceName")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(app_name)
+        .to_string();
+    // **先检验再上传**：C# 星尘里没有这个服务、或工作目录对不上时，
+    // 一个字节都不下载（包动辄几十 MB，下载完才发现服务不存在＝白烧带宽与时间）。
+    precheck_cstar_target(&service, &dir_path)?;
     let pkg = match cmd
         .get("path")
         .and_then(|x| x.as_str())
@@ -961,14 +977,6 @@ fn run_overwrite(
         Some(p) => Some(crate::apppkg::overwrite_into(&target, &p.file_name, &p.body)?),
         None => None,
     };
-    // 服务名：平台显式给的优先，否则用应用名（C# 子服务名通常与程序名一致）
-    let service = cmd
-        .get("serviceName")
-        .and_then(|x| x.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(app_name)
-        .to_string();
     let restart = cmd
         .get("restart")
         .and_then(|x| x.as_bool())
@@ -994,6 +1002,82 @@ fn run_overwrite(
             "{covered}，但重启服务「{service}」失败：{e}（文件已更新，请人工确认服务状态）"
         )),
     }
+}
+
+/// 覆盖部署前的**本地预检**：C# 星尘里是否真有这个服务、工作目录是否与平台实例一致。
+///
+/// 复用 `migrate::scan`（只读解析 `Config/StarAgent.config`，且**排除 Rust 版自身配置**），
+/// 纯本地文件读取、毫秒级；不通过直接返回错误，**调用方据此在下载前中止**。
+///
+/// 之所以严格比对目录：覆盖写的是 `dirPath`，星尘重启的是「服务名」——
+/// 两者对不上就会「把 A 目录的程序换掉、去重启 B 服务」，比直接失败危险得多。
+fn precheck_cstar_target(service: &str, dir_path: &str) -> Result<(), String> {
+    let scan = crate::migrate::scan(None).map_err(|e| {
+        format!(
+            "无法确认 C# 星尘里存在服务「{service}」，本次未下载任何文件：{e}\
+             （该实例的托管方式若应为 rstar，请在平台改正）"
+        )
+    })?;
+    verify_cstar_entry(&scan, service, dir_path)
+}
+
+/// [`precheck_cstar_target`] 的纯判定部分（拆出来便于单测）。
+fn verify_cstar_entry(
+    scan: &crate::migrate::Scan,
+    service: &str,
+    dir_path: &str,
+) -> Result<(), String> {
+    let Some(app) = scan
+        .apps
+        .iter()
+        .find(|a| a.name.trim().eq_ignore_ascii_case(service))
+    else {
+        let names = scan
+            .apps
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>()
+            .join("、");
+        return Err(format!(
+            "C# 星尘（{}）里没有服务「{service}」，本次未下载任何文件；现有服务：{}",
+            scan.dir.display(),
+            if names.is_empty() { "（空）" } else { &names }
+        ));
+    };
+    // 配置里的工作目录可能为空或相对路径（相对 C# 安装目录），先绝对化再比
+    let raw = app.working_directory.as_deref().unwrap_or("").trim();
+    if raw.is_empty() {
+        // 没有工作目录就无法判断覆盖目标，宁可让运维先补配置
+        return Err(format!(
+            "服务「{service}」在 C# 星尘里没有工作目录，无法确认部署目标，本次未下载任何文件；\
+             请先补全该服务的 WorkingDirectory 或改用 rstar 托管"
+        ));
+    }
+    let raw_path = std::path::Path::new(raw);
+    let abs = if raw_path.is_absolute() {
+        raw_path.to_path_buf()
+    } else {
+        scan.dir.join(raw_path)
+    };
+    let have = util::lexical_normalize(&abs);
+    let want = util::lexical_normalize(std::path::Path::new(dir_path));
+    // Windows 路径大小写不敏感，Linux 敏感——按平台选比较方式，避免漏判或误判
+    let have_s = have.to_string_lossy().replace('/', "\\");
+    let want_s = want.to_string_lossy().replace('/', "\\");
+    let same = if cfg!(windows) {
+        have_s.trim_end_matches('\\').eq_ignore_ascii_case(want_s.trim_end_matches('\\'))
+    } else {
+        have.to_string_lossy().trim_end_matches('/') == want.to_string_lossy().trim_end_matches('/')
+    };
+    if !same {
+        return Err(format!(
+            "服务「{service}」在 C# 星尘里的工作目录是 {}，与平台实例的部署目录 {} 不一致，\
+             本次未下载任何文件；请改正其中一侧后再部署",
+            have.display(),
+            want.display()
+        ));
+    }
+    Ok(())
 }
 
 /// 平台请求**在线目录只读**（`fileList`）：返回目录清单。
@@ -1359,4 +1443,85 @@ fn build_heartbeat(manager: &AppManager) -> String {
             "sites": if sites_changed { site_summary } else { serde_json::Value::Null },
         }),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// 造一份「C# 星尘扫描结果」（不碰真实文件系统）。
+    fn scan_fixture() -> crate::migrate::Scan {
+        let dir = PathBuf::from(r"C:\StarAgent");
+        let app = |name: &str, wd: Option<&str>| crate::config::AppConfig {
+            name: name.to_string(),
+            file_name: format!("{name}.exe"),
+            working_directory: wd.map(str::to_string),
+            enable: true,
+            ..Default::default()
+        };
+        crate::migrate::Scan {
+            dir,
+            config_path: PathBuf::from(r"C:\StarAgent\Config\StarAgent.config"),
+            service_name: "StarAgent".to_string(),
+            service_installed: true,
+            service_running: true,
+            local_port: 5500,
+            apps: vec![
+                app("demo-agent", Some(r"..\agents\demo")),
+                app("site-app", Some("../apps/site-app")),
+                app("empty-wd", None),
+            ],
+            warnings: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn precheck_rejects_missing_service() {
+        let scan = scan_fixture();
+        let err = verify_cstar_entry(&scan, "nope", r"C:\agents\demo").unwrap_err();
+        assert!(err.contains("没有服务"), "{err}");
+        // 报错要列出本机现有服务名，运维才好对照
+        assert!(err.contains("demo-agent"), "{err}");
+        assert!(err.contains("未下载任何文件"), "{err}");
+    }
+
+    #[test]
+    fn precheck_accepts_relative_working_directory() {
+        let scan = scan_fixture();
+        // 相对路径按 C# 安装目录绝对化后与实例目录一致
+        verify_cstar_entry(&scan, "demo-agent", r"C:\agents\demo").unwrap();
+        verify_cstar_entry(&scan, "site-app", "C:/apps/site-app").unwrap();
+    }
+
+    #[test]
+    fn precheck_rejects_mismatched_directory() {
+        let scan = scan_fixture();
+        let err = verify_cstar_entry(&scan, "demo-agent", r"C:\agents\other").unwrap_err();
+        assert!(err.contains("不一致"), "{err}");
+        assert!(err.contains("未下载任何文件"), "{err}");
+        // 两侧的真实值都要给出来
+        assert!(err.contains("agents"), "{err}");
+    }
+
+    #[test]
+    fn precheck_rejects_missing_working_directory() {
+        let scan = scan_fixture();
+        let err = verify_cstar_entry(&scan, "empty-wd", r"C:\apps\empty-wd").unwrap_err();
+        assert!(err.contains("没有工作目录"), "{err}");
+    }
+
+    #[test]
+    fn precheck_ignores_case_and_trailing_slash() {
+        let scan = scan_fixture();
+        // Windows 路径大小写不敏感 + 尾部斜杠不应造成误判
+        #[cfg(windows)]
+        {
+            verify_cstar_entry(&scan, "DEMO-AGENT", r"c:\AGENTS\demo\").unwrap();
+        }
+        #[cfg(not(windows))]
+        {
+            verify_cstar_entry(&scan, "demo-agent", "C:/agents/demo/").unwrap();
+        }
+    }
 }
