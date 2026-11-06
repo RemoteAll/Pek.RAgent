@@ -2540,13 +2540,7 @@ function renderFileman(){
    <button class="btn btn-secondary btn-sm" ${sel===1?'':'disabled'} onclick="fmChmod()">🔒 权限</button>
    <button class="btn btn-danger btn-sm" ${sel?'':'disabled'} onclick="fmDelete([...fmSelected])">🗑 删除</button>
   </div>
-  ${clip?`<div class="fm-clip">
-   <span class="fm-clip-badge">${clip.mode==='cut'?'✂ 剪切':'📋 复制'}</span>
-   <span class="fm-clip-count">${clip.paths.length} 项</span>
-   <span class="fm-clip-src" title="${escAttr(clip.paths.join('\n'))}">${esc(clip.paths.map(p=>p.split(/[\\/]/).pop()).join('、'))}</span>
-   <span class="fm-clip-tip">→ 进入目标目录后点「📥 粘贴」</span>
-   <button class="btn btn-ghost btn-sm" onclick="fmClipClear()">清空</button>
-  </div>`:''}
+  ${FmClient.clip.html(clip)}
   <div style="overflow-x:auto"><table class="svc-table">
    <thead><tr>
     <th style="width:34px"><input type="checkbox" id="fm-sel-all" title="全选 / 取消全选" onchange="fmToggleAll(this.checked)"></th>
@@ -2655,6 +2649,8 @@ FmClient.configure({
  toast: (msg,err)=>showToast(msg, err?'error':'success'),
  esc: escAttr,
  onUploadDone: ()=>loadFileman(),
+ // 剪贴板提示条里的「清空」由共享模块的委托事件触发，这里只同步本地状态并重绘
+ onClipChange: (v)=>{ fmClip=v||null; if(fmData&&fmData.path)renderFileman() },
  storagePrefix: 'fm',
 });
 

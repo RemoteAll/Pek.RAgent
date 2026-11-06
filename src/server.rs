@@ -322,6 +322,12 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             dhrust::assets::FM_TRANSPORT_JS.as_bytes(),
             "application/javascript; charset=utf-8",
         )
+        // 传输面板/剪贴板提示条的共享样式（面板自有样式在前者之后加载，可继续覆盖）
+        .embed(
+            "/assets/fm-transport.css",
+            dhrust::assets::FM_TRANSPORT_CSS.as_bytes(),
+            "text/css; charset=utf-8",
+        )
         .embed(
             "/assets/xterm.js",
             include_bytes!("../res/web/xterm.js"),

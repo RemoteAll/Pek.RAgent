@@ -16,7 +16,6 @@ use std::path::{Path, PathBuf};
 use dhrust::net::controller::{ActionResult, arg, json_body, json_error, json_result};
 use dhrust::net::http::HttpResponse;
 use dhrust::net::router::Ctx;
-#[cfg(windows)]
 use serde_json::Value as Json;
 use serde_json::json;
 
