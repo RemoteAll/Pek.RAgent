@@ -436,6 +436,12 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                     send_event(&agent_id, reply);
                 });
             }
+            // 平台请求**在线目录只读**（部署客户端的在线目录）：返回目录清单
+            "fileList" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_file_list(&mgr, &cmd));
+            }
             // 平台请求**立即**上报子应用清单（面板「同步应用」：不必等 60 秒心跳）
             "appsQuery" => {
                 let mgr = msg_mgr.clone();
@@ -988,6 +994,38 @@ fn run_overwrite(
             "{covered}，但重启服务「{service}」失败：{e}（文件已更新，请人工确认服务状态）"
         )),
     }
+}
+
+/// 平台请求**在线目录只读**（`fileList`）：返回目录清单。
+///
+/// 与面板「文件管理」共用 `fileman::browse`，**只读**：平台侧目前只开放
+/// `onlineView`（查看）权限，写入/删除/上传等通道不在本阶段内。
+/// 回执带 `reqId` 原样回传，平台据此把异步 WS 回执接回同步的 HTTP 请求。
+fn handle_file_list(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let req_id = cmd
+        .get("reqId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let path = cmd.get("path").and_then(|x| x.as_str()).unwrap_or("");
+    let reply = match crate::fileman::browse(manager.base(), path) {
+        Ok(mut v) => {
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("type".to_string(), json!("fileListResult"));
+                obj.insert("reqId".to_string(), json!(req_id));
+                obj.insert("ok".to_string(), json!(true));
+            }
+            v
+        }
+        Err(e) => json!({
+            "type": "fileListResult",
+            "reqId": req_id,
+            "ok": false,
+            "message": e,
+        }),
+    };
+    send_event(&agent_id, reply);
 }
 
 /// 平台请求扫描 C# 星尘配置（只读）：返回可纳管的子服务清单。

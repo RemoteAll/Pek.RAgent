@@ -34,13 +34,15 @@ pub(crate) use dhrust::fileman::{
 
 // ————— 动作：浏览 / 读写 —————
 
-/// `GET /star/fileList?path=`：目录浏览（path 为空 → 快捷根列表/盘符）。
-pub fn file_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
-    if !panel.check_auth(ctx) {
-        return json_error(401, "Unauthorized");
-    }
-    let base = panel.base();
-    let raw_input = arg(ctx, "path").unwrap_or_default();
+/// 目录浏览的核心实现（HTTP 面板与平台 `fileList` **共用**）。
+///
+/// `raw_input` 为空 → 快捷根/盘符视图；否则按程序基础目录解析并归一化。
+/// 平台下发的在线目录请求与面板点目录必须走**同一份**逻辑，否则
+/// 「根视图 / 路径归一化 / 隐藏上传分片」的判定很容易两处出现分歧。
+///
+/// 与 HTTP 版的唯一差别：错误统一成可读文案（HTTP 版曾用 404 区分「目录不存在」，
+/// 但面板前端只看 `code != 0`，合并为 400 不影响使用）。
+pub fn browse(base: &Path, raw_input: &str) -> Result<Json, String> {
     // Linux：空路径归一为 `/`（根视图即文件系统根，后续逻辑统一处理）
     #[cfg(unix)]
     let raw = {
@@ -52,7 +54,7 @@ pub fn file_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         }
     };
     #[cfg(windows)]
-    let raw = raw_input;
+    let raw = raw_input.to_string();
 
     // Windows 根视图：列出盘符（Linux 的空路径已在上面归一为 `/`）
     #[cfg(windows)]
@@ -71,45 +73,41 @@ pub fn file_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
                 }));
             }
         }
-        return json_result(
-            0,
-            "",
-            Some(json!({
-                "path": "",
-                "parent": "",
-                "items": items,
-                "roots": quick_roots(base),
-                "base": base.display().to_string(),
-            })),
-        );
+        return Ok(json!({
+            "path": "",
+            "parent": "",
+            "items": items,
+            "roots": quick_roots(base),
+            "base": base.display().to_string(),
+        }));
     }
 
-    let dir = match resolve_path(base, &raw) {
-        Ok(p) => p,
-        Err(e) => return json_error(400, &e),
-    };
+    let dir = resolve_path(base, &raw)?;
     if !dir.is_dir() {
-        return json_error(404, &format!("目录不存在：{}", dir.display()));
+        return Err(format!("目录不存在：{}", dir.display()));
     }
-    match list_dir(&dir) {
-        Ok(items) => {
-            let parent = dir
-                .parent()
-                .map(|p| p.display().to_string())
-                .unwrap_or_default();
-            json_result(
-                0,
-                "",
-                Some(json!({
-                    "path": dir.display().to_string(),
-                    "parent": parent,
-                    "items": items,
-                    "roots": quick_roots(base),
-                    "base": base.display().to_string(),
-                })),
-            )
-        }
-        Err(e) => json_error(500, &e),
+    let items = list_dir(&dir)?;
+    let parent = dir
+        .parent()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    Ok(json!({
+        "path": dir.display().to_string(),
+        "parent": parent,
+        "items": items,
+        "roots": quick_roots(base),
+        "base": base.display().to_string(),
+    }))
+}
+
+/// `GET /star/fileList?path=`：目录浏览（path 为空 → 快捷根列表/盘符）。
+pub fn file_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    match browse(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
+        Ok(v) => json_result(0, "", Some(v)),
+        Err(e) => json_error(400, &e),
     }
 }
 

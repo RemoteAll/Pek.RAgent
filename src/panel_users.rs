@@ -39,6 +39,9 @@ pub const CAP_APP_DEPLOY: &str = "appDeploy";
 /// 能力标识（平台可对 **C# 星尘托管的存量应用**做 `deployOverwrite` 覆盖与 `cstarScan` 扫描）。
 pub const CAP_CSTAR: &str = "cstar";
 
+/// 能力标识（平台可下发 `fileList` 读取节点目录，供部署客户端的在线目录使用）。
+pub const CAP_FILEMAN: &str = "fileman";
+
 /// 摘要缓存（5 秒）：register 与首次心跳间隔很短，避免重复读库。
 static SUMMARY: OnceLock<Mutex<(Instant, String, usize)>> = OnceLock::new();
 
@@ -79,9 +82,17 @@ pub fn merge_summary(base: &Path, v: &mut Json) {
         // `appsSync`：支持平台请求立即上报子应用清单（`appsQuery` → `appsSync`）
         // `appDeploy`：支持首次部署（应用不存在时按平台预置目录新建）
         // `cstar`：支持 C# 星尘存量纳管（`deployOverwrite` 覆盖 + `cstarScan` 扫描）
+        // `fileman`：支持平台下发 `fileList`（部署客户端在线目录用，只读）
         obj.insert(
             "caps".to_string(),
-            json!([CAP, CAP_APP_UPGRADE, CAP_APPS_SYNC, CAP_APP_DEPLOY, CAP_CSTAR]),
+            json!([
+                CAP,
+                CAP_APP_UPGRADE,
+                CAP_APPS_SYNC,
+                CAP_APP_DEPLOY,
+                CAP_CSTAR,
+                CAP_FILEMAN
+            ]),
         );
         obj.insert("panelUsersVersion".to_string(), Json::String(digest));
         obj.insert("panelUsersCount".to_string(), json!(count));
