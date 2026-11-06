@@ -124,12 +124,22 @@ pub fn deploy_bytes_ext(
         ));
     }
 
+    // 目录安全校验放在最前：先拒绝，再解包（不把一个注定失败的包解开一遍）
+    check_work_dir(opts, manager.base())?;
     let base = manager.base().to_path_buf();
     let staging = staging_dir(&base)?;
     let rs = deploy_staged(manager, &staging, package_name, data, opts);
     // 无论成败都清理暂存目录（成功路径的文件已复制到工作目录）
     let _ = fs::remove_dir_all(&staging);
     rs
+}
+
+/// 部署前校验调用方给的目录（`work_dir`）；空白视为未给。
+fn check_work_dir(opts: &DeployOptions, base: &Path) -> Result<(), String> {
+    if let Some(dir) = opts.work_dir.map(str::trim).filter(|s| !s.is_empty()) {
+        validate_deploy_dir(Path::new(dir), base)?;
+    }
+    Ok(())
 }
 
 /// 暂存目录：`{base}/Data/apppkg-{pid}-{nanos}`（与工作目录同盘，保证原子改名可用）。
@@ -143,6 +153,46 @@ fn staging_dir(base: &Path) -> Result<PathBuf, String> {
     let dir = data_dir.join(format!("apppkg-{}-{}", std::process::id(), nonce));
     fs::create_dir_all(&dir).map_err(|e| format!("创建暂存目录失败：{e}"))?;
     Ok(dir)
+}
+
+/// 部署/覆盖目标目录的安全校验：绝对路径、非根目录、**不落在星尘自身目录内**。
+///
+/// 两条硬约束都来自「平台被冒充」的假设：即使攻击者能伪造平台下发指令，
+/// 也不能让节点往 `/` 或星尘自己的目录里写文件（那句"升级星尘"会变成自毁）。
+///
+/// 比较前先做**词法规范化**：否则 `/opt/ragent/../apps/demo` 这种写法会被误判成
+/// 「落在星尘目录内」而拒绝，反过来 `/opt/ragent/./Data` 之类的变体也可能绕过检查。
+pub fn validate_deploy_dir(target: &Path, base: &Path) -> Result<(), String> {
+    if target.as_os_str().is_empty() {
+        return Err("未指定部署目录".to_string());
+    }
+    if !target.is_absolute() {
+        return Err(format!("部署目录必须是绝对路径：{}", target.display()));
+    }
+    if target.parent().is_none() {
+        return Err("拒绝部署到根目录".to_string());
+    }
+    let t = flatten(&util::lexical_normalize(target));
+    let b = flatten(&util::lexical_normalize(base));
+    // 前缀比较必须带分隔符：`/opt/ragent-apps` 不是 `/opt/ragent` 的子目录
+    if t == b || t.starts_with(&(b + "/")) {
+        return Err(format!(
+            "拒绝部署到星尘自身目录（{}）；如需升级星尘本体请用自动升级或面板升级",
+            target.display()
+        ));
+    }
+    Ok(())
+}
+
+/// 路径 → 紧凑的斜杠形式（Windows 统一小写），用于前缀比较。
+fn flatten(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(windows) {
+        s.to_ascii_lowercase()
+    } else {
+        s
+    }
 }
 
 /// 把包内容**覆盖**解压到目标目录（不注册服务、不动星尘配置）；返回写入文件数。
@@ -165,6 +215,14 @@ pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<
     }
     if target.as_os_str().is_empty() {
         return Err("未指定覆盖目标目录".to_string());
+    }
+    // 存量覆盖的语义是「换掉已有应用目录里的文件」：目录不存在就是平台把 DirPath 填错了，
+    // 此时凭空建一个目录并塞进文件，只会缁下一个没人托管、却占了磁盘的孤儿目录。
+    if !target.is_dir() {
+        return Err(format!(
+            "覆盖目标目录不存在或不是目录：{}；存量覆盖只针对已存在的部署目录，不会新建",
+            target.display()
+        ));
     }
     let base = std::env::temp_dir().join(format!(
         "ra-overwrite-{}-{}",
@@ -934,5 +992,72 @@ mod tests {
         assert_eq!(app2.arguments.as_deref(), Some("--print-table"));
 
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 造一个含假 ELF 主程序的 zip（x86_64，2KB）。
+    fn sample_zip() -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            zw.start_file("dhdeploy-agent-rust", opts).unwrap();
+            let mut bin = vec![0u8; 2048];
+            bin[..4].copy_from_slice(b"\x7fELF");
+            bin[4] = 2; // 64-bit
+            bin[18] = 0x3E; // x86-64
+            zw.write_all(&bin).unwrap();
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    /// 存量覆盖只针对**已存在**的目录：平台把 DirPath 填错时不能凭空建一个孤儿目录。
+    #[test]
+    fn overwrite_requires_existing_target_dir() {
+        let tmp = temp_dir("overwrite");
+        let data = sample_zip();
+        let missing = tmp.join("not-exist");
+        let err = overwrite_into(&missing, "legacyapp-1.0.0.zip", &data).unwrap_err();
+        assert!(err.contains("不存在"), "错误应说明目录不存在：{err}");
+        assert!(!missing.exists(), "失败路径不应创建目录");
+
+        let target = tmp.join("app");
+        std::fs::create_dir_all(&target).unwrap();
+        let files = overwrite_into(&target, "legacyapp-1.0.0.zip", &data).unwrap();
+        assert!(files > 0, "应写入文件");
+        assert!(target.join("dhdeploy-agent-rust").is_file());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// 部署目录安全校验：必须绝对路径、非根、不落在星尘自身目录内。
+    ///
+    /// 注意 Windows 的 `/opt/...` **不是**绝对路径（需要盘符），所以基准按平台取。
+    #[test]
+    fn validate_deploy_dir_rejects_dangerous_targets() {
+        let (base, root) = if cfg!(windows) {
+            (PathBuf::from(r"C:\opt\ragent"), PathBuf::from(r"C:\"))
+        } else {
+            (PathBuf::from("/opt/ragent"), PathBuf::from("/"))
+        };
+        // 相对路径
+        assert!(validate_deploy_dir(Path::new("apps/demo"), &base).is_err());
+        // 根目录
+        assert!(validate_deploy_dir(&root, &base).is_err());
+        // 星尘自身与其子目录（含 `..` / `.` 变体，规范化后仍应命中）
+        assert!(validate_deploy_dir(&base, &base).is_err());
+        assert!(validate_deploy_dir(&base.join("Data"), &base).is_err());
+        assert!(validate_deploy_dir(&base.join("./Data"), &base).is_err());
+        assert!(validate_deploy_dir(&base.join("sub/../Data"), &base).is_err());
+        // 正常业务目录：`..` 跳出后不算落在自身目录；同名前缀也不算
+        assert!(validate_deploy_dir(&base.join("../apps/demo"), &base).is_ok());
+        let sibling = if cfg!(windows) {
+            PathBuf::from(r"C:\opt\ragent-apps\demo")
+        } else {
+            PathBuf::from("/opt/ragent-apps/demo")
+        };
+        assert!(validate_deploy_dir(&sibling, &base).is_ok());
     }
 }

@@ -629,8 +629,18 @@ fn handle_package_command(
         );
     };
 
-    if app_name.is_empty() || version.is_empty() {
-        reply(false, "缺少 appName 或 version".to_string());
+    if app_name.is_empty() {
+        reply(false, "缺少 appName".to_string());
+        return;
+    }
+    // 有 `path` = 要下载并部署，必须有版本号；`deployOverwrite` 不带 path 的「只重启」不需要
+    let has_path = cmd
+        .get("path")
+        .and_then(|x| x.as_str())
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    if has_path && version.is_empty() {
+        reply(false, "缺少 version（下载部署包时必须给出）".to_string());
         return;
     }
     // 串行化：避免两个升级任务同时改同一应用目录
@@ -930,7 +940,7 @@ fn run_overwrite(
         return Err("缺少 dirPath（平台实例未预置部署目录）".to_string());
     }
     let target = std::path::PathBuf::from(&dir_path);
-    validate_overwrite_dir(&target, manager.base())?;
+    crate::apppkg::validate_deploy_dir(&target, manager.base())?;
     let pkg = match cmd
         .get("path")
         .and_then(|x| x.as_str())
@@ -978,33 +988,6 @@ fn run_overwrite(
             "{covered}，但重启服务「{service}」失败：{e}（文件已更新，请人工确认服务状态）"
         )),
     }
-}
-
-/// 覆盖目标目录的安全校验：必须是绝对路径，且不能是根目录 / 不能覆盖星尘自身目录。
-fn validate_overwrite_dir(target: &std::path::Path, base: &std::path::Path) -> Result<(), String> {
-    if !target.is_absolute() {
-        return Err(format!("覆盖目标必须是绝对路径：{}", target.display()));
-    }
-    if target.parent().is_none() {
-        return Err("拒绝覆盖到根目录".to_string());
-    }
-    let norm = |p: &std::path::Path| {
-        let s = p.to_string_lossy().replace('\\', "/");
-        if cfg!(windows) {
-            s.to_ascii_lowercase()
-        } else {
-            s
-        }
-    };
-    let t = norm(target);
-    let b = norm(base);
-    if t == b || t.starts_with(&(b + "/")) {
-        return Err(format!(
-            "拒绝覆盖星尘自身目录（{}）；如需升级星尘本体请使用自动升级或面板升级",
-            target.display()
-        ));
-    }
-    Ok(())
 }
 
 /// 平台请求扫描 C# 星尘配置（只读）：返回可纳管的子服务清单。
