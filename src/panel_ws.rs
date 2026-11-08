@@ -810,6 +810,34 @@ fn fetch_package(
     if expected_sha.len() != 64 || !expected_sha.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("平台下发的 SHA-256 无效".to_string());
     }
+    let file_name = cmd
+        .get("fileName")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let file_name = if file_name.is_empty() {
+        format!("{app_name}-{version}.zip")
+    } else {
+        file_name
+    };
+    // **先查本地缓存**：同一 SHA-256 已经下载过就不再联网
+    // （重试、回滚、同包多实例 → 零流量；用户 2026-11-08 明确要求）
+    if let Some(body) = crate::apppkg_cache::get(&expected_sha) {
+        util::log_format(
+            "应用包缓存命中，跳过下载：{} v{}（{} KB，SHA-256 {}…）",
+            &[
+                app_name,
+                version,
+                &(body.len() / 1024).to_string(),
+                &expected_sha[..12],
+            ],
+        );
+        return Ok(FetchedPackage { body, file_name });
+    }
     util::log_format(
         "开始下载应用包：{} v{} ← {}",
         &[app_name, version, &redact_url_ticket(&url)],
@@ -859,20 +887,8 @@ fn fetch_package(
             &actual[..12],
         ],
     );
-    let file_name = cmd
-        .get("fileName")
-        .and_then(|x| x.as_str())
-        .unwrap_or("")
-        .trim()
-        .rsplit(['/', '\\'])
-        .next()
-        .unwrap_or("")
-        .to_string();
-    let file_name = if file_name.is_empty() {
-        format!("{app_name}-{version}.zip")
-    } else {
-        file_name
-    };
+    // 落缓存：下次同包（重试/回滚/多实例）直接命中，不再占用平台出口带宽
+    crate::apppkg_cache::put(&actual, &resp.body);
     Ok(FetchedPackage {
         body: resp.body,
         file_name,

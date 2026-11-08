@@ -10,6 +10,7 @@ mod agent;
 mod ai;
 mod app;
 mod apppkg;
+mod apppkg_cache;
 mod audit;
 mod certdeploy;
 mod cli;
