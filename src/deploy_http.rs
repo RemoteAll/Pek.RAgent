@@ -43,6 +43,8 @@ pub struct Ticket {
     pub mode: String,
     /// 目标目录（`deploy`/`overwrite` 必填；`upgrade` 忽略）
     pub dir_path: String,
+    /// 启动参数（首次部署时写入；升级时保留原值）
+    pub arguments: Option<String>,
     /// 包内容的 SHA-256（小写 hex）
     pub sha256: String,
     /// 签发时刻（TTL 判定）
@@ -56,6 +58,7 @@ impl Ticket {
         version: impl Into<String>,
         mode: impl Into<String>,
         dir_path: impl Into<String>,
+        arguments: Option<String>,
         sha256: impl Into<String>,
     ) -> Self {
         Self {
@@ -63,6 +66,7 @@ impl Ticket {
             version: version.into(),
             mode: mode.into(),
             dir_path: dir_path.into(),
+            arguments: arguments.filter(|s| !s.trim().is_empty()),
             sha256: sha256.into(),
             issued: Instant::now(),
         }
@@ -256,7 +260,7 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
                 body,
                 &crate::apppkg::DeployOptions {
                     name_hint: Some(&t.app_name),
-                    arguments: None,
+                    arguments: t.arguments.as_deref(),
                     auto_start: true,
                     work_dir: if work_dir.is_empty() {
                         None
@@ -336,7 +340,7 @@ mod tests {
         let id = tid(1);
         assert!(issue(
             &id,
-            Ticket::new("demo", "1.0.0", "deploy", "/tmp/demo", "a".repeat(64))
+            Ticket::new("demo", "1.0.0", "deploy", "/tmp/demo", None, "a".repeat(64))
         ));
         assert!(take(&id).is_some(), "第一次核销应成功");
         assert!(take(&id).is_none(), "票据一次性，第二次必须失败");
@@ -344,10 +348,13 @@ mod tests {
 
     #[test]
     fn rejects_invalid_ticket_id() {
-        assert!(!issue("", Ticket::new("a", "1", "deploy", "/x", "a".repeat(64))));
+        assert!(!issue(
+            "",
+            Ticket::new("a", "1", "deploy", "/x", None, "a".repeat(64))
+        ));
         assert!(!issue(
             "../etc/passwd",
-            Ticket::new("a", "1", "deploy", "/x", "a".repeat(64))
+            Ticket::new("a", "1", "deploy", "/x", None, "a".repeat(64))
         ));
         assert!(take("not-hex!").is_none());
     }
@@ -357,7 +364,7 @@ mod tests {
         // 用真实目录才能走到 mode 判定之后；这里只验证 mode 匹配逻辑的兜底分支
         let mgr = None::<&Arc<AppManager>>;
         assert!(mgr.is_none());
-        let t = Ticket::new("demo", "1.0.0", "bogus", "", "a".repeat(64));
+        let t = Ticket::new("demo", "1.0.0", "bogus", "", None, "a".repeat(64));
         assert_eq!(t.mode, "bogus");
     }
 }

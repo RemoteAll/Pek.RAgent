@@ -421,6 +421,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                     version.clone(),
                     mode.clone(),
                     s("dirPath", 300),
+                    Some(s("arguments", 500)),
                     s("sha256", 64),
                 );
                 if crate::deploy_http::issue(&id, ticket) {
