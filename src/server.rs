@@ -131,7 +131,13 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     //   AI 对话内容），历史上已多次为此逐个加白名单；
     // - 保留 **IP 黑白名单 + CC 限流（默认 600 次/分钟/IP）**——面板 3 秒轮询约 40 次/分钟，余量充足。
     let mut waf_cfg = pek_rwaf::WafConfig::admin_api();
-    waf_cfg.skip_attack_prefixes = vec!["/api".to_string(), "/star".to_string()];
+    // `/deploy` 是直连部署（裸二进制包）：既不能按机器人拦（客户端 UA 各式各样），
+    // 也不能做 body 攻击特征扫描（压缩包字节会被误判）。它的安全靠一次性票据。
+    waf_cfg.skip_attack_prefixes = vec![
+        "/api".to_string(),
+        "/star".to_string(),
+        "/deploy".to_string(),
+    ];
     // DHDeploy 契约接口属敏感路径（服务清单拿安装路径/启停能力）：该前缀下禁一切机器人
     waf_cfg.sensitive_prefixes = vec![
         "/GetServices".to_string(),
@@ -149,14 +155,33 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
     waf.set_trust_forwarded_for(true);
     // 强制豁免走内存态（不受 Config/Waf.toml 在线修改影响）：面板与机器接口（DHDeploy 的
     // RestSharp / HttpClient UA）不应被判为扫描器。
-    waf.set_forced_skip_bot_prefixes(vec!["/api".to_string(), "/star".to_string()]);
-    waf.set_forced_skip_attack_prefixes(vec!["/api".to_string(), "/star".to_string()]);
+    waf.set_forced_skip_bot_prefixes(vec![
+        "/api".to_string(),
+        "/star".to_string(),
+        "/deploy".to_string(),
+    ]);
+    waf.set_forced_skip_attack_prefixes(vec![
+        "/api".to_string(),
+        "/star".to_string(),
+        "/deploy".to_string(),
+    ]);
     router.use_middleware(waf.middleware());
 
     // Web 管理面板：/api/* 与 /star/*（Bearer Token 鉴权，契约对齐 C# 面板；WAF 用于「安全」页在线管理）
     let panel = WebPanel::new(manager.clone(), manager.base(), port, waf.clone());
     build_api_controller(panel.clone()).mount(&mut router);
     build_star_controller(panel.clone()).mount(&mut router);
+
+    // **直连部署**：客户端 → 本机推包，包不经平台。
+    // 鉴权不靠 panel_access（客户服务器可能设成本机面板），而是靠平台下发的一次性票据。
+    let m = manager.clone();
+    router.map_post(
+        "/deploy/apply",
+        route(move |ctx| {
+            let m = m.clone();
+            async move { crate::deploy_http::apply(m, ctx) }
+        }),
+    );
 
     // 在线终端：WebSocket 升级路由（真 PTY 流式；认证在处理器内完成，见 terminal.rs）
     let term_panel = panel.clone();

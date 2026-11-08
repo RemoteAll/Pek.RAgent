@@ -16,6 +16,7 @@ mod certdeploy;
 mod cli;
 mod config;
 mod deploy;
+mod deploy_http;
 mod fileman;
 mod history;
 mod iis;

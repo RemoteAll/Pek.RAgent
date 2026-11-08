@@ -400,6 +400,41 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
             }
+            // 平台下发**直连部署票据**（`deployTicket`）：客户端拿同一张票据直连本机推包，
+            // 包不经平台。票据一次性、10 分钟 TTL（见 `deploy_http`）。
+            "deployTicket" => {
+                let s = |k: &str, max: usize| -> String {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(max)
+                        .collect()
+                };
+                let id = s("ticket", 64);
+                let app_name = s("appName", 100);
+                let version = s("version", 50);
+                let mode = s("mode", 20);
+                let ticket = crate::deploy_http::Ticket::new(
+                    app_name.clone(),
+                    version.clone(),
+                    mode.clone(),
+                    s("dirPath", 300),
+                    s("sha256", 64),
+                );
+                if crate::deploy_http::issue(&id, ticket) {
+                    util::log_format(
+                        "已登记直连部署票据：{} v{}（{}，{}…）",
+                        &[&app_name, &version, &mode, &id.chars().take(8).collect::<String>()],
+                    );
+                } else {
+                    util::log_error(&format!(
+                        "直连部署票据登记失败（票据 id 非法或待处理票据过多）：{} v{}，id={id}",
+                        app_name, version
+                    ));
+                }
+            }
             // 平台下发子应用升级（`appUpgrade`）：下载 → SHA-256 校验 → 部署 → 重启 → 回执
             "appUpgrade" => {
                 let mgr = msg_mgr.clone();
@@ -1030,7 +1065,7 @@ fn run_overwrite(
 ///
 /// 之所以严格比对目录：覆盖写的是 `dirPath`，星尘重启的是「服务名」——
 /// 两者对不上就会「把 A 目录的程序换掉、去重启 B 服务」，比直接失败危险得多。
-fn precheck_cstar_target(service: &str, dir_path: &str) -> Result<(), String> {
+pub(crate) fn precheck_cstar_target(service: &str, dir_path: &str) -> Result<(), String> {
     let scan = crate::migrate::scan(None).map_err(|e| {
         format!(
             "无法确认 C# 星尘里存在服务「{service}」，本次未下载任何文件：{e}\
@@ -1482,6 +1517,36 @@ fn cstar_probe(force: bool) -> Option<(std::path::PathBuf, String)> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     Some((dir, format!("{}|{mtime}|{}", path.display(), md.len())))
+}
+
+/// 供**直连部署**回报结果（与平台下发路径共用同一份回执格式）。
+///
+/// 直连时包不经平台，但结果必须回到平台，否则任务永远停在 sent、实例版本也不会刷新。
+pub fn report_app_result(
+    manager: &AppManager,
+    app_name: &str,
+    version: &str,
+    ok: bool,
+    message: &str,
+) {
+    if !connected() {
+        util::log_format(
+            "平台未连接，直连部署结果无法上报（本地已生效）：{} v{}——{}",
+            &[app_name, version, message],
+        );
+        return;
+    }
+    let agent_id = manager.config().agent_id.clone();
+    send_event(
+        &agent_id,
+        json!({
+            "type": "appUpgradeResult",
+            "appName": app_name,
+            "version": version,
+            "ok": ok,
+            "message": message,
+        }),
+    );
 }
 
 /// 平台「服务器节点」展示用的面板元数据：端口 / 是否允许远程访问 / 内置管理员状态。
