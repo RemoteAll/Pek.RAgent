@@ -416,7 +416,7 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 let app_name = s("appName", 100);
                 let version = s("version", 50);
                 let mode = s("mode", 20);
-                let ticket = crate::deploy_http::Ticket::new(
+                let mut ticket = crate::deploy_http::Ticket::new(
                     app_name.clone(),
                     version.clone(),
                     mode.clone(),
@@ -424,6 +424,11 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                     Some(s("arguments", 500)),
                     s("sha256", 64),
                 );
+                // 部署成功后要按实例回报文件清单快照（旧平台不带该字段 → 0 = 不上报）
+                ticket.instance_id = v
+                    .get("instanceId")
+                    .and_then(|x| x.as_i64())
+                    .unwrap_or(0);
                 if crate::deploy_http::issue(&id, ticket) {
                     util::log_format(
                         "已登记直连部署票据：{} v{}（{}，{}…）",
@@ -1547,6 +1552,59 @@ pub fn report_app_result(
             "ok": ok,
             "message": message,
         }),
+    );
+}
+
+/// 上报**部署目录的实际文件清单**（平台据此存快照，多台部署端共享同一份基线）。
+///
+/// - `files`：`(相对路径, sha256, 字节数)`；
+/// - 平台按 `instanceId` 整体替换；`instance_id <= 0`（旧平台未下发）时不上报，
+///   避免把「不知道属于哪个实例」的清单写进库。
+pub fn report_snapshot(
+    manager: &AppManager,
+    instance_id: i64,
+    app_name: &str,
+    dir_path: &str,
+    files: &[(String, String, u64)],
+) {
+    if instance_id <= 0 {
+        return;
+    }
+    if !connected() {
+        util::log_format(
+            "平台未连接，部署快照无法上报（{} 个文件）：{}",
+            &[&files.len().to_string(), dir_path],
+        );
+        return;
+    }
+    let agent_id = manager.config().agent_id.clone();
+    let list: Vec<serde_json::Value> = files
+        .iter()
+        .map(|(path, sha, size)| {
+            json!({ "path": path, "sha256": sha, "size": *size as i64 })
+        })
+        .collect();
+    // 快照版本号：一次上报一个值（平台按该值整体替换，便于排查是哪次部署写的）
+    let version = dhrust::random::hex(8);
+    send_event(
+        &agent_id,
+        json!({
+            "type": "appSnapshot",
+            "instanceId": instance_id,
+            "appName": app_name,
+            "dirPath": dir_path,
+            "snapshotVersion": version,
+            "files": list,
+        }),
+    );
+    util::log_format(
+        "已上报部署快照：{} 个文件（{}；实例 {}，版本 {}）",
+        &[
+            &files.len().to_string(),
+            dir_path,
+            &instance_id.to_string(),
+            &version,
+        ],
     );
 }
 

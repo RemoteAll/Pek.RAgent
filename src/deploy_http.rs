@@ -52,6 +52,8 @@ pub struct Ticket {
     /// 剩余**写**次数（读目录指纹不消耗）。客户端流程是「读指纹 → 写一次」，
     /// 所以写配额 1 就够；用完即删，不可重放。
     remaining: u8,
+    /// 部署实例编号（平台签票时下发；部署成功后据此回报文件清单快照，0 = 不上报）
+    pub instance_id: i64,
 }
 
 impl Ticket {
@@ -73,6 +75,7 @@ impl Ticket {
             sha256: sha256.into(),
             issued: Instant::now(),
             remaining: 1,
+            instance_id: 0,
         }
     }
 }
@@ -254,6 +257,30 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
     }
     // 回报平台：平台据此闭环任务、刷新实例版本（平台只收结果，不收包）
     crate::panel_ws::report_app_result(&manager, &ticket.app_name, &ticket.version, ok, &message);
+    // 部署成功后回报**实际文件清单**（平台存快照，多台部署端共享同一份基线；失败不回报，
+    // 免得把半成品目录当成新基线）。目录取票据里的 dirPath。
+    if ok && ticket.instance_id > 0 {
+        let dir = ticket.dir_path.trim();
+        if !dir.is_empty() {
+            let root = std::path::PathBuf::from(dir);
+            if root.is_dir() {
+                let (files, truncated) = scan_files(&root);
+                if truncated {
+                    crate::util::log_format(
+                        "部署快照条目超过上限（{} 个），已截断；请检查部署目录是否选错",
+                        &[&files.len().to_string()],
+                    );
+                }
+                crate::panel_ws::report_snapshot(
+                    &manager,
+                    ticket.instance_id,
+                    &ticket.app_name,
+                    dir,
+                    &files,
+                );
+            }
+        }
+    }
     crate::audit::record(
         manager.base(),
         &crate::audit::AuditEntry {
@@ -330,6 +357,58 @@ pub fn fingerprint(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
         "指纹已读取",
         &json!({ "dir": dir, "exists": true, "files": files, "truncated": truncated }),
     )
+}
+
+/// 扫描目录下所有文件的 `(相对路径, sha256, 字节数)`（相对路径用 `/` 分隔）。
+///
+/// 与 [`collect_fingerprint`] 同一套上限（文件数 / 单文件体积），
+/// 供「部署成功后回报快照」复用，避免两处口径不一。
+fn scan_files(root: &std::path::Path) -> (Vec<(String, String, u64)>, bool) {
+    let mut out: Vec<(String, String, u64)> = Vec::new();
+    let mut truncated = false;
+    scan_files_inner(root, root, &mut out, &mut truncated);
+    (out, truncated)
+}
+
+fn scan_files_inner(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut Vec<(String, String, u64)>,
+    truncated: &mut bool,
+) {
+    if out.len() >= MAX_FINGERPRINT_FILES {
+        *truncated = true;
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cur) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if out.len() >= MAX_FINGERPRINT_FILES {
+            *truncated = true;
+            return;
+        }
+        let path = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            scan_files_inner(root, &path, out, truncated);
+            continue;
+        }
+        if !md.is_file() || md.len() > MAX_FINGERPRINT_FILE_BYTES {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        out.push((
+            rel.to_string_lossy().replace('\\', "/"),
+            dhrust::sign::sha256_hex(&data),
+            md.len(),
+        ));
+    }
 }
 
 /// 递归收集文件指纹（相对路径用 `/` 分隔，跨平台一致）。
