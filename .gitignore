@@ -12,3 +12,7 @@
 /Config
 # Python 缓存
 __pycache__/
+
+# 回归报告与临时产物（工具生成，不入库）
+/artifacts/
+

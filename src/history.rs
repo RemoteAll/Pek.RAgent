@@ -1153,9 +1153,11 @@ mod tests {
         let store = storage(&base).unwrap();
         let admin = db_admin_for(&base, store);
         let info = admin.database_info();
+        // `pek_rcode` 自 61c394a 起把 Data Source 里的反斜杠按目录分隔符解析（跨平台），
+        // 返回的是归一化后的 `/` 分隔路径；比较时两端都归一化，Windows/Linux 都稳。
         assert_eq!(
-            info["path"].as_str().unwrap_or_default(),
-            custom.display().to_string(),
+            info["path"].as_str().unwrap_or_default().replace('\\', "/"),
+            custom.display().to_string().replace('\\', "/"),
             "{info}"
         );
         cleanup(&base);
