@@ -202,6 +202,123 @@ fn flatten(p: &Path) -> String {
 ///
 /// 只覆盖、不删多余文件：删冗余需要「哪些是包内文件」的完整快照，误删线上数据
 /// （上传目录、配置、日志）的代价远大于省下的磁盘。
+/// 读取包里**指定条目**的文本内容（找不到返回 `Ok(None)`）。
+///
+/// 用于增量部署的「残留清理清单」（`.pek-prune.txt`）：只解压出该条目，不落盘到部署目录。
+pub fn entry_text(data: &[u8], name: &str) -> Result<Option<String>, String> {
+    if data.is_empty() {
+        return Err("上传内容为空".to_string());
+    }
+    if data.len() > MAX_PACKAGE_SIZE {
+        return Err(format!(
+            "包过大（{} MB，上限 {} MB）",
+            data.len() / 1024 / 1024,
+            MAX_PACKAGE_SIZE / 1024 / 1024
+        ));
+    }
+    let base = std::env::temp_dir().join(format!(
+        "ra-entrytext-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&base).map_err(|e| format!("创建暂存目录失败：{e}"))?;
+    let result = (|| -> Result<Option<String>, String> {
+        let kind = package_kind(data)?;
+        let unpack = base.join("unpack");
+        fs::create_dir_all(&unpack).map_err(|e| format!("创建解压目录失败：{e}"))?;
+        match kind {
+            PackageKind::Zip => {
+                let pkg = base.join("package.zip");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                check_zip_limits(&pkg)?;
+                dhrust::zip::extract_zip_limited(&pkg, &unpack, MAX_UNPACKED_SIZE, MAX_ENTRY_COUNT)?;
+            }
+            PackageKind::TarGz => {
+                let pkg = base.join("package.tar.gz");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                extract_tar_gz(&pkg, &unpack)?;
+            }
+        }
+        // 清单可能位于顶层，也可能被单一顶层目录包着（`descend_root` 后）
+        let root = descend_root(&unpack);
+        for dir in [&root, &unpack] {
+            let p = dir.join(name);
+            if p.is_file() {
+                let text = fs::read_to_string(&p)
+                    .map_err(|e| format!("读取 {name} 失败：{e}"))?;
+                return Ok(Some(text));
+            }
+        }
+        Ok(None)
+    })();
+    let _ = fs::remove_dir_all(&base);
+    result
+}
+
+#[allow(dead_code)]
+pub fn package_entries_unused(data: &[u8]) -> Result<Vec<String>, String> {
+    if data.is_empty() {
+        return Err("上传内容为空".to_string());
+    }
+    if data.len() > MAX_PACKAGE_SIZE {
+        return Err(format!(
+            "包过大（{} MB，上限 {} MB）",
+            data.len() / 1024 / 1024,
+            MAX_PACKAGE_SIZE / 1024 / 1024
+        ));
+    }
+    let base = std::env::temp_dir().join(format!(
+        "ra-entries-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    fs::create_dir_all(&base).map_err(|e| format!("创建暂存目录失败：{e}"))?;
+    let result = (|| -> Result<Vec<String>, String> {
+        let kind = package_kind(data)?;
+        let unpack = base.join("unpack");
+        fs::create_dir_all(&unpack).map_err(|e| format!("创建解压目录失败：{e}"))?;
+        match kind {
+            PackageKind::Zip => {
+                let pkg = base.join("package.zip");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                check_zip_limits(&pkg)?;
+                dhrust::zip::extract_zip_limited(&pkg, &unpack, MAX_UNPACKED_SIZE, MAX_ENTRY_COUNT)?;
+            }
+            PackageKind::TarGz => {
+                let pkg = base.join("package.tar.gz");
+                fs::write(&pkg, data).map_err(|e| format!("写入临时包失败：{e}"))?;
+                extract_tar_gz(&pkg, &unpack)?;
+            }
+        }
+        let root = descend_root(&unpack);
+        let mut out: Vec<String> = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(cur) = stack.pop() {
+            let entries = fs::read_dir(&cur).map_err(|e| format!("读取解压目录失败：{e}"))?;
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if let Ok(rel) = path.strip_prefix(&root) {
+                    out.push(rel.to_string_lossy().replace('\\', "/"));
+                }
+            }
+        }
+        out.sort();
+        Ok(out)
+    })();
+    let _ = fs::remove_dir_all(&base);
+    result
+}
+
 pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<usize, String> {
     if data.is_empty() {
         return Err("上传内容为空".to_string());
@@ -739,6 +856,10 @@ fn copy_tree_inner(src: &Path, dst: &Path, count: &mut usize) -> Result<(), Stri
 
         let lower = entry.file_name().to_string_lossy().to_ascii_lowercase();
         if lower.ends_with(".del") || lower.ends_with(".tmp") {
+            continue;
+        }
+        // 增量包的残留清理清单：只给节点读，**绝不能**写进部署目录
+        if lower == ".pek-prune.txt" {
             continue;
         }
         crate::deploy::copy_file_safe(&path, &target)

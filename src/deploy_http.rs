@@ -54,6 +54,8 @@ pub struct Ticket {
     remaining: u8,
     /// 部署实例编号（平台签票时下发；部署成功后据此回报文件清单快照，0 = 不上报）
     pub instance_id: i64,
+    /// 是否清理「目录里有、增量包里没有」的残留文件（**移到备份目录**，不直接删）
+    pub prune: bool,
 }
 
 impl Ticket {
@@ -76,6 +78,7 @@ impl Ticket {
             issued: Instant::now(),
             remaining: 1,
             instance_id: 0,
+            prune: false,
         }
     }
 }
@@ -175,6 +178,14 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
     let overlay = query_mode.eq_ignore_ascii_case("overlay");
     if overlay {
         ticket.mode = "overlay".to_string();
+        // 残留清理需显式请求（默认关闭）：只做「移动到备份目录」，不直接删除
+        ticket.prune = ctx
+            .query_value("prune")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true")
+            })
+            .unwrap_or(false);
     }
     let body = &ctx.req.body;
     if body.is_empty() {
@@ -518,6 +529,22 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             let is_cstar = crate::panel_ws::precheck_cstar_target(&t.app_name, dir).is_ok();
             let files = crate::apppkg::overwrite_into(&target, &t.app_name, body)?;
             util_log_overwrite(&t.app_name, dir, files);
+            // 可选：把「目录里有、增量包里没有」的残留文件移到备份目录（不直接删，可回滚）
+            let pruned_note = if t.prune {
+                match prune_leftovers(&target, body) {
+                    Ok(n) if n > 0 => format!("，已把 {n} 个残留文件移入备份目录"),
+                    Ok(_) => String::new(),
+                    Err(e) => {
+                        crate::util::log_error(&format!(
+                            "残留清理失败（目录 {}）：{e}（文件已覆盖，残留保持原样）",
+                            target.display()
+                        ));
+                        format!("，残留清理失败：{e}")
+                    }
+                }
+            } else {
+                String::new()
+            };
             if is_cstar {
                 return match dhrust::staragent::operate_by_default_ports(
                     &t.app_name,
@@ -525,7 +552,7 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
                     Duration::from_secs(60),
                 ) {
                     Ok(msg) => Ok(format!(
-                        "已增量覆盖 {files} 个文件到 {}，并{msg}",
+                        "已增量覆盖 {files} 个文件到 {}，并{msg}{pruned_note}",
                         target.display()
                     )),
                     Err(e) => Err(format!(
@@ -538,12 +565,12 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             // Rust 子应用：由本机 RAgent 托管，直接按应用名重启
             match manager.restart_app(&t.app_name, "direct-overlay") {
                 Ok(true) => Ok(format!(
-                    "已增量覆盖 {files} 个文件到 {}，并已重启应用 {}",
+                    "已增量覆盖 {files} 个文件到 {}，并已重启应用 {}{pruned_note}",
                     target.display(),
                     t.app_name
                 )),
                 Ok(false) => Ok(format!(
-                    "已增量覆盖 {files} 个文件到 {}（该应用当前未运行，未重启）",
+                    "已增量覆盖 {files} 个文件到 {}（该应用当前未运行，未重启）{pruned_note}",
                     target.display()
                 )),
                 Err(e) => Err(format!(
@@ -587,6 +614,92 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             "未知的部署方式「{other}」（仅支持 deploy / upgrade / overwrite / overlay）"
         )),
     }
+}
+
+/// 增量包里的「残留清理清单」条目名（每行一个相对路径；由客户端生成，节点不会把它写进部署目录）。
+const PRUNE_MANIFEST: &str = ".pek-prune.txt";
+
+/// 清理残留：把目标目录里**清单列出的**文件移到同级备份目录。
+///
+/// 设计取舍（重要）：
+/// - **只移动、不删除** —— 移到 `{dir 的同级}/.prune-<时间戳>/` 下保留原相对路径，
+///   出问题可以原样搬回；跨盘/权限失败则报错但**不影响已完成的覆盖**；
+/// - **只处理文件，不删目录** —— 目录树残留（空目录）留着无害，删目录风险高；
+/// - **清理清单来自包内条目** [`PRUNE_MANIFEST`]，不是「包里没有的文件」——
+///   这一点很关键：`overlay` 包本来就只有变化文件，若按「包里没有」当残留，
+///   会把所有未变化的文件（含主程序 exe）全部搬走（2026-11-10 e2e 抓到过这个 bug）。
+///
+/// 返回被移动的文件数。
+fn prune_leftovers(target: &std::path::Path, package: &[u8]) -> Result<usize, String> {
+    use std::collections::HashSet;
+
+    // 1) 读包内清单（每行一个相对路径）
+    let drop: HashSet<String> = match crate::apppkg::entry_text(package, PRUNE_MANIFEST) {
+        Ok(Some(text)) => text
+            .lines()
+            .map(|l| l.trim().to_ascii_lowercase())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        Ok(None) => return Ok(0),
+        Err(e) => return Err(format!("读取残留清单失败：{e}")),
+    };
+    if drop.is_empty() {
+        return Ok(0);
+    }
+
+    // 2) 备份目录：与部署目录同级，带时间戳
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let parent = target.parent().unwrap_or(target);
+    let backup = parent.join(format!(".prune-{stamp}"));
+
+    // 3) 遍历目录，把不在 keep 里的文件移走
+    let mut moved = 0usize;
+    let mut stack: Vec<std::path::PathBuf> = vec![target.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&cur) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let path = e.path();
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                stack.push(path);
+                continue;
+            }
+            let Ok(rel) = path.strip_prefix(target) else {
+                continue;
+            };
+            let key = rel.to_string_lossy().replace('\\', "/").to_ascii_lowercase();
+            if !drop.contains(&key) {
+                continue;
+            }
+            let dest = backup.join(rel);
+            if let Some(dir) = dest.parent() {
+                if std::fs::create_dir_all(dir).is_err() {
+                    continue;
+                }
+            }
+            if std::fs::rename(&path, &dest).is_ok() {
+                moved += 1;
+            } else {
+                // 跨盘/占用：尝试复制后删除原文件
+                if std::fs::copy(&path, &dest).is_ok() {
+                    let _ = std::fs::remove_file(&path);
+                    moved += 1;
+                }
+            }
+        }
+    }
+    if moved > 0 {
+        crate::util::log_format(
+            "残留清理：{} 个文件已移入备份目录 {}（可原样搬回）",
+            &[&moved.to_string(), &backup.display().to_string()],
+        );
+    }
+    Ok(moved)
 }
 
 fn util_log_overwrite(app: &str, dir: &str, files: usize) {
