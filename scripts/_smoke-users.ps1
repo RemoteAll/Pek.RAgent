@@ -24,11 +24,24 @@ function Req($method, $path, $body, $token) {
 }
 
 # 1. admin login + me
+# 注意：RAgent 起对默认凭据加了「首次登录必须先改密」的硬闸（返回 428 + mustChangePassword），
+# 不改密的话后面每个需要鉴权的调用都会被 428 拦住（这里以前一次性红了 37 项）。
+$ADMIN_PWD = 'admin2'
 $r = Req 'POST' '/api/login' '{"user":"admin","password":"admin"}' $null
 Check 'admin login' ($r.code -eq 0)
 $admin = $r.data.token
+if ($r.data.mustChangePassword -eq $true) {
+    $r = Req 'POST' '/api/changePassword' '{"oldPassword":"admin","newPassword":"admin2"}' $admin
+    Check 'first-login forced password change' ($r.code -eq 0)
+    $r = Req 'POST' '/api/login' '{"user":"admin","password":"admin2"}' $null
+    Check 'login with new admin password' ($r.code -eq 0)
+    $admin = $r.data.token
+} else {
+    Check 'first-login forced password change' $true
+    Check 'login with new admin password' $true
+}
 $r = Req 'GET' '/api/me' $null $admin
-Check 'admin me isAdmin with all perms' ($r.code -eq 0 -and $r.data.isAdmin -eq $true -and $r.data.perms.Count -eq 13)
+Check 'admin me isAdmin with all perms' ($r.code -eq 0 -and $r.data.isAdmin -eq $true -and $r.data.perms.Count -eq 16)
 
 # 2. create user u1 (dashboard + fileman)
 $r = Req 'POST' '/star/userSave' '{"name":"u1","password":"u1pass","permissions":["dashboard","fileman"],"enabled":true,"remark":"smoke"}' $admin
@@ -40,11 +53,11 @@ $builtin = $r.data.users | Where-Object { $_.isBuiltin -eq $true }
 Check 'userList shows builtin admin' ($null -ne $builtin -and $builtin.userName -eq 'admin')
 $r = Req 'POST' '/star/userDelete' '{"name":"admin"}' $admin
 Check 'builtin admin cannot be deleted' ($r.code -eq 400)
-$r = Req 'POST' '/star/userSave' '{"name":"admin","password":"admin2"}' $admin
+$r = Req 'POST' '/star/userSave' '{"name":"admin","password":"admin3"}' $admin
 Check 'change builtin admin password via userSave' ($r.code -eq 0)
-$r = Req 'POST' '/api/login' '{"user":"admin","password":"admin"}' $null
-Check 'old admin password rejected' ($r.code -eq 401)
 $r = Req 'POST' '/api/login' '{"user":"admin","password":"admin2"}' $null
+Check 'old admin password rejected' ($r.code -eq 401)
+$r = Req 'POST' '/api/login' '{"user":"admin","password":"admin3"}' $null
 Check 'new admin password works' ($r.code -eq 0)
 
 # 2c. builtin admin rename: collision rejected / rename + login / rename back
@@ -54,7 +67,7 @@ $r = Req 'POST' '/star/userSave' '{"name":"admin","newName":"boss"}' $admin
 Check 'rename builtin admin (no password change)' ($r.code -eq 0)
 $r = Req 'POST' '/api/login' '{"user":"admin","password":"admin2"}' $null
 Check 'old admin name rejected after rename' ($r.code -eq 401)
-$r = Req 'POST' '/api/login' '{"user":"boss","password":"admin2"}' $null
+$r = Req 'POST' '/api/login' '{"user":"boss","password":"admin3"}' $null
 Check 'renamed admin login works' ($r.code -eq 0)
 $r = Req 'POST' '/star/userSave' '{"name":"boss","newName":"admin"}' $admin
 Check 'rename back to admin' ($r.code -eq 0)

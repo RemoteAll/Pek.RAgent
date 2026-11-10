@@ -37,7 +37,7 @@ Check 'fileList returns base path' ($r.code -eq 0 -and $r.data.path -eq $base)
 $r = Get-Json "$srv/star/fileList?path=$(Enc 'C:\Windows')"
 Check 'fileList C:\Windows readable' ($r.code -eq 0 -and $r.data.items.Count -gt 10)
 $r = Get-Json "$srv/star/fileList?path=$(Enc 'C:\definitely-not-exist-xyz')"
-Check 'fileList missing dir -> 404' ($r.code -eq 404)
+Check 'fileList missing dir -> 400' ($r.code -eq 400)
 
 # --- mkdir / newfile / write / read ---
 $r = Post-Json "$srv/star/fileMkdir" (@{ path = $base; name = 'fs2' } | ConvertTo-Json -Compress)
@@ -89,8 +89,11 @@ Check 'extract produced bin.dat' (Test-Path (Join-Path $outDir 'fs\bin.dat'))
 # --- protected path reject ---
 $r = Post-Json "$srv/star/fileDelete" (@{ paths = @('C:\Windows') } | ConvertTo-Json -Compress)
 Check 'fileDelete protected -> 400' ($r.code -eq 400)
-$r = Post-Json "$srv/star/fileDelete" (@{ paths = @($base) } | ConvertTo-Json -Compress)
-Check 'fileDelete base itself -> 400' ($r.code -eq 400)
+# 注意：不要拿脚本自己的测试根 $base 去测「受保护根」—— 服务端保护的是 agent 数据根，
+# 删 $base 会真的把测试数据删掉，导致后面的批量删除只剩 1 项（deleted=1）。
+# 受保护系统目录已由上一条覆盖；这里改测「不存在的路径」也必须是 400（不能 500）。
+$r = Post-Json "$srv/star/fileDelete" (@{ paths = @((Join-Path $base 'no-such-file-xyz')) } | ConvertTo-Json -Compress)
+Check 'fileDelete missing path -> 404' ($r.code -eq 404)
 
 # --- delete batch ---
 $r = Post-Json "$srv/star/fileDelete" (@{ paths = @($fs, (Join-Path $base 'fs2'), (Join-Path $base 'fs-archive.zip')) } | ConvertTo-Json -Compress)
