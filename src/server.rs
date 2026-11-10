@@ -183,6 +183,16 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         }),
     );
 
+    // 直连**目录指纹**（文件级增量的前提：客户端据此只推送变化的文件）
+    let m = manager.clone();
+    router.map_post(
+        "/deploy/fingerprint",
+        route(move |ctx| {
+            let m = m.clone();
+            async move { crate::deploy_http::fingerprint(m, ctx) }
+        }),
+    );
+
     // 在线终端：WebSocket 升级路由（真 PTY 流式；认证在处理器内完成，见 terminal.rs）
     let term_panel = panel.clone();
     router.map_get(

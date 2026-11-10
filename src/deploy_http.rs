@@ -49,6 +49,9 @@ pub struct Ticket {
     pub sha256: String,
     /// 签发时刻（TTL 判定）
     issued: Instant,
+    /// 剩余**写**次数（读目录指纹不消耗）。客户端流程是「读指纹 → 写一次」，
+    /// 所以写配额 1 就够；用完即删，不可重放。
+    remaining: u8,
 }
 
 impl Ticket {
@@ -69,6 +72,7 @@ impl Ticket {
             arguments: arguments.filter(|s| !s.trim().is_empty()),
             sha256: sha256.into(),
             issued: Instant::now(),
+            remaining: 1,
         }
     }
 }
@@ -103,15 +107,32 @@ fn valid_ticket_id(id: &str) -> bool {
     !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit())
 }
 
-/// 核销票据（**一次性**：取出即删，失败也不退回）。
-fn take(id: &str) -> Option<Ticket> {
+/// 取票据：`consume_write = true` 扣一次写配额（用尽即删，不可重放）；
+/// `false` 只做只读校验（读目录指纹），不消耗配额。
+fn take_for(id: &str, consume_write: bool) -> Option<Ticket> {
     if !valid_ticket_id(id) {
         return None;
     }
+    let key = id.to_ascii_lowercase();
     let mut m = table().lock().unwrap_or_else(|e| e.into_inner());
     m.retain(|_, t| t.issued.elapsed() < TICKET_TTL);
-    m.remove(&id.to_ascii_lowercase())
-        .filter(|t| t.issued.elapsed() < TICKET_TTL)
+    let t = m.get_mut(&key)?;
+    if t.issued.elapsed() >= TICKET_TTL {
+        m.remove(&key);
+        return None;
+    }
+    if !consume_write {
+        return Some(t.clone());
+    }
+    if t.remaining == 0 {
+        return None;
+    }
+    t.remaining -= 1;
+    let out = t.clone();
+    if t.remaining == 0 {
+        m.remove(&key);
+    }
+    Some(out)
 }
 
 fn json_error(status: u16, message: &str) -> HttpOutcome {
@@ -137,12 +158,21 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
     if ticket_id.is_empty() {
         return json_error(401, "缺少部署票据（ticket）");
     }
-    let Some(ticket) = take(&ticket_id) else {
+    let Some(ticket) = take_for(&ticket_id, true) else {
         return json_error(
             401,
             "部署票据无效、已使用或已过期；请回平台重新发起（票据一次性，不可重放）",
         );
     };
+    // mode 覆盖：客户端做**文件级增量**时推的是「只含变化文件」的小包，
+    // 与票据里登记的整包摘要必然不同。只允许把票据模式收窄为 `overlay`
+    // （overlay 只覆盖列出的文件、不删任何东西，比 deploy/overwrite 更保守）。
+    let query_mode = ctx.query_value("mode").unwrap_or_default();
+    let mut ticket = ticket;
+    let overlay = query_mode.eq_ignore_ascii_case("overlay");
+    if overlay {
+        ticket.mode = "overlay".to_string();
+    }
     let body = &ctx.req.body;
     if body.is_empty() {
         return json_error(400, "包内容为空");
@@ -158,12 +188,22 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
         );
     }
     let actual = dhrust::sign::sha256_hex(body);
-    if !actual.eq_ignore_ascii_case(&ticket.sha256) {
+    let expected = if overlay {
+        // 增量包由客户端现场生成，摘要随请求一起给出（自校验完整性）
+        let q = ctx.query_value("sha256").unwrap_or_default();
+        if q.len() != 64 || !q.chars().all(|c| c.is_ascii_hexdigit()) {
+            return json_error(400, "增量部署必须带 sha256（增量包摘要）");
+        }
+        q.to_string()
+    } else {
+        ticket.sha256.clone()
+    };
+    if !actual.eq_ignore_ascii_case(&expected) {
         return json_error(
             400,
             &format!(
                 "包校验失败：SHA-256 不一致（期望 {}…，实际 {}…）",
-                prefix12(&ticket.sha256),
+                prefix12(&expected),
                 prefix12(&actual)
             ),
         );
@@ -241,6 +281,107 @@ fn prefix12(s: &str) -> String {
     s.chars().take(12).collect()
 }
 
+/// 指纹扫描上限（防误选超大目录时把节点拖死）
+const MAX_FINGERPRINT_FILES: usize = 5000;
+/// 单文件超过这个体积就不计入指纹（大文件本就不适合增量比对）
+const MAX_FINGERPRINT_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// `POST /deploy/fingerprint?ticket=…`：返回**目标目录现有文件**的相对路径 + 体积 + SHA-256。
+///
+/// 这是「文件级增量」的前提：客户端拿它跟新包内的文件清单比对，
+/// 只把变化的文件打成一个增量包推上来（C# 应用几百个 DLL 里通常只改几个）。
+///
+/// 安全：与写接口共用同一张票据；本接口只读，不消耗写配额。
+pub fn fingerprint(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
+    let ticket_id = ctx.query_value("ticket").unwrap_or_default();
+    if ticket_id.is_empty() {
+        return json_error(401, "缺少部署票据（ticket）");
+    }
+    let Some(ticket) = take_for(&ticket_id, false) else {
+        return json_error(401, "部署票据无效或已过期；请回平台重新发起");
+    };
+    let dir = ticket.dir_path.trim();
+    if dir.is_empty() {
+        return json_error(400, "该票据没有部署目录，无法读取指纹");
+    }
+    let root = std::path::PathBuf::from(dir);
+    if !root.is_dir() {
+        // 目录还不存在（首次部署）：返回空清单即可，客户端据此全量推送
+        return json_ok(
+            "目标目录尚不存在，按首次部署处理",
+            &json!({ "dir": dir, "exists": false, "files": [], "truncated": false }),
+        );
+    }
+    if let Err(e) = crate::apppkg::validate_deploy_dir(&root, manager.base()) {
+        return json_error(400, &e);
+    }
+    let mut files: Vec<serde_json::Value> = Vec::new();
+    let mut truncated = false;
+    collect_fingerprint(&root, &root, &mut files, &mut truncated);
+    crate::util::log_format(
+        "直连目录指纹：{} 个文件（{}；票据 {}…）",
+        &[
+            &files.len().to_string(),
+            &format!("{}", root.display()),
+            &prefix12(&ticket_id),
+        ],
+    );
+    json_ok(
+        "指纹已读取",
+        &json!({ "dir": dir, "exists": true, "files": files, "truncated": truncated }),
+    )
+}
+
+/// 递归收集文件指纹（相对路径用 `/` 分隔，跨平台一致）。
+fn collect_fingerprint(
+    root: &std::path::Path,
+    cur: &std::path::Path,
+    out: &mut Vec<serde_json::Value>,
+    truncated: &mut bool,
+) {
+    if files_done(out, truncated) {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(cur) else {
+        return;
+    };
+    for e in entries.flatten() {
+        if files_done(out, truncated) {
+            return;
+        }
+        let path = e.path();
+        let Ok(md) = e.metadata() else { continue };
+        if md.is_dir() {
+            collect_fingerprint(root, &path, out, truncated);
+            continue;
+        }
+        if !md.is_file() || md.len() > MAX_FINGERPRINT_FILE_BYTES {
+            continue;
+        }
+        let Ok(rel) = path.strip_prefix(root) else {
+            continue;
+        };
+        let rel_text = rel.to_string_lossy().replace('\\', "/");
+        // 读不出来的文件跳过（权限/占用），不让整个指纹失败
+        let Ok(data) = std::fs::read(&path) else {
+            continue;
+        };
+        out.push(json!({
+            "path": rel_text,
+            "size": md.len(),
+            "sha256": dhrust::sign::sha256_hex(&data),
+        }));
+    }
+}
+
+fn files_done(out: &[serde_json::Value], truncated: &mut bool) -> bool {
+    if out.len() >= MAX_FINGERPRINT_FILES {
+        *truncated = true;
+        return true;
+    }
+    false
+}
+
 /// 按票据的 `mode` 执行实际部署。
 fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, String> {
     match t.mode.to_ascii_lowercase().as_str() {
@@ -284,6 +425,55 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
                 deployed.program.display()
             ))
         }
+        // `overlay` = **文件级增量的落地端**：包内只含变化的文件，只覆盖不删。
+        // 两类节点都要支持：C# 星尘托管（重启交星尘）/ Rust 子应用（RAgent 自己管）。
+        "overlay" => {
+            use dhrust::staragent::ServiceOp;
+            let dir = t.dir_path.trim();
+            if dir.is_empty() {
+                return Err("缺少 dirPath（平台实例未预置部署目录）".to_string());
+            }
+            let target = std::path::PathBuf::from(dir);
+            crate::apppkg::validate_deploy_dir(&target, manager.base())?;
+            // 是 C# 星尘托管的服务就先预检（不存在/目录不符 → 一个字节都不写）
+            let is_cstar = crate::panel_ws::precheck_cstar_target(&t.app_name, dir).is_ok();
+            let files = crate::apppkg::overwrite_into(&target, &t.app_name, body)?;
+            util_log_overwrite(&t.app_name, dir, files);
+            if is_cstar {
+                return match dhrust::staragent::operate_by_default_ports(
+                    &t.app_name,
+                    ServiceOp::Restart,
+                    Duration::from_secs(60),
+                ) {
+                    Ok(msg) => Ok(format!(
+                        "已增量覆盖 {files} 个文件到 {}，并{msg}",
+                        target.display()
+                    )),
+                    Err(e) => Err(format!(
+                        "已增量覆盖 {files} 个文件到 {}，但重启星尘服务「{}」失败：{e}（文件已更新，请人工确认服务状态）",
+                        target.display(),
+                        t.app_name
+                    )),
+                };
+            }
+            // Rust 子应用：由本机 RAgent 托管，直接按应用名重启
+            match manager.restart_app(&t.app_name, "direct-overlay") {
+                Ok(true) => Ok(format!(
+                    "已增量覆盖 {files} 个文件到 {}，并已重启应用 {}",
+                    target.display(),
+                    t.app_name
+                )),
+                Ok(false) => Ok(format!(
+                    "已增量覆盖 {files} 个文件到 {}（该应用当前未运行，未重启）",
+                    target.display()
+                )),
+                Err(e) => Err(format!(
+                    "已增量覆盖 {files} 个文件到 {}，但重启应用「{}」失败：{e}",
+                    target.display(),
+                    t.app_name
+                )),
+            }
+        }
         // C# 星尘存量覆盖：只换目录里的文件，重启交给本机星尘
         "overwrite" => {
             use dhrust::staragent::ServiceOp;
@@ -315,7 +505,7 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             }
         }
         other => Err(format!(
-            "未知的部署方式「{other}」（仅支持 deploy / upgrade / overwrite）"
+            "未知的部署方式「{other}」（仅支持 deploy / upgrade / overwrite / overlay）"
         )),
     }
 }
@@ -342,8 +532,12 @@ mod tests {
             &id,
             Ticket::new("demo", "1.0.0", "deploy", "/tmp/demo", None, "a".repeat(64))
         ));
-        assert!(take(&id).is_some(), "第一次核销应成功");
-        assert!(take(&id).is_none(), "票据一次性，第二次必须失败");
+        // 读指纹可重复，且不消耗写配额（文件级增量要先读一次再写一次）
+        assert!(take_for(&id, false).is_some(), "读指纹应成功");
+        assert!(take_for(&id, false).is_some(), "读指纹可重复");
+        // 写配额 = 1：写一次之后票据作废（不可重放）
+        assert!(take_for(&id, true).is_some(), "第一次写应成功");
+        assert!(take_for(&id, true).is_none(), "写配额用尽后必须失败");
     }
 
     #[test]
@@ -356,7 +550,7 @@ mod tests {
             "../etc/passwd",
             Ticket::new("a", "1", "deploy", "/x", None, "a".repeat(64))
         ));
-        assert!(take("not-hex!").is_none());
+        assert!(take_for("not-hex!", false).is_none());
     }
 
     #[test]
