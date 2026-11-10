@@ -5,6 +5,8 @@
 /dist
 /tools/*
 !/tools/continuity/
+# 一键回归入口要入库（其余 tools 内容仍忽略）
+!/tools/regression.ps1
 # 运行时目录（服务在源码目录直接运行时产生）
 /Data
 /Log
