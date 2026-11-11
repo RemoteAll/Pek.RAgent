@@ -393,15 +393,21 @@ pub fn overwrite_into_ex(
         {
             crate::util::log_format("部署前备份：{}", &[&b.summary()]);
         }
-        let files = copy_tree(&root, target)?;
-        if files == 0 {
+        let st = copy_tree(&root, target)?;
+        if st.files == 0 && st.kept == 0 {
             return Err(format!(
                 "包内没有可覆盖的文件（{}，包 {}）",
                 target.display(),
                 package_name
             ));
         }
-        Ok(files)
+        if st.kept > 0 {
+            crate::util::log_format(
+                "本次覆盖保留线上受保护文件 {} 个（Data/Settings 目录、appsettings*）",
+                &[&st.kept.to_string()],
+            );
+        }
+        Ok(st.files)
     })();
     let _ = fs::remove_dir_all(&base);
     result
@@ -489,9 +495,16 @@ fn deploy_staged(
     {
         util::log_format("部署前备份（应用升级）：{}", &[&b.summary()]);
     }
-    let files = copy_tree(&root, &work)?;
-    if files == 0 {
+    let st = copy_tree(&root, &work)?;
+    if st.files == 0 && st.kept == 0 {
         return Err("包内没有可部署的文件".to_string());
+    }
+    let files = st.files;
+    if st.kept > 0 {
+        util::log_format(
+            "本次部署保留线上受保护文件 {} 个（Data/Settings 目录、appsettings*）",
+            &[&st.kept.to_string()],
+        );
     }
 
     let program = work.join(&rel);
@@ -859,24 +872,67 @@ fn read_head(path: &Path, n: usize) -> Result<Vec<u8>, std::io::Error> {
     Ok(buf)
 }
 
-/// 递归复制目录到工作目录（覆盖同名文件；跳过临时文件）。
-fn copy_tree(src: &Path, dst: &Path) -> Result<usize, String> {
-    fs::create_dir_all(dst).map_err(|e| format!("创建工作目录失败 {}：{e}", dst.display()))?;
-    let mut count = 0usize;
-    copy_tree_inner(src, dst, &mut count)?;
-    Ok(count)
+/// 部署保护判断（对齐 C# `DeployService.IsProtectedDeployPath`）。
+///
+/// 命中任一即视为「配置类文件」：
+/// 1. 相对路径里**任意层级（不含文件名那层）**名为 `Data` / `Settings` 的目录；
+/// 2. 任意路径段含 `appsettings`（不区分大小写）。
+///
+/// 语义：这类文件**线上已存在时保留线上版本**（不覆盖）——新部署时目标目录为空，
+/// 自然照常写入；升级/覆盖时不会把线上配置冲掉。
+pub fn is_protected_path(relative: &str) -> bool {
+    let rel = relative.replace('\\', "/");
+    let segs: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    if segs.is_empty() {
+        return false;
+    }
+    for s in &segs[..segs.len() - 1] {
+        if s.eq_ignore_ascii_case("data") || s.eq_ignore_ascii_case("settings") {
+            return true;
+        }
+    }
+    segs.iter()
+        .any(|s| s.to_ascii_lowercase().contains("appsettings"))
 }
 
-/// 递归复制实现。
-fn copy_tree_inner(src: &Path, dst: &Path, count: &mut usize) -> Result<(), String> {
+/// 复制统计。
+#[derive(Clone, Copy, Debug, Default)]
+struct CopyStats {
+    /// 实际写入的文件数
+    files: usize,
+    /// 因「线上已存在且属于保护范围」而保留线上版本的文件数
+    kept: usize,
+}
+
+/// 递归复制目录到工作目录（覆盖同名文件；跳过临时文件与受保护配置）。
+fn copy_tree(src: &Path, dst: &Path) -> Result<CopyStats, String> {
+    fs::create_dir_all(dst).map_err(|e| format!("创建工作目录失败 {}：{e}", dst.display()))?;
+    let mut st = CopyStats::default();
+    copy_tree_inner(src, dst, "", &mut st)?;
+    Ok(st)
+}
+
+/// 递归复制实现（`rel` 是相对目标目录的路径，用于保护判断）。
+fn copy_tree_inner(
+    src: &Path,
+    dst: &Path,
+    rel: &str,
+    st: &mut CopyStats,
+) -> Result<(), String> {
     let entries = fs::read_dir(src).map_err(|e| format!("读取目录失败 {}：{e}", src.display()))?;
     for entry in entries.flatten() {
         let path = entry.path();
         let target = dst.join(entry.file_name());
+        let name = entry.file_name().to_string_lossy().to_string();
+        let rel_path = if rel.is_empty() {
+            name.clone()
+        } else {
+            format!("{rel}/{name}")
+        };
         if path.is_dir() {
             fs::create_dir_all(&target)
                 .map_err(|e| format!("创建目录失败 {}：{e}", target.display()))?;
-            copy_tree_inner(&path, &target, count)?;
+            copy_tree_inner(&path, &target, &rel_path, st)?;
             continue;
         }
 
@@ -888,9 +944,15 @@ fn copy_tree_inner(src: &Path, dst: &Path, count: &mut usize) -> Result<(), Stri
         if lower == ".pek-prune.txt" {
             continue;
         }
+        // 受保护配置：线上已存在同名文件则保留线上版本（不覆盖）
+        if is_protected_path(&rel_path) && target.exists() {
+            st.kept += 1;
+            crate::util::log_format("部署保留线上受保护文件：{}", &[&rel_path]);
+            continue;
+        }
         crate::deploy::copy_file_safe(&path, &target)
             .map_err(|e| format!("复制文件失败 {}：{e}", target.display()))?;
-        *count += 1;
+        st.files += 1;
     }
     Ok(())
 }
@@ -972,6 +1034,27 @@ pub fn sanitize_name(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 保护规则对齐 C# `IsProtectedDeployPath`（与 `DHDeploy.Agent.Rust::is_config_protected` 同口径）。
+    #[test]
+    fn protected_paths_match_csharp_rules() {
+        // 含 appsettings 的文件（任意层级）
+        assert!(is_protected_path("appsettings.json"));
+        assert!(is_protected_path("appsettings.Production.json"));
+        assert!(is_protected_path("sub/dir/appsettings.Staging.json"));
+        assert!(is_protected_path("AppSettings.json"), "大小写不敏感");
+        // 任意层级名为 Data / Settings 的目录
+        assert!(is_protected_path("Data/DH.db"));
+        assert!(is_protected_path("sub/Settings/site.json"));
+        assert!(is_protected_path("settings/a.json"));
+        // 反斜杠路径也认
+        assert!(is_protected_path("data\\dh.db"));
+        // 不算保护：普通业务文件、只是名字里带 Data 的文件
+        assert!(!is_protected_path("app.dll"));
+        assert!(!is_protected_path("Data.txt"), "文件名里的 Data 不是目录");
+        assert!(!is_protected_path("bin/app.exe"));
+        assert!(!is_protected_path(""));
+    }
 
     fn temp_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1158,6 +1241,85 @@ mod tests {
             zw.finish().unwrap();
         }
         buf
+    }
+
+    /// 造一个「文本条目」zip（保护逻辑用例用，不需要真 ELF）。
+    fn text_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
+        use std::io::Write;
+        let mut buf = Vec::new();
+        {
+            let mut zw = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let opts: zip::write::SimpleFileOptions = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Stored);
+            for (name, data) in entries {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf
+    }
+
+    /// **非新部署**：线上已有的保护文件（Data/Settings 目录、appsettings*）保留线上版本，
+    /// 其余文件照常覆盖。
+    #[test]
+    fn protected_config_is_not_overwritten() {
+        let tmp = temp_dir("protect-keep");
+        let target = tmp.join("site");
+        std::fs::create_dir_all(target.join("Data")).unwrap();
+        std::fs::create_dir_all(target.join("Settings")).unwrap();
+        std::fs::write(target.join("appsettings.json"), b"online").unwrap();
+        std::fs::write(target.join("Data/db.json"), b"online-data").unwrap();
+        std::fs::write(target.join("Settings/site.json"), b"online-site").unwrap();
+        std::fs::write(target.join("app.dll"), b"old").unwrap();
+
+        let zip = text_zip(&[
+            ("appsettings.json", b"packaged"),
+            ("Data/db.json", b"packaged-data"),
+            ("Settings/site.json", b"packaged-site"),
+            ("app.dll", b"new"),
+        ]);
+        let files = overwrite_into(&target, "demo.zip", &zip).unwrap();
+        assert_eq!(files, 1, "只有 app.dll 应被覆盖");
+        assert_eq!(
+            std::fs::read(target.join("appsettings.json")).unwrap(),
+            b"online",
+            "appsettings.json 必须保留线上版本"
+        );
+        assert_eq!(
+            std::fs::read(target.join("Data/db.json")).unwrap(),
+            b"online-data",
+            "Data/ 下的配置必须保留线上版本"
+        );
+        assert_eq!(
+            std::fs::read(target.join("Settings/site.json")).unwrap(),
+            b"online-site",
+            "Settings/ 下的配置必须保留线上版本"
+        );
+        assert_eq!(std::fs::read(target.join("app.dll")).unwrap(), b"new");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// **新部署**（目标目录里还没有这些文件）：保护文件照常写入。
+    #[test]
+    fn protected_config_is_written_on_first_deploy() {
+        let tmp = temp_dir("protect-new");
+        let target = tmp.join("site");
+        std::fs::create_dir_all(&target).unwrap();
+
+        let zip = text_zip(&[
+            ("appsettings.json", b"packaged"),
+            ("Data/db.json", b"packaged-data"),
+            ("app.dll", b"new"),
+        ]);
+        let files = overwrite_into(&target, "demo.zip", &zip).unwrap();
+        assert_eq!(files, 3, "新部署应写入全部文件");
+        assert_eq!(
+            std::fs::read(target.join("appsettings.json")).unwrap(),
+            b"packaged",
+            "首次部署应写入包内配置"
+        );
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 
     /// 存量覆盖只针对**已存在**的目录：平台把 DirPath 填错时不能凭空建一个孤儿目录。

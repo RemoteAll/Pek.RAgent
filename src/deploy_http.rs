@@ -687,6 +687,11 @@ fn prune_leftovers(target: &std::path::Path, package: &[u8]) -> Result<usize, St
             if !drop.contains(&key) {
                 continue;
             }
+            // 受保护配置（Data/Settings 目录、appsettings*）不参与残留清理：
+            // 它们本来就不该被新包覆盖，更不该被「清理」搬走
+            if crate::apppkg::is_protected_path(&key) {
+                continue;
+            }
             let dest = backup.join(rel);
             if let Some(dir) = dest.parent() {
                 if std::fs::create_dir_all(dir).is_err() {
