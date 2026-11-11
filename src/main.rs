@@ -12,6 +12,7 @@ mod app;
 mod apppkg;
 mod apppkg_cache;
 mod audit;
+mod backup;
 mod certdeploy;
 mod cli;
 mod config;

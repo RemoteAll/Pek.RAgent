@@ -319,7 +319,21 @@ pub fn package_entries_unused(data: &[u8]) -> Result<Vec<String>, String> {
     result
 }
 
+/// 覆盖写入（**默认先做部署前备份**）。
+///
+/// `overwrite` / `overlay` 两条链路（直连与平台中转共用本函数）都在这里备份，
+/// 备份失败即中止部署 —— 宁可这次不部署，也不要无备份地覆盖用户目录。
 pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<usize, String> {
+    overwrite_into_ex(target, package_name, data, true)
+}
+
+/// 覆盖写入（可显式关闭备份）。
+pub fn overwrite_into_ex(
+    target: &Path,
+    package_name: &str,
+    data: &[u8],
+    backup: bool,
+) -> Result<usize, String> {
     if data.is_empty() {
         return Err("上传内容为空".to_string());
     }
@@ -373,6 +387,12 @@ pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<
             }
         }
         let root = descend_root(&unpack);
+        // 部署前备份（用户要求：直连与中转都要有；过滤规则见 crate::backup）
+        if backup
+            && let Some(b) = crate::backup::backup_target(target, package_name)?
+        {
+            crate::util::log_format("部署前备份：{}", &[&b.summary()]);
+        }
         let files = copy_tree(&root, target)?;
         if files == 0 {
             return Err(format!(
@@ -463,6 +483,12 @@ fn deploy_staged(
 
     // 工作目录：沿用已有配置；新应用按 deploy 约定（`{base}/../apps/{name}`）
     let work = crate::deploy::work_dir(&base, &app);
+    // 升级场景：覆盖前先备份现有工作目录（新建没有旧内容可备份）
+    if !is_new
+        && let Some(b) = crate::backup::backup_target(&work, &name)?
+    {
+        util::log_format("部署前备份（应用升级）：{}", &[&b.summary()]);
+    }
     let files = copy_tree(&root, &work)?;
     if files == 0 {
         return Err("包内没有可部署的文件".to_string());

@@ -56,6 +56,8 @@ pub struct Ticket {
     pub instance_id: i64,
     /// 是否清理「目录里有、增量包里没有」的残留文件（**移到备份目录**，不直接删）
     pub prune: bool,
+    /// 是否在覆盖前备份部署目录（默认开；失败即中止部署）
+    pub backup: bool,
 }
 
 impl Ticket {
@@ -79,6 +81,7 @@ impl Ticket {
             remaining: 1,
             instance_id: 0,
             prune: false,
+            backup: true,
         }
     }
 }
@@ -175,6 +178,14 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
     // （overlay 只覆盖列出的文件、不删任何东西，比 deploy/overwrite 更保守）。
     let query_mode = ctx.query_value("mode").unwrap_or_default();
     let mut ticket = ticket;
+    // 备份开关：默认开；只有显式 `backup=0/false` 才关（与 mode 无关，overlay 也生效）
+    ticket.backup = !ctx
+        .query_value("backup")
+        .map(|v| {
+            let v = v.trim();
+            v == "0" || v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false);
     let overlay = query_mode.eq_ignore_ascii_case("overlay");
     if overlay {
         ticket.mode = "overlay".to_string();
@@ -527,7 +538,7 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             crate::apppkg::validate_deploy_dir(&target, manager.base())?;
             // 是 C# 星尘托管的服务就先预检（不存在/目录不符 → 一个字节都不写）
             let is_cstar = crate::panel_ws::precheck_cstar_target(&t.app_name, dir).is_ok();
-            let files = crate::apppkg::overwrite_into(&target, &t.app_name, body)?;
+            let files = crate::apppkg::overwrite_into_ex(&target, &t.app_name, body, t.backup)?;
             util_log_overwrite(&t.app_name, dir, files);
             // 可选：把「目录里有、增量包里没有」的残留文件移到备份目录（不直接删，可回滚）
             let pruned_note = if t.prune {
@@ -591,7 +602,7 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             crate::apppkg::validate_deploy_dir(&target, manager.base())?;
             // 与平台下发路径同一套预检：服务不存在/目录不符时**一个字节都不写**
             crate::panel_ws::precheck_cstar_target(&t.app_name, dir)?;
-            let files = crate::apppkg::overwrite_into(&target, &t.app_name, body)?;
+            let files = crate::apppkg::overwrite_into_ex(&target, &t.app_name, body, t.backup)?;
             util_log_overwrite(&t.app_name, dir, files);
             match dhrust::staragent::operate_by_default_ports(
                 &t.app_name,
