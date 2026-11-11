@@ -110,41 +110,45 @@ pub fn file_list(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
 }
 
-/// `GET /star/fileRead?path=`：读取文本文件（≤2MB，二进制拒读）。
+/// 读取文本文件内容（面板 `/star/fileRead` 与平台下发 `fileRead` **共用**）。
+///
+/// `raw_input` 与目录浏览走同一套路径解析（`resolve_path`），
+/// 因此平台下发的在线查看同样无法用 `..` 之类的输入跳出基础目录。
+/// **只读**：不写盘、不改时间戳。
+pub fn read_text(base: &Path, raw_input: &str) -> Result<Json, String> {
+    let path = resolve_path(base, raw_input)?;
+    let md = fs::metadata(&path).map_err(|_| format!("文件不存在：{}", path.display()))?;
+    if md.is_dir() {
+        return Err("目标是目录，无法读取内容".to_string());
+    }
+    if md.len() > MAX_EDIT_SIZE {
+        return Err(format!(
+            "文件过大（{} KB，上限 {} MB），请使用下载",
+            md.len() / 1024,
+            MAX_EDIT_SIZE / 1024 / 1024
+        ));
+    }
+    let data = fs::read(&path).map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))?;
+    if data.contains(&0) {
+        return Err("二进制文件不支持在线查看，请下载后处理".to_string());
+    }
+    let content = String::from_utf8(data)
+        .map_err(|_| "仅支持 UTF-8 文本（该文件编码不受支持）".to_string())?;
+    Ok(json!({
+        "path": path.display().to_string(),
+        "content": content,
+        "size": md.len(),
+    }))
+}
+
+/// `GET /star/fileRead?path=`：读取文本文件（≤10MB，二进制拒读）。
 pub fn file_read(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
-    let path = match resolve_path(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
-        Ok(p) => p,
-        Err(e) => return json_error(400, &e),
-    };
-    let Ok(md) = fs::metadata(&path) else {
-        return json_error(404, &format!("文件不存在：{}", path.display()));
-    };
-    if md.is_dir() {
-        return json_error(400, "目标是目录，无法编辑");
-    }
-    if md.len() > MAX_EDIT_SIZE {
-        return json_error(400, "文件过大（上限 10MB），请使用下载或 SFTP");
-    }
-    let Ok(data) = fs::read(&path) else {
-        return json_error(500, "读取文件失败（权限不足？）");
-    };
-    if data.contains(&0) {
-        return json_error(400, "二进制文件不支持在线编辑，请下载后处理");
-    }
-    match String::from_utf8(data) {
-        Ok(content) => json_result(
-            0,
-            "",
-            Some(json!({
-                "path": path.display().to_string(),
-                "content": content,
-                "size": md.len(),
-            })),
-        ),
-        Err(_) => json_error(400, "仅支持 UTF-8 文本编辑（该文件编码不受支持）"),
+    match read_text(panel.base(), &arg(ctx, "path").unwrap_or_default()) {
+        Ok(v) => json_result(0, "", Some(v)),
+        Err(e) => json_error(400, &e),
     }
 }
 
@@ -1103,12 +1107,44 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// 在线查看文件内容（`read_text`）：文本可读；二进制/非 UTF-8/目录/不存在都明确拒绝。
+    ///
+    /// 平台「在线目录 → 查看内容」与面板 `/star/fileRead` 共用本函数，
+    /// 所以这里的边界就是两处入口的共同口径。
+    #[test]
+    fn read_text_reads_utf8_and_rejects_non_text() {
+        let dir = temp_dir("read");
+        let text = "{\n  \"a\": 1\n}\n中文行";
+        fs::write(dir.join("a.json"), text.as_bytes()).unwrap();
+        let v = read_text(&dir, "a.json").unwrap();
+        assert_eq!(v.get("content").unwrap().as_str().unwrap(), text);
+        assert_eq!(v.get("size").unwrap().as_u64().unwrap(), text.len() as u64);
+        assert!(v.get("path").unwrap().as_str().unwrap().ends_with("a.json"));
+
+        // 含 NUL → 判为二进制，拒绝在线查看（提示引导去下载）
+        fs::write(dir.join("b.bin"), b"MZ\x00\x01\x02").unwrap();
+        let e = read_text(&dir, "b.bin").unwrap_err();
+        assert!(e.contains("二进制"), "实际：{e}");
+
+        // 非 UTF-8（GBK 的“中”= 0xD6 0xD0）→ 明确拒绝，而不是显示乱码
+        fs::write(dir.join("c.txt"), [0xD6u8, 0xD0]).unwrap();
+        assert!(read_text(&dir, "c.txt").unwrap_err().contains("UTF-8"));
+
+        // 目录不能“查看内容”
+        fs::create_dir(dir.join("sub")).unwrap();
+        assert!(read_text(&dir, "sub").unwrap_err().contains("目录"));
+
+        // 不存在
+        assert!(read_text(&dir, "none.txt").unwrap_err().contains("不存在"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn delete_copy_move_rename_roundtrip() {
         let dir = temp_dir("ops");
         let src = dir.join("src.txt");
         fs::write(&src, b"payload").unwrap();
-
         // 复制
         let copy_dst = dir.join("copy.txt");
         let (files, bytes) = copy_recursive(&src, &copy_dst).unwrap();
