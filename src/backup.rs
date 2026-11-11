@@ -16,19 +16,34 @@ use std::path::{Path, PathBuf};
 pub const BACKUP_KEEP: usize = 5;
 
 /// 排除的目录名（任一层命中即整棵跳过，大小写不敏感）。
+///
+/// 与 C# `DeployService.CompressWithFilter` 的 `excludeDirs` 对齐：
+/// `Log / Logs / Temp / Cache / .git / .vs / obj / node_modules / Uploads`。
+/// （C# 另列了 `wwwroot\Uploads`，这里按「目录名 = uploads」匹配，任意层级都已覆盖。）
 const SKIP_DIRS: &[&str] = &[
     "log", "logs", "temp", "tmp", "cache", ".git", ".vs", "obj", "node_modules", "uploads",
 ];
 
 /// 排除的扩展名（大小写不敏感）。
+///
+/// **故意不跳过 `.zip`**（C# 也不跳）：业务资源包常是 zip，跳过会让备份不完整。
+/// 备份文件本身落在 Agent 数据目录，不会自我包含。
 const SKIP_EXTS: &[&str] = &[
     ".log", ".tmp", ".temp", ".cache", ".bak", ".old", ".db-wal", ".db-shm", ".db-journal",
-    // 备份文件本身不该再进备份（历史上把 .backup-*.zip 放同目录时尤其要注意）
-    ".zip",
 ];
 
-/// 排除的相对路径（小写、正斜杠）。
-const SKIP_PATHS: &[&str] = &["data/log.db"];
+/// 排除的相对路径（小写、正斜杠）——命中即整个目录/文件及其子路径全部跳过。
+///
+/// - `data/log.db`：C# 的 `Data/Log.db`（系统日志库，运行中持续写入，备份它等于拷一个活动库）；
+/// - `bin/debug`、`bin/release`：C# `excludeDirs` 的 `bin\\Debug` / `bin\\Release`。
+///   注意是**按路径**而不是把整个 `bin` 整棵跳过，避免误伤某些项目自己的 `bin` 资源目录。
+const SKIP_PATHS: &[&str] = &["data/log.db", "bin/debug", "bin/release"];
+
+/// 单文件上限：超过就跳过（C# 同为 100MB）。
+///
+/// 备份是「出事了能回滚」用，不是灾难备份：一个 2GB 的数据文件会把备份拖成分钟级，
+/// 还容易被误认为卡死；真要完整备份应该停服务后单独做。
+const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// 备份结果。
 #[derive(Clone, Debug)]
@@ -210,14 +225,22 @@ fn walk(
             *skipped += 1;
             continue;
         }
-        let data = fs::read(&path).map_err(|e| format!("读取文件失败（{}）：{e}", path.display()))?;
+        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+        if size > MAX_FILE_SIZE {
+            // 与 C# 同口径：超大单文件不进备份（备份要能在分钟级完成，否则等同于卡死）
+            *skipped += 1;
+            continue;
+        }
         z.start_file(rel_str.as_str(), opts.unix_permissions(0o644))
             .map_err(|e| format!("写备份条目失败（{rel_str}）：{e}"))?;
-        use std::io::Write;
-        z.write_all(&data)
-            .map_err(|e| format!("写备份内容失败（{rel_str}）：{e}"))?;
-        *files += 1;
-    }
+        {
+            // 流式写入：不把整个文件读进内存（活动数据库/大资源包也不会撑爆内存）
+            let mut f = fs::File::open(&path)
+                .map_err(|e| format!("打开文件失败（{}）：{e}", path.display()))?;
+            std::io::copy(&mut f, z)
+                .map_err(|e| format!("写备份内容失败（{rel_str}）：{e}"))?;
+        }
+        *files += 1;    }
     Ok(())
 }
 
@@ -290,6 +313,39 @@ mod tests {
             .collect();
         names.sort();
         assert_eq!(names, vec!["app.dll", "appsettings.json"]);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// 与 C# `CompressWithFilter` 口径对齐：
+    /// `Data/Log.db`、`bin/Debug|Release` 中间产物、`.log` 不进备份；业务 zip 必须备份（C# 也不跳）。
+    #[test]
+    fn backup_matches_csharp_filter_rules() {
+        let root = temp_dir("csharp");
+        let app = root.join("web");
+        fs::create_dir_all(app.join("Data")).unwrap();
+        fs::create_dir_all(app.join("bin/Debug/net8.0")).unwrap();
+        fs::create_dir_all(app.join("res")).unwrap();
+        fs::write(app.join("App.dll"), b"dll").unwrap();
+        fs::write(app.join("Data/DH.db"), b"db").unwrap();
+        fs::write(app.join("Data/Log.db"), b"logmsg").unwrap();
+        fs::write(app.join("bin/Debug/net8.0/App.dll"), b"noise").unwrap();
+        fs::write(app.join("res/plugin.zip"), b"zipdata").unwrap();
+        fs::write(app.join("run.log"), b"noise").unwrap();
+
+        let b = backup_target(&app, "demo", &root)
+            .unwrap()
+            .expect("应产生备份");
+        let f = fs::File::open(&b.file).unwrap();
+        let mut z = zip::ZipArchive::new(f).unwrap();
+        let mut names: Vec<String> = (0..z.len())
+            .map(|i| z.by_index(i).unwrap().name().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["App.dll", "Data/DH.db", "res/plugin.zip"],
+            "Log.db / bin 中间产物 / .log 不进备份；业务 zip 必须备份"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
