@@ -63,8 +63,9 @@ impl Backup {
 
 /// 备份根目录：`{Agent 数据目录}/Data/DeployBackups/{应用}/`。
 ///
-/// **绝不能放在部署目录同级**：部署目录常是站点的 `wwwroot` 子目录，
-/// 同级放一个含源码/配置的 zip 会变成 `https://站点/.backup-xxx.zip` 可直接下载的泄露面。
+/// **绝不能放在部署目录同级**：部署目录常位于宝塔站点根（`/www/wwwroot/<域名>/`）之下，
+/// 同级放一个含源码/配置的 zip 会变成 `https://域名/.backup-xxx.zip` 可直接下载的泄露面。
+/// （`wwwroot` 是 .NET 项目自己的静态资源目录，和站点根不是一回事。）
 pub fn backup_dir(backup_root: &Path, app_name: &str) -> PathBuf {
     backup_root
         .join("Data")
