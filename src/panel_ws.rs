@@ -1034,7 +1034,12 @@ fn run_overwrite(
         None => None,
     };
     let files = match &pkg {
-        Some(p) => Some(crate::apppkg::overwrite_into(&target, &p.file_name, &p.body)?),
+        Some(p) => Some(crate::apppkg::overwrite_into(
+            &target,
+            &p.file_name,
+            &p.body,
+            manager.base(),
+        )?),
         None => None,
     };
     let restart = cmd

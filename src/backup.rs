@@ -61,26 +61,38 @@ impl Backup {
     }
 }
 
+/// 备份根目录：`{Agent 数据目录}/Data/DeployBackups/{应用}/`。
+///
+/// **绝不能放在部署目录同级**：部署目录常是站点的 `wwwroot` 子目录，
+/// 同级放一个含源码/配置的 zip 会变成 `https://站点/.backup-xxx.zip` 可直接下载的泄露面。
+pub fn backup_dir(backup_root: &Path, app_name: &str) -> PathBuf {
+    backup_root
+        .join("Data")
+        .join("DeployBackups")
+        .join(sanitize(app_name))
+}
+
 /// 部署前备份。
 ///
+/// - `backup_root`：Agent 数据目录（备份落在 `Data/DeployBackups/{应用}/` 下）；
 /// - 目标目录不存在或为空 → 返回 `Ok(None)`（新建应用没有旧内容可备份）；
 /// - 备份失败 → 返回 `Err`，**调用方应中止部署**（宁可这次不部署，也不要无备份覆盖）。
-pub fn backup_target(target: &Path, app_name: &str) -> Result<Option<Backup>, String> {
+pub fn backup_target(
+    target: &Path,
+    app_name: &str,
+    backup_root: &Path,
+) -> Result<Option<Backup>, String> {
     if !target.is_dir() {
         return Ok(None);
     }
-    let parent = target.parent().ok_or_else(|| {
-        format!(
-            "部署目录没有父目录，无法放置备份：{}",
-            target.display()
-        )
-    })?;
+    let dir = backup_dir(backup_root, app_name);
+    fs::create_dir_all(&dir)
+        .map_err(|e| format!("创建备份目录失败（{}）：{e}", dir.display()))?;
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = sanitize(app_name);
-    let file = parent.join(format!(".backup-{name}-{stamp}.zip"));
+    let file = dir.join(format!(".backup-{stamp}.zip"));
 
     let f = fs::File::create(&file)
         .map_err(|e| format!("创建备份文件失败（{}）：{e}", file.display()))?;
@@ -106,7 +118,7 @@ pub fn backup_target(target: &Path, app_name: &str) -> Result<Option<Backup>, St
         let _ = fs::remove_file(&file);
         return Ok(None);
     }
-    let pruned = cleanup_old_backups(parent, &name);
+    let pruned = cleanup_old_backups(&dir);
     Ok(Some(Backup {
         file,
         files,
@@ -115,11 +127,11 @@ pub fn backup_target(target: &Path, app_name: &str) -> Result<Option<Backup>, St
     }))
 }
 
-/// 清理同应用的历史备份，只保留最近 [`BACKUP_KEEP`] 份。
-fn cleanup_old_backups(parent: &Path, name: &str) -> usize {
-    let prefix = format!(".backup-{name}-");
+/// 清理历史备份，只保留最近 [`BACKUP_KEEP`] 份。
+fn cleanup_old_backups(dir: &Path) -> usize {
+    const PREFIX: &str = ".backup-";
     let mut found: Vec<(u64, PathBuf)> = Vec::new();
-    let Ok(rd) = fs::read_dir(parent) else {
+    let Ok(rd) = fs::read_dir(dir) else {
         return 0;
     };
     for e in rd.filter_map(|x| x.ok()) {
@@ -127,11 +139,11 @@ fn cleanup_old_backups(parent: &Path, name: &str) -> usize {
         let Some(fname) = p.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !fname.starts_with(&prefix) || !fname.ends_with(".zip") {
+        if !fname.starts_with(PREFIX) || !fname.ends_with(".zip") {
             continue;
         }
         // 时间戳是 epoch 秒：按数值排序即可（比字符串排序稳）
-        let ts: u64 = fname[prefix.len()..]
+        let ts: u64 = fname[PREFIX.len()..]
             .trim_end_matches(".zip")
             .parse()
             .unwrap_or(0);
@@ -255,10 +267,20 @@ mod tests {
         fs::write(app.join("Logs/today.log"), b"noise").unwrap();
         fs::write(app.join("node_modules/x.js"), b"noise").unwrap();
 
-        let b = backup_target(&app, "demo").unwrap().expect("应产生备份");
+        let b = backup_target(&app, "demo", &root).unwrap().expect("应产生备份");
         assert_eq!(b.files, 2, "只有 app.dll 与 appsettings.json 进备份");
         assert!(b.skipped >= 3, "日志/依赖目录应被跳过");
-        assert!(b.file.file_name().unwrap().to_string_lossy().starts_with(".backup-demo-"));
+        // 落点必须在 Agent 数据目录下，**不能落在部署目录同级**
+        assert!(
+            b.file.starts_with(root.join("Data").join("DeployBackups").join("demo")),
+            "备份必须落在 Data/DeployBackups 下，实际：{}",
+            b.file.display()
+        );
+        assert!(
+            !b.file.starts_with(&app),
+            "备份绝不能落在部署目录里：{}",
+            b.file.display()
+        );
 
         let f = fs::File::open(&b.file).unwrap();
         let mut z = zip::ZipArchive::new(f).unwrap();
@@ -274,7 +296,7 @@ mod tests {
     #[test]
     fn backup_returns_none_for_missing_dir() {
         let root = temp_dir("missing");
-        let b = backup_target(&root.join("nope"), "demo").unwrap();
+        let b = backup_target(&root.join("nope"), "demo", &root).unwrap();
         assert!(b.is_none());
         let _ = fs::remove_dir_all(&root);
     }
@@ -286,18 +308,20 @@ mod tests {
         let app = root.join("web");
         fs::create_dir_all(&app).unwrap();
         fs::write(app.join("a.txt"), b"x").unwrap();
-        // 造 N+2 份历史备份
+        // 在**新落点**（Agent 数据目录）造 N+2 份历史备份
+        let dir = backup_dir(&root, "demo");
+        fs::create_dir_all(&dir).unwrap();
         for i in 0..(BACKUP_KEEP + 2) {
-            fs::write(root.join(format!(".backup-demo-{}0000.zip", i + 1)), b"old").unwrap();
+            fs::write(dir.join(format!(".backup-{}0000.zip", i + 1)), b"old").unwrap();
         }
-        let b = backup_target(&app, "demo").unwrap().unwrap();
+        let b = backup_target(&app, "demo", &root).unwrap().unwrap();
         assert!(b.pruned > 0, "超过保留份数应清理");
-        let left = fs::read_dir(&root)
+        let left = fs::read_dir(backup_dir(&root, "demo"))
             .unwrap()
             .filter_map(|x| x.ok())
             .filter(|e| {
                 let n = e.file_name().to_string_lossy().to_string();
-                n.starts_with(".backup-demo-") && n.ends_with(".zip")
+                n.starts_with(".backup-") && n.ends_with(".zip")
             })
             .count();
         assert_eq!(left, BACKUP_KEEP, "最终应只剩 {BACKUP_KEEP} 份");

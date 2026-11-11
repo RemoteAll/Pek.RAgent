@@ -538,11 +538,17 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             crate::apppkg::validate_deploy_dir(&target, manager.base())?;
             // 是 C# 星尘托管的服务就先预检（不存在/目录不符 → 一个字节都不写）
             let is_cstar = crate::panel_ws::precheck_cstar_target(&t.app_name, dir).is_ok();
-            let files = crate::apppkg::overwrite_into_ex(&target, &t.app_name, body, t.backup)?;
+            let files = crate::apppkg::overwrite_into_ex(
+                &target,
+                &t.app_name,
+                body,
+                t.backup,
+                manager.base(),
+            )?;
             util_log_overwrite(&t.app_name, dir, files);
             // 可选：把「目录里有、增量包里没有」的残留文件移到备份目录（不直接删，可回滚）
             let pruned_note = if t.prune {
-                match prune_leftovers(&target, body) {
+                match prune_leftovers(&target, &t.app_name, body, manager.base()) {
                     Ok(n) if n > 0 => format!("，已把 {n} 个残留文件移入备份目录"),
                     Ok(_) => String::new(),
                     Err(e) => {
@@ -602,7 +608,13 @@ fn run(manager: &Arc<AppManager>, t: &Ticket, body: &[u8]) -> Result<String, Str
             crate::apppkg::validate_deploy_dir(&target, manager.base())?;
             // 与平台下发路径同一套预检：服务不存在/目录不符时**一个字节都不写**
             crate::panel_ws::precheck_cstar_target(&t.app_name, dir)?;
-            let files = crate::apppkg::overwrite_into_ex(&target, &t.app_name, body, t.backup)?;
+            let files = crate::apppkg::overwrite_into_ex(
+                &target,
+                &t.app_name,
+                body,
+                t.backup,
+                manager.base(),
+            )?;
             util_log_overwrite(&t.app_name, dir, files);
             match dhrust::staragent::operate_by_default_ports(
                 &t.app_name,
@@ -641,7 +653,12 @@ const PRUNE_MANIFEST: &str = ".pek-prune.txt";
 ///   会把所有未变化的文件（含主程序 exe）全部搬走（2026-11-10 e2e 抓到过这个 bug）。
 ///
 /// 返回被移动的文件数。
-fn prune_leftovers(target: &std::path::Path, package: &[u8]) -> Result<usize, String> {
+fn prune_leftovers(
+    target: &std::path::Path,
+    app_name: &str,
+    package: &[u8],
+    backup_root: &std::path::Path,
+) -> Result<usize, String> {
     use std::collections::HashSet;
 
     // 1) 读包内清单（每行一个相对路径）
@@ -663,8 +680,8 @@ fn prune_leftovers(target: &std::path::Path, package: &[u8]) -> Result<usize, St
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let parent = target.parent().unwrap_or(target);
-    let backup = parent.join(format!(".prune-{stamp}"));
+    // 与部署前备份同一落点：Agent 数据目录，**不放部署目录同级**（避免被 Web 下载）
+    let backup = crate::backup::backup_dir(backup_root, app_name).join(format!(".prune-{stamp}"));
 
     // 3) 遍历目录，把不在 keep 里的文件移走
     let mut moved = 0usize;

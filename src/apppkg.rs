@@ -323,8 +323,16 @@ pub fn package_entries_unused(data: &[u8]) -> Result<Vec<String>, String> {
 ///
 /// `overwrite` / `overlay` 两条链路（直连与平台中转共用本函数）都在这里备份，
 /// 备份失败即中止部署 —— 宁可这次不部署，也不要无备份地覆盖用户目录。
-pub fn overwrite_into(target: &Path, package_name: &str, data: &[u8]) -> Result<usize, String> {
-    overwrite_into_ex(target, package_name, data, true)
+///
+/// `backup_root` = Agent 数据目录：备份落在它下面的 `Data/DeployBackups/{应用}/`，
+/// **不落部署目录同级**（那里常是 Web 根，备份里的源码/配置会被直接下载）。
+pub fn overwrite_into(
+    target: &Path,
+    package_name: &str,
+    data: &[u8],
+    backup_root: &Path,
+) -> Result<usize, String> {
+    overwrite_into_ex(target, package_name, data, true, backup_root)
 }
 
 /// 覆盖写入（可显式关闭备份）。
@@ -333,6 +341,7 @@ pub fn overwrite_into_ex(
     package_name: &str,
     data: &[u8],
     backup: bool,
+    backup_root: &Path,
 ) -> Result<usize, String> {
     if data.is_empty() {
         return Err("上传内容为空".to_string());
@@ -389,7 +398,7 @@ pub fn overwrite_into_ex(
         let root = descend_root(&unpack);
         // 部署前备份（用户要求：直连与中转都要有；过滤规则见 crate::backup）
         if backup
-            && let Some(b) = crate::backup::backup_target(target, package_name)?
+            && let Some(b) = crate::backup::backup_target(target, package_name, backup_root)?
         {
             crate::util::log_format("部署前备份：{}", &[&b.summary()]);
         }
@@ -491,7 +500,7 @@ fn deploy_staged(
     let work = crate::deploy::work_dir(&base, &app);
     // 升级场景：覆盖前先备份现有工作目录（新建没有旧内容可备份）
     if !is_new
-        && let Some(b) = crate::backup::backup_target(&work, &name)?
+        && let Some(b) = crate::backup::backup_target(&work, &name, manager.base())?
     {
         util::log_format("部署前备份（应用升级）：{}", &[&b.summary()]);
     }
@@ -1279,7 +1288,7 @@ mod tests {
             ("Settings/site.json", b"packaged-site"),
             ("app.dll", b"new"),
         ]);
-        let files = overwrite_into(&target, "demo.zip", &zip).unwrap();
+        let files = overwrite_into(&target, "demo.zip", &zip, &tmp).unwrap();
         assert_eq!(files, 1, "只有 app.dll 应被覆盖");
         assert_eq!(
             std::fs::read(target.join("appsettings.json")).unwrap(),
@@ -1312,7 +1321,7 @@ mod tests {
             ("Data/db.json", b"packaged-data"),
             ("app.dll", b"new"),
         ]);
-        let files = overwrite_into(&target, "demo.zip", &zip).unwrap();
+        let files = overwrite_into(&target, "demo.zip", &zip, &tmp).unwrap();
         assert_eq!(files, 3, "新部署应写入全部文件");
         assert_eq!(
             std::fs::read(target.join("appsettings.json")).unwrap(),
@@ -1328,13 +1337,13 @@ mod tests {
         let tmp = temp_dir("overwrite");
         let data = sample_zip();
         let missing = tmp.join("not-exist");
-        let err = overwrite_into(&missing, "legacyapp-1.0.0.zip", &data).unwrap_err();
+        let err = overwrite_into(&missing, "legacyapp-1.0.0.zip", &data, &tmp).unwrap_err();
         assert!(err.contains("不存在"), "错误应说明目录不存在：{err}");
         assert!(!missing.exists(), "失败路径不应创建目录");
 
         let target = tmp.join("app");
         std::fs::create_dir_all(&target).unwrap();
-        let files = overwrite_into(&target, "legacyapp-1.0.0.zip", &data).unwrap();
+        let files = overwrite_into(&target, "legacyapp-1.0.0.zip", &data, &tmp).unwrap();
         assert!(files > 0, "应写入文件");
         assert!(target.join("dhdeploy-agent-rust").is_file());
 
