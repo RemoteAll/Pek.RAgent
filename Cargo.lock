@@ -1799,6 +1799,7 @@ dependencies = [
  "pek-radmin",
  "pek-rcode",
  "pek-rwaf",
+ "rustls",
  "serde",
  "serde_json",
  "tar",

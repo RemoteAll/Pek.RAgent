@@ -44,7 +44,6 @@ mod udp_rpc;
 mod util;
 mod weblog;
 mod webpanel;
-
 use std::path::{Path, PathBuf};
 
 /// 版本标记字符串源（结尾 NUL 便于平台字节扫描精确截断）。
@@ -82,6 +81,12 @@ fn main() {
     let level = dhrust::logs::level_from_env();
     util::init_logging(&base, true, level);
     install_panic_logging();
+    // 固定 rustls 进程级加密提供者（ring）：依赖图里同时存在 `ring` 与 `aws-lc-rs` 时，
+    // rustls 无法自动选择，会在 WS/TLS 调用处 panic（2026-11-12 节点全部离线）。
+    // 已安装时返回 Err（携带现有提供者），直接忽略。
+    let _ = rustls::crypto::CryptoProvider::install_default(
+        rustls::crypto::ring::default_provider(),
+    );
 
     let code = cli::run(&args, &base);
     // 异步文件日志同步落盘后再退出（否则最后若干条日志可能在队列中丢失，
@@ -117,8 +122,7 @@ fn install_panic_logging() {
 }
 
 /// 把 zip 参数绝对化（相对路径优先按调用目录，其次保持原样由部署层兜底）。
-fn absolutize_zip_args(args: Vec<String>, cwd: &Path) -> Vec<String> {
-    args.into_iter()
+fn absolutize_zip_args(args: Vec<String>, cwd: &Path) -> Vec<String> {    args.into_iter()
         .map(|a| {
             if a.to_ascii_lowercase().ends_with(".zip") {
                 let p = Path::new(&a);
@@ -132,4 +136,30 @@ fn absolutize_zip_args(args: Vec<String>, cwd: &Path) -> Vec<String> {
             a
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tls_tests {
+    /// 回归守卫：显式安装 `ring` 后，rustls 的进程级提供者必须可解析。
+    ///
+    /// 2026-11-12 事故：依赖图里同时有 `ring`（dhrust）与 `aws-lc-rs`（tiberius /
+    /// tokio-postgres-rustls 的默认特性）→ `CryptoProvider::get_default()` 返回 None →
+    /// `ClientConfig::builder()` 在 WS 线程 panic → 节点全部离线。
+    ///
+    /// 主程序在 `main()` 启动时调用同一个 `install_default`；本用例把「安装后能建 TLS 配置」
+    /// 这件事钉住：删掉安装代码或换回多提供者而不安装，这里会直接 panic。
+    #[test]
+    fn rustls_provider_installed_and_usable() {
+        let _ = rustls::crypto::CryptoProvider::install_default(
+            rustls::crypto::ring::default_provider(),
+        );
+        assert!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "rustls 进程级提供者未安装：WS/TLS 会在运行时 panic"
+        );
+        // 真正会 panic 的入口（dhrust 与各驱动都用它）
+        let _cfg = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+    }
 }

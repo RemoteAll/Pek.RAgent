@@ -48,6 +48,11 @@ tar = "0.4"
 # 注：在线插件源签名（Ed25519）已随插件协议下沉至 dhrust::plugin（feature "plugin"）
 # HTTP 服务端宿主运行时（dhrust::net::http 基于 hyper/tokio）
 tokio = { version = "1", features = ["rt", "net", "io-util", "time", "sync"] }
+# 固定 rustls 进程级加密提供者为 `ring`（与 dhrust 的 net-tls 同一提供者）：
+# 依赖图里一旦同时出现 `ring` 与 `aws-lc-rs`，rustls 无法自动选定提供者，
+# 会在 WS/TLS 调用处 panic（2026-11-12 节点全部离线事故的根因）。
+# 启动时显式 install_default，即使将来某个依赖又引入另一个提供者也不会歧义。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
