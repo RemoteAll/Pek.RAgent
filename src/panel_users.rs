@@ -49,6 +49,12 @@ pub const CAP_FILEMAN: &str = "fileman";
 /// 有了本能力位，平台可以立即给出「请升级节点 Agent」而不是等 15 秒。
 pub const CAP_FILEMAN_READ: &str = "filemanRead";
 
+/// 能力标识（平台可下发 `dbList` / `dbQuery`：按连接名查询节点本机可连的数据库）。
+///
+/// 用途：客户的库常禁止外部直连，由节点代连；平台/客户端只认连接名。
+/// 单独一个能力位是为了让旧 Agent 立即得到「请升级」而不是白等超时。
+pub const CAP_DB_REMOTE: &str = "dbRemote";
+
 /// 摘要缓存（5 秒）：register 与首次心跳间隔很短，避免重复读库。
 static SUMMARY: OnceLock<Mutex<(Instant, String, usize)>> = OnceLock::new();
 
@@ -91,6 +97,7 @@ pub fn merge_summary(base: &Path, v: &mut Json) {
         // `cstar`：支持 C# 星尘存量纳管（`deployOverwrite` 覆盖 + `cstarScan` 扫描）
         // `fileman`：支持平台下发 `fileList`（部署客户端在线目录用，只读）
         // `filemanRead`：支持平台下发 `fileRead`（部署客户端在线查看文件内容，只读）
+        // `dbRemote`：支持平台下发 `dbList` / `dbQuery`（按连接名查询本机可连的库，只读）
         obj.insert(
             "caps".to_string(),
             json!([
@@ -100,7 +107,8 @@ pub fn merge_summary(base: &Path, v: &mut Json) {
                 CAP_APP_DEPLOY,
                 CAP_CSTAR,
                 CAP_FILEMAN,
-                CAP_FILEMAN_READ
+                CAP_FILEMAN_READ,
+                CAP_DB_REMOTE
             ]),
         );
         obj.insert("panelUsersVersion".to_string(), Json::String(digest));

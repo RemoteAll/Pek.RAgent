@@ -16,6 +16,8 @@ mod backup;
 mod certdeploy;
 mod cli;
 mod config;
+mod db_direct;
+mod dbconn;
 mod deploy;
 mod deploy_http;
 mod fileman;

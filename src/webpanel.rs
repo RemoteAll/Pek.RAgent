@@ -6,7 +6,7 @@
 //! - `/star/*`：services / startService / stopService / restartService / addService /
 //!   removeService / appDeploy / starAgentScan / starAgentMigrate / getStarConfig /
 //!   updateStarConfig / machine / webTraffic / portTraffic /
-//!   trafficHistory / getProcessList / dbInfo / dbQuery / dbBackup / dbRestore /
+//!   trafficHistory / getProcessList / dbInfo / dbConnections / dbQuery / dbExec / dbBackup / dbRestore /
 //!   dbListBackups / dbCreateBackup / dbDownloadBackup / dbRestoreBackup / dbDeleteBackup /
 //!   fileList / fileRead / fileWrite / fileMkdir / fileMkdirs / fileNewFile / fileDelete / fileRename /
 //!   fileMove / fileCopy / fileUpload / fileDownload / fileCompress / fileExtract /
@@ -707,6 +707,8 @@ const ACTION_TITLES: &[(&str, &str)] = &[
     ("removeService", "删除子服务"),
     ("updateStarConfig", "更新星尘设置"),
     ("dbQuery", "数据库查询"),
+    ("dbExec", "数据库写入"),
+    ("dbConnections", "数据库连接清单"),
     ("dbBackup", "数据库备份下载"),
     ("dbRestore", "数据库还原"),
     ("dbCreateBackup", "创建数据库备份"),
@@ -990,7 +992,12 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         guarded(panel.clone(), PERM_TRAFFIC, traffic_history),
     );
     controller = controller.get("dbInfo", guarded(panel.clone(), PERM_DATABASE, db_info));
+    controller = controller.get(
+        "dbConnections",
+        guarded(panel.clone(), PERM_DATABASE, db_connections),
+    );
     controller = controller.post("dbQuery", guarded(panel.clone(), PERM_DATABASE, db_query));
+    controller = controller.post("dbExec", guarded(panel.clone(), PERM_DATABASE, db_exec));
     controller = controller.get("dbBackup", guarded(panel.clone(), PERM_DATABASE, db_backup));
     controller = controller.post("dbRestore", guarded(panel.clone(), PERM_DATABASE, db_restore));
     controller = controller.get(
@@ -1681,24 +1688,67 @@ fn db_info(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     )
 }
 
+/// 本机连接清单（`Config/Database.toml`；**不含口令/账号**）。
+///
+/// 平台与部署客户端只认连接名；连接串与口令只留在节点本地。
+fn db_connections(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    json_result(
+        0,
+        "",
+        Some(crate::dbconn::list_connections(panel.manager.base())),
+    )
+}
+
 /// 只读 SQL 查询（仅 SELECT；安全校验 + 500 行上限）。
+///
+/// `conn` 缺省 = 本机默认连接（Agent 自身库，与原行为一致）；
+/// 需要查客户的内网库时由平台/客户端指定连接名（见 `dbconn`）。
 fn db_query(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     if !panel.check_auth(ctx) {
         return json_error(401, "Unauthorized");
     }
-    let sql = json_body(ctx)
-        .and_then(|v| {
-            v.get("sql")
-                .and_then(|s| s.as_str())
-                .map(|s| s.to_string())
-        })
-        .unwrap_or_default();
-    if let Err(e) = crate::history::validate_readonly_sql(&sql) {
-        return json_error(400, &e);
-    }
-    match crate::history::query_readonly(panel.manager.base(), &sql) {
+    let body = json_body(ctx).unwrap_or(Json::Null);
+    let sql = body
+        .get("sql")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let conn = body
+        .get("conn")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match crate::dbconn::query(panel.manager.base(), &conn, &sql) {
         Ok(data) => json_result(0, "", Some(data)),
-        Err(e) => json_error(500, &e),
+        Err(e) => json_error(400, &e),
+    }
+}
+
+/// 执行**写语句**（单条；`ReadOnly` 连接拒绝；影响行数回传）。
+///
+/// 安全闸门在 `dbconn::exec`：`validate_write_sql`（白名单首关键字 + 禁破坏性片段）
+/// 与连接级 `ReadOnly` 标记；本函数只做鉴权与信封处理。
+fn db_exec(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
+    if !panel.check_auth(ctx) {
+        return json_error(401, "Unauthorized");
+    }
+    let body = json_body(ctx).unwrap_or(Json::Null);
+    let sql = body
+        .get("sql")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let conn = body
+        .get("conn")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    match crate::dbconn::exec(panel.manager.base(), &conn, &sql) {
+        Ok(data) => json_result(0, "已执行", Some(data)),
+        Err(e) => json_error(400, &e),
     }
 }
 

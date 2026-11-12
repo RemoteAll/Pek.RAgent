@@ -35,7 +35,7 @@ const TABLE_WEB: &str = "WebTrafficDaily";
 /// 端口流量表。
 const TABLE_PORTS: &str = "PortTrafficDaily";
 /// 数据库文件名（位于 `Data/` 下）。
-const DB_FILE: &str = "traffic.db";
+pub(crate) const DB_FILE: &str = "traffic.db";
 /// 单次清理最多删除的行数（防御）。
 const MAX_PRUNE_ROWS: usize = 100_000;
 
@@ -783,7 +783,9 @@ fn backup_store(base: &Path) -> pek_rcode::db_admin::BackupStore {
 }
 
 /// 只读查询校验（安全闸门）：仅放行单条 `SELECT` 文本（实现已下沉 `pek_rcode::db_admin`）。
-pub use pek_rcode::db_admin::validate_readonly_sql;
+///
+/// 注：面板与节点代连查询统一走 `dbconn`（它内部先用 `validate_readonly_sql` 再执行），
+/// 这里不再对外转发，避免出现「两处入口、两套口径」。
 
 /// 数据库概况（面板“数据库”页）：文件路径、大小与各业务表行数。
 pub fn database_info(base: &Path) -> Json {
@@ -1496,6 +1498,7 @@ mod tests {
 
     #[test]
     fn readonly_sql_guard_rejects_writes() {
+        use pek_rcode::db_admin::validate_readonly_sql;
         assert!(validate_readonly_sql("SELECT 1").is_ok());
         assert!(validate_readonly_sql("  select * from t ").is_ok());
         for bad in [

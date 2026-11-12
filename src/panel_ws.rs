@@ -400,6 +400,47 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 util::log_info("平台下发「立即检查升级」指令，开始检查");
                 crate::self_upgrade::trigger(msg_mgr.config(), true);
             }
+            // 平台下发**直连数据库票据**（`dbTicket`）：客户端带票据直连本机查/写库，不经平台中转
+            "dbTicket" => {
+                let s = |k: &str, max: usize| -> String {
+                    v.get(k)
+                        .and_then(|x| x.as_str())
+                        .unwrap_or("")
+                        .trim()
+                        .chars()
+                        .take(max)
+                        .collect()
+                };
+                let id = s("ticket", 64);
+                let conn = s("conn", 100);
+                let user = s("user", 100);
+                let ops: Vec<String> = v
+                    .get("ops")
+                    .and_then(|x| x.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|x| x.as_str())
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let ticket = crate::db_direct::DbTicket::new(conn.clone(), ops.clone(), user);
+                if crate::db_direct::issue(&id, ticket) {
+                    util::log_format(
+                        "已登记直连数据库票据：连接={}，级别={}（{}…）",
+                        &[
+                            if conn.is_empty() { "(默认)" } else { &conn },
+                            &ops.join(" / "),
+                            &id.chars().take(8).collect::<String>(),
+                        ],
+                    );
+                } else {
+                    util::log_error(&format!(
+                        "直连数据库票据登记失败（票据 id 非法或待处理票据过多）：连接={conn}，id={id}"
+                    ));
+                }
+            }
             // 平台下发**直连部署票据**（`deployTicket`）：客户端拿同一张票据直连本机推包，
             // 包不经平台。票据一次性、10 分钟 TTL（见 `deploy_http`）。
             "deployTicket" => {
@@ -491,6 +532,24 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 let mgr = msg_mgr.clone();
                 let cmd = v.clone();
                 std::thread::spawn(move || handle_file_read(&mgr, &cmd));
+            }
+            // 平台请求**本机可连数据库清单**（「通过 RAgent 管理数据库」）：只读，不含口令/账号
+            "dbList" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_db_list(&mgr, &cmd));
+            }
+            // 平台/客户端**按连接名只读查询**（客户的库不允许外部直连，由节点代连）
+            "dbQuery" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_db_query(&mgr, &cmd));
+            }
+            // 平台/客户端**按连接名执行写语句**（P3；单条 + 白名单 + ReadOnly 连接拒绝）
+            "dbExec" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_db_exec(&mgr, &cmd));
             }
             // 平台请求**立即**上报子应用清单（面板「同步应用」：不必等 60 秒心跳）
             "appsQuery" => {
@@ -1211,6 +1270,159 @@ fn handle_file_read(manager: &Arc<AppManager>, cmd: &Json) {
             "ok": false,
             "message": e,
         }),
+    };
+    send_event(&agent_id, reply);
+}
+
+/// 平台请求**本机可连数据库清单**（`dbList`）：只读，**不含口令/账号**。
+///
+/// 实现与面板 `/star/dbConnections` 同一份（`dbconn::list_connections`）：
+/// 平台/客户端只认连接名，连接串与口令只在节点本地。
+fn handle_db_list(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let req_id = cmd
+        .get("reqId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let mut reply = crate::dbconn::list_connections(manager.base());
+    if let Some(obj) = reply.as_object_mut() {
+        obj.insert("type".to_string(), json!("dbListResult"));
+        obj.insert("reqId".to_string(), json!(req_id));
+        obj.insert("ok".to_string(), json!(true));
+    }
+    send_event(&agent_id, reply);
+}
+
+/// 平台/客户端**按连接名只读查询**（`dbQuery`）。
+///
+/// 安全边界全部在 `dbconn::query`：仅单条 `SELECT`、500 行上限、
+/// 外部连接不带模型（不建表）且 SQLite 文件必须已存在。
+fn handle_db_query(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let req_id = cmd
+        .get("reqId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let conn = cmd.get("conn").and_then(|x| x.as_str()).unwrap_or("");
+    let sql = cmd.get("sql").and_then(|x| x.as_str()).unwrap_or("");
+    let reply = match crate::dbconn::query(manager.base(), conn, sql) {
+        Ok(data) => {
+            // 只记连接名与语句长度：SQL 里常含业务字面量，不整段落日志
+            util::log_format(
+                "管理查询返回：连接={}，SQL 长度={}，行数={}",
+                &[
+                    if conn.trim().is_empty() { "(默认)" } else { conn },
+                    &sql.chars().count().to_string(),
+                    &data
+                        .get("rowCount")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0)
+                        .to_string(),
+                ],
+            );
+            json!({
+                "type": "dbQueryResult",
+                "reqId": req_id,
+                "ok": true,
+                "data": data,
+            })
+        }
+        Err(e) => {
+            util::log_format(
+                "管理查询失败：连接={}，原因={}",
+                &[if conn.trim().is_empty() { "(默认)" } else { conn }, &e],
+            );
+            json!({
+                "type": "dbQueryResult",
+                "reqId": req_id,
+                "ok": false,
+                "message": e,
+            })
+        }
+    };
+    send_event(&agent_id, reply);
+}
+
+/// 平台/客户端**按连接名执行写语句**（`dbExec`）。
+///
+/// 安全边界全部在 `dbconn::exec`：单条写语句分级（`validate_sql`）+ 禁账号/库级/服务级语句，
+/// 根级 `ReadOnlyConnections` 名单里的连接直接拒绝。写通道只由显式授权的入口下发。
+fn handle_db_exec(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let req_id = cmd
+        .get("reqId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let conn = cmd.get("conn").and_then(|x| x.as_str()).unwrap_or("");
+    let sql = cmd.get("sql").and_then(|x| x.as_str()).unwrap_or("");
+    // 平台在指令里带上发起人（审计用）；旧平台不带时回退为 `platform`
+    let user = cmd
+        .get("user")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("platform")
+        .to_string();
+    let reply = match crate::dbconn::exec(manager.base(), conn, sql) {
+        Ok(data) => {
+            util::log_format(
+                "管理写操作返回：用户={}，连接={}，影响行数={}",
+                &[
+                    &user,
+                    if conn.trim().is_empty() { "(默认)" } else { conn },
+                    &data
+                        .get("affected")
+                        .and_then(|x| x.as_u64())
+                        .unwrap_or(0)
+                        .to_string(),
+                ],
+            );
+            crate::dbconn::record_audit(
+                manager.base(),
+                &user,
+                "platform",
+                "dbExec",
+                "/star/dbExec",
+                conn,
+                data.get("opLabel").and_then(|x| x.as_str()).unwrap_or("写入"),
+                sql,
+                true,
+                "",
+            );
+            json!({
+                "type": "dbExecResult",
+                "reqId": req_id,
+                "ok": true,
+                "data": data,
+            })
+        }
+        Err(e) => {
+            util::log_format(
+                "管理写操作失败：用户={}，连接={}，原因={}",
+                &[&user, if conn.trim().is_empty() { "(默认)" } else { conn }, &e],
+            );
+            crate::dbconn::record_audit(
+                manager.base(),
+                &user,
+                "platform",
+                "dbExec",
+                "/star/dbExec",
+                conn,
+                "写入",
+                sql,
+                false,
+                &e,
+            );
+            json!({
+                "type": "dbExecResult",
+                "reqId": req_id,
+                "ok": false,
+                "message": e,
+            })
+        }
     };
     send_event(&agent_id, reply);
 }

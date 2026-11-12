@@ -19,8 +19,17 @@ license = "MIT"
 dhrust = { path = "../DH.RustBase", features = ["net", "net-tls", "toml", "service", "zip-extract", "term", "plugin", "patch", "fileman", "secret"] }
 # 数据访问（Pek.RCode = DH.NCode/XCode 的 Rust 实现）：流量历史每日归档落 SQLite
 # （rusqlite 内嵌，无外部依赖）；模型按 XCode 规范维护于 Entity/Model.xml，
-# 与 C# / rcodegen 生态共用同一份模型。按“仅 SQLite 消费方”裁剪驱动与 TLS。
-pek-rcode = { path = "../Pek.RCode", default-features = false, features = ["database"] }
+# 与 C# / rcodegen 生态共用同一份模型。
+# 驱动：默认内置 SQLite；另带 MySQL / PostgreSQL / SQL Server（「通过 RAgent 管理数据库」——
+# 客户的库常禁止外部直连，只能由节点本机连过去查询，见 docs 数据库代理设计）。
+# TLS 用 rustls（musl 交叉打包不引 openssl-sys）；`database` = Config/Database.toml 多连接约定。
+pek-rcode = { path = "../Pek.RCode", default-features = false, features = [
+    "database",
+    "driver-mysql",
+    "driver-postgresql",
+    "driver-sqlserver",
+    "tls-rustls",
+] }
 # 管理组件（Pek.RAdmin）：面板用户与操作审计数据层（audit.rs 薄壳消费；仅管理界面项目需要）
 pek-radmin = { path = "../Pek.RAdmin" }
 # Web 应用防火墙（爬虫分级：拦恶意扫描器；路径探测/CC；Config/Waf.json 热重载）

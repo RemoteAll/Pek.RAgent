@@ -137,6 +137,8 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         "/api".to_string(),
         "/star".to_string(),
         "/deploy".to_string(),
+        // 直连数据库（JSON `{conn, sql}`）：SQL 关键字会被误判为攻击特征，安全靠短时效票据
+        "/db".to_string(),
     ];
     // DHDeploy 契约接口属敏感路径（服务清单拿安装路径/启停能力）：该前缀下禁一切机器人
     waf_cfg.sensitive_prefixes = vec![
@@ -159,11 +161,13 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         "/api".to_string(),
         "/star".to_string(),
         "/deploy".to_string(),
+        "/db".to_string(),
     ]);
     waf.set_forced_skip_attack_prefixes(vec![
         "/api".to_string(),
         "/star".to_string(),
         "/deploy".to_string(),
+        "/db".to_string(),
     ]);
     router.use_middleware(waf.middleware());
 
@@ -190,6 +194,17 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         route(move |ctx| {
             let m = m.clone();
             async move { crate::deploy_http::fingerprint(m, ctx) }
+        }),
+    );
+
+    // **直连数据库**：客户端 → 本机查/写库，不经平台中转。
+    // 鉴权同样靠平台下发的短时效票据（绑定连接名与语句级别），不依赖 panel_access。
+    let m = manager.clone();
+    router.map_post(
+        "/db/apply",
+        route(move |ctx| {
+            let m = m.clone();
+            async move { crate::db_direct::apply(m, ctx) }
         }),
     );
 
