@@ -85,7 +85,10 @@ fn take(id: &str, op: &str, conn: &str) -> Result<DbTicket, String> {
         .map_err(|e| format!("数据库{e}"))
 }
 
-/// `POST /db/apply?ticket=…`：JSON `{conn?, sql}`；查询与写共用（按语句分级自动分流）。
+/// `POST /db/apply?ticket=…`：JSON `{conn?, sql}` 或 `{conn?, op:"tables"}`。
+///
+/// - 默认（无 `op` 或 `op:"sql"`）：按语句分级自动分流查询/写；
+/// - `op:"tables"`：只读**表结构**（表/列/索引），票据需含 `view` 级。
 pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
     let ticket_id = ctx.query_value("ticket").unwrap_or_default();
     if ticket_id.is_empty() {
@@ -106,6 +109,39 @@ pub fn apply(manager: Arc<AppManager>, ctx: Ctx) -> HttpOutcome {
         .unwrap_or("")
         .trim()
         .to_string();
+    let op_name = body
+        .get("op")
+        .and_then(|v| v.as_str())
+        .unwrap_or("sql")
+        .trim()
+        .to_ascii_lowercase();
+    // 表结构：纯只读，票据有 view 级即可（不消耗写配额）
+    if op_name == "tables" {
+        let ticket = match take(&ticket_id, "view", &conn) {
+            Ok(t) => t,
+            Err(e) => return json_error(401, &e),
+        };
+        let base = manager.base();
+        return match crate::dbconn::tables(base, &conn) {
+            Ok(data) => {
+                crate::util::log_format(
+                    "直连读取表结构：用户={}，连接={}，表数={}",
+                    &[
+                        if ticket.user.trim().is_empty() { "(未知)" } else { &ticket.user },
+                        if conn.is_empty() { "(默认)" } else { &conn },
+                        &data
+                            .get("tables")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.len())
+                            .unwrap_or(0)
+                            .to_string(),
+                    ],
+                );
+                json_ok("表结构", &data)
+            }
+            Err(e) => json_error(400, &e),
+        };
+    }
     // 语句分级：与平台侧同一口径（服务端仍会再校验一次）
     let op = match pek_rcode::db_admin::validate_sql(&sql) {
         Ok(op) => op,

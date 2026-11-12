@@ -551,6 +551,12 @@ fn build_hooks(manager: Arc<AppManager>, session_id: Arc<std::sync::Mutex<String
                 let cmd = v.clone();
                 std::thread::spawn(move || handle_db_exec(&mgr, &cmd));
             }
+            // 平台/客户端**读取表结构**（表/列/索引；只读，供客户端「表结构树」）
+            "dbTables" => {
+                let mgr = msg_mgr.clone();
+                let cmd = v.clone();
+                std::thread::spawn(move || handle_db_tables(&mgr, &cmd));
+            }
             // 平台请求**立即**上报子应用清单（面板「同步应用」：不必等 60 秒心跳）
             "appsQuery" => {
                 let mgr = msg_mgr.clone();
@@ -1418,6 +1424,41 @@ fn handle_db_exec(manager: &Arc<AppManager>, cmd: &Json) {
             );
             json!({
                 "type": "dbExecResult",
+                "reqId": req_id,
+                "ok": false,
+                "message": e,
+            })
+        }
+    };
+    send_event(&agent_id, reply);
+}
+
+/// 平台/客户端**读取表结构**（`dbTables`）：只读，返回表/列/索引。
+///
+/// 实现见 `dbconn::tables`（复用 `pek_rcode::catalog::read_tables`），
+/// 不带模型、不建表，SQLite 外部连接要求文件已存在。
+fn handle_db_tables(manager: &Arc<AppManager>, cmd: &Json) {
+    let agent_id = manager.config().agent_id.clone();
+    let req_id = cmd
+        .get("reqId")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
+    let conn = cmd.get("conn").and_then(|x| x.as_str()).unwrap_or("");
+    let reply = match crate::dbconn::tables(manager.base(), conn) {
+        Ok(data) => json!({
+            "type": "dbTablesResult",
+            "reqId": req_id,
+            "ok": true,
+            "data": data,
+        }),
+        Err(e) => {
+            util::log_format(
+                "读取表结构失败：连接={}，原因={}",
+                &[if conn.trim().is_empty() { "(默认)" } else { conn }, &e],
+            );
+            json!({
+                "type": "dbTablesResult",
                 "reqId": req_id,
                 "ok": false,
                 "message": e,

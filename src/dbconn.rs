@@ -364,6 +364,152 @@ pub fn exec(base: &Path, conn: &str, sql: &str) -> Result<Json, String> {
 /// SQL 摘要（审计/日志用）：实现已下沉 `pek_rcode::db_admin::redact_sql`。
 pub use pek_rcode::db_admin::redact_sql;
 
+/// 表结构目录上限：列总数超过即截断（大库动辄上千张表，JSON 会撑爆直连请求与平台中转）。
+const MAX_COLUMNS: usize = 8000;
+
+/// 表结构目录（表 / 列 / 索引）：只读，供客户端「表结构树」使用。
+///
+/// 实现直接复用 [`pek_rcode::catalog::read_tables`]（反向工程/结构同步的同一底座，
+/// 已覆盖 SQLite / MySQL / PostgreSQL 系（含 VastBase/KingBase/HighGo）/ SQL Server /
+/// Oracle / DuckDB / 达梦 等），**不在这里另写一套 information_schema 查询**。
+///
+/// 与 [`query`] 的差异：不校验 SQL（没有 SQL），但仍然只读、不带模型（外部连接绝不建表），
+/// SQLite 连接要求文件已存在。
+///
+/// 返回 `{conn, provider, tables[{name, description, columns[{name, rawType, type,
+/// length, precision, scale, nullable, primaryKey, identity, defaultValue, description}],
+/// indexes[{name, columns[], unique}]}], columnCount, truncated}`。
+pub fn tables(base: &Path, conn: &str) -> Result<Json, String> {
+    let (real_name, source) = open_for_read(base, conn)?;
+    let dal = source.dal();
+    let mut session = dal
+        .open_session()
+        .map_err(|e| format!("连接「{real_name}」打开会话失败：{e}"))?;
+    let kind = dal.kind();
+    let catalog = pek_rcode::catalog::read_tables(session.as_mut(), kind, None)
+        .map_err(|e| format!("连接「{real_name}」读取表结构失败：{e}"))?;
+
+    let mut column_count = 0usize;
+    let mut truncated = false;
+    let mut tables: Vec<Json> = Vec::with_capacity(catalog.len());
+    for table in catalog {
+        if column_count >= MAX_COLUMNS {
+            truncated = true;
+            break;
+        }
+        let mut columns: Vec<Json> = Vec::with_capacity(table.columns.len());
+        for c in &table.columns {
+            if column_count >= MAX_COLUMNS {
+                truncated = true;
+                break;
+            }
+            column_count += 1;
+            columns.push(json!({
+                "name": c.name,
+                "rawType": c.raw_type,
+                // 映射后的模型类型（跨库统一口径，前端做展示/生成 SQL 都方便）
+                "type": c.data_type.name(),
+                "length": c.length,
+                "precision": c.precision,
+                "scale": c.scale,
+                "nullable": c.nullable,
+                "primaryKey": c.primary_key,
+                "identity": c.identity,
+                "defaultValue": c.default_value.clone().unwrap_or_default(),
+                "description": c.description,
+            }));
+        }
+        let indexes: Vec<Json> = table
+            .indexes
+            .iter()
+            .map(|i| json!({ "name": i.name, "columns": i.columns, "unique": i.unique }))
+            .collect();
+        tables.push(json!({
+            "name": table.name,
+            "description": table.description,
+            "columns": columns,
+            "indexes": indexes,
+        }));
+    }
+    util::log_format(
+        "读取表结构完成：连接={}，表数={}，列数={}，截断={}",
+        &[
+            &real_name,
+            &tables.len().to_string(),
+            &column_count.to_string(),
+            if truncated { "是" } else { "否" },
+        ],
+    );
+    Ok(json!({
+        "conn": real_name,
+        "provider": kind.name(),
+        "tables": tables,
+        "columnCount": column_count,
+        "truncated": truncated,
+    }))
+}
+
+/// 只读路径的连接来源：节点自身库在共享存储里（`&Dal`），外部连接在连接缓存里（`Arc<Dal>`）。
+enum ReadSource {
+    /// 节点自身库（`history::storage` 的 `SharedStore`）
+    Shared(Arc<pek_rcode::store::SharedStore>),
+    /// 外部连接（`Config/Database.toml`，已探活并缓存）
+    External(Arc<pek_rcode::Dal>),
+}
+
+impl ReadSource {
+    fn dal(&self) -> &pek_rcode::Dal {
+        match self {
+            ReadSource::Shared(store) => store.dal(),
+            ReadSource::External(dal) => dal.as_ref(),
+        }
+    }
+}
+
+/// 把连接名解析成可读的 `Dal`（表结构读取专用）。
+///
+/// - 空 / 默认连接 / 无配置文件时的内置连接 → 节点自身库（`history::storage`）；
+/// - 外部连接：按 `Config/Database.toml` 解析（支持 `MapTo=` 别名），SQLite 要求文件已存在
+///   （管理功能不在客户机上凭空建库）。
+///
+/// 不在这里做只读名单校验：这是纯读路径，`ReadOnlyConnections` 只约束写。
+fn open_for_read(base: &Path, conn: &str) -> Result<(String, ReadSource), String> {
+    let name = conn.trim();
+    let file = pek_rcode::database::DatabaseFile::load(base)?;
+    let default_name = file.as_ref().map(|f| f.default_name().to_string());
+    let is_builtin = name.is_empty() || (file.is_none() && name.eq_ignore_ascii_case(BUILTIN_CONN));
+    let is_default = default_name
+        .as_deref()
+        .is_some_and(|d| d.eq_ignore_ascii_case(name));
+    if is_builtin || is_default {
+        let real = default_name.unwrap_or_else(|| BUILTIN_CONN.to_string());
+        let store = crate::history::storage(base)?;
+        return Ok((real, ReadSource::Shared(store)));
+    }
+    let Some(file) = file else {
+        return Err(format!(
+            "连接「{name}」不存在：本机没有 Config/Database.toml，只有内置连接 {BUILTIN_CONN}"
+        ));
+    };
+    let real_name = file
+        .names()
+        .into_iter()
+        .find(|n| n.eq_ignore_ascii_case(name))
+        .map(str::to_string)
+        .ok_or_else(|| format!("连接「{name}」不存在（可用：{}）", file.names().join(", ")))?;
+    let conn_str = file.resolve_connection(base, &real_name)?;
+    if let Some(path) = pek_rcode::database::sqlite_file_of(base, &conn_str)
+        && !path.is_file()
+    {
+        return Err(format!(
+            "连接「{real_name}」的 SQLite 数据文件不存在：{}（管理功能不会自动创建空库，请先核对路径）",
+            path.display()
+        ));
+    }
+    let dal = open_cached(base, &real_name, &conn_str)?;
+    Ok((real_name, ReadSource::External(dal)))
+}
+
 /// 写操作审计（平台中转与直连共用）。
 ///
 /// 直连（`/db/apply`）与平台 WS 下发都不经过面板 `guarded`，必须在这里补记，
@@ -609,6 +755,45 @@ ConnectionString = 'Data Source=Data/ghost.db;Provider=SQLite'
         assert!(err.contains("不存在"), "{err}");
         // 不允许因为一次查询就在客户目录里造出空库
         assert!(!dir.join("Data").join("ghost.db").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lists_table_structure() {
+        let dir = temp_dir("tables");
+        let extra = dir.join("Data").join("extra.db");
+        make_sqlite(&extra);
+        std::fs::write(
+            dir.join("Config").join("Database.toml"),
+            r#"Default = "main"
+[Connections.main]
+ConnectionString = 'Data Source=Data/main.db;Provider=SQLite'
+[Connections.extra]
+ConnectionString = 'Data Source=Data/extra.db;Provider=SQLite'
+"#,
+        )
+        .unwrap();
+        let v = tables(&dir, "extra").unwrap();
+        assert_eq!(v["conn"].as_str(), Some("extra"));
+        assert_eq!(v["provider"].as_str(), Some("SQLite"));
+        assert_eq!(v["truncated"].as_bool(), Some(false));
+        let list = v["tables"].as_array().unwrap();
+        let demo = list
+            .iter()
+            .find(|t| t["name"].as_str() == Some("t_demo"))
+            .expect("应读到 t_demo");
+        let cols = demo["columns"].as_array().unwrap();
+        assert_eq!(cols.len(), 2, "{cols:?}");
+        let id = &cols[0];
+        assert_eq!(id["name"].as_str(), Some("Id"));
+        assert_eq!(id["primaryKey"].as_bool(), Some(true));
+        assert_eq!(id["nullable"].as_bool(), Some(false));
+        let name = cols.iter().find(|c| c["name"] == "Name").unwrap();
+        assert_eq!(name["nullable"].as_bool(), Some(true));
+        assert!(!name["rawType"].as_str().unwrap_or("").is_empty());
+        // 不存在的连接：说清楚，不静默返回空清单
+        let err = tables(&dir, "nope").unwrap_err();
+        assert!(err.contains("不存在"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
