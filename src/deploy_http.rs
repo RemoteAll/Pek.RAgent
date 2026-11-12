@@ -17,20 +17,27 @@
 //!
 //! 因此：没有票据的人即使能访问本端口也无法写入任何东西；票据用过即废，无法重放。
 
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use dhrust::net::http::{HttpOutcome, HttpResponse};
+use dhrust::net::http::HttpOutcome;
 use dhrust::net::router::Ctx;
 use serde_json::json;
 
+// 信封实现已下沉 `dhrust::net::http::HttpResponse::{json_error, json_ok}`（本仓薄壳见 `crate::jsout`）
+use crate::jsout::{error as json_error, ok as json_ok};
 use crate::manager::AppManager;
 
 /// 票据有效期：客户端拿到就要连，10 分钟足够，过期即废。
 const TICKET_TTL: Duration = Duration::from_secs(600);
 /// 同时挂起的票据上限（防平台异常时刷爆内存）。
 const MAX_TICKETS: usize = 64;
+
+/// 部署票据库（实现已下沉 `dhrust::ticket::TicketStore`：TTL/容量/配额统一）。
+fn tickets() -> &'static dhrust::ticket::TicketStore<Ticket> {
+    static S: OnceLock<dhrust::ticket::TicketStore<Ticket>> = OnceLock::new();
+    S.get_or_init(|| dhrust::ticket::TicketStore::new(TICKET_TTL, MAX_TICKETS))
+}
 
 /// 一次性部署票据（平台经 WS `deployTicket` 下发）。
 #[derive(Clone, Debug)]
@@ -47,11 +54,6 @@ pub struct Ticket {
     pub arguments: Option<String>,
     /// 包内容的 SHA-256（小写 hex）
     pub sha256: String,
-    /// 签发时刻（TTL 判定）
-    issued: Instant,
-    /// 剩余**写**次数（读目录指纹不消耗）。客户端流程是「读指纹 → 写一次」，
-    /// 所以写配额 1 就够；用完即删，不可重放。
-    remaining: u8,
     /// 部署实例编号（平台签票时下发；部署成功后据此回报文件清单快照，0 = 不上报）
     pub instance_id: i64,
     /// 是否清理「目录里有、增量包里没有」的残留文件（**移到备份目录**，不直接删）
@@ -77,18 +79,11 @@ impl Ticket {
             dir_path: dir_path.into(),
             arguments: arguments.filter(|s| !s.trim().is_empty()),
             sha256: sha256.into(),
-            issued: Instant::now(),
-            remaining: 1,
             instance_id: 0,
             prune: false,
             backup: true,
         }
     }
-}
-
-fn table() -> &'static Mutex<HashMap<String, Ticket>> {
-    static T: OnceLock<Mutex<HashMap<String, Ticket>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 部署串行锁：同一时刻只允许一个直连部署改应用目录。
@@ -97,65 +92,19 @@ fn busy() -> &'static Mutex<bool> {
     B.get_or_init(|| Mutex::new(false))
 }
 
-/// 登记票据；返回 `false` = 票据格式非法 / 表已满。
+/// 登记票据（写配额 1 次）；返回 `false` = 票据格式非法 / 表已满。
 pub fn issue(id: &str, ticket: Ticket) -> bool {
-    if !valid_ticket_id(id) {
-        return false;
-    }
-    let mut m = table().lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, t| t.issued.elapsed() < TICKET_TTL);
-    if m.len() >= MAX_TICKETS {
-        return false;
-    }
-    m.insert(id.to_ascii_lowercase(), ticket);
-    true
-}
-
-/// 票据 id 只能是最多 64 位 hex（防注入/超长键）。
-fn valid_ticket_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+    tickets().issue(id, ticket, 1)
 }
 
 /// 取票据：`consume_write = true` 扣一次写配额（用尽即删，不可重放）；
 /// `false` 只做只读校验（读目录指纹），不消耗配额。
 fn take_for(id: &str, consume_write: bool) -> Option<Ticket> {
-    if !valid_ticket_id(id) {
-        return None;
+    if consume_write {
+        tickets().take(id, |_| Ok(())).ok()
+    } else {
+        tickets().peek(id)
     }
-    let key = id.to_ascii_lowercase();
-    let mut m = table().lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, t| t.issued.elapsed() < TICKET_TTL);
-    let t = m.get_mut(&key)?;
-    if t.issued.elapsed() >= TICKET_TTL {
-        m.remove(&key);
-        return None;
-    }
-    if !consume_write {
-        return Some(t.clone());
-    }
-    if t.remaining == 0 {
-        return None;
-    }
-    t.remaining -= 1;
-    let out = t.clone();
-    if t.remaining == 0 {
-        m.remove(&key);
-    }
-    Some(out)
-}
-
-fn json_error(status: u16, message: &str) -> HttpOutcome {
-    HttpOutcome::Response(HttpResponse::json(
-        status,
-        json!({ "ok": false, "message": message }).to_string(),
-    ))
-}
-
-fn json_ok(message: &str, data: &serde_json::Value) -> HttpOutcome {
-    HttpOutcome::Response(HttpResponse::json(
-        200,
-        json!({ "ok": true, "message": message, "data": data }).to_string(),
-    ))
 }
 
 /// `POST /deploy/apply?ticket=…`：裸 body = 包内容，元数据全在票据里。

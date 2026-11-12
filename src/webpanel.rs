@@ -797,21 +797,10 @@ fn resolve_client_ip(
 }
 
 /// 去掉 IP 串可能带的端口（`1.2.3.4:56`、`[::1]:56`）。
+///
+/// 实现已下沉 `dhrust::net::strip_port`（零分配）；这里只额外去掉转发头里常见的引号。
 fn strip_ip_port(raw: &str) -> String {
-    let s = raw.trim().trim_matches('"');
-    if let Some(rest) = s.strip_prefix('[')
-        && let Some((host, _)) = rest.split_once(']')
-    {
-        return host.to_string();
-    }
-    if s.matches(':').count() == 1
-        && let Some((host, port)) = s.rsplit_once(':')
-        && !port.is_empty()
-        && port.chars().all(|c| c.is_ascii_digit())
-    {
-        return host.to_string();
-    }
-    s.to_string()
+    dhrust::net::strip_port(raw.trim().trim_matches('"')).to_string()
 }
 
 /// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。

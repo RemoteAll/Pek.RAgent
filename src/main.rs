@@ -23,6 +23,7 @@ mod deploy_http;
 mod fileman;
 mod history;
 mod iis;
+mod jsout;
 mod logclean;
 mod manager;
 mod memsys;

@@ -9,14 +9,14 @@
 //!
 //! 因此：没有票据的人即使能连上本端口也查不到任何库；票据不能换库、不能越级、过期即废。
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
-use dhrust::net::http::{HttpOutcome, HttpResponse};
+use dhrust::net::http::HttpOutcome;
 use dhrust::net::router::Ctx;
-use serde_json::json;
 
+// 信封实现已下沉 `dhrust::net::http::HttpResponse::{json_error, json_ok}`（本仓薄壳见 `crate::jsout`）
+use crate::jsout::{error as json_error, ok as json_ok};
 use crate::manager::AppManager;
 
 /// 票据有效期：拿到就连，10 分钟足够，过期即废。
@@ -35,109 +35,54 @@ pub struct DbTicket {
     pub ops: Vec<String>,
     /// 平台用户（审计用）
     pub user: String,
-    /// 签发时刻（TTL 判定）
-    issued: Instant,
-    /// 剩余请求次数
-    remaining: u32,
 }
 
 impl DbTicket {
-    /// 构造（`issued` / 次数由本模块维护）。
+    /// 构造（TTL / 配额由票据库维护）。
     pub fn new(conn: impl Into<String>, ops: Vec<String>, user: impl Into<String>) -> Self {
         Self {
             conn: conn.into(),
             ops,
             user: user.into(),
-            issued: Instant::now(),
-            remaining: MAX_REQUESTS,
         }
     }
 }
 
-fn table() -> &'static Mutex<HashMap<String, DbTicket>> {
-    static T: OnceLock<Mutex<HashMap<String, DbTicket>>> = OnceLock::new();
-    T.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// 票据 id 只能是最多 64 位 hex（防注入/超长键）。
-fn valid_ticket_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_hexdigit())
+/// 数据库票据库（实现已下沉 `dhrust::ticket::TicketStore`：TTL/容量/配额统一）。
+fn tickets() -> &'static dhrust::ticket::TicketStore<DbTicket> {
+    static S: OnceLock<dhrust::ticket::TicketStore<DbTicket>> = OnceLock::new();
+    S.get_or_init(|| dhrust::ticket::TicketStore::new(TICKET_TTL, MAX_TICKETS))
 }
 
 /// 登记票据；返回 `false` = 票据格式非法 / 表已满。
 pub fn issue(id: &str, ticket: DbTicket) -> bool {
-    if !valid_ticket_id(id) {
-        return false;
-    }
-    let mut m = table().lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, t| t.issued.elapsed() < TICKET_TTL);
-    if m.len() >= MAX_TICKETS {
-        return false;
-    }
-    m.insert(id.to_ascii_lowercase(), ticket);
-    true
+    tickets().issue(id, ticket, MAX_REQUESTS)
 }
 
 /// 核销一次请求：校验票据、连接绑定与语句级别，成功则扣一次配额。
 fn take(id: &str, op: &str, conn: &str) -> Result<DbTicket, String> {
-    if !valid_ticket_id(id) {
-        return Err("数据库票据格式无效".to_string());
-    }
-    let key = id.to_ascii_lowercase();
-    let mut m = table().lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|_, t| t.issued.elapsed() < TICKET_TTL);
-    let Some(t) = m.get_mut(&key) else {
-        return Err("数据库票据无效或已过期（请重新申请）".to_string());
-    };
-    if t.issued.elapsed() >= TICKET_TTL {
-        m.remove(&key);
-        return Err("数据库票据已过期（请重新申请）".to_string());
-    }
-    if t.remaining == 0 {
-        m.remove(&key);
-        return Err("数据库票据请求次数已用尽（请重新申请）".to_string());
-    }
-    // 票据绑定的连接：不允许换库（防「拿 A 库的票据查 B 库」）
-    let bound = t.conn.trim();
-    let req = conn.trim();
-    if bound.is_empty() {
-        // 空 = 只授权「默认连接」；若允许任意连接，签给默认库的票据就能读所有库
-        if !req.is_empty() {
-            return Err(format!(
-                "该票据只授权默认连接，不能用于「{req}」"
-            ));
-        }
-    } else if !bound.eq_ignore_ascii_case(req) {
-        return Err(format!(
-            "该票据只授权连接「{bound}」，不能用于「{req}」"
-        ));
-    }
-    if !t.ops.iter().any(|o| o.eq_ignore_ascii_case(op)) {
-        return Err(format!(
-            "该票据未授权「{op}」级操作（允许：{}）",
-            t.ops.join(" / ")
-        ));
-    }
-    t.remaining -= 1;
-    let out = t.clone();
-    if t.remaining == 0 {
-        m.remove(&key);
-    }
-    Ok(out)
-}
-
-fn json_error(status: u16, message: &str) -> HttpOutcome {
-    HttpOutcome::Response(HttpResponse::json(
-        status,
-        json!({ "ok": false, "message": message }).to_string(),
-    ))
-}
-
-fn json_ok(message: &str, data: &serde_json::Value) -> HttpOutcome {
-    HttpOutcome::Response(HttpResponse::json(
-        200,
-        json!({ "ok": true, "message": message, "data": data }).to_string(),
-    ))
+    tickets()
+        .take(id, |t| {
+            // 票据绑定的连接：不允许换库（防「拿 A 库的票据查 B 库」）
+            let bound = t.conn.trim();
+            let req = conn.trim();
+            if bound.is_empty() {
+                // 空 = 只授权「默认连接」；若允许任意连接，签给默认库的票据就能读所有库
+                if !req.is_empty() {
+                    return Err(format!("该票据只授权默认连接，不能用于「{req}」"));
+                }
+            } else if !bound.eq_ignore_ascii_case(req) {
+                return Err(format!("该票据只授权连接「{bound}」，不能用于「{req}」"));
+            }
+            if !t.ops.iter().any(|o| o.eq_ignore_ascii_case(op)) {
+                return Err(format!(
+                    "该票据未授权「{op}」级操作（允许：{}）",
+                    t.ops.join(" / ")
+                ));
+            }
+            Ok(())
+        })
+        .map_err(|e| format!("数据库{e}"))
 }
 
 /// `POST /db/apply?ticket=…`：JSON `{conn?, sql}`；查询与写共用（按语句分级自动分流）。
@@ -256,9 +201,8 @@ mod tests {
     #[test]
     fn quota_exhausts_and_removes_ticket() {
         let id = "abcdef0123456789";
-        let mut t = DbTicket::new("", vec!["view".into()], "op2");
-        t.remaining = 2;
-        assert!(issue(id, t));
+        // 直接用票据库验配额（`issue` 包装固定配额 500）
+        assert!(tickets().issue(id, DbTicket::new("", vec!["view".into()], "op2"), 2));
         assert!(take(id, "view", "").is_ok());
         assert!(take(id, "view", "").is_ok());
         // 用尽即删

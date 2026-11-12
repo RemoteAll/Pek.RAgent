@@ -159,37 +159,21 @@ fn connection_json(
 }
 
 /// 连接串里的（服务器[:端口], 库名）；**不解析账号口令**。
+///
+/// 键名兼容交由 `pek_rcode::dal::ConnectionString`（`server`/`port`/`database` 访问器），
+/// 节点侧只负责「按需拼端口」：SQL Server 的 `Server=tcp:host,1433` 原样保留。
 fn endpoint_of(conn: &str) -> (String, String) {
-    let mut server = String::new();
-    let mut port = String::new();
-    let mut database = String::new();
-    for seg in conn.split(';') {
-        let Some((k, v)) = seg.split_once('=') else {
-            continue;
-        };
-        let key = k.trim().to_ascii_lowercase();
-        let value = v.trim();
-        if value.is_empty() {
-            continue;
-        }
-        match key.as_str() {
-            "server" | "host" | "address" | "addr" => server = value.to_string(),
-            "port" => port = value.to_string(),
-            "database" | "initial catalog" => database = value.to_string(),
-            _ => {}
-        }
-    }
-    let host = match (server.is_empty(), port.is_empty()) {
-        (true, _) => String::new(),
-        (false, true) => server,
-        (false, false) => {
-            if server.contains(':') {
-                // `Server=tcp:host,1433` 这类已带端口/协议前缀的写法原样保留
-                server
-            } else {
-                format!("{server}:{port}")
-            }
-        }
+    let parsed = pek_rcode::dal::ConnectionString::parse(conn);
+    let server = parsed.server().unwrap_or("").trim();
+    let port = parsed.port().unwrap_or("").trim();
+    let database = parsed.database().unwrap_or("").trim().to_string();
+    let host = if server.is_empty() {
+        String::new()
+    } else if port.is_empty() || server.contains(':') {
+        // 已带端口/协议前缀（`tcp:host,1433`、`host,1433`、IPv6）→ 原样
+        server.to_string()
+    } else {
+        format!("{server}:{port}")
     };
     (host, database)
 }
