@@ -768,39 +768,15 @@ pub(crate) fn effective_client_ip(trust: bool, ctx: &Ctx) -> (String, bool) {
 }
 
 /// [`effective_client_ip`] 的纯函数版本（便于单测）。
+///
+/// 实现已下沉 `dhrust::net::panel_auth::client_ip_with_proxy_flag`（X-Real-IP 优先、返回「是否经反代」）。
 fn resolve_client_ip(
     peer: &str,
     real: Option<&str>,
     xff: Option<&str>,
     trust: bool,
 ) -> (String, bool) {
-    let peer = peer.trim().to_string();
-    if !is_loopback(&peer) {
-        return (peer, false);
-    }
-    let real = real.map(str::trim).filter(|s| !s.is_empty());
-    let xff = xff.map(str::trim).filter(|s| !s.is_empty());
-    if real.is_none() && xff.is_none() {
-        return (peer, false);
-    }
-    if !trust {
-        return (peer, true);
-    }
-    let ip = real
-        .map(|s| s.to_string())
-        .or_else(|| {
-            xff.and_then(|s| s.rsplit(',').next())
-                .map(|s| s.trim().to_string())
-        })
-        .unwrap_or(peer);
-    (strip_ip_port(&ip), true)
-}
-
-/// 去掉 IP 串可能带的端口（`1.2.3.4:56`、`[::1]:56`）。
-///
-/// 实现已下沉 `dhrust::net::strip_port`（零分配）；这里只额外去掉转发头里常见的引号。
-fn strip_ip_port(raw: &str) -> String {
-    dhrust::net::strip_port(raw.trim().trim_matches('"')).to_string()
+    dhrust::net::panel_auth::client_ip_with_proxy_flag(peer, real, xff, trust)
 }
 
 /// 请求参数摘要（查询串 + JSON/表单体；敏感字段脱敏；截断至 400 字符）。
@@ -5561,7 +5537,14 @@ mod tests {
             resolve_client_ip("198.51.100.5", Some("127.0.0.1"), Some("127.0.0.1"), true),
             ("198.51.100.5".to_string(), false)
         );
-        assert_eq!(strip_ip_port("[::1]:5501"), "::1");
-        assert_eq!(strip_ip_port("203.0.113.9:1234"), "203.0.113.9");
+        // 端口与引号的清理由公共方法负责（`dhrust::net::strip_port`）
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", Some("[::1]:5501"), None, true).0,
+            "::1"
+        );
+        assert_eq!(
+            resolve_client_ip("127.0.0.1", Some("\"203.0.113.9:1234\""), None, true).0,
+            "203.0.113.9"
+        );
     }
 }
