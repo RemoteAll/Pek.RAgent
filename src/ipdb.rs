@@ -364,12 +364,16 @@ pub fn ipdb_status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         obj.insert("signature".into(), json!(!cfg.ipdb_pubkey.trim().is_empty()));
         obj.insert("includeV6".into(), json!(cfg.ipdb_include_v6));
         obj.insert("autoEnroll".into(), json!(cfg.ipdb_auto_enroll));
-        // 授权身份（installId）能让运维直接去平台「IP 授权」页找到对应待批准项
-        let install_id = pek_ip::auth::AuthClient::load_or_create(&auth_cfg(panel.base()), panel.base())
-            .ok()
-            .map(|c| c.install_id().to_string())
-            .unwrap_or_default();
-        obj.insert("installId".into(), json!(install_id));
+        // 只读已有的 installId：状态接口不能因为一次 GET 就创建身份文件（未启用时不该在磁盘上留痕迹）
+        obj.insert("installId".into(), json!(existing_install_id(panel.base())));
+        // 待批准：刷新告警里带「批准」字样（平台对所有新客户端都是 pending，需人工批准）
+        let pending = LAST_REPORT
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|r| r.warnings.iter().any(|w| w.contains("批准")))
+            .unwrap_or(false);
+        obj.insert("pendingApproval".into(), json!(pending));
         obj.insert(
             "mirrorUrl".into(),
             json!(format!("http://127.0.0.1:{}/ipdb", panel.port())),
@@ -464,6 +468,13 @@ pub fn trigger(cfg: AgentConfig, base: PathBuf, force: bool) -> bool {
 fn file_sha256(path: &Path) -> Option<String> {
     let data = fs::read(path).ok()?;
     Some(dhrust::sign::sha256_hex(&data))
+}
+
+/// 已有的 installId（**只读**；不存在返回空串，不创建身份）。
+fn existing_install_id(base: &Path) -> String {
+    fs::read_to_string(auth_dir(base).join("install.id"))
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default()
 }
 
 /// 原子写（同目录 `.tmp-<pid>` + rename），避免读到写一半的文件。

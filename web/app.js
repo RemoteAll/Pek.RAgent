@@ -164,6 +164,7 @@ function renderNav(){
   else if(k==='logs')show=canView('logs')||canView('audit'); // 日志页含“操作日志”子页签（任一权限可见）
   else if(k==='config')show=canView('config')||canView('starconfig')||canView('control'); // 配置页含“星尘设置/安全”子页签（任一权限可见）
   else if(k==='services')show=canView('services')||canView('watchdog'); // 子服务页含“看门狗”卡片（任一权限可见）
+  else if(k==='ipdb')show=canView('plugins'); // IP 库镜像与插件同属「分发/组件」权限（后端动作同为 PERM_PLUGINS）
   else if(me&&!me.isAdmin)show=(me.perms||[]).includes(k);
   a.style.display=show?'':'none';
  });
@@ -230,6 +231,7 @@ function switchPanel(name){
   fileman:loadFileman,
   cert:loadCert,
   plugins:loadPlugins,
+  ipdb:loadIpdb,
   ai:loadAi,
   terminal:loadTerminal,
   users:loadUsers
@@ -3839,4 +3841,118 @@ async function probeAuthlessAccess(){
   const j=await r.json();
   if(j&&j.code===0)showApp();
  }catch(e){}
+}
+
+/* ── 📚 IP 库镜像（本机分发）────────────────────────────────────────────
+   后端：GET /star/ipdbStatus（开关/源/授权/缓存清单/最近告警）、POST /star/ipdbRefresh。
+   用途：服务器装了本程序后，Pek.ZIP 等本机应用配 MirrorUrl 指向 /ipdb 即可，
+        同样的数据只下一次；开 IpdbAutoEnroll 后本机会以独立身份向平台注册，
+        首次需在「分发中心 → IP 授权」批准（平台对所有新客户端都是 pending）。
+   ─────────────────────────────────────────────────────────────────── */
+let ipdbData=null;
+
+async function loadIpdb(){
+ try{
+  const j=await api('/star/ipdbStatus');
+  if(j.code!==0){showToast(j.message||'加载失败','error');return}
+  ipdbData=j.data||{};
+  const box=$('panel-ipdb');if(box)box.innerHTML=ipdbShellHtml(ipdbData);
+ }catch(e){}
+}
+
+function ipdbShellHtml(d){
+ const enabled=!!d.enabled,pending=!!d.pendingApproval;
+ const mirror=d.mirrorUrl||('http://127.0.0.1:'+location.port+'/ipdb');
+ const files=d.files||[],warns=d.lastWarnings||[];
+ const totalKB=Number(d.totalKB||0),catalogBytes=Number(d.catalogBytes||0);
+ const installId=d.installId||'';
+ let rows='';
+ for(const f of files){
+  rows+=`<tr><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(f.name)}</td>`+
+        `<td style="text-align:right;white-space:nowrap">${Number(f.sizeKB||0).toLocaleString()} KB</td></tr>`;
+ }
+ if(!rows)rows='<tr><td colspan="2" class="text-muted">暂无缓存文件（未启用、或还没刷新成功）</td></tr>';
+
+ let enroll='<span class="text-muted">未开启（只转发目录，安装包仍由各应用自行向平台取）</span>';
+ if(d.autoEnroll){
+  if(pending)enroll='<span style="color:var(--orange,#d97706);font-weight:600">待平台批准</span>'+
+   '<div class="text-muted" style="font-size:12px;margin-top:4px">去 Pek.RPanlServer「分发中心 → IP 授权」批准下方 installId；批准后点「立即刷新」即开始下包</div>';
+  else if(installId)enroll='<span style="color:var(--green,#16a34a);font-weight:600">已就绪</span>';
+  else enroll='<span class="text-muted">尚未注册（下次刷新时自动注册）</span>';
+ }
+
+ let warnHtml='';
+ if(warns.length){
+  warnHtml=`<div style="margin-top:12px"><div style="font-weight:600;font-size:13px">最近一次刷新的告警（${warns.length}）</div>`+
+   `<ul style="margin:6px 0 0 18px;font-size:12px;line-height:1.7">${warns.slice(0,10).map(w=>`<li>${esc(w)}</li>`).join('')}</ul>`+
+   (warns.length>10?`<div class="text-muted" style="font-size:11px">…共 ${warns.length} 条，仅显示前 10 条</div>`:'')+`</div>`;
+ }
+
+ const disabled=enabled?'':'disabled title="先在服务器 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true"';
+ return `<div class="glass-card card">
+ <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+  <h2>📚 IP 库镜像</h2>
+  <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+   <button class="btn btn-secondary btn-sm" onclick="ipdbCopy('${escAttr(mirror)}')">📋 复制镜像地址</button>
+   <button class="btn btn-primary btn-sm" ${disabled} onclick="ipdbRefreshNow()">🔄 立即刷新</button>
+  </div>
+ </div>
+ <table style="width:100%;border-collapse:collapse;font-size:13px">
+  <tr><td style="width:150px" class="text-muted">镜像状态</td><td>${enabled?'<span style="color:var(--green,#16a34a);font-weight:600">已启用</span>':'<span class="text-muted">未启用</span>'}</td></tr>
+  <tr><td class="text-muted">平台源</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(d.sourceUrl||'')}</td></tr>
+  <tr><td class="text-muted">本机镜像地址</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(mirror)}</td></tr>
+  <tr><td class="text-muted">应用侧配置</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">MirrorUrl = "${esc(mirror)}"</td></tr>
+  <tr><td class="text-muted">下载授权</td><td>${enroll}</td></tr>
+  ${installId?`<tr><td class="text-muted">installId</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(installId)} <button class="btn btn-secondary btn-sm" style="margin-left:6px" onclick="ipdbCopy('${escAttr(installId)}')">复制</button></td></tr>`:''}
+  <tr><td class="text-muted">刷新间隔</td><td>${Number(d.refreshMinutes||0)} 分钟（0/未设按 5 分钟下限；改配置后重启生效）</td></tr>
+  <tr><td class="text-muted">目录</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(d.dir||'')}</td></tr>
+ </table>
+ <div class="text-muted" style="margin-top:10px;font-size:12px">目录与签名按平台原始字节转发（镜像不重签），客户端仍用平台公钥验签；本端点<b>仅回环可读</b>，不对外提供下载。</div>
+ </div>
+
+ <div class="glass-card card">
+  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
+   <h2>缓存内容</h2>
+   <span class="text-muted" style="font-size:12px">目录 ${catalogBytes?Math.ceil(catalogBytes/1024)+' KB':'—'} · 文件 ${files.length} 个 · 合计 ${(totalKB/1024).toFixed(1)} MB</span>
+  </div>
+  <table style="width:100%;border-collapse:collapse;font-size:13px">
+   <tr class="text-muted"><td>文件名</td><td style="text-align:right;width:130px">大小</td></tr>
+   ${rows}
+  </table>
+  ${warnHtml}
+ </div>`;
+}
+
+async function ipdbRefreshNow(){
+ try{
+  const j=await api('/star/ipdbRefresh',{method:'POST',body:'{}'});
+  if(j.code===0){
+   showToast('已开始刷新（下载中会先只有目录，稍后自动刷新本页）','success');
+   // 包要真下载（合计十几 MB），单次延时回读会看起来“没生效”：分几次回读，看到文件就停
+   const tries=[2500,6000,12000,20000,30000];
+   let i=0;
+   const tick=async()=>{
+    if(_activePanel!=='ipdb')return; // 离开本页就不再打请求
+    await loadIpdb();
+    const n=((ipdbData&&ipdbData.files)||[]).length;
+    if(n>0&&i>=1)return; // 已有文件：不再续轮
+    if(++i<tries.length)setTimeout(tick,tries[i]-tries[i-1]);
+   };
+   setTimeout(tick,tries[0]);
+  }
+  else showToast(j.message||'刷新失败','error');
+ }catch(e){showToast('刷新失败：网络错误','error')}
+}
+
+function ipdbCopy(text){
+ const done=()=>showToast('已复制','success');
+ if(navigator.clipboard&&navigator.clipboard.writeText){
+  navigator.clipboard.writeText(text).then(done).catch(()=>ipdbCopyFallback(text,done));
+ }else ipdbCopyFallback(text,done);
+}
+function ipdbCopyFallback(text,done){
+ try{
+  const ta=document.createElement('textarea');ta.value=text;ta.style.position='fixed';ta.style.opacity='0';
+  document.body.appendChild(ta);ta.select();document.execCommand('copy');document.body.removeChild(ta);done();
+ }catch(e){showToast('复制失败，请手动选择文本','error')}
 }
