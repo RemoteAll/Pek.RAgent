@@ -6,7 +6,7 @@
 //!
 //! 目录约定（与平台 `/components/*` 同构，客户端只要把 MirrorUrl 指到 `/ipdb`）：
 //! - `{base}/Ipdb/catalog.json`      平台目录原始字节
-//! - `{base}/Ipdb/catalog.json.sig`  平台签名原始字节（配了 `IpdbPubKey` 才会落盘/校验）
+//! - `{base}/Ipdb/catalog.json.sig`  平台签名原始字节（**平台给就转发**；配了 `IpdbPubKey` 才额外校一遍）
 //! - `{base}/Ipdb/components/<文件名>.zip`
 //!
 //! 安全边界：**仅回环访问**（对端不是 127.0.0.1/::1 一律当作不存在）；只读自身缓存目录，
@@ -33,6 +33,8 @@ use crate::webpanel::WebPanel;
 pub const DIR: &str = "Ipdb";
 const CATALOG: &str = "catalog.json";
 const SIG: &str = "catalog.json.sig";
+/// 最近一次刷新的结果快照（落盘）：服务重启后面板仍能看到「上次什么时候刷的、有没有告警」。
+const LAST_REFRESH: &str = "last-refresh.json";
 /// 只镜像平台「IP 库」分类（与 Pek.ZIP 的 `IP_DATABASE_CATEGORY` 一致）。
 const CATEGORY: &str = "ip-database";
 const MAX_CATALOG: usize = 2 * 1024 * 1024;
@@ -162,6 +164,54 @@ pub struct Report {
     /// 本轮清理掉的旧组件文件数（不再被当前目录引用：旧版本、已关闭的 v6 等）
     pub pruned: usize,
     pub warnings: Vec<String>,
+    /// 本轮完成时间（本地时间字符串；仅用于展示/落盘）
+    pub checked_at: String,
+}
+
+/// 把本轮结果落盘（原子写）；失败只记日志，不影响刷新本身。
+fn write_last_refresh(base: &Path, checked_at: &str, result: &Result<Report, String>) {
+    let value = match result {
+        Ok(r) => json!({
+            "checkedAt": checked_at,
+            "catalogBytes": r.catalog_bytes,
+            "downloaded": r.downloaded,
+            "skipped": r.skipped,
+            "pruned": r.pruned,
+            "warnings": r.warnings,
+        }),
+        Err(e) => json!({ "checkedAt": checked_at, "error": e }),
+    };
+    let text = value.to_string();
+    if let Err(e) = write_atomic(&root(base).join(LAST_REFRESH), text.as_bytes()) {
+        util::log_format("IP 库镜像：写入刷新快照失败：{}", &[&e]);
+    }
+}
+
+/// 读回落盘的刷新快照（服务重启后沿用，能让面板显示上次结果）。
+fn read_last_refresh(base: &Path) -> Option<Report> {
+    let text = fs::read_to_string(root(base).join(LAST_REFRESH)).ok()?;
+    let v: Json = serde_json::from_str(&text).ok()?;
+    Some(Report {
+        catalog_bytes: v.get("catalogBytes").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        downloaded: v.get("downloaded").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        skipped: v.get("skipped").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        pruned: v.get("pruned").and_then(|x| x.as_u64()).unwrap_or(0) as usize,
+        warnings: v
+            .get("warnings")
+            .and_then(|x| x.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|i| i.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        checked_at: v
+            .get("checkedAt")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string(),
+    })
 }
 
 /// 刷新镜像：拉目录（可选验签）→ 挑 `ip-database` 里 `any`/本机 target 的条目 →
@@ -334,30 +384,42 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
     }
 
     // 清理：只保留当前目录引用的文件（旧版本 / 已关闭的 v6 自动释放空间）
-    // 安全阀：“本轮一个都没识别到” 时绝不清理，避免目录解析异常把缓存清空。
-    if !keep.is_empty() {
-        if let Ok(entries) = fs::read_dir(&components_dir(base)) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if !path.is_file() {
-                    continue;
+    //
+    // 两道安全阀：
+    // 1) `keep` 为空（本轮一个条目都没识别到）→ 绝不清理，避免目录解析异常把缓存清空；
+    // 2) **「当前引用的文件没全部就位」→ 跳过清理**。实测过平台有每日下载配额（20 次/天）：
+    //    配额用尽时新版本下不来，若此时还清掉旧版本，镜像就会连这个数据集一起丢掉。
+    let missing = keep
+        .iter()
+        .filter(|n| !components_dir(base).join(n.as_str()).is_file())
+        .count();
+    if keep.is_empty() {
+        // 什么都不删（正常不会发生：keep 至少含一个可下载条目）
+    } else if missing > 0 {
+        report.warnings.push(format!(
+            "本轮有 {missing} 个组件未就位（下载失败/配额用尽），已跳过旧版本清理（旧包保留，客户端可继续用）"
+        ));
+    } else if let Ok(entries) = fs::read_dir(&components_dir(base)) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path
+                .file_name()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default();
+            if keep.contains(&name) {
+                continue;
+            }
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    report.pruned += 1;
+                    util::log_format("IP 库镜像：清理旧组件 {}（不再被当前目录引用）", &[&name]);
                 }
-                let name = path
-                    .file_name()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
-                if keep.contains(&name) {
-                    continue;
-                }
-                match fs::remove_file(&path) {
-                    Ok(()) => {
-                        report.pruned += 1;
-                        util::log_format("IP 库镜像：清理旧组件 {}（不再被当前目录引用）", &[&name]);
-                    }
-                    Err(e) => report
-                        .warnings
-                        .push(format!("清理旧组件 {name} 失败：{e}（{}）", path.display())),
-                }
+                Err(e) => report
+                    .warnings
+                    .push(format!("清理旧组件 {name} 失败：{e}（{}）", path.display())),
             }
         }
     }
@@ -389,14 +451,20 @@ pub fn status(base: &Path) -> Json {
         .ok()
         .map(|m| m.len())
         .unwrap_or(0);
-    let report = LAST_REPORT.lock().unwrap().clone();
+    let report = LAST_REPORT.lock().unwrap().clone().or_else(|| read_last_refresh(base));
     let last_error = LAST_ERROR.lock().unwrap().clone();
+    let last_checked = LAST_CHECKED_AT
+        .lock()
+        .unwrap()
+        .clone()
+        .or_else(|| report.as_ref().map(|r| r.checked_at.clone()));
     json!({
         "dir": dir.to_string_lossy(),
         "catalogBytes": catalog,
         "files": files,
         "totalKB": total / 1024,
         "lastError": last_error,
+        "lastCheckedAt": last_checked,
         "lastWarnings": report.as_ref().map(|r| r.warnings.clone()).unwrap_or_default(),
         "lastDownloaded": report.as_ref().map(|r| r.downloaded).unwrap_or(0),
         "lastSkipped": report.as_ref().map(|r| r.skipped).unwrap_or(0),
@@ -461,6 +529,8 @@ static RUNNING: AtomicBool = AtomicBool::new(false);
 /// 最近一次刷新的结果/错误（面板状态页用：一眼看出镜像能不能用）。
 static LAST_REPORT: Mutex<Option<Report>> = Mutex::new(None);
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+/// 最近一次刷新完成的时间（本地 `YYYY-MM-DD HH:MM:SS`；面板直接展示，免得运维去翻日志）。
+static LAST_CHECKED_AT: Mutex<Option<String>> = Mutex::new(None);
 
 /// 是否启用镜像（开关打开且配了源地址）。
 pub fn enabled(cfg: &AgentConfig) -> bool {
@@ -489,6 +559,9 @@ pub fn trigger(cfg: AgentConfig, base: PathBuf, force: bool) -> bool {
     std::thread::spawn(move || {
         let result = refresh(&base, &cfg, &HttpFetcher);
         RUNNING.store(false, Ordering::SeqCst);
+        let checked_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        *LAST_CHECKED_AT.lock().unwrap() = Some(checked_at.clone());
+        write_last_refresh(&base, &checked_at, &result);
         match result {
             Ok(r) => {
                 *LAST_ERROR.lock().unwrap() = None;
@@ -675,6 +748,45 @@ mod tests {
         );
         // 不落盘：坏包绝不能出现在缓存里
         assert!(!base.join("Ipdb/components/v4.zip").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn prune_is_skipped_when_a_referenced_package_is_missing() {
+        // 实测过：平台有每日下载配额（20 次/天）。配额用尽时新版本下不来，
+        // 如果此时还把旧版本清掉，镜像就连这个数据集都没了——所以必须「引用未全部就位就不清」。
+        let base = tmp_base("prune-guard");
+        let pkg = b"zip".to_vec();
+        let sha = dhrust::sign::sha256_hex(&pkg);
+        let catalog: Vec<u8> = format!(
+            r#"{{"components":[
+                {{"id":"ip2region-v4","category":"ip-database","target":"any","url":"https://p.example/components/v4.zip","sha256":"{sha}"}},
+                {{"id":"geolite2-city","category":"ip-database","target":"any","url":"https://p.example/components/city.zip","sha256":"{sha}"}}
+            ]}}"#
+        )
+        .into_bytes();
+        // city.zip 故意不给 → 模拟“下载失败/配额用尽”
+        let fake = Fake::new(&[
+            (BASE_URL, &catalog),
+            ("https://p.example/components/catalog.json.sig", b"c2ln"),
+            ("https://p.example/components/v4.zip", &pkg),
+        ]);
+        let mut cfg = AgentConfig::default();
+        cfg.ipdb_source_url = BASE_URL.to_string();
+
+        fs::create_dir_all(components_dir(&base)).unwrap();
+        let stale = components_dir(&base).join("v4-2020.01.zip");
+        fs::write(&stale, b"old").unwrap();
+
+        let report = refresh(&base, &cfg, &fake).expect("refresh");
+        assert_eq!(report.pruned, 0, "引用未就位时不得清理旧包");
+        assert!(stale.exists(), "旧包必须保留");
+        assert!(base.join("Ipdb/components/v4.zip").is_file());
+        assert!(
+            report.warnings.iter().any(|w| w.contains("跳过旧版本清理")),
+            "{:?}",
+            report.warnings
+        );
         let _ = fs::remove_dir_all(&base);
     }
 

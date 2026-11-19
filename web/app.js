@@ -3915,7 +3915,7 @@ function ipdbShellHtml(d){
    <h2>缓存内容</h2>
    <span class="text-muted" style="font-size:12px">目录 ${catalogBytes?Math.ceil(catalogBytes/1024)+' KB':'—'} · 文件 ${files.length} 个 · 合计 ${(totalKB/1024).toFixed(1)} MB</span>
   </div>
-  <div class="text-muted" style="font-size:12px;margin-bottom:8px">最近一次刷新：新下载 ${Number(d.lastDownloaded||0)} · 复用 ${Number(d.lastSkipped||0)} · 清理旧文件 ${Number(d.lastPruned||0)} · 告警 ${warns.length}（旧版本会被自动清掉，只保留当前目录引用的文件）</div>
+  <div class="text-muted" style="font-size:12px;margin-bottom:8px">最近一次刷新${d.lastCheckedAt?'（'+esc(d.lastCheckedAt)+'）':''}：新下载 ${Number(d.lastDownloaded||0)} · 复用 ${Number(d.lastSkipped||0)} · 清理旧文件 ${Number(d.lastPruned||0)} · 告警 ${warns.length}（旧版本会被自动清掉，只保留当前目录引用的文件）</div>
   <table style="width:100%;border-collapse:collapse;font-size:13px">
    <tr class="text-muted"><td>文件名</td><td style="text-align:right;width:130px">大小</td></tr>
    ${rows}
