@@ -133,18 +133,24 @@ pub fn serve(base: &Path, req: &HttpRequest) -> Option<HttpResponse> {
     if !is_loopback(req.remote_addr.as_deref()) {
         return None;
     }
-    let (dir, rel) = if rest == CATALOG || rest == SIG {
-        (root(base), rest.to_string())
-    } else {
-        let name = rest.strip_prefix("components/")?;
-        if !safe_file_name(name) {
-            return None;
-        }
-        (components_dir(base), name.to_string())
-    };
+    // 目录与签名**手工下发**：`StaticFiles` 只认 MIME 表里的扩展，`.sig` 会被当成未知类型 404
+    //（实测踩过：文件在盘上、`/ipdb/catalog.json.sig` 却 404，导致有公钥的客户端全部回退平台）。
+    if rest == CATALOG || rest == SIG {
+        let bytes = fs::read(root(base).join(rest)).ok()?;
+        let ctype = if rest == SIG {
+            "text/plain; charset=utf-8"
+        } else {
+            "application/json; charset=utf-8"
+        };
+        return Some(HttpResponse::bytes(200, ctype, bytes));
+    }
+    let name = rest.strip_prefix("components/")?;
+    if !safe_file_name(name) {
+        return None;
+    }
     let mut scoped = req.clone();
-    scoped.path = format!("/{rel}");
-    StaticFiles::new(dir).try_serve_request(&scoped)
+    scoped.path = format!("/{name}");
+    StaticFiles::new(components_dir(base)).try_serve_request(&scoped)
 }
 
 /// 一次刷新的结果。
@@ -171,16 +177,34 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
         .get(url, MAX_CATALOG)
         .map_err(|e| format!("拉取组件目录失败：{e}（{url}）"))?;
 
-    // 配了公钥就强制验签（目录被篡改宁可整轮失败，不静默放行）
+    let mut report = Report {
+        catalog_bytes: bytes.len(),
+        ..Default::default()
+    };
+
+    // 目录签名：**平台给转发什么就存什么**（镜像不重签），配了 IpdbPubKey 才强制验签。
+    //
+    // 关键：即使没配公钥也要把 `.sig` 一起存下来——客户端（Pek.ZIP）会用自己 TOFU 学到的
+    // 平台公钥去校它；镜像不存就等于「镜像目录不可验证」，客户端只能回退平台，白折腾。
     let pubkey = cfg.ipdb_pubkey.trim();
-    if !pubkey.is_empty() {
-        let sig_url = format!("{url}.sig");
-        let sig = fetch
-            .get(&sig_url, 8192)
-            .map_err(|e| format!("拉取目录签名失败：{e}（{sig_url}）"))?;
-        dhrust::plugin::verify_base64(pubkey, &bytes, &String::from_utf8_lossy(&sig))
-            .map_err(|e| format!("目录签名校验失败：{e}（核对 IpdbPubKey；目录可能被篡改）"))?;
-        write_atomic(&root(base).join(SIG), &sig)?;
+    let sig_url = format!("{url}.sig");
+    match fetch.get(&sig_url, 8192) {
+        Ok(sig) => {
+            if !pubkey.is_empty() {
+                dhrust::plugin::verify_base64(pubkey, &bytes, &String::from_utf8_lossy(&sig))
+                    .map_err(|e| format!("目录签名校验失败：{e}（核对 IpdbPubKey；目录可能被篡改）"))?;
+            }
+            write_atomic(&root(base).join(SIG), &sig)?;
+        }
+        Err(e) if !pubkey.is_empty() => {
+            // 配了公钥却没有签名：宁可整轮失败（不静默放行）
+            return Err(format!("拉取目录签名失败：{e}（{sig_url}）"));
+        }
+        Err(e) => {
+            report.warnings.push(format!(
+                "平台未提供目录签名，镜像将没有 .sig（配了平台公钥的客户端会回退平台）：{e}（{sig_url}）"
+            ));
+        }
     }
     write_atomic(&root(base).join(CATALOG), &bytes)?;
 
@@ -188,11 +212,6 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
         .map_err(|e| format!("catalog.json 解析失败：{e}（{url}）"))?;
     let Some(list) = json.get("components").and_then(|v| v.as_array()) else {
         return Err("catalog.json 缺少 components 数组".to_string());
-    };
-
-    let mut report = Report {
-        catalog_bytes: bytes.len(),
-        ..Default::default()
     };
     // 平台对组件包要求下载票据（直连 URL 一律 403）：开 IpdbAutoEnroll 就自动注册 + 取票。
     // 实现直接复用 Pek.IP 的 AuthClient（enroll/ticket 与 Pek.ZIP 同一套协议）。
@@ -587,6 +606,7 @@ mod tests {
         .into_bytes();
         let fake = Fake::new(&[
             (BASE_URL, &catalog),
+            ("https://p.example/components/catalog.json.sig", b"c2ln"),
             ("https://p.example/components/v4.zip", b"tampered".as_slice()),
         ]);
         let mut cfg = AgentConfig::default();
@@ -594,8 +614,11 @@ mod tests {
 
         let report = refresh(&base, &cfg, &fake).expect("refresh");
         assert_eq!(report.downloaded, 0);
-        assert_eq!(report.warnings.len(), 1);
-        assert!(report.warnings[0].contains("SHA-256 不匹配"));
+        assert!(
+            report.warnings.iter().any(|w| w.contains("SHA-256 不匹配")),
+            "{:?}",
+            report.warnings
+        );
         // 不落盘：坏包绝不能出现在缓存里
         assert!(!base.join("Ipdb/components/v4.zip").exists());
         let _ = fs::remove_dir_all(&base);
@@ -613,10 +636,43 @@ mod tests {
     }
 
     #[test]
+    fn refresh_forwards_catalog_signature_even_without_pubkey() {
+        // 镜像不重签：平台给什么签名就存什么，客户端（Pek.ZIP）用自己 TOFU 的公钥去校。
+        // 没配 IpdbPubKey 时**也必须存**，否则客户端只能判定「镜像目录不可验证」而回退平台。
+        let base = tmp_base("sig-forward");
+        let catalog = br#"{"components":[]}"#.to_vec();
+        let fake = Fake::new(&[(BASE_URL, &catalog), ("https://p.example/components/catalog.json.sig", b"c2ln")]);
+        let mut cfg = AgentConfig::default();
+        cfg.ipdb_source_url = BASE_URL.to_string();
+        let report = refresh(&base, &cfg, &fake).expect("refresh");
+        assert_eq!(report.warnings.len(), 0);
+        assert!(base.join("Ipdb/catalog.json").is_file());
+        assert!(base.join("Ipdb/catalog.json.sig").is_file(), "平台有签名时必须转发保存");
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn refresh_warns_but_keeps_going_when_signature_missing() {
+        // 平台没给签名 + 没配公钥 → 只告警（客户端会自行回退平台），目录仍可用
+        let base = tmp_base("sig-missing");
+        let catalog = br#"{"components":[]}"#.to_vec();
+        let fake = Fake::new(&[(BASE_URL, &catalog)]);
+        let mut cfg = AgentConfig::default();
+        cfg.ipdb_source_url = BASE_URL.to_string();
+        let report = refresh(&base, &cfg, &fake).expect("refresh");
+        assert_eq!(report.warnings.len(), 1);
+        assert!(report.warnings[0].contains(".sig"), "{}", report.warnings[0]);
+        assert!(base.join("Ipdb/catalog.json").is_file());
+        assert!(!base.join("Ipdb/catalog.json.sig").exists());
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn serve_is_loopback_only_and_rejects_traversal() {
         let base = tmp_base("serve");
         fs::create_dir_all(components_dir(&base)).unwrap();
         fs::write(root(&base).join(CATALOG), b"{}").unwrap();
+        fs::write(root(&base).join(SIG), b"c2ln").unwrap();
         fs::write(components_dir(&base).join("v4.zip"), b"zip").unwrap();
 
         let mut req = HttpRequest {
@@ -628,6 +684,9 @@ mod tests {
             remote_addr: Some("127.0.0.1:5555".into()),
         };
         assert!(serve(&base, &req).is_some());
+        // `.sig` 必须能下发（StaticFiles 不认这个扩展，所以是手工下发的；漏了会让有公钥的客户端全部回退平台）
+        req.path = "/ipdb/catalog.json.sig".into();
+        assert!(serve(&base, &req).is_some(), "/ipdb/catalog.json.sig 必须 200");
         req.path = "/ipdb/components/v4.zip".into();
         assert!(serve(&base, &req).is_some());
         req.path = "/ipdb/components/../Ipdb/catalog.json".into();
