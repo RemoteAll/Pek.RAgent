@@ -3888,7 +3888,12 @@ function ipdbShellHtml(d){
    (warns.length>10?`<div class="text-muted" style="font-size:11px">…共 ${warns.length} 条，仅显示前 10 条</div>`:'')+`</div>`;
  }
 
- const disabled=enabled?'':'disabled title="先在服务器 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true"';
+ const disabled=enabled?'':'disabled title="先在服务器 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true（并确认真 IpdbSourceUrl）"';
+ const stateText=enabled
+  ?'<span style="color:var(--green,#16a34a);font-weight:600">已启用</span>'
+  :((d.sourceUrl||'').trim()
+    ?'<span class="text-muted">未启用（IpdbMirrorEnabled 未打开）</span>'
+    :'<span class="text-muted">未启用（IpdbSourceUrl 为空：填平台组件目录地址）</span>');
  return `<div class="glass-card card">
  <div class="flex-between mb-16" style="flex-wrap:wrap;gap:8px">
   <h2>📚 IP 库镜像</h2>
@@ -3898,7 +3903,7 @@ function ipdbShellHtml(d){
   </div>
  </div>
  <table style="width:100%;border-collapse:collapse;font-size:13px">
-  <tr><td style="width:150px" class="text-muted">镜像状态</td><td>${enabled?'<span style="color:var(--green,#16a34a);font-weight:600">已启用</span>':'<span class="text-muted">未启用</span>'}</td></tr>
+  <tr><td style="width:150px" class="text-muted">镜像状态</td><td>${stateText}</td></tr>
   <tr><td class="text-muted">平台源</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(d.sourceUrl||'')}</td></tr>
   <tr><td class="text-muted">本机镜像地址</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(mirror)}</td></tr>
   <tr><td class="text-muted">应用侧配置</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">MirrorUrl = "${esc(mirror)}"</td></tr>
@@ -3907,7 +3912,7 @@ function ipdbShellHtml(d){
   <tr><td class="text-muted">刷新间隔</td><td>${Number(d.refreshMinutes||0)} 分钟（0/未设按 5 分钟下限；改配置后重启生效）</td></tr>
   <tr><td class="text-muted">目录</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(d.dir||'')}</td></tr>
  </table>
- <div class="text-muted" style="margin-top:10px;font-size:12px">目录与签名按平台原始字节转发（镜像不重签），客户端仍用平台公钥验签；本端点<b>仅回环可读</b>，不对外提供下载。</div>
+ <div class="text-muted" style="margin-top:10px;font-size:12px">目录与签名按平台原始字节转发（镜像不重签），客户端仍用平台公钥验签；本端点<b>仅回环可读</b>，不对外提供下载。<br>面板开了 HTTPS 时，<b>本机程序仍可用上面的 http 地址取数据</b>（连接层对回环放行 `/ipdb`，不必导入自签证书）；非本机访问依旧 301 到 https。</div>
  </div>
 
  <div class="glass-card card">

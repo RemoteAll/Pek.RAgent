@@ -103,6 +103,10 @@ pub fn start(
                     // 单端口 HTTPS：明文 HTTP 请求（旧书签 http://ip:端口）由连接层识别后
                     // 自动 301 到 https://同端口——不需要额外端口，也不会“连不上/协议错误”
                     https_redirect_port: if https { Some(port) } else { None },
+                    // 但本机进程间的只读小接口（`/ipdb` IP 库镜像，供 Pek.ZIP 等本机程序取数据）
+                    // 走明文不跳转：否则对方要么跟着 301 撞自签证书、要么得手工导入 CA。
+                    // 仅回环对端生效（连接层判定），外部访问仍是 301 → https。
+                    plain_allow_loopback_prefixes: vec!["/ipdb".to_string()],
                     // WebSocket（在线终端）30 秒服务端 Ping：穿透反向代理的空闲断开
                     ws: dhrust::net::ws::WsServerOptions {
                         server_ping: Some(std::time::Duration::from_secs(30)),
@@ -139,6 +143,9 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         "/deploy".to_string(),
         // 直连数据库（JSON `{conn, sql}`）：SQL 关键字会被误判为攻击特征，安全靠短时效票据
         "/db".to_string(),
+        // IP 库镜像：本机程序（Pek.ZIP 等）取目录/包，UA 是各式 HTTP 客户端；
+        // 而且它只对回环对端提供（非回环直接 404），没有对外攻击面
+        "/ipdb".to_string(),
     ];
     // DHDeploy 契约接口属敏感路径（服务清单拿安装路径/启停能力）：该前缀下禁一切机器人
     waf_cfg.sensitive_prefixes = vec![
@@ -162,12 +169,14 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
         "/star".to_string(),
         "/deploy".to_string(),
         "/db".to_string(),
+        "/ipdb".to_string(),
     ]);
     waf.set_forced_skip_attack_prefixes(vec![
         "/api".to_string(),
         "/star".to_string(),
         "/deploy".to_string(),
         "/db".to_string(),
+        "/ipdb".to_string(),
     ]);
     router.use_middleware(waf.middleware());
 

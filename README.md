@@ -397,6 +397,10 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 - `/ipdb/catalog.json`、`/ipdb/catalog.json.sig` —— 平台原始字节**原样转发**（镜像不重签，客户端仍用平台公钥验签）
 - `/ipdb/components/<文件名>` —— 缓存的组件包
 
+> **面板开了 HTTPS 也能用明文取**：连接层对**回环对端**放行 `/ipdb` 前缀的明文请求
+> （`HttpServerOptions::plain_allow_loopback_prefixes`），本机程序按 `http://127.0.0.1:端口/ipdb`
+> 直取即可，**不必导入自签证书**；非回环访问仍然 301 到 https，其余路径也照旧 301。
+
 **启用三步**（推荐）：
 
 1. `Config/StarAgent.config` 里置 `IpdbMirrorEnabled=true`、`IpdbAutoEnroll=true`，重启服务；

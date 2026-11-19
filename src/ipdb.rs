@@ -513,7 +513,13 @@ pub fn ipdb_refresh(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
     }
     let cfg = panel.config();
     if !enabled(&cfg) {
-        return json_error(400, "IP 库镜像未启用（先打开 IpdbMirrorEnabled）");
+        // 两种原因分别说清楚：只说“未启用（先打开开关）”会让已经打开开关、只是源地址空了的人反复看同一个提示
+        let reason = if !cfg.ipdb_mirror_enabled {
+            "IP 库镜像未启用（先打开 IpdbMirrorEnabled）"
+        } else {
+            "IP 库镜像缺少源地址（IpdbSourceUrl 为空：填平台组件目录地址，如 https://p.sc8.fun/components/catalog.json）"
+        };
+        return json_error(400, reason);
     }
     if trigger(cfg, panel.base().to_path_buf(), true) {
         json_result(0, "已开始刷新 IP 库镜像（后台执行，稍后刷新本页看结果）", None)
