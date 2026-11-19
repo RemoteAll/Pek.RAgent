@@ -1,4 +1,4 @@
-﻿# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
+# Pek.RAgent —— 星尘代理（StarAgent 的 Rust 实现）
 
 部署在每台应用服务器 / 边缘节点上的节点守护代理，以系统服务方式运行，负责**多应用进程守护、影子目录部署、运行中文件替换与本地控制接口**。
 
@@ -245,6 +245,8 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 | `-PluginStorePublish <插件源目录> <插件.zip> [--base-url https://…/] [--key 私钥]` | 发布插件（推荐）：校验包 → 计算 SHA-256 → 更新 `catalog.json`（url+sha256）→ 重新签名 `.sig`；首次需 `--base-url`（写入 `store.json` 记忆）；同 id 旧版本包自动清理 |
 | `-PluginStoreRemove <插件源目录> <插件id> [--key 私钥]` | 下线插件：删除目录条目与包文件并重新签名 |
 | `-PluginStoreSign <catalog.json> [私钥文件]` | 仅对目录签名（手动维护目录时使用） |
+| `-IpdbStatus` | 查看本机 IP 库镜像状态（开关/源/刷新间隔/自动注册/镜像地址/缓存文件；未启用时退出码 1） |
+| `-IpdbRefresh` | 立即刷新一次 IP 库镜像（无面板的无头服务器用；需先开 `IpdbMirrorEnabled`） |
 | `pek-ragent app.zip 参数…` | 位置参数 zip 一次性拉起（影子目录；支持 `-name`、`-shadow`） |
 | `-selftest` / `-ensure-running` | 升级管线内部命令（影子自检 / 重启助手兜底），由程序自动调用，无需手工执行 |
 | `-help` / `-version` | 帮助 / 版本 |
@@ -369,8 +371,43 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 
 ---
 
-## 6. 部署模式与影子目录
+### 5.4 IP 库镜像（`/ipdb`，供本机应用免凭据取数据）
 
+同一台机器上可能有多个程序要 IP 归属地库（Pek.ZIP 等）。默认每个进程各自向平台拉目录（约 87 KB）与安装包
+（数 MB～十几 MB）；服务器既然装了星尘，就让它统一缓存一次，本机程序按回环地址取即可。
+
+| 配置项 | 默认 | 说明 |
+|---|---|---|
+| `IpdbMirrorEnabled` | `false` | 开镜像：把平台组件目录里 `ip-database` 分类的包缓存到 `{程序目录}/Ipdb` |
+| `IpdbSourceUrl` | `https://p.sc8.fun/components/catalog.json` | 镜像源（平台组件目录 URL；仅 https，127.0.0.1 例外） |
+| `IpdbRefreshMinutes` | `360` | 刷新间隔（5~1440；本地 SHA-256 未变则不下载） |
+| `IpdbAutoEnroll` | `false` | 自动注册下载身份并取票据（平台对组件包要求票据，直连一律 403） |
+| `IpdbPubKey` | 空 | 目录签名公钥（hex）；非空则强制验签 `catalog.json.sig` |
+| `IpdbIncludeV6` | `false` | 是否一并缓存 `ip2region-v6`（约 37 MiB） |
+
+**端点**（`GET`，**仅回环可读**，非回环一律按不存在处理；只读自身缓存，不承接任何写操作）：
+
+- `/ipdb/catalog.json`、`/ipdb/catalog.json.sig` —— 平台原始字节**原样转发**（镜像不重签，客户端仍用平台公钥验签）
+- `/ipdb/components/<文件名>` —— 缓存的组件包
+
+**启用三步**（推荐）：
+
+1. `Config/StarAgent.config` 里置 `IpdbMirrorEnabled=true`、`IpdbAutoEnroll=true`，重启服务；
+2. 打开面板 **📚 IP 库** 页（或 `-IpdbStatus`）拿到 installId，到 Pek.RPanlServer「分发中心 → IP 授权」**批准**它；
+3. 回到面板点 **🔄 立即刷新**（或 `-IpdbRefresh`）：状态变「已就绪」，缓存里出现各数据包。
+
+之后本地应用按需取即可，例如 Pek.ZIP 的 `Config/Ip.toml`：
+
+```toml
+MirrorUrl = "http://127.0.0.1:5501/ipdb"   # 端口=本机面板端口；应用侧 AutoEnroll 可留 false（零凭据）
+```
+
+面板 **📚 IP 库** 页可直接看到：启用状态、平台源、镜像地址与可复制的 `MirrorUrl` 配置行、授权状态
+（未注册 / **待平台批准** / 已就绪）、缓存文件与合计、以及最近一次刷新的告警（含 403 未批准的原文）。
+
+> 未批准时镜像仍会转发目录（客户端会自行回落平台）；开了 `IpdbAutoEnroll` 才会有待批准项，程序不会自批。
+
+## 6. 部署模式与影子目录
 | 模式 | 行为 |
 |------|------|
 | `shadow`（默认） | 解压到 `{工作目录}/../shadow/{名称}-{MD5前8位}` 运行；工作目录只保留配置/数据；新版本重启后切换影子目录并清理旧版 |

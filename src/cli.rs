@@ -112,6 +112,8 @@ pub fn run(args: &[String], base: &Path) -> i32 {
         }
         "selftest" => cmd_selftest(base),
         "update" => cmd_update(base, args),
+        "ipdbstatus" | "ipdb" => cmd_ipdb_status(base),
+        "ipdbrefresh" => cmd_ipdb_refresh(base),
         "ensure-running" => cmd_ensure_running(base),
         _ => {
             if cmd.ends_with(".zip")
@@ -341,6 +343,73 @@ fn cmd_svc_ctl(base: &Path, op: SvcOp) -> i32 {
 
 /// 影子自检：供升级管线从影子位置验证新版程序可用（不启动服务、不绑定端口）。
 ///
+/// `-IpdbStatus`：查看 IP 库镜像状态（无面板的无头服务器用）。
+fn cmd_ipdb_status(base: &Path) -> i32 {
+    let cfg = AgentConfig::load(base);
+    let enabled = crate::ipdb::enabled(&cfg);
+    println!("IP 库镜像：{}", if enabled { "已启用" } else { "未启用" });
+    println!("平台源    ：{}", cfg.ipdb_source_url.trim());
+    println!(
+        "刷新间隔  ：{} 分钟（5~1440；改配置后重启生效）",
+        cfg.ipdb_refresh_minutes
+    );
+    println!(
+        "自动注册  ：{}（开=本机以独立身份向平台取票据，首次需在「分发中心 → IP 授权」批准）",
+        if cfg.ipdb_auto_enroll { "开" } else { "关" }
+    );
+    println!(
+        "本地端口  ：{}（镜像地址 http://127.0.0.1:{}/ipdb）",
+        cfg.local_port, cfg.local_port
+    );
+    println!("缓存目录  ：{}", crate::ipdb::components_dir(base).display());
+    let snapshot = crate::ipdb::status(base);
+    if let Some(files) = snapshot.get("files").and_then(|v| v.as_array()) {
+        println!("缓存文件  ：{} 个", files.len());
+        for f in files {
+            println!(
+                "  {:<40} {:>8} KB",
+                f.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                f.get("sizeKB").and_then(|v| v.as_u64()).unwrap_or(0)
+            );
+        }
+    }
+    if !enabled {
+        println!(
+            "提示：未启用——把 Config/StarAgent.config 里的 IpdbMirrorEnabled 设为 true 后重启服务"
+        );
+        return 1;
+    }
+    0
+}
+
+/// `-IpdbRefresh`：立即刷新一次 IP 库镜像（同步执行，打印结果）。
+fn cmd_ipdb_refresh(base: &Path) -> i32 {
+    let cfg = AgentConfig::load(base);
+    if !crate::ipdb::enabled(&cfg) {
+        println!("IP 库镜像未启用：先在 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true");
+        return 1;
+    }
+    match crate::ipdb::refresh(base, &cfg, &crate::plugins::HttpFetcher) {
+        Ok(r) => {
+            println!(
+                "刷新完成：目录 {} 字节，新下载 {}，复用 {}，告警 {}",
+                r.catalog_bytes,
+                r.downloaded,
+                r.skipped,
+                r.warnings.len()
+            );
+            for w in &r.warnings {
+                println!("告警：{w}");
+            }
+            0
+        }
+        Err(e) => {
+            println!("刷新失败：{e}（源 {}）", cfg.ipdb_source_url.trim());
+            2
+        }
+    }
+}
+
 /// 设计原则：只做快速同步检查（配置可解析、程序目录可写），任何情况下都应立即退出，
 /// 避免拖慢升级流程；退出码 0 表示通过。
 fn cmd_selftest(base: &Path) -> i32 {
@@ -1288,8 +1357,10 @@ fn print_help() {
                                     从插件源移除插件并重新签名
   pek-ragent -PluginStoreSign <catalog.json> [私钥文件]
                                     仅对目录签名（手动维护目录时使用）
+IP 库镜像（/ipdb；供本机 Pek.ZIP 等程序免凭据取数据）：
+  pek-ragent -IpdbStatus            查看镜像开关/源/授权 installId/缓存清单与最近告警
+  pek-ragent -IpdbRefresh           立即刷新一次（无面板的无头服务器用；需先开 IpdbMirrorEnabled）
   pek-ragent -help                  显示本帮助
-
 配置文件：Config/StarAgent.config（XML，与 C# StarAgent 同格式互通）
 本地控制接口：http://127.0.0.1:5501（默认端口；RestartService / StartService / StopService 等，兼容 DHDeploy）
 "#,
