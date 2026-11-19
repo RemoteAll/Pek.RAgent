@@ -159,6 +159,8 @@ pub struct Report {
     pub catalog_bytes: usize,
     pub downloaded: usize,
     pub skipped: usize,
+    /// 本轮清理掉的旧组件文件数（不再被当前目录引用：旧版本、已关闭的 v6 等）
+    pub pruned: usize,
     pub warnings: Vec<String>,
 }
 
@@ -181,6 +183,8 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
         catalog_bytes: bytes.len(),
         ..Default::default()
     };
+    // 当前目录引用到的文件名（只有 ip-database 里我们要的那几只；v6 关掉时就不含 v6）
+    let mut keep: std::collections::HashSet<String> = std::collections::HashSet::new();
 
     // 目录签名：**平台给转发什么就存什么**（镜像不重签），配了 IpdbPubKey 才强制验签。
     //
@@ -262,6 +266,8 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
             continue;
         }
         let dest = components_dir(base).join(&name);
+        // 记下本轮“当前目录引用的文件名”：刷新末尾只保留它们（否则每月一发版，旧包会无限堆盘）
+        keep.insert(name.clone());
         if let Some(got) = file_sha256(&dest) {
             if got.eq_ignore_ascii_case(sha) {
                 report.skipped += 1;
@@ -326,6 +332,36 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
             }
         }
     }
+
+    // 清理：只保留当前目录引用的文件（旧版本 / 已关闭的 v6 自动释放空间）
+    // 安全阀：“本轮一个都没识别到” 时绝不清理，避免目录解析异常把缓存清空。
+    if !keep.is_empty() {
+        if let Ok(entries) = fs::read_dir(&components_dir(base)) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let name = path
+                    .file_name()
+                    .map(|s| s.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                if keep.contains(&name) {
+                    continue;
+                }
+                match fs::remove_file(&path) {
+                    Ok(()) => {
+                        report.pruned += 1;
+                        util::log_format("IP 库镜像：清理旧组件 {}（不再被当前目录引用）", &[&name]);
+                    }
+                    Err(e) => report
+                        .warnings
+                        .push(format!("清理旧组件 {name} 失败：{e}（{}）", path.display())),
+                }
+            }
+        }
+    }
+
     Ok(report)
 }
 
@@ -364,6 +400,7 @@ pub fn status(base: &Path) -> Json {
         "lastWarnings": report.as_ref().map(|r| r.warnings.clone()).unwrap_or_default(),
         "lastDownloaded": report.as_ref().map(|r| r.downloaded).unwrap_or(0),
         "lastSkipped": report.as_ref().map(|r| r.skipped).unwrap_or(0),
+        "lastPruned": report.as_ref().map(|r| r.pruned).unwrap_or(0),
     })
 }
 
@@ -456,15 +493,16 @@ pub fn trigger(cfg: AgentConfig, base: PathBuf, force: bool) -> bool {
             Ok(r) => {
                 *LAST_ERROR.lock().unwrap() = None;
                 *LAST_REPORT.lock().unwrap() = Some(r.clone());
-                let (catalog, down, skip, warn) = (
+                let (catalog, down, skip, warn, pruned) = (
                     r.catalog_bytes.to_string(),
                     r.downloaded.to_string(),
                     r.skipped.to_string(),
                     r.warnings.len().to_string(),
+                    r.pruned.to_string(),
                 );
                 util::log_format(
-                    "IP 库镜像刷新完成：目录 {} 字节，新下载 {}，复用 {}，告警 {}",
-                    &[&catalog, &down, &skip, &warn],
+                    "IP 库镜像刷新完成：目录 {} 字节，新下载 {}，复用 {}，清理 {}，告警 {}",
+                    &[&catalog, &down, &skip, &pruned, &warn],
                 );
                 for w in r.warnings.iter().take(10) {
                     util::log_format("IP 库镜像告警：{}", &[w]);
@@ -592,6 +630,22 @@ mod tests {
         let report3 = refresh(&base, &cfg, &fake).expect("refresh3");
         assert_eq!(report3.downloaded, 1);
         assert!(base.join("Ipdb/components/v6.zip").is_file());
+
+        // 旧版本文件（不再被当前目录引用）应被清理；当前引用的必须保留
+        let stale = components_dir(&base).join("v4-2020.01.zip");
+        fs::write(&stale, b"old").unwrap();
+        let report4 = refresh(&base, &cfg, &fake).expect("refresh4");
+        assert_eq!(report4.pruned, 1, "旧版本应被清理");
+        assert!(!stale.exists(), "旧版本文件应被删除");
+        assert!(base.join("Ipdb/components/v4.zip").is_file(), "当前版本必须保留");
+        assert!(base.join("Ipdb/components/v6.zip").is_file());
+
+        // 关掉 v6 → 旧 v6 包不再被引用，下一轮应被清掉（释放 37 MiB）
+        cfg.ipdb_include_v6 = false;
+        let report5 = refresh(&base, &cfg, &fake).expect("refresh5");
+        assert_eq!(report5.pruned, 1);
+        assert!(!base.join("Ipdb/components/v6.zip").exists());
+        assert!(base.join("Ipdb/components/v4.zip").is_file());
 
         let _ = fs::remove_dir_all(&base);
     }

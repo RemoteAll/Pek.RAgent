@@ -392,10 +392,11 @@ fn cmd_ipdb_refresh(base: &Path) -> i32 {
     match crate::ipdb::refresh(base, &cfg, &crate::plugins::HttpFetcher) {
         Ok(r) => {
             println!(
-                "刷新完成：目录 {} 字节，新下载 {}，复用 {}，告警 {}",
+                "刷新完成：目录 {} 字节，新下载 {}，复用 {}，清理 {}，告警 {}",
                 r.catalog_bytes,
                 r.downloaded,
                 r.skipped,
+                r.pruned,
                 r.warnings.len()
             );
             for w in &r.warnings {
