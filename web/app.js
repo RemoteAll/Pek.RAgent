@@ -3857,7 +3857,11 @@ async function loadIpdb(){
   if(j.code!==0){showToast(j.message||'加载失败','error');return}
   ipdbData=j.data||{};
   const box=$('panel-ipdb');if(box)box.innerHTML=ipdbShellHtml(ipdbData);
- }catch(e){}
+ }catch(e){
+  // 不能吞：渲染异常会让整页空白，必须能在控制台/界面看到原因
+  console.error('IP 库页面渲染失败',e);
+  showToast('IP 库页面加载失败：'+((e&&e.message)||e),'error');
+ }
 }
 
 function ipdbShellHtml(d){
@@ -3888,7 +3892,7 @@ function ipdbShellHtml(d){
    (warns.length>10?`<div class="text-muted" style="font-size:11px">…共 ${warns.length} 条，仅显示前 10 条</div>`:'')+`</div>`;
  }
 
- const disabled=enabled?'':'disabled title="先在服务器 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true（并确认真 IpdbSourceUrl）"';
+ const disabled=enabled?'':'disabled title="先在服务器 Config/StarAgent.config 里把 IpdbMirrorEnabled 设为 true（并确认 IpdbSourceUrl 不为空）"';
  const stateText=enabled
   ?'<span style="color:var(--green,#16a34a);font-weight:600">已启用</span>'
   :((d.sourceUrl||'').trim()
@@ -3912,7 +3916,7 @@ function ipdbShellHtml(d){
   <tr><td class="text-muted">刷新间隔</td><td>${Number(d.refreshMinutes||0)} 分钟（0/未设按 5 分钟下限；改配置后重启生效）</td></tr>
   <tr><td class="text-muted">目录</td><td style="font:12px ui-monospace,Consolas,monospace;word-break:break-all">${esc(d.dir||'')}</td></tr>
  </table>
- <div class="text-muted" style="margin-top:10px;font-size:12px">目录与签名按平台原始字节转发（镜像不重签），客户端仍用平台公钥验签；本端点<b>仅回环可读</b>，不对外提供下载。<br>面板开了 HTTPS 时，<b>本机程序仍可用上面的 http 地址取数据</b>（连接层对回环放行 `/ipdb`，不必导入自签证书）；非本机访问依旧 301 到 https。</div>
+ <div class="text-muted" style="margin-top:10px;font-size:12px">目录与签名按平台原始字节转发（镜像不重签），客户端仍用平台公钥验签；本端点<b>仅回环可读</b>，不对外提供下载。<br>面板开了 HTTPS 时，<b>本机程序仍可用上面的 http 地址取数据</b>（连接层对回环放行「/ipdb」，不必导入自签证书）；非本机访问依旧 301 到 https。</div>
  </div>
 
  <div class="glass-card card">
