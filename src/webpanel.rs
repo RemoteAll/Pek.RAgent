@@ -1120,6 +1120,16 @@ pub fn build_star_controller(panel: Arc<WebPanel>) -> Controller {
         ),
     );
 
+    // 本机 IP 库镜像（/ipdb 静态分发；这里只做状态查看与手动刷新）
+    controller = controller.get(
+        "ipdbStatus",
+        guarded(panel.clone(), PERM_PLUGINS, crate::ipdb::ipdb_status),
+    );
+    controller = controller.post(
+        "ipdbRefresh",
+        guarded(panel.clone(), PERM_PLUGINS, crate::ipdb::ipdb_refresh),
+    );
+
     // 用户管理（仅内置管理员）与操作日志
     controller = controller.get("userList", guarded(panel.clone(), PERM_USERS, user_list));
     controller = controller.post("userSave", guarded(panel.clone(), PERM_USERS, user_save));

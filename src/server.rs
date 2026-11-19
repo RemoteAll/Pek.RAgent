@@ -394,7 +394,7 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             "application/javascript; charset=utf-8",
         )
         .spa_fallback(true)
-        .spa_excludes(&["/api", "/star", "/plugins"]);
+        .spa_excludes(&["/api", "/star", "/plugins", "/ipdb"]);
 
     // 404（静态未命中时）
     let plugins_base = manager.base().to_path_buf();
@@ -406,6 +406,11 @@ fn build_router(manager: Arc<AppManager>, port: u16) -> Router {
             let method_ok = ctx.req.method.eq_ignore_ascii_case("GET")
                 || ctx.req.method.eq_ignore_ascii_case("HEAD");
             if method_ok {
+                // 本机 IP 库镜像：/ipdb/catalog.json（+ .sig）与 /ipdb/components/*.zip
+                // 仅回环可读（其它对端当作不存在），给 Pek.ZIP 等本机程序复用同一份缓存。
+                if let Some(response) = crate::ipdb::serve(&plugins_base, &ctx.req) {
+                    return HttpOutcome::Response(response);
+                }
                 // 插件静态资源：/plugins/<id>/...（本地放置的扩展页面，见 plugins.rs）
                 if let Some(response) = crate::plugins::serve(&plugins_base, &ctx.req) {
                     return HttpOutcome::Response(response);

@@ -112,6 +112,18 @@ pub struct AgentConfig {
     pub plugin_store_url: String,
     /// 在线插件源 Ed25519 公钥（hex；32 字节裸公钥或 44 字节 SPKI DER）。非空时强制校验 `catalog.json.sig`
     pub plugin_store_pubkey: String,
+    /// 本机 IP 库镜像开关：开启后把平台组件目录里 `ip-database` 分类的包缓存到 `{base}/Ipdb`，
+    /// 供本机其它程序（Pek.ZIP 等，`MirrorUrl = http://127.0.0.1:<端口>/ipdb`）直接取。**仅回环可读**。
+    pub ipdb_mirror_enabled: bool,
+    /// IP 库镜像源（平台组件目录 URL；仅 https，127.0.0.1 例外）。默认官方平台
+    pub ipdb_source_url: String,
+    /// IP 库镜像刷新间隔（分钟，默认 360；5~1440）
+    pub ipdb_refresh_minutes: u32,
+    /// IP 库镜像目录签名公钥（hex）。非空时强制验签 `catalog.json.sig`；
+    /// 留空 = 不验目录签名（仍逐包校 SHA-256），仅在完全内网时建议留空。
+    pub ipdb_pubkey: String,
+    /// IP 库镜像是否一并缓存 IPv6 库（`ip2region-v6`，约 37 MiB；默认 false，仅需要 IPv6 归属地时开）
+    pub ipdb_include_v6: bool,
     /// 代理自动升级源地址（发行源 `catalog.json` URL；仅 https，127.0.0.1 例外）。默认官方平台；留空 = 关闭自动升级
     ///
     /// 验签公钥复用 `PluginStorePubKey`（平台同一把签名密钥）：配置后强制验签，留空仅 HTTPS+SHA-256。
@@ -193,6 +205,12 @@ impl Default for AgentConfig {
             cert_nginx_bin: String::new(),
             plugin_store_url: String::new(),
             plugin_store_pubkey: String::new(),
+            // IP 库镜像：默认**关闭**（开启后才会定期拉包占带宽；但一旦开了就是本机共享）
+            ipdb_mirror_enabled: false,
+            ipdb_source_url: "https://p.sc8.fun/components/catalog.json".to_string(),
+            ipdb_refresh_minutes: 360,
+            ipdb_pubkey: String::new(),
+            ipdb_include_v6: false,
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
             auto_upgrade_interval_minutes: 60,
             auto_upgrade_token: String::new(),
@@ -747,6 +765,21 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = text_of(obj, "PluginStorePubKey") {
         cfg.plugin_store_pubkey = v;
     }
+    if let Some(v) = bool_of(obj, "IpdbMirrorEnabled") {
+        cfg.ipdb_mirror_enabled = v;
+    }
+    if let Some(v) = text_of(obj, "IpdbSourceUrl") {
+        cfg.ipdb_source_url = v;
+    }
+    if let Some(v) = parse_of::<u32>(obj, "IpdbRefreshMinutes") {
+        cfg.ipdb_refresh_minutes = v;
+    }
+    if let Some(v) = text_of(obj, "IpdbPubKey") {
+        cfg.ipdb_pubkey = v;
+    }
+    if let Some(v) = bool_of(obj, "IpdbIncludeV6") {
+        cfg.ipdb_include_v6 = v;
+    }
     if let Some(v) = text_of(obj, "AutoUpgradeUrl") {
         cfg.auto_upgrade_url = v;
     }
@@ -920,6 +953,11 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("CertNginxBin", cfg.cert_nginx_bin.clone());
         push("PluginStoreUrl", cfg.plugin_store_url.clone());
         push("PluginStorePubKey", cfg.plugin_store_pubkey.clone());
+        push("IpdbMirrorEnabled", bool_text(cfg.ipdb_mirror_enabled));
+        push("IpdbSourceUrl", cfg.ipdb_source_url.clone());
+        push("IpdbRefreshMinutes", cfg.ipdb_refresh_minutes.to_string());
+        push("IpdbPubKey", cfg.ipdb_pubkey.clone());
+        push("IpdbIncludeV6", bool_text(cfg.ipdb_include_v6));
         push("AutoUpgradeUrl", cfg.auto_upgrade_url.clone());
         push("AutoUpgradeToken", cfg.auto_upgrade_token.clone());
         push(

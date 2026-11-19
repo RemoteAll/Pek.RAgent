@@ -215,6 +215,17 @@ fn run_core(manager: Arc<AppManager>, port: u16, local_only: bool, guard_period:
     });
     au_timer.set_async(true);
 
+    // 3.4.1) 本机 IP 库镜像刷新（IpdbMirrorEnabled 打开才生效；频率由 IpdbRefreshMinutes 决定）。
+    //        同一台机器只下一次 IP 库，Pek.ZIP 等程序按 /ipdb 取，省带宽也省时间。
+    let ip = manager.clone();
+    let ipdb_timer = Timer::new(65_000, 60_000, move |_| {
+        let cfg = ip.config();
+        if crate::ipdb::enabled(&cfg) {
+            crate::ipdb::trigger(cfg, ip.base().to_path_buf(), false);
+        }
+    });
+    ipdb_timer.set_async(true);
+
     // 3.5) 平台实时通道（Pek.RPanlServer「服务器节点」；配置接入令牌后启用：
     //      上报机器数据 + 接收「立即检查升级」指令；线程自管理重连，无需定时器）
     crate::panel_ws::start(manager.clone());
