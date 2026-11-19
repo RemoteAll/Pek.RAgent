@@ -81,15 +81,36 @@ pub fn send_event(agent_id: &str, mut v: Json) {
     if let Some(obj) = v.as_object_mut() {
         obj.insert("agentId".to_string(), Json::String(agent_id.to_string()));
     }
+    // 发送失败必须留痕：平台侧只会看到「N 秒内未回执」，若节点侧也一片空白就无从定位
+    // （2026-11-18 在线查看文件 15s 超时即此类：文件大小/版本均已排除）。
+    let kind = v
+        .get("type")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .to_string();
     let text = v.to_string();
-    if let Some(client) = CURRENT
+    let bytes = text.len();
+    let client = CURRENT
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .clone()
-        && client.is_connected()
-    {
-        let _ = client.send_text(text);
+        .clone();
+    let Some(client) = client else {
+        util::log_error(&format!(
+            "上行事件未发送（type={kind}，{bytes} 字节）：实时通道尚未建立，平台将收不到该回执"
+        ));
+        return;
+    };
+    if !client.is_connected() {
+        util::log_error(&format!(
+            "上行事件未发送（type={kind}，{bytes} 字节）：实时通道已断开（等待重连），平台将收不到该回执"
+        ));
+        return;
+    }
+    if !client.send_text(text) {
+        util::log_error(&format!(
+            "上行事件发送失败（type={kind}，{bytes} 字节）：发送队列已满，平台将收不到该回执"
+        ));
     }
 }
 
@@ -1222,6 +1243,7 @@ fn verify_cstar_entry(
 /// `onlineView`（查看）权限，写入/删除/上传等通道不在本阶段内。
 /// 回执带 `reqId` 原样回传，平台据此把异步 WS 回执接回同步的 HTTP 请求。
 fn handle_file_list(manager: &Arc<AppManager>, cmd: &Json) {
+    let started = std::time::Instant::now();
     let agent_id = manager.config().agent_id.clone();
     let req_id = cmd
         .get("reqId")
@@ -1245,6 +1267,30 @@ fn handle_file_list(manager: &Arc<AppManager>, cmd: &Json) {
             "message": e,
         }),
     };
+    // 与 `handle_file_read` 对照用：目录能开、内容打不开时，一眼看出哪一步慢/失败
+    let ok = reply.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    let note = if ok {
+        format!(
+            "{} 项",
+            reply
+                .get("items")
+                .and_then(|x| x.as_array())
+                .map(|a| a.len())
+                .unwrap_or(0)
+        )
+    } else {
+        format!(
+            "失败：{}",
+            reply
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("未给原因")
+        )
+    };
+    util::log_format(
+        "平台在线浏览目录：{}（{}，耗时 {} ms）",
+        &[path, &note, &started.elapsed().as_millis().to_string()],
+    );
     send_event(&agent_id, reply);
 }
 
@@ -1254,6 +1300,7 @@ fn handle_file_list(manager: &Arc<AppManager>, cmd: &Json) {
 /// 二进制判定与路径归一化），平台侧只做只读转发，**不下发任何写入**。
 /// 回执带 `reqId` 原样回传，平台据此把异步 WS 回执接回同步的 HTTP 请求。
 fn handle_file_read(manager: &Arc<AppManager>, cmd: &Json) {
+    let started = std::time::Instant::now();
     let agent_id = manager.config().agent_id.clone();
     let req_id = cmd
         .get("reqId")
@@ -1277,6 +1324,26 @@ fn handle_file_read(manager: &Arc<AppManager>, cmd: &Json) {
             "message": e,
         }),
     };
+    // 一行日志即可定位「平台没收到回执」到底出在节点哪一步（成功读了多少字节 / 失败原因 / 耗时）
+    let ok = reply.get("ok").and_then(|x| x.as_bool()).unwrap_or(false);
+    let note = if ok {
+        format!(
+            "成功，读取 {} 字节",
+            reply.get("size").and_then(|x| x.as_i64()).unwrap_or(0)
+        )
+    } else {
+        format!(
+            "失败：{}",
+            reply
+                .get("message")
+                .and_then(|x| x.as_str())
+                .unwrap_or("未给原因")
+        )
+    };
+    util::log_format(
+        "平台在线查看文件：{}（{}，耗时 {} ms）",
+        &[path, &note, &started.elapsed().as_millis().to_string()],
+    );
     send_event(&agent_id, reply);
 }
 
