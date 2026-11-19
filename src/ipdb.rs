@@ -46,6 +46,31 @@ pub fn components_dir(base: &Path) -> PathBuf {
     root(base).join("components")
 }
 
+/// 下载授权身份目录（install.id / client.key / pubkey.txt / license）。
+pub fn auth_dir(base: &Path) -> PathBuf {
+    root(base).join("client")
+}
+
+fn auth_cfg(base: &Path) -> pek_ip::auth::IpAuthConfig {
+    pek_ip::auth::IpAuthConfig {
+        enabled: true,
+        state_dir: Some(auth_dir(base)),
+        ..Default::default()
+    }
+}
+
+/// 从目录 URL 推导平台源站（`https://host/components/catalog.json` → `https://host`）。
+pub fn origin_of(catalog_url: &str) -> Option<String> {
+    let url = catalog_url.trim();
+    let idx = url.find("/components/")?;
+    let origin = &url[..idx];
+    if origin.is_empty() {
+        None
+    } else {
+        Some(origin.to_string())
+    }
+}
+
 /// 本机 target 标识（与平台目录里的 `target` 字段同口径：`win-x64` / `linux-arm64` / `macos-arm64`）。
 pub fn target() -> String {
     let os = match std::env::consts::OS {
@@ -169,6 +194,23 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
         catalog_bytes: bytes.len(),
         ..Default::default()
     };
+    // 平台对组件包要求下载票据（直连 URL 一律 403）：开 IpdbAutoEnroll 就自动注册 + 取票。
+    // 实现直接复用 Pek.IP 的 AuthClient（enroll/ticket 与 Pek.ZIP 同一套协议）。
+    let origin = origin_of(url);
+    let mut auth: Option<pek_ip::auth::AuthClient> = if cfg.ipdb_auto_enroll {
+        match pek_ip::auth::AuthClient::load_or_create(&auth_cfg(base), base) {
+            Ok(client) => Some(client),
+            Err(e) => {
+                report
+                    .warnings
+                    .push(format!("初始化下载授权身份失败：{e}（目录 {}）", auth_dir(base).display()));
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mut pending_reported = false;
     let host_target = target();
     for item in list {
         if item.get("category").and_then(|v| v.as_str()) != Some(CATEGORY) {
@@ -207,7 +249,37 @@ pub fn refresh(base: &Path, cfg: &AgentConfig, fetch: &dyn StoreFetcher) -> Resu
                 continue;
             }
         }
-        match fetch.get(pkg_url, MAX_PACKAGE) {
+        // 取下载地址：有授权身份就用票据 URL，否则直连（新平台直连会 403，下面会给出提示）。
+        let mut download_url = pkg_url.to_string();
+        if let (Some(client), Some(origin)) = (auth.as_mut(), origin.as_deref()) {
+            let version = item.get("version").and_then(|v| v.as_str()).unwrap_or("");
+            match client.ticket(origin, id, version) {
+                Ok(url) => download_url = url,
+                Err(pek_ip::Error::Unsupported(_)) => {
+                    // 旧平台无授权接口：保持直连（公开下载）
+                }
+                Err(err) => {
+                    let msg = err.to_string();
+                    let pending = msg.contains("批准") || msg.contains("pending");
+                    if pending {
+                        if !pending_reported {
+                            pending_reported = true;
+                            report.warnings.push(format!(
+                                "已向平台注册下载身份，等待管理员批准（Pek.RPanlServer「分发中心 → IP 授权」；installId={}，状态目录 {}）：{msg}",
+                                client.install_id(),
+                                auth_dir(base).display()
+                            ));
+                        }
+                    } else {
+                        report
+                            .warnings
+                            .push(format!("申请 {id} 下载票据失败：{msg}（installId={}）", client.install_id()));
+                    }
+                    continue;
+                }
+            }
+        }
+        match fetch.get(&download_url, MAX_PACKAGE) {
             Ok(data) => {
                 let got = dhrust::sign::sha256_hex(&data);
                 if !got.eq_ignore_ascii_case(sha) {
@@ -291,6 +363,13 @@ pub fn ipdb_status(panel: &WebPanel, ctx: &Ctx) -> ActionResult {
         obj.insert("refreshMinutes".into(), json!(cfg.ipdb_refresh_minutes));
         obj.insert("signature".into(), json!(!cfg.ipdb_pubkey.trim().is_empty()));
         obj.insert("includeV6".into(), json!(cfg.ipdb_include_v6));
+        obj.insert("autoEnroll".into(), json!(cfg.ipdb_auto_enroll));
+        // 授权身份（installId）能让运维直接去平台「IP 授权」页找到对应待批准项
+        let install_id = pek_ip::auth::AuthClient::load_or_create(&auth_cfg(panel.base()), panel.base())
+            .ok()
+            .map(|c| c.install_id().to_string())
+            .unwrap_or_default();
+        obj.insert("installId".into(), json!(install_id));
         obj.insert(
             "mirrorUrl".into(),
             json!(format!("http://127.0.0.1:{}/ipdb", panel.port())),
@@ -569,5 +648,19 @@ mod tests {
         assert!(!safe_file_name("../x"));
         assert!(!safe_file_name("a/b"));
         assert!(!safe_file_name(".hidden"));
+    }
+
+    #[test]
+    fn origin_is_derived_from_catalog_url() {
+        assert_eq!(
+            origin_of("https://p.sc8.fun/components/catalog.json").as_deref(),
+            Some("https://p.sc8.fun")
+        );
+        assert_eq!(
+            origin_of("http://127.0.0.1:8899/ipdb/components/catalog.json").as_deref(),
+            Some("http://127.0.0.1:8899/ipdb")
+        );
+        // 不是组件目录形态 → 取不到源站（拒绝猜测）
+        assert!(origin_of("https://p.sc8.fun/catalog.json").is_none());
     }
 }

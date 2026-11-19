@@ -1779,6 +1779,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "pek-ip"
+version = "0.1.0"
+dependencies = [
+ "dhrust",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "pek-radmin"
 version = "0.1.0"
 dependencies = [
@@ -1796,6 +1806,7 @@ dependencies = [
  "dhrust",
  "flate2",
  "libc",
+ "pek-ip",
  "pek-radmin",
  "pek-rcode",
  "pek-rwaf",

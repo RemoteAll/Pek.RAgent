@@ -34,6 +34,9 @@ pek-rcode = { path = "../Pek.RCode", default-features = false, features = [
 pek-radmin = { path = "../Pek.RAdmin" }
 # Web 应用防火墙（爬虫分级：拦恶意扫描器；路径探测/CC；Config/Waf.json 热重载）
 pek-rwaf = { path = "../Pek.RWaf" }
+# IP 库下载授权（enroll + Ed25519 票据）：复用 Pek.IP 的现成实现，不在这里重写一套。
+# 只开 manager 特性（auth/manager），不带 mmdb——本仓只需拿票据，不读 xdb。
+pek-ip = { path = "../Pek.IP", default-features = false, features = ["manager"] }
 # 配置与状态序列化（AgentConfig / data/state.json）
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

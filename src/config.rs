@@ -124,6 +124,11 @@ pub struct AgentConfig {
     pub ipdb_pubkey: String,
     /// IP 库镜像是否一并缓存 IPv6 库（`ip2region-v6`，约 37 MiB；默认 false，仅需要 IPv6 归属地时开）
     pub ipdb_include_v6: bool,
+    /// IP 库镜像是否自动注册下载身份（enroll + 票据）。
+    ///
+    /// 平台对组件包要求下载票据（直连 URL 一律 403），打开后本机会以独立身份向平台注册，
+    /// 首次会在「分发中心 → IP 授权」出现一条待批准项（installId 见状态接口），批准后即可自动下包。
+    pub ipdb_auto_enroll: bool,
     /// 代理自动升级源地址（发行源 `catalog.json` URL；仅 https，127.0.0.1 例外）。默认官方平台；留空 = 关闭自动升级
     ///
     /// 验签公钥复用 `PluginStorePubKey`（平台同一把签名密钥）：配置后强制验签，留空仅 HTTPS+SHA-256。
@@ -211,6 +216,7 @@ impl Default for AgentConfig {
             ipdb_refresh_minutes: 360,
             ipdb_pubkey: String::new(),
             ipdb_include_v6: false,
+            ipdb_auto_enroll: false,
             auto_upgrade_url: "https://p.sc8.fun/store/agents/catalog.json".to_string(),
             auto_upgrade_interval_minutes: 60,
             auto_upgrade_token: String::new(),
@@ -780,6 +786,9 @@ fn config_from_json(root: &Json) -> AgentConfig {
     if let Some(v) = bool_of(obj, "IpdbIncludeV6") {
         cfg.ipdb_include_v6 = v;
     }
+    if let Some(v) = bool_of(obj, "IpdbAutoEnroll") {
+        cfg.ipdb_auto_enroll = v;
+    }
     if let Some(v) = text_of(obj, "AutoUpgradeUrl") {
         cfg.auto_upgrade_url = v;
     }
@@ -958,6 +967,7 @@ fn render_xml(cfg: &AgentConfig, current: Option<&str>) -> Result<String, String
         push("IpdbRefreshMinutes", cfg.ipdb_refresh_minutes.to_string());
         push("IpdbPubKey", cfg.ipdb_pubkey.clone());
         push("IpdbIncludeV6", bool_text(cfg.ipdb_include_v6));
+        push("IpdbAutoEnroll", bool_text(cfg.ipdb_auto_enroll));
         push("AutoUpgradeUrl", cfg.auto_upgrade_url.clone());
         push("AutoUpgradeToken", cfg.auto_upgrade_token.clone());
         push(
