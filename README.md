@@ -396,7 +396,9 @@ Pek.RAgent	版本：0.1.4	发布：2026-10-09 10:00:00
 2. 打开面板 **📚 IP 库** 页（或 `-IpdbStatus`）拿到 installId，到 Pek.RPanlServer「分发中心 → IP 授权」**批准**它；
 3. 回到面板点 **🔄 立即刷新**（或 `-IpdbRefresh`）：状态变「已就绪」，缓存里出现各数据包。
 
-之后本地应用按需取即可，例如 Pek.ZIP 的 `Config/Ip.toml`：
+之后本地应用按需取即可。Pek.ZIP（Zig 版）默认会**自动探测** `http://127.0.0.1:5501/ipdb`
+（探测超时 800 ms、只在真要联网时探一次，命中即用、未命中直连平台），**多数情况无需任何配置**；
+端口改过或想显式指定时，在应用的 `Config/Ip.toml` 里写：
 
 ```toml
 MirrorUrl = "http://127.0.0.1:5501/ipdb"   # 端口=本机面板端口；应用侧 AutoEnroll 可留 false（零凭据）
